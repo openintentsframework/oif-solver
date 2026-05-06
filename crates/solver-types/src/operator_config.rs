@@ -75,6 +75,12 @@ pub struct OperatorConfig {
 	/// If None, rebalancing is disabled.
 	#[serde(default)]
 	pub rebalance: Option<OperatorRebalanceConfig>,
+
+	/// Optional per-chain fee-policy override. None = use auto-generated
+	/// defaults. Whatever fields/chains you specify here are merged on top of
+	/// the auto-generated delivery config.
+	#[serde(default)]
+	pub fee_policy: Option<crate::seed_overrides::FeePolicyOverride>,
 }
 
 /// Account configuration for signing backends.
@@ -980,6 +986,7 @@ mod tests {
 			auth_enabled: false,
 			account: None,
 			rebalance: None,
+			fee_policy: None,
 		};
 
 		let json = serde_json::to_string_pretty(&config).unwrap();

@@ -285,8 +285,11 @@ mod tests {
 			unimplemented!("get_receipt not used in tests")
 		}
 
-		async fn get_gas_price(&self, _: u64) -> Result<String, DeliveryError> {
-			unimplemented!("get_gas_price not used in tests")
+		async fn get_fee_params(
+			&self,
+			chain_id: u64,
+		) -> Result<solver_delivery::FeeParams, DeliveryError> {
+			Ok(solver_delivery::FeeParams::legacy(chain_id, 1_000_000_000))
 		}
 
 		async fn get_balance(

@@ -5091,6 +5091,7 @@ dependencies = [
  "async-trait",
  "hex",
  "mockall",
+ "proptest",
  "reqwest",
  "serde",
  "serde_json",

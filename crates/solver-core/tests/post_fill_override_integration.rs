@@ -65,7 +65,7 @@ use async_trait::async_trait;
 use solver_core::engine::post_fill_overrides::{
 	build_post_fill_state_override, estimate_post_fill_with_overrides_for_test,
 };
-use solver_delivery::{DeliveryError, DeliveryInterface};
+use solver_delivery::{DeliveryError, DeliveryInterface, FeeParams};
 use solver_types::{
 	Address as SolverAddress, ConfigSchema, Schema, Transaction as SolverTransaction,
 };
@@ -226,7 +226,7 @@ impl DeliveryInterface for LiveRpcDelivery {
 		unimplemented!()
 	}
 
-	async fn get_gas_price(&self, _chain_id: u64) -> Result<String, DeliveryError> {
+	async fn get_fee_params(&self, _chain_id: u64) -> Result<FeeParams, DeliveryError> {
 		unimplemented!()
 	}
 

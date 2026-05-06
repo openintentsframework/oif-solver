@@ -656,8 +656,12 @@ mod tests {
 
 		let mut mock_delivery_1 = MockDeliveryInterface::new();
 		mock_delivery_1
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("1000000000".to_string()) }));
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(
+					async move { Ok(solver_delivery::FeeParams::legacy(chain_id, 1_000_000_000)) },
+				)
+			});
 		mock_delivery_1
 			.expect_get_balance()
 			.returning(|_, _, _| Box::pin(async move { Ok("5000000000".to_string()) }));
@@ -665,8 +669,12 @@ mod tests {
 
 		let mut mock_delivery_137 = MockDeliveryInterface::new();
 		mock_delivery_137
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("1000000000".to_string()) }));
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(
+					async move { Ok(solver_delivery::FeeParams::legacy(chain_id, 1_000_000_000)) },
+				)
+			});
 		mock_delivery_137
 			.expect_get_balance()
 			.returning(|_, _, _| Box::pin(async move { Ok("5000000000".to_string()) }));

@@ -641,6 +641,36 @@ fn generate_demo_config(
 		.collect::<serde_json::Map<String, serde_json::Value>>();
 
 	let first_chain = *chain_ids.first().unwrap_or(&31337);
+
+	// Build the per-chain `fee_policy.chains` map. Every chain id present
+	// in `delivery.implementations.evm_alloy.network_ids` MUST have an
+	// entry here — startup validation rejects configs that don't.
+	// Defaults match `build_delivery_config_from_operator` in solver-service:
+	// 0.01 gwei floor + fallback so the percentile-driven estimator drives
+	// priority in every realistic regime. Operators who need a different
+	// per-chain shape pass a `fee_policy` block in their bootstrap config.
+	fn fee_policy_chains_for(chain_ids: &[u64]) -> serde_json::Map<String, serde_json::Value> {
+		chain_ids
+			.iter()
+			.map(|chain_id| {
+				let mut entry = serde_json::Map::new();
+				entry.insert(
+					"min_priority_fee_per_gas".to_string(),
+					serde_json::Value::String("10000000".to_string()),
+				);
+				entry.insert(
+					"priority_fee_fallback".to_string(),
+					serde_json::Value::String("10000000".to_string()),
+				);
+				entry.insert(
+					"quote_cost_strategy".to_string(),
+					serde_json::Value::String("buffered_effective_125".to_string()),
+				);
+				(chain_id.to_string(), serde_json::Value::Object(entry))
+			})
+			.collect()
+	}
+
 	let config = serde_json::json!({
 		"solver": {
 			"id": "oif-solver-demo",
@@ -670,7 +700,13 @@ fn generate_demo_config(
 		"delivery": {
 			"min_confirmations": 1,
 			"implementations": {
-				"evm_alloy": { "network_ids": chain_ids }
+				"evm_alloy": {
+					"network_ids": chain_ids,
+					"fee_policy": {
+						"default_speed": "fast",
+						"chains": fee_policy_chains_for(chain_ids)
+					}
+				}
 			}
 		},
 		"discovery": {
@@ -1173,6 +1209,7 @@ mod tests {
 			rebalance: None,
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		}
 	}
 

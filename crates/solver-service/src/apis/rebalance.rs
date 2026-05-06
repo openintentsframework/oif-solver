@@ -1048,6 +1048,7 @@ mod tests {
 					"vault_addresses": { "1": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }
 				})),
 			}),
+			fee_policy: None,
 		}
 	}
 

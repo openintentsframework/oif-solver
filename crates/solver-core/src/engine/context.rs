@@ -261,7 +261,7 @@ mod tests {
 	use mockall::predicate::*;
 	use serde_json::json;
 	use solver_account::MockAccountInterface;
-	use solver_delivery::MockDeliveryInterface;
+	use solver_delivery::{FeeParams, MockDeliveryInterface};
 	use solver_types::{
 		networks::RpcEndpoint,
 		utils::tests::builders::{
@@ -281,10 +281,11 @@ mod tests {
 	fn create_mock_delivery_service() -> Arc<DeliveryService> {
 		let mut mock_delivery = MockDeliveryInterface::new();
 
-		// Mock get_chain_data calls
-		mock_delivery
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async { Ok("20000000000".to_string()) }));
+		// Mock get_chain_data calls (chain_data.gas_price is sourced from
+		// FeeParams::cost_per_gas, so configure it via fee params)
+		mock_delivery.expect_get_fee_params().returning(|chain_id| {
+			Box::pin(async move { Ok(FeeParams::legacy(chain_id, 20_000_000_000u128)) })
+		});
 		mock_delivery
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async { Ok(12345678) }));
@@ -579,9 +580,11 @@ mod tests {
 
 		// Setup mocks for chain 1 - should be called 3 times (native + 2 tokens)
 		mock_delivery_1
-			.expect_get_gas_price()
+			.expect_get_fee_params()
 			.times(1)
-			.returning(|_| Box::pin(async { Ok("20000000000".to_string()) }));
+			.returning(|chain_id| {
+				Box::pin(async move { Ok(FeeParams::legacy(chain_id, 20_000_000_000u128)) })
+			});
 		mock_delivery_1
 			.expect_get_block_number()
 			.times(1)
@@ -596,9 +599,11 @@ mod tests {
 
 		// Setup mocks for chain 137 - should be called 1 time (native only)
 		mock_delivery_137
-			.expect_get_gas_price()
+			.expect_get_fee_params()
 			.times(1)
-			.returning(|_| Box::pin(async { Ok("30000000000".to_string()) }));
+			.returning(|chain_id| {
+				Box::pin(async move { Ok(FeeParams::legacy(chain_id, 30_000_000_000u128)) })
+			});
 		mock_delivery_137
 			.expect_get_block_number()
 			.times(1)

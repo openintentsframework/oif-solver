@@ -30,7 +30,7 @@ pub(crate) mod post_fill_outcome {
 }
 use rust_decimal::Decimal;
 use solver_config::Config;
-use solver_delivery::DeliveryService;
+use solver_delivery::{DeliveryService, FeeParams};
 use solver_pricing::PricingService;
 use solver_storage::StorageService;
 use solver_types::{
@@ -172,12 +172,48 @@ fn first_hyperlane_oracle_for_quote(
 }
 
 /// Parameters for gas unit calculations
+#[derive(Debug, Clone)]
 pub struct GasUnits {
 	pub open_units: u64,
 	pub fill_units: u64,
 	pub post_fill_units: u64,
 	pub pre_claim_units: u64,
 	pub claim_units: u64,
+}
+
+/// Wei-denominated cost split for the OIF contract gas legs.
+///
+/// The chain boundaries follow the OIF settler/filler topology:
+/// `Settler.open*`, pre-claim, and `finalise*` always run on the origin
+/// chain, while `BaseFiller.fill*` and post-fill oracle work always run
+/// on the destination chain. This struct exists so the split is a pure
+/// computation that can be property-tested independently of mocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GasLegCostsWei {
+	open: U256,
+	fill: U256,
+	post_fill: U256,
+	pre_claim: U256,
+	claim: U256,
+}
+
+/// Compute per-leg wei costs from gas units and resolved per-chain
+/// `cost_per_gas` values. Origin legs (open / pre_claim / claim) use
+/// `origin_cost_per_gas`; destination legs (fill / post_fill) use
+/// `dest_cost_per_gas`. Saturating multiplication mirrors the inline
+/// behaviour the helper replaced.
+fn calculate_gas_leg_costs_wei(
+	gas_units: &GasUnits,
+	origin_cost_per_gas: U256,
+	dest_cost_per_gas: U256,
+) -> GasLegCostsWei {
+	GasLegCostsWei {
+		open: origin_cost_per_gas.saturating_mul(U256::from(gas_units.open_units)),
+		fill: dest_cost_per_gas.saturating_mul(U256::from(gas_units.fill_units)),
+		post_fill: dest_cost_per_gas.saturating_mul(U256::from(gas_units.post_fill_units)),
+		pre_claim: origin_cost_per_gas.saturating_mul(U256::from(gas_units.pre_claim_units)),
+		claim: origin_cost_per_gas.saturating_mul(U256::from(gas_units.claim_units)),
+	}
 }
 
 /// Result of callback simulation
@@ -964,18 +1000,46 @@ impl CostProfitService {
 		// Read gas_buffer_bps from solver config (hot-reloadable)
 		let gas_buffer_bps_value = config.solver.gas_buffer_bps;
 
-		// Gas reads are independent and only need eth_gasPrice.
-		let (origin_gp, dest_gp) = tokio::try_join!(
-			self.get_chain_gas_price(origin_chain_id),
-			self.get_chain_gas_price(dest_chain_id),
+		// Resolve effective fee params per chain — the same model used by
+		// transaction submit. `cost_per_gas` is the quote-economics value
+		// chosen by the configured `FeeCostStrategy` (e.g. buffered
+		// effective EIP-1559 price).
+		let (origin_fee, dest_fee) = tokio::try_join!(
+			self.get_chain_fee_params(origin_chain_id),
+			self.get_chain_fee_params(dest_chain_id),
 		)?;
 
-		// Calculate gas costs in wei
-		let open_cost_wei = origin_gp.saturating_mul(U256::from(gas_units.open_units));
-		let fill_cost_wei = dest_gp.saturating_mul(U256::from(gas_units.fill_units));
-		let post_fill_cost_wei = dest_gp.saturating_mul(U256::from(gas_units.post_fill_units));
-		let pre_claim_cost_wei = origin_gp.saturating_mul(U256::from(gas_units.pre_claim_units));
-		let claim_cost_wei = origin_gp.saturating_mul(U256::from(gas_units.claim_units));
+		let origin_gp = U256::from(origin_fee.cost_per_gas);
+		let dest_gp = U256::from(dest_fee.cost_per_gas);
+
+		// Single structured event covering both legs — at INFO so the value
+		// used for quote economics is auditable in canary deploys. Move to
+		// `debug` once production confidence exists.
+		tracing::info!(
+			origin_chain_id,
+			dest_chain_id,
+			origin_fee_model = ?origin_fee.model,
+			origin_cost_per_gas = origin_fee.cost_per_gas,
+			origin_max_fee_per_gas = ?origin_fee.max_fee_per_gas,
+			origin_max_priority_fee_per_gas = ?origin_fee.max_priority_fee_per_gas,
+			origin_legacy_gas_price = ?origin_fee.gas_price,
+			dest_fee_model = ?dest_fee.model,
+			dest_cost_per_gas = dest_fee.cost_per_gas,
+			dest_max_fee_per_gas = ?dest_fee.max_fee_per_gas,
+			dest_max_priority_fee_per_gas = ?dest_fee.max_priority_fee_per_gas,
+			dest_legacy_gas_price = ?dest_fee.gas_price,
+			"Quote gas fee params resolved"
+		);
+
+		// Split gas costs across origin/destination contract legs. Helper
+		// is pure to allow proptest coverage of the chain-boundary
+		// invariant without touching mocks.
+		let leg_costs = calculate_gas_leg_costs_wei(gas_units, origin_gp, dest_gp);
+		let open_cost_wei = leg_costs.open;
+		let fill_cost_wei = leg_costs.fill;
+		let post_fill_cost_wei = leg_costs.post_fill;
+		let pre_claim_cost_wei = leg_costs.pre_claim;
+		let claim_cost_wei = leg_costs.claim;
 
 		// Price conversions are independent as well.
 		let (gas_open, gas_fill, gas_post_fill, gas_pre_claim, gas_claim) = tokio::try_join!(
@@ -1292,6 +1356,18 @@ impl CostProfitService {
 			"arbitrage opportunity"
 		};
 
+		// Build the optional PreClaim cost line — kept out of the printed
+		// summary when zero to avoid noise on flows that have no pre-claim
+		// step (most common today).
+		let pre_claim_line = if breakdown_for_decision.gas_pre_claim.is_zero() {
+			String::new()
+		} else {
+			format!(
+				"│  │  ├─ PreClaim:        $ {:>7.4}\n",
+				breakdown_for_decision.gas_pre_claim
+			)
+		};
+
 		// Log streamlined profitability validation summary
 		tracing::info!(
 			"\n\
@@ -1311,6 +1387,8 @@ impl CostProfitService {
 			│  ├─ Gas Costs:\n\
 			│  │  ├─ Open:            {}\n\
 			│  │  ├─ Fill:            $ {:>7.4}\n\
+			│  │  ├─ PostFill:        $ {:>7.4}\n\
+			{}\
 			│  │  ├─ Claim:           $ {:>7.4}\n\
 			│  │  └─ Buffer (10%):    $ {:>7.4}\n\
 			│  ├─ Total Operational:  $ {:>7.4}\n\
@@ -1342,6 +1420,8 @@ impl CostProfitService {
 				format!("$ {:>7.4}", breakdown_for_decision.gas_open)
 			},
 			breakdown_for_decision.gas_fill,
+			breakdown_for_decision.gas_post_fill,
+			pre_claim_line,
 			breakdown_for_decision.gas_claim,
 			breakdown_for_decision.gas_buffer,
 			operational_cost_usd,
@@ -2062,21 +2142,18 @@ impl CostProfitService {
 		})
 	}
 
-	/// Gets the gas price for a specific chain
-	async fn get_chain_gas_price(&self, chain_id: u64) -> Result<U256, APIError> {
-		let gas_price = self
-			.delivery_service
-			.get_gas_price(chain_id)
+	/// Gets effective fee params for a specific chain.
+	///
+	/// Uses the same fee model the delivery layer applies at submit time,
+	/// so the quote economics line up with the actual on-chain cost.
+	async fn get_chain_fee_params(&self, chain_id: u64) -> Result<FeeParams, APIError> {
+		self.delivery_service
+			.get_fee_params(chain_id)
 			.await
 			.map_err(|e| APIError::InternalServerError {
 				error_type: ApiErrorType::ServiceError,
-				message: format!("Failed to get gas price: {e}"),
-			})?;
-
-		match U256::from_str_radix(&gas_price, 10) {
-			Ok(gas_price) => Ok(gas_price),
-			Err(_) => Ok(U256::from(DEFAULT_GAS_PRICE_WEI)),
-		}
+				message: format!("Failed to get fee params: {e}"),
+			})
 	}
 
 	async fn wei_to_usd(&self, value_wei: &U256) -> Result<Decimal, CostProfitError> {
@@ -2932,9 +3009,9 @@ mod tests {
 		});
 
 		// Remove duplicate expectations and add proper setup
-		mock_delivery
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("20000000000".to_string()) }));
+		mock_delivery.expect_get_fee_params().returning(|chain_id| {
+			Box::pin(async move { Ok(FeeParams::legacy(chain_id, 20_000_000_000u128)) })
+		});
 
 		mock_delivery
 			.expect_get_block_number()
@@ -2956,8 +3033,10 @@ mod tests {
 			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
 		});
 		mock_delivery_137
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("20000000000".to_string()) }));
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(async move { Ok(FeeParams::legacy(chain_id, 20_000_000_000u128)) })
+			});
 		mock_delivery_137
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async move { Ok(12345u64) }));
@@ -3096,9 +3175,9 @@ mod tests {
 		mock_delivery.expect_config_schema().returning(|| {
 			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
 		});
-		mock_delivery
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("20000000000".to_string()) }));
+		mock_delivery.expect_get_fee_params().returning(|chain_id| {
+			Box::pin(async move { Ok(FeeParams::legacy(chain_id, 20_000_000_000u128)) })
+		});
 		mock_delivery
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async move { Ok(12345u64) }));
@@ -3116,8 +3195,10 @@ mod tests {
 			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
 		});
 		mock_delivery_137
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("20000000000".to_string()) }));
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(async move { Ok(FeeParams::legacy(chain_id, 20_000_000_000u128)) })
+			});
 		mock_delivery_137
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async move { Ok(12345u64) }));
@@ -3255,8 +3336,10 @@ mod tests {
 			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
 		});
 		mock_delivery_1
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("20000000000".to_string()) }));
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(async move { Ok(FeeParams::legacy(chain_id, 20_000_000_000u128)) })
+			});
 		mock_delivery_1
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async move { Ok(12345u64) }));
@@ -3267,8 +3350,10 @@ mod tests {
 			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
 		});
 		mock_delivery_137
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("20000000000".to_string()) }));
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(async move { Ok(FeeParams::legacy(chain_id, 20_000_000_000u128)) })
+			});
 		mock_delivery_137
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async move { Ok(12345u64) }));
@@ -3474,16 +3559,18 @@ mod tests {
 
 		let mut origin_delivery = MockDeliveryInterface::new();
 		origin_delivery
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("10".to_string()) }));
+			.expect_get_fee_params()
+			.returning(|chain_id| Box::pin(async move { Ok(FeeParams::legacy(chain_id, 10u128)) }));
 		origin_delivery.expect_config_schema().returning(|| {
 			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
 		});
 
 		let mut destination_delivery = MockDeliveryInterface::new();
 		destination_delivery
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("100".to_string()) }));
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(async move { Ok(FeeParams::legacy(chain_id, 100u128)) })
+			});
 		destination_delivery.expect_config_schema().returning(|| {
 			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
 		});
@@ -4986,9 +5073,9 @@ mod tests {
 		mock_origin.expect_config_schema().returning(|| {
 			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
 		});
-		mock_origin
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("20000000000".to_string()) }));
+		mock_origin.expect_get_fee_params().returning(|chain_id| {
+			Box::pin(async move { Ok(FeeParams::legacy(chain_id, 20_000_000_000u128)) })
+		});
 		mock_origin
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async move { Ok(12345u64) }));
@@ -4998,9 +5085,9 @@ mod tests {
 		mock_dest.expect_config_schema().returning(|| {
 			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
 		});
-		mock_dest
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("20000000000".to_string()) }));
+		mock_dest.expect_get_fee_params().returning(|chain_id| {
+			Box::pin(async move { Ok(FeeParams::legacy(chain_id, 20_000_000_000u128)) })
+		});
 		mock_dest
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async move { Ok(12345u64) }));
@@ -5417,9 +5504,9 @@ mod tests {
 		mock_origin.expect_config_schema().returning(|| {
 			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
 		});
-		mock_origin
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("20000000000".to_string()) }));
+		mock_origin.expect_get_fee_params().returning(|chain_id| {
+			Box::pin(async move { Ok(FeeParams::legacy(chain_id, 20_000_000_000u128)) })
+		});
 		mock_origin
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async move { Ok(12345u64) }));
@@ -5428,9 +5515,9 @@ mod tests {
 		mock_dest.expect_config_schema().returning(|| {
 			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
 		});
-		mock_dest
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("20000000000".to_string()) }));
+		mock_dest.expect_get_fee_params().returning(|chain_id| {
+			Box::pin(async move { Ok(FeeParams::legacy(chain_id, 20_000_000_000u128)) })
+		});
 		mock_dest
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async move { Ok(12345u64) }));
@@ -6527,5 +6614,80 @@ mod tests {
 			"margin {} must reflect stored cost, not the inflated fresh cost",
 			margin,
 		);
+	}
+}
+
+#[cfg(test)]
+mod gas_leg_proptests {
+	//! Property tests for `calculate_gas_leg_costs_wei`.
+	//!
+	//! Encodes the OIF contract-derived chain-boundary invariant:
+	//!   - `Settler.open*`, pre-claim, and `finalise*` are origin-chain costs.
+	//!   - `BaseFiller.fill*` and post-fill oracle work are destination-chain costs.
+	//! Changing destination fee params must never move origin legs (and vice
+	//! versa). These tests run without any mock infrastructure because the
+	//! helper is pure.
+	use super::*;
+	use proptest::prelude::*;
+
+	fn arb_gas_units() -> impl Strategy<Value = GasUnits> {
+		(
+			0u64..2_000_000u64,
+			0u64..2_000_000u64,
+			0u64..2_000_000u64,
+			0u64..2_000_000u64,
+			0u64..2_000_000u64,
+		)
+			.prop_map(|(open, fill, post_fill, pre_claim, claim)| GasUnits {
+				open_units: open,
+				fill_units: fill,
+				post_fill_units: post_fill,
+				pre_claim_units: pre_claim,
+				claim_units: claim,
+			})
+	}
+
+	proptest! {
+		#[test]
+		fn gas_leg_accounting_uses_contract_chain_boundaries(
+			gas_units in arb_gas_units(),
+			origin_fee in 0u128..1_000_000_000_000u128,
+			dest_fee in 0u128..1_000_000_000_000u128,
+		) {
+			let costs = calculate_gas_leg_costs_wei(
+				&gas_units,
+				U256::from(origin_fee),
+				U256::from(dest_fee),
+			);
+
+			prop_assert_eq!(costs.open, U256::from(origin_fee) * U256::from(gas_units.open_units));
+			prop_assert_eq!(costs.pre_claim, U256::from(origin_fee) * U256::from(gas_units.pre_claim_units));
+			prop_assert_eq!(costs.claim, U256::from(origin_fee) * U256::from(gas_units.claim_units));
+			prop_assert_eq!(costs.fill, U256::from(dest_fee) * U256::from(gas_units.fill_units));
+			prop_assert_eq!(costs.post_fill, U256::from(dest_fee) * U256::from(gas_units.post_fill_units));
+		}
+
+		#[test]
+		fn changing_dest_fee_does_not_change_origin_contract_legs(
+			gas_units in arb_gas_units(),
+			origin_fee in 0u128..1_000_000_000_000u128,
+			dest_fee_a in 0u128..1_000_000_000_000u128,
+			dest_fee_b in 0u128..1_000_000_000_000u128,
+		) {
+			let a = calculate_gas_leg_costs_wei(
+				&gas_units,
+				U256::from(origin_fee),
+				U256::from(dest_fee_a),
+			);
+			let b = calculate_gas_leg_costs_wei(
+				&gas_units,
+				U256::from(origin_fee),
+				U256::from(dest_fee_b),
+			);
+
+			prop_assert_eq!(a.open, b.open);
+			prop_assert_eq!(a.pre_claim, b.pre_claim);
+			prop_assert_eq!(a.claim, b.claim);
+		}
 	}
 }

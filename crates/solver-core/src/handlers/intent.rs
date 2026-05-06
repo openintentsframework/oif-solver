@@ -560,7 +560,7 @@ mod tests {
 	use serde_json::json;
 	use solver_account::MockAccountInterface;
 	use solver_config::ConfigBuilder;
-	use solver_delivery::DeliveryService;
+	use solver_delivery::{DeliveryService, FeeParams};
 	use solver_order::{MockExecutionStrategy, MockOrderInterface};
 	use solver_pricing::{MockPricingInterface, PricingService};
 	use solver_storage::{MockStorageInterface, StorageError};
@@ -798,8 +798,10 @@ mod tests {
 
 		let mut mock_delivery_1 = solver_delivery::MockDeliveryInterface::new();
 		mock_delivery_1
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("20000".to_string()) }));
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(async move { Ok(FeeParams::legacy(chain_id, 20_000u128)) })
+			});
 		mock_delivery_1
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async move { Ok(1000000u64) }));
@@ -809,8 +811,10 @@ mod tests {
 
 		let mut mock_delivery_137 = solver_delivery::MockDeliveryInterface::new();
 		mock_delivery_137
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("20000".to_string()) }));
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(async move { Ok(FeeParams::legacy(chain_id, 20_000u128)) })
+			});
 		mock_delivery_137
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async move { Ok(1000000u64) }));
