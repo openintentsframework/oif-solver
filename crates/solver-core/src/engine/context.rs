@@ -322,9 +322,6 @@ mod tests {
 					.unwrap();
 			solver_account::AccountSigner::Local(signer)
 		});
-		mock_account
-			.expect_config_schema()
-			.returning(|| Box::new(solver_account::implementations::local::LocalWalletSchema));
 
 		Arc::new(solver_account::AccountService::new(Box::new(mock_account)))
 	}

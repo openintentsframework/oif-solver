@@ -642,9 +642,6 @@ mod tests {
 				Ok(parse_address("3333333333333333333333333333333333333333").unwrap())
 			})
 		});
-		mock_account
-			.expect_config_schema()
-			.returning(|| Box::new(solver_account::implementations::local::LocalWalletSchema));
 		mock_account.expect_signer().returning(|| {
 			use alloy_signer_local::PrivateKeySigner;
 			let signer: PrivateKeySigner =

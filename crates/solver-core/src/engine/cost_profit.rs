@@ -2888,9 +2888,6 @@ mod tests {
 		mock_account
 			.expect_address()
 			.returning(|| Box::pin(async move { Ok(solver_types::Address([0xAB; 20].to_vec())) }));
-		mock_account
-			.expect_config_schema()
-			.returning(|| Box::new(solver_account::implementations::local::LocalWalletSchema));
 		mock_account.expect_signer().returning(|| {
 			use alloy_signer_local::PrivateKeySigner;
 			let signer: PrivateKeySigner =
