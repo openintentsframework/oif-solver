@@ -5,7 +5,7 @@
 
 use alloy_consensus::SignableTransaction;
 use alloy_network::TxSigner;
-use alloy_primitives::{Address, Signature, B256};
+use alloy_primitives::{Address, Signature};
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
 use async_trait::async_trait;
@@ -38,39 +38,12 @@ impl AccountSigner {
 		}
 	}
 
-	/// Returns the signer's chain ID.
-	pub fn chain_id(&self) -> Option<u64> {
-		match self {
-			Self::Local(s) => Signer::chain_id(s),
-			#[cfg(feature = "kms")]
-			Self::Kms(s) => Signer::chain_id(s),
-		}
-	}
-
-	/// Sets the chain ID.
-	pub fn set_chain_id(&mut self, chain_id: Option<u64>) {
-		match self {
-			Self::Local(s) => Signer::set_chain_id(s, chain_id),
-			#[cfg(feature = "kms")]
-			Self::Kms(s) => Signer::set_chain_id(s, chain_id),
-		}
-	}
-
 	/// Returns a new signer with the specified chain ID.
 	pub fn with_chain_id(self, chain_id: Option<u64>) -> Self {
 		match self {
 			Self::Local(s) => Self::Local(Signer::with_chain_id(s, chain_id)),
 			#[cfg(feature = "kms")]
 			Self::Kms(s) => Self::Kms(Signer::with_chain_id(s, chain_id)),
-		}
-	}
-
-	/// Signs the given hash.
-	pub async fn sign_hash(&self, hash: &B256) -> alloy_signer::Result<Signature> {
-		match self {
-			Self::Local(s) => s.sign_hash(hash).await,
-			#[cfg(feature = "kms")]
-			Self::Kms(s) => s.sign_hash(hash).await,
 		}
 	}
 }
@@ -130,28 +103,14 @@ mod tests {
 	}
 
 	#[test]
-	fn test_account_signer_chain_id_none_by_default() {
-		let signer = create_test_signer();
-		assert_eq!(signer.chain_id(), None);
-	}
-
-	#[test]
 	fn test_account_signer_with_chain_id() {
 		let signer = create_test_signer();
-		let signer_with_chain = signer.with_chain_id(Some(1));
-		assert_eq!(signer_with_chain.chain_id(), Some(1));
-	}
-
-	#[test]
-	fn test_account_signer_set_chain_id() {
-		let mut signer = create_test_signer();
-		assert_eq!(signer.chain_id(), None);
-
-		signer.set_chain_id(Some(42));
-		assert_eq!(signer.chain_id(), Some(42));
-
-		signer.set_chain_id(None);
-		assert_eq!(signer.chain_id(), None);
+		let with_chain = signer.with_chain_id(Some(1));
+		// Address must remain stable after binding a chain id
+		assert_eq!(
+			format!("{:?}", with_chain.address()).to_lowercase(),
+			"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+		);
 	}
 
 	#[test]
@@ -159,14 +118,6 @@ mod tests {
 		let signer = create_test_signer();
 		let cloned = signer.clone();
 		assert_eq!(signer.address(), cloned.address());
-	}
-
-	#[tokio::test]
-	async fn test_account_signer_sign_hash() {
-		let signer = create_test_signer();
-		let hash = B256::ZERO;
-		let signature = signer.sign_hash(&hash).await;
-		assert!(signature.is_ok());
 	}
 
 	#[tokio::test]

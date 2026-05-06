@@ -88,6 +88,17 @@ pub enum BridgeError {
 	/// produced. No deposit/source bridge transaction was attempted.
 	#[error("approve submit failed before deposit attempt: {error}")]
 	ApproveSubmitFailed { error: String },
+
+	/// Delivery returned `NonceTooLow` — the nonce cache had drifted relative
+	/// to the chain's pending count when the tx was built. The next call to
+	/// `next_nonce_for` will resync against `eth_getTransactionCount(pending)`,
+	/// so this is a transient condition: the caller should retry on the next
+	/// monitor tick rather than mark the transfer terminally failed.
+	///
+	/// NOT terminal — paired with `ApprovePending` as the explicitly-retryable
+	/// pre-deposit outcomes.
+	#[error("delivery reported nonce too low (transient): {0}")]
+	NonceTooLow(String),
 }
 
 impl From<solver_storage::StorageError> for BridgeError {
@@ -236,12 +247,17 @@ impl BridgeService {
 				transfer.transition_to(BridgeTransferStatus::Failed(format!(
 					"approve reverted (tx {tx_hash}): {error}"
 				)));
+				// Propagate save failures (mirroring `ApprovePending` above).
+				// If we only warn, the in-memory rollback never reaches storage,
+				// so the next monitor tick still sees `bridge_submit_attempted = true`
+				// (from the line-204 pre-call save) without a tx hash and escalates
+				// it as a possible-double-deposit crash-window case — even though
+				// the deposit was never attempted.
 				if let Err(save_err) = self.storage.save_transfer(&transfer).await {
-					tracing::warn!(
-						transfer_id = %transfer.id,
-						error = %save_err,
-						"Failed to persist approve-reverted transfer"
-					);
+					return Err(BridgeError::Storage(format!(
+						"failed to persist approve-reverted rollback for transfer {}: {save_err}",
+						transfer.id,
+					)));
 				}
 				return Err(BridgeError::ApproveReverted { tx_hash, error });
 			},
@@ -251,11 +267,10 @@ impl BridgeService {
 					"approve failed before deposit attempt: {error}"
 				)));
 				if let Err(save_err) = self.storage.save_transfer(&transfer).await {
-					tracing::warn!(
-						transfer_id = %transfer.id,
-						error = %save_err,
-						"Failed to persist approve-submit-failed transfer"
-					);
+					return Err(BridgeError::Storage(format!(
+						"failed to persist approve-submit-failed rollback for transfer {}: {save_err}",
+						transfer.id,
+					)));
 				}
 				return Err(BridgeError::ApproveSubmitFailed { error });
 			},
@@ -266,13 +281,31 @@ impl BridgeService {
 				transfer.bridge_submit_attempted = false;
 				transfer.transition_to(BridgeTransferStatus::NeedsIntervention(reason.clone()));
 				if let Err(save_err) = self.storage.save_transfer(&transfer).await {
+					return Err(BridgeError::Storage(format!(
+						"failed to persist insufficient-native-gas rollback for transfer {}: {save_err}",
+						transfer.id,
+					)));
+				}
+				return Err(BridgeError::InsufficientNativeGas(reason));
+			},
+			Err(BridgeError::NonceTooLow(reason)) => {
+				// Nonce drift is transient and pre-broadcast: the RPC rejected
+				// the tx because the local nonce cache was stale. The next call
+				// to `next_nonce_for` resyncs against `eth_getTransactionCount`,
+				// so we roll back the crash-window marker and leave the transfer
+				// in its current status (typically `Submitted`) for the next
+				// monitor tick to retry. We do NOT mark NeedsIntervention or
+				// Failed — there's no operator action required; the underlying
+				// resync happens automatically.
+				transfer.bridge_submit_attempted = false;
+				if let Err(save_err) = self.storage.save_transfer(&transfer).await {
 					tracing::warn!(
 						transfer_id = %transfer.id,
 						error = %save_err,
-						"Failed to persist insufficient-native-gas transfer"
+						"Failed to persist NonceTooLow rollback"
 					);
 				}
-				return Err(BridgeError::InsufficientNativeGas(reason));
+				return Err(BridgeError::NonceTooLow(reason));
 			},
 			Err(err) => {
 				// Generic error path: any other error is ambiguous — the deposit

@@ -261,13 +261,18 @@ impl IntentHandler {
 		let order_bytes = &intent.order_bytes;
 
 		// For on-chain discovered intents, we use a simple callback that returns the intent ID
-		// since the order ID was already computed during discovery
-		let intent_id = intent.id.clone();
+		// since the order ID was already computed during discovery.
+		//
+		// Normalize the id before handing it to `hex::decode`. Discovery sources may emit
+		// ids with or without the `0x` prefix; without normalization a prefixed intent
+		// passes the dedupe step above (which canonicalizes via `with_0x_prefix`) but
+		// then fails order creation here, since `alloy_primitives::hex::decode` rejects
+		// `0x...`-prefixed inputs.
+		let intent_id = solver_types::without_0x_prefix(&intent.id).to_string();
 		let order_id_callback: solver_types::OrderIdCallback =
 			Box::new(move |_chain_id, _tx_data| {
 				let id = intent_id.clone();
 				Box::pin(async move {
-					// Return the intent ID as bytes (it's already a hex string)
 					alloy_primitives::hex::decode(&id)
 						.map_err(|e| format!("Failed to decode intent ID: {e}"))
 				})
@@ -560,7 +565,7 @@ mod tests {
 	use serde_json::json;
 	use solver_account::MockAccountInterface;
 	use solver_config::ConfigBuilder;
-	use solver_delivery::DeliveryService;
+	use solver_delivery::{DeliveryService, FeeParams};
 	use solver_order::{MockExecutionStrategy, MockOrderInterface};
 	use solver_pricing::{MockPricingInterface, PricingService};
 	use solver_storage::{MockStorageInterface, StorageError};
@@ -798,8 +803,10 @@ mod tests {
 
 		let mut mock_delivery_1 = solver_delivery::MockDeliveryInterface::new();
 		mock_delivery_1
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("20000".to_string()) }));
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(async move { Ok(FeeParams::legacy(chain_id, 20_000u128)) })
+			});
 		mock_delivery_1
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async move { Ok(1000000u64) }));
@@ -809,8 +816,10 @@ mod tests {
 
 		let mut mock_delivery_137 = solver_delivery::MockDeliveryInterface::new();
 		mock_delivery_137
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("20000".to_string()) }));
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(async move { Ok(FeeParams::legacy(chain_id, 20_000u128)) })
+			});
 		mock_delivery_137
 			.expect_get_block_number()
 			.returning(|_| Box::pin(async move { Ok(1000000u64) }));

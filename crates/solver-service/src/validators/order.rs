@@ -285,8 +285,11 @@ mod tests {
 			unimplemented!("get_receipt not used in tests")
 		}
 
-		async fn get_gas_price(&self, _: u64) -> Result<String, DeliveryError> {
-			unimplemented!("get_gas_price not used in tests")
+		async fn get_fee_params(
+			&self,
+			chain_id: u64,
+		) -> Result<solver_delivery::FeeParams, DeliveryError> {
+			Ok(solver_delivery::FeeParams::legacy(chain_id, 1_000_000_000))
 		}
 
 		async fn get_balance(
@@ -322,6 +325,14 @@ mod tests {
 
 		async fn estimate_gas(&self, _: solver_types::Transaction) -> Result<u64, DeliveryError> {
 			unimplemented!("estimate_gas not used in tests")
+		}
+
+		async fn estimate_gas_with_overrides(
+			&self,
+			_: solver_types::Transaction,
+			_: alloy_rpc_types::state::StateOverride,
+		) -> Result<u64, DeliveryError> {
+			unimplemented!("estimate_gas_with_overrides not used in tests")
 		}
 
 		async fn eth_call(&self, tx: solver_types::Transaction) -> Result<Bytes, DeliveryError> {

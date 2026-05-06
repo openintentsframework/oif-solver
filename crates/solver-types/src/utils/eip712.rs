@@ -814,13 +814,21 @@ pub fn admin_eip712_types() -> serde_json::Value {
 		"UpdateGasConfig": [
 			{"name": "resourceLockOpen", "type": "uint64"},
 			{"name": "resourceLockFill", "type": "uint64"},
+			{"name": "resourceLockPostFill", "type": "uint64"},
+			{"name": "resourceLockPreClaim", "type": "uint64"},
 			{"name": "resourceLockClaim", "type": "uint64"},
 			{"name": "permit2EscrowOpen", "type": "uint64"},
 			{"name": "permit2EscrowFill", "type": "uint64"},
+			{"name": "permit2EscrowPostFill", "type": "uint64"},
+			{"name": "permit2EscrowPreClaim", "type": "uint64"},
 			{"name": "permit2EscrowClaim", "type": "uint64"},
 			{"name": "eip3009EscrowOpen", "type": "uint64"},
 			{"name": "eip3009EscrowFill", "type": "uint64"},
+			{"name": "eip3009EscrowPostFill", "type": "uint64"},
+			{"name": "eip3009EscrowPreClaim", "type": "uint64"},
 			{"name": "eip3009EscrowClaim", "type": "uint64"},
+			{"name": "livePostFillEstimateChainIds", "type": "uint64[]"},
+			{"name": "liveFillEstimateEnabled", "type": "bool"},
 			{"name": "nonce", "type": "uint256"},
 			{"name": "deadline", "type": "uint256"}
 		],
@@ -1968,8 +1976,8 @@ mod tests {
 			.as_array()
 			.expect("should be an array");
 
-		// UpdateGasConfig should have 11 fields
-		assert_eq!(gas_config.len(), 11);
+		// UpdateGasConfig should have 19 fields
+		assert_eq!(gas_config.len(), 19);
 
 		let names: Vec<&str> = gas_config
 			.iter()
@@ -1977,13 +1985,21 @@ mod tests {
 			.collect();
 		assert!(names.contains(&"resourceLockOpen"));
 		assert!(names.contains(&"resourceLockFill"));
+		assert!(names.contains(&"resourceLockPostFill"));
+		assert!(names.contains(&"resourceLockPreClaim"));
 		assert!(names.contains(&"resourceLockClaim"));
 		assert!(names.contains(&"permit2EscrowOpen"));
 		assert!(names.contains(&"permit2EscrowFill"));
+		assert!(names.contains(&"permit2EscrowPostFill"));
+		assert!(names.contains(&"permit2EscrowPreClaim"));
 		assert!(names.contains(&"permit2EscrowClaim"));
 		assert!(names.contains(&"eip3009EscrowOpen"));
 		assert!(names.contains(&"eip3009EscrowFill"));
+		assert!(names.contains(&"eip3009EscrowPostFill"));
+		assert!(names.contains(&"eip3009EscrowPreClaim"));
 		assert!(names.contains(&"eip3009EscrowClaim"));
+		assert!(names.contains(&"livePostFillEstimateChainIds"));
+		assert!(names.contains(&"liveFillEstimateEnabled"));
 		assert!(names.contains(&"nonce"));
 		assert!(names.contains(&"deadline"));
 	}

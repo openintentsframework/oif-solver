@@ -138,6 +138,16 @@ pub struct SeedDefaults {
 	pub gas_permit2_escrow: GasFlowUnits,
 	/// Gas units for EIP-3009 escrow flow.
 	pub gas_eip3009_escrow: GasFlowUnits,
+
+	// Live gas estimation flags
+	/// Default for `OperatorGasConfig::live_fill_estimate_enabled` when the
+	/// bootstrap config does not override it.
+	pub live_fill_estimate_enabled: bool,
+	/// Default chain IDs that opt-in to live post-fill gas estimation via
+	/// stateOverride. Empty by default (per-chain opt-in). The bootstrap
+	/// config can override this list via
+	/// `SeedOverrides::live_post_fill_estimate_chain_ids`.
+	pub live_post_fill_estimate_chain_ids: &'static [u64],
 }
 
 /// Gas unit configuration for a specific order flow.
@@ -147,6 +157,10 @@ pub struct GasFlowUnits {
 	pub open: u64,
 	/// Gas units for fill step.
 	pub fill: u64,
+	/// Gas units for post-fill settlement step.
+	pub post_fill: u64,
+	/// Gas units for pre-claim settlement step.
+	pub pre_claim: u64,
 	/// Gas units for claim/finalize step.
 	pub claim: u64,
 }
@@ -197,18 +211,31 @@ pub const COMMON_DEFAULTS: SeedDefaults = SeedDefaults {
 	gas_resource_lock: GasFlowUnits {
 		open: 0,
 		fill: 100_000,
+		post_fill: 300_000,
+		pre_claim: 0,
 		claim: 122793,
 	},
 	gas_permit2_escrow: GasFlowUnits {
 		open: 146306,
 		fill: 100_000,
+		post_fill: 300_000,
+		pre_claim: 0,
 		claim: 60084,
 	},
 	gas_eip3009_escrow: GasFlowUnits {
 		open: 130254,
 		fill: 100_000,
+		post_fill: 300_000,
+		pre_claim: 0,
 		claim: 60084,
 	},
+
+	// Live gas estimation flags
+	live_fill_estimate_enabled: true,
+	// Default empty: post-fill override path is opt-in per chain. Operators
+	// add chain IDs via the bootstrap config (`live_post_fill_estimate_chain_ids`)
+	// or via signed admin UpdateGasConfig at runtime.
+	live_post_fill_estimate_chain_ids: &[],
 };
 
 #[cfg(test)]

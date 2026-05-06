@@ -344,7 +344,20 @@ generate_main_config() {
                 min_confirmations: $min_confirmations,
                 implementations: {
                     evm_alloy: {
-                        network_ids: [$origin_id, $dest_id]
+                        network_ids: [$origin_id, $dest_id],
+                        fee_policy: {
+                            default_speed: "fast",
+                            chains: {
+                                "\($origin_id)": {
+                                    priority_fee_fallback: "100000000",
+                                    quote_cost_strategy: "buffered_effective_125"
+                                },
+                                "\($dest_id)": {
+                                    priority_fee_fallback: "100000000",
+                                    quote_cost_strategy: "buffered_effective_125"
+                                }
+                            }
+                        }
                     }
                 }
             },

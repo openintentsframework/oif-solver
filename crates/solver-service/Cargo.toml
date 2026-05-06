@@ -19,6 +19,7 @@ kms = ["solver-account/kms"]
 
 [dependencies]
 alloy-primitives = { workspace = true, features = ["std", "serde"] }
+alloy-rpc-types = { workspace = true }
 alloy-signer = { workspace = true }
 alloy-sol-types = { workspace = true }
 async-trait = "0.1"
