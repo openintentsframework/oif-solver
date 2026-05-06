@@ -1,31 +1,14 @@
-//! Live happy-path E2E:
-//!   1. Spawn two Anvils (31337 = origin, 31338 = destination).
-//!   2. Deploy MockERC20 × 2 + AlwaysYesOracle + InputSettlerEscrow +
-//!      OutputSettlerSimple on each chain.
-//!   3. Spawn the `solver` binary against the freshly-deployed addresses.
-//!   4. As the user: approve + call `open(StandardOrder)` on origin.
-//!   5. Assert the solver fills on destination (`OutputFilled` event with
-//!      matching orderId).
-//!   6. Assert the solver settles on origin (`Finalised` event with matching
-//!      orderId).
-//!   7. Assert balances moved consistently.
+//! Direct on-chain happy path: user calls `open()`, solver fills, solver claims.
 //!
 //! Run with:
 //!   cargo test -p solver-e2e-tests --test happy_e2e_open_fill_settle \
 //!       -- --ignored --nocapture
-//!
-//! Marked `#[ignore]` because plain `cargo test` shouldn't try to spawn Anvil
-//! on every dev machine.
 
 use alloy_primitives::B256;
 use solver_e2e_tests::{
-	amount_with_decimals_helper, Finalised, Harness, OutputFilled, StandardOrderBuilder,
-	DEST_CHAIN_ID, ORIGIN_CHAIN_ID,
+	amount_with_decimals, Finalised, Harness, OutputFilled, StandardOrderBuilder, DEST_CHAIN_ID,
+	FILL_TIMEOUT, ORIGIN_CHAIN_ID, SETTLE_TIMEOUT,
 };
-use std::time::Duration;
-
-const FILL_TIMEOUT: Duration = Duration::from_secs(60);
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Anvil + oif-contracts/out; opt-in via --ignored"]
@@ -36,10 +19,9 @@ async fn happy_e2e_open_fill_settle() -> anyhow::Result<()> {
 	let recipient = h.recipient_address();
 	let solver = h.solver_address();
 
-	let amount_in = amount_with_decimals_helper(1_000);
-	let amount_out = amount_with_decimals_helper(990); // small spread for solver profit
+	let amount_in = amount_with_decimals(1_000);
+	let amount_out = amount_with_decimals(990); // small spread for solver profit
 
-	// (a) Snapshot balances before. We assert against these at the end.
 	let user_in_before = h.balance(ORIGIN_CHAIN_ID, h.origin.token_a, user).await?;
 	let recipient_out_before = h
 		.balance(DEST_CHAIN_ID, h.destination.token_b, recipient)
@@ -48,23 +30,14 @@ async fn happy_e2e_open_fill_settle() -> anyhow::Result<()> {
 		.balance(DEST_CHAIN_ID, h.destination.token_b, solver)
 		.await?;
 
-	// (b) User approves InputSettlerEscrow on origin chain. Standard ERC20
-	// approve — no Permit2, no signature off-chain.
 	h.user_approve(h.origin.token_a, h.origin.input_settler, amount_in)
 		.await?;
 
-	// (c) Build the StandardOrder. orderId is deterministic from these fields,
-	// so we'll match it against the Open event the call emits.
 	let order = StandardOrderBuilder::happy_path(&h, "e2e-happy-1").build();
-
-	// (d) Submit open(). The receipt's Open event yields the orderId we'll
-	// chase across the next two events.
 	let order_id: B256 = h.user_open(order).await?;
-	eprintln!("Open submitted; orderId = {order_id}");
+	tracing::info!(%order_id, "Open submitted");
 
-	// (e) Wait for the destination fill. OutputFilled is the cross-chain
-	// signal that the solver picked up the intent and executed it.
-	let (filled, _filled_log) = h
+	let (filled, _) = h
 		.await_event::<OutputFilled>(
 			DEST_CHAIN_ID,
 			h.destination.output_settler,
@@ -72,22 +45,10 @@ async fn happy_e2e_open_fill_settle() -> anyhow::Result<()> {
 			FILL_TIMEOUT,
 		)
 		.await?;
-	assert_eq!(
-		filled.orderId, order_id,
-		"OutputFilled.orderId must match our Open"
-	);
-	assert_eq!(
-		filled.finalAmount, amount_out,
-		"OutputFilled.finalAmount must match the order's MandateOutput.amount"
-	);
-	eprintln!(
-		"OutputFilled observed on chain {DEST_CHAIN_ID} (final={}, solver={})",
-		filled.finalAmount, filled.solver
-	);
+	assert_eq!(filled.orderId, order_id);
+	assert_eq!(filled.finalAmount, amount_out);
 
-	// (f) Wait for the origin claim. Finalised is the signal that the solver
-	// completed the round trip and was paid the input asset.
-	let (finalised, _final_log) = h
+	let (finalised, _) = h
 		.await_event::<Finalised>(
 			ORIGIN_CHAIN_ID,
 			h.origin.input_settler,
@@ -95,13 +56,8 @@ async fn happy_e2e_open_fill_settle() -> anyhow::Result<()> {
 			SETTLE_TIMEOUT,
 		)
 		.await?;
-	assert_eq!(
-		finalised.orderId, order_id,
-		"Finalised.orderId must match our Open"
-	);
-	eprintln!("Finalised observed on chain {ORIGIN_CHAIN_ID}");
+	assert_eq!(finalised.orderId, order_id);
 
-	// (g) Balance assertions — sanity bound on the event-based assertion.
 	let user_in_after = h.balance(ORIGIN_CHAIN_ID, h.origin.token_a, user).await?;
 	let recipient_out_after = h
 		.balance(DEST_CHAIN_ID, h.destination.token_b, recipient)
@@ -110,21 +66,9 @@ async fn happy_e2e_open_fill_settle() -> anyhow::Result<()> {
 		.balance(DEST_CHAIN_ID, h.destination.token_b, solver)
 		.await?;
 
-	assert_eq!(
-		user_in_before - user_in_after,
-		amount_in,
-		"user TOKA on origin should have decreased by exactly amount_in"
-	);
-	assert_eq!(
-		recipient_out_after - recipient_out_before,
-		amount_out,
-		"recipient TOKB on destination should have increased by exactly amount_out"
-	);
-	assert_eq!(
-		solver_out_before - solver_out_after,
-		amount_out,
-		"solver TOKB on destination should have decreased by exactly amount_out (the fill)"
-	);
+	assert_eq!(user_in_before - user_in_after, amount_in);
+	assert_eq!(recipient_out_after - recipient_out_before, amount_out);
+	assert_eq!(solver_out_before - solver_out_after, amount_out);
 
 	Ok(())
 }

@@ -13,14 +13,16 @@ run_solver_all() {
   "${solver_all}"
 }
 
-if ! command -v docker >/dev/null 2>&1; then
-  echo "docker is required when REDIS_URL is not already set" >&2
-  exit 1
-fi
-
+# Honor a pre-set REDIS_URL before requiring Docker — otherwise runners
+# without Docker can't take advantage of an externally provisioned Redis.
 if [ -n "${REDIS_URL:-}" ]; then
   run_solver_all
   exit $?
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "docker is required when REDIS_URL is not already set" >&2
+  exit 1
 fi
 
 cleanup() {

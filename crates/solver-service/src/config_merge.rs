@@ -1240,11 +1240,20 @@ fn build_storage_config_from_operator(solver_id: &str) -> StorageConfig {
 	implementations.insert("redis".to_string(), redis_config);
 
 	// File implementation. Registered unconditionally so it's available when
-	// `STORAGE_BACKEND=file` selects it as the primary. STORAGE_PATH mirrors
+	// `STORAGE_BACKEND=file` selects it as the primary. `STORAGE_PATH` mirrors
 	// the env var read by `solver_storage::StoreConfig::from_env()` so the
-	// seed-config layer and the runtime layer agree on a single path.
-	let storage_path =
+	// seed-config layer and the runtime layer agree on a single root.
+	//
+	// We append `solver_id` as a subdirectory so two solvers on the same host
+	// (or successive E2E tests reusing a shared root) don't share the same
+	// orders/intents directory — matching the per-solver isolation Redis gets
+	// from `key_prefix`.
+	let storage_root =
 		std::env::var("STORAGE_PATH").unwrap_or_else(|_| "./data/storage".to_string());
+	let storage_path = std::path::Path::new(&storage_root)
+		.join(solver_id)
+		.to_string_lossy()
+		.into_owned();
 	let file_config = json_object(vec![
 		("storage_path", serde_json::Value::String(storage_path)),
 		("ttl_orders", int(0)),
@@ -1903,10 +1912,19 @@ fn build_pricing_config_from_operator(pricing: &OperatorPricingConfig) -> Pricin
 	// COMMON_DEFAULTS specifies. Mirrors the `STORAGE_BACKEND` pattern: an
 	// opt-in escape hatch for non-network-bound runs (tests, local demos)
 	// without changing default deployment behavior.
-	let primary = match std::env::var("PRICING_PRIMARY") {
-		Ok(value) if !value.trim().is_empty() => value.trim().to_lowercase(),
-		_ => pricing.primary.clone(),
-	};
+	//
+	// Compute the override once and branch off `Option::is_some` consistently
+	// for both primary and fallbacks. Empty / whitespace-only values count as
+	// "no override" — otherwise `PRICING_PRIMARY=""` would silently wipe
+	// fallbacks while leaving primary unchanged, which is a confusing partial
+	// behavior change from the default path.
+	let primary_override = std::env::var("PRICING_PRIMARY").ok().and_then(|v| {
+		let trimmed = v.trim().to_lowercase();
+		(!trimmed.is_empty()).then_some(trimmed)
+	});
+	let primary = primary_override
+		.clone()
+		.unwrap_or_else(|| pricing.primary.clone());
 
 	// `PRICING_FALLBACKS` (comma-separated) similarly overrides fallbacks.
 	// When `PRICING_PRIMARY=mock` is set without explicit fallbacks, it's
@@ -1918,7 +1936,7 @@ fn build_pricing_config_from_operator(pricing: &OperatorPricingConfig) -> Pricin
 			.map(|s| s.trim().to_lowercase())
 			.filter(|s| !s.is_empty())
 			.collect(),
-		Err(_) if std::env::var("PRICING_PRIMARY").is_ok() => Vec::new(),
+		Err(_) if primary_override.is_some() => Vec::new(),
 		Err(_) => pricing.fallbacks.clone(),
 	};
 
@@ -5946,7 +5964,8 @@ mod tests {
 		assert_eq!(storage.primary, "file");
 		let file_config = storage.implementations.get("file").unwrap();
 		let storage_path = file_config.get("storage_path").unwrap().as_str().unwrap();
-		assert_eq!(storage_path, "/tmp/test-storage-path");
+		// Per-solver subdirectory mirrors the Redis `key_prefix=solver_id` pattern.
+		assert_eq!(storage_path, "/tmp/test-storage-path/test-solver");
 	}
 
 	#[test]

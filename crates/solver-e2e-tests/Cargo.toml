@@ -2,6 +2,7 @@
 name = "solver-e2e-tests"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 publish = false
 
 # Test-only crate. Excluded from `default-members`. Run with:

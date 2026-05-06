@@ -25,30 +25,18 @@ use std::{
 use tempfile::TempDir;
 use tokio::sync::{Mutex, MutexGuard};
 
-/// Process-global serializer for harness instances. The harness owns fixed
-/// ports (Anvil 8545/8546, solver API 3000), so two `Harness` instances in
-/// the same process must not run concurrently. `cargo test` parallelizes
-/// tests within a binary by default; without this lock the user has to
-/// remember `--test-threads=1`. With it, parallel tests just queue up.
-///
-/// The guard is held for the entire lifetime of `Harness` and dropped
-/// alongside the rest of the harness state, so the next test gets a clean
-/// environment regardless of how the previous one exited.
+/// Serializes harness instances within a process. The harness uses fixed
+/// ports (Anvil 8545/8546, solver API 3000), so concurrent boots collide.
+/// Held for the lifetime of `Harness` and released on Drop.
 fn harness_lock() -> &'static Mutex<()> {
 	static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 	LOCK.get_or_init(|| Mutex::new(()))
 }
 
 // =============================================================================
-// Public sol! types
+// Public sol! types — mirror on-chain types; solver-discovery's sol!s are
+// crate-private, so we redeclare here.
 // =============================================================================
-//
-// These mirror the on-chain types we need to encode (for `open(...)`) and
-// decode (for assertion). Kept here, public, because:
-//   - solver-discovery's sol! declarations are private to its impl module.
-//   - solver-types defines the StandardOrder Rust struct but not the sol! event.
-//   - duplicating ~30 lines of struct/event ABI is cheaper than re-exposing
-//     internals across crates.
 
 sol! {
 	#[derive(Debug)]
@@ -142,8 +130,8 @@ pub const PERMIT2_ADDRESS: &str = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
 // Re-exports so test files can build EIP-712 payloads + POST `/api/v1/orders`
 // without each one taking a direct `solver-types` dependency.
 pub use solver_types::api::{
-	OifOrder, OrderPayload, OriginMode, OriginSubmission, PostOrderRequest, PostOrderResponse,
-	PostOrderResponseStatus, SignatureType,
+	OifOrder, OrderPayload, PostOrderRequest, PostOrderResponse, PostOrderResponseStatus,
+	SignatureType,
 };
 pub use solver_types::utils::eip712::{reconstruct_eip3009_digest, reconstruct_permit2_digest};
 pub use solver_types::InteropAddress;
@@ -160,6 +148,18 @@ pub const SOLVER_API_PORT: u16 = 3000;
 
 const SOLVER_HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
 const ANVIL_HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Default budget for the destination-chain `OutputFilled` event after
+/// submitting an order. Matches direct + Permit2 + EIP-3009 happy paths.
+pub const FILL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Default budget for the origin-chain `Finalised` event after `OutputFilled`.
+/// Hyperlane settlement may need more — that test defines its own.
+pub const SETTLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Budget for `await_no_event` calls — long enough for the solver to have
+/// definitely tried and failed, short enough that a passing test stays fast.
+pub const NO_EVENT_TIMEOUT: Duration = Duration::from_secs(15);
 
 // =============================================================================
 // Public Harness
@@ -233,12 +233,6 @@ pub struct HarnessOptions {
 	/// The list is matched against `order.user` and every output recipient,
 	/// case-insensitively. See PR #308 / `IntentHandler::load_deny_list`.
 	pub deny_list_addresses: Option<Vec<String>>,
-	// Future scenario groups can add typed fields here as they get real
-	// call sites, e.g.:
-	// pub enable_permit2: bool,
-	// pub enable_offchain_api: bool,
-	// pub enable_rebalance: bool,
-	// pub rebalance_pairs: Vec<solver_types::OperatorRebalancePairConfig>,
 }
 
 impl Default for HarnessOptions {
@@ -265,25 +259,15 @@ impl Harness {
 	pub async fn boot_with(options: HarnessOptions) -> Result<Self> {
 		init_tracing();
 
-		// Serialize across concurrent harness constructions in the same
-		// process before doing any port-touching work. See `harness_lock` for
-		// rationale. The guard is moved into the returned `Harness` and held
-		// until the test's harness goes out of scope.
 		let lock_guard = harness_lock().lock().await;
 
-		// Pre-flight: kill any orphans on our fixed ports. solver-demo's
-		// AnvilManager intentionally `mem::forget`s child handles; previous
-		// runs that crashed may have left listeners alive.
+		// solver-demo's AnvilManager `mem::forget`s child handles, so previous
+		// crashed runs may have left listeners on our fixed ports.
 		kill_listeners_on_ports(&[ORIGIN_RPC_PORT, DEST_RPC_PORT, SOLVER_API_PORT]);
 
 		let tempdir = TempDir::new().context("create tempdir")?;
-
-		// Build the solver binary up front; the test should fail loudly here
-		// rather than mid-flow if the workspace is broken.
 		ensure_solver_binary_built()?;
 
-		// Boot two anvil processes. We track the children so Drop can SIGKILL
-		// them, even if the test panics.
 		let anvils = vec![
 			spawn_anvil(ORIGIN_CHAIN_ID, ORIGIN_RPC_PORT)?,
 			spawn_anvil(DEST_CHAIN_ID, DEST_RPC_PORT)?,
@@ -422,10 +406,8 @@ impl Harness {
 		)
 		.context("write bootstrap config")?;
 
-		// Spawn the solver binary. We capture stderr to a file (rather than
-		// `Stdio::inherit()`) so we can dump it on failure regardless of how
-		// the test harness is buffering its own stderr. `dump_solver_stderr`
-		// reads it.
+		// Capture solver stderr to a file so we can dump it on failure
+		// regardless of how cargo test buffers its own stderr.
 		let solver_stderr_path = tempdir.path().join("solver.stderr.log");
 		let solver = spawn_solver(
 			&bootstrap_path,
@@ -764,8 +746,7 @@ impl Drop for Harness {
 			let _ = a.kill();
 			let _ = a.wait();
 		}
-		// Belt-and-suspenders cleanup. If a child handle was lost (e.g. due to
-		// a panic in a method that didn't unwind cleanly), this catches it.
+		// Catch any orphans from a child handle lost to a panic.
 		kill_listeners_on_ports(&[ORIGIN_RPC_PORT, DEST_RPC_PORT, SOLVER_API_PORT]);
 	}
 }
@@ -893,13 +874,10 @@ async fn build_provider(rpc_url: &str, signer: PrivateKeySigner) -> Result<DynPr
 	Ok(provider)
 }
 
-fn amount_with_decimals(whole: u64) -> U256 {
+/// `whole * 10^18`, the standard 18-decimal token amount. Used for both
+/// input and output token sides — all mock ERC20s in the harness use 18 decimals.
+pub fn amount_with_decimals(whole: u64) -> U256 {
 	U256::from(whole) * U256::from(10u64).pow(U256::from(18u64))
-}
-
-/// Public re-export of `amount_with_decimals` for tests.
-pub fn amount_with_decimals_helper(whole: u64) -> U256 {
-	amount_with_decimals(whole)
 }
 
 pub fn assert_open_failed(result: Result<TransactionReceipt>, context: &str) {
@@ -935,13 +913,6 @@ pub fn assert_open_failed(result: Result<TransactionReceipt>, context: &str) {
 			);
 		},
 	}
-}
-
-pub fn assert_balance_delta(before: U256, after: U256, expected: U256, context: &str) {
-	let actual = after
-		.checked_sub(before)
-		.unwrap_or_else(|| panic!("{context}: balance decreased"));
-	assert_eq!(actual, expected, "{context}");
 }
 
 pub fn redis_url_or_skip() -> Option<String> {
@@ -1483,8 +1454,8 @@ fn extract_order_id_from_receipt(receipt: &TransactionReceipt) -> Option<B256> {
 // Convenience helpers for tests
 // =============================================================================
 
-/// Returns a unix timestamp `secs` seconds in the future. Use this to set
-/// `expires` and `fillDeadline` on test orders.
+/// Unix timestamp `secs` seconds in the future. Used for `expires` and
+/// `fillDeadline`.
 pub fn unix_now_plus(secs: u64) -> u32 {
 	(SystemTime::now()
 		.duration_since(UNIX_EPOCH)
@@ -1504,6 +1475,23 @@ pub fn unix_now_minus(secs: u64) -> u32 {
 		.saturating_sub(secs)
 		.try_into()
 		.unwrap_or(0)
+}
+
+/// Current unix time in seconds. Use for typed-data fields that need a u64.
+pub fn unix_now_secs() -> u64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.expect("clock before unix epoch")
+		.as_secs()
+}
+
+/// Current unix time in milliseconds. Permit2 nonces use this granularity to
+/// stay unique within a test run.
+pub fn unix_now_millis() -> u64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.expect("clock before unix epoch")
+		.as_millis() as u64
 }
 
 /// Address as bytes32 (left-padded). Required by MandateOutput's bytes32 fields.
