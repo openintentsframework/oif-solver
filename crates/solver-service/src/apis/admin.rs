@@ -27,9 +27,9 @@ use solver_storage::{
 };
 pub use solver_types::admin_api::{
 	AdminActionResponse, AdminConfigResponse, AdminConfigSummary, AdminNetworkResponse,
-	AdminSolverResponse, AdminTokenResponse, ApproveTokensResponse, BalancesResponse,
-	ChainBalances, Eip712Domain, Eip712TypeInfo, FeeConfigResponse, GasConfigResponse,
-	GasFlowResponse, NonceResponse, TokenBalance, WithdrawalResponse,
+	AdminSolverResponse, AdminTokenResponse, AdminWhitelistResponse, ApproveTokensResponse,
+	BalancesResponse, ChainBalances, Eip712Domain, Eip712TypeInfo, FeeConfigResponse,
+	GasConfigResponse, GasFlowResponse, NonceResponse, TokenBalance, WithdrawalResponse,
 };
 use solver_types::{
 	format_token_amount, with_0x_prefix, AdminConfig, OperatorAdminConfig, OperatorConfig,
@@ -317,6 +317,27 @@ pub async fn handle_get_gas(
 ) -> Result<Json<GasConfigResponse>, AdminAuthError> {
 	let versioned = state.config_store.get().await.map_err(config_store_error)?;
 	Ok(Json(gas_config_response(&versioned.data.gas)))
+}
+
+/// GET /api/v1/admin/whitelist
+///
+/// Returns the configured admin whitelist.
+pub async fn handle_get_whitelist(
+	State(state): State<AdminApiState>,
+) -> Result<Json<AdminWhitelistResponse>, AdminAuthError> {
+	let versioned = state.config_store.get().await.map_err(config_store_error)?;
+	let admins: Vec<String> = versioned
+		.data
+		.admin
+		.admin_addresses
+		.iter()
+		.map(|addr| with_0x_prefix(&hex::encode(addr.as_slice())))
+		.collect();
+
+	Ok(Json(AdminWhitelistResponse {
+		count: admins.len(),
+		admins,
+	}))
 }
 
 /// POST /api/v1/admin/whitelist
@@ -1404,6 +1425,22 @@ mod tests {
 
 		let json = serde_json::to_string(&response).unwrap();
 		assert!(json.contains("\"success\":true"));
+	}
+
+	#[test]
+	fn test_admin_whitelist_response_serialization() {
+		let response = AdminWhitelistResponse {
+			admins: vec![
+				"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
+				"0x70997970c51812dc3a010c7d01b50e0d17dc79c8".to_string(),
+			],
+			count: 2,
+		};
+
+		let json = serde_json::to_string(&response).unwrap();
+		assert!(json.contains("\"admins\""));
+		assert!(json.contains("0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"));
+		assert!(json.contains("\"count\":2"));
 	}
 
 	#[test]
@@ -2543,6 +2580,31 @@ mod tests {
 		assert_eq!(response.expires_in, 300);
 		assert_eq!(response.domain, "test.example.com");
 		assert_eq!(response.chain_id, 1);
+	}
+
+	#[tokio::test]
+	async fn test_handle_get_whitelist_returns_configured_admins() {
+		let admin_one = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+		let admin_two = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
+		let mut operator_config =
+			build_operator_config(admin_one, OperatorWithdrawalsConfig { enabled: false });
+		operator_config.admin.admin_addresses.push(admin_two);
+
+		let state = create_admin_state_with_operator_config(
+			operator_config,
+			create_delivery_service(None, false),
+		)
+		.await;
+		let response = handle_get_whitelist(State(state)).await.unwrap().0;
+
+		assert_eq!(response.count, 2);
+		assert_eq!(
+			response.admins,
+			vec![
+				"0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".to_string(),
+				"0x70997970c51812dc3a010c7d01b50e0d17dc79c8".to_string(),
+			]
+		);
 	}
 
 	#[tokio::test]

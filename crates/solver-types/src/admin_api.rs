@@ -23,6 +23,14 @@ pub struct AdminActionResponse {
 	pub admin: String,
 }
 
+/// Response for reading the admin whitelist.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminWhitelistResponse {
+	pub admins: Vec<String>,
+	pub count: usize,
+}
+
 /// Response for balances across networks.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

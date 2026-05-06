@@ -175,6 +175,45 @@ paths:
                 $ref: "#/components/schemas/AdminAuthErrorResponse"
 
   /admin/whitelist:
+    get:
+      summary: Get admin whitelist
+      description: |
+        Returns the configured list of admin wallet addresses.
+      operationId: getAdminWhitelist
+      tags:
+        - Admin
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current admin whitelist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminWhitelistResponse"
+              example:
+                admins:
+                  - "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+                  - "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
+                count: 2
+        "401":
+          description: Unauthorized (JWT failure)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "403":
+          description: Not authorized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
+        "500":
+          description: Internal error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdminAuthErrorResponse"
     post:
       summary: Add an admin
       description: |
@@ -806,6 +845,26 @@ components:
           type: string
           description: Admin address
           example: "0x1234567890abcdef1234567890abcdef12345678"
+
+    AdminWhitelistResponse:
+      type: object
+      required:
+        - admins
+        - count
+      properties:
+        admins:
+          type: array
+          description: Configured admin wallet addresses
+          items:
+            type: string
+            pattern: "^0x[a-fA-F0-9]{40}$"
+          example:
+            - "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266"
+            - "0x70997970c51812dc3a010c7d01b50e0d17dc79c8"
+        count:
+          type: integer
+          description: Number of configured admin wallet addresses
+          example: 2
 
     SignedAdminRequestAddToken:
       type: object

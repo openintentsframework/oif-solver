@@ -935,6 +935,7 @@ The admin API enables authorized wallet addresses to perform administrative oper
 - **DELETE `/api/v1/admin/tokens`** - Remove a token from a network (protected)
 - **POST `/api/v1/admin/tokens/approve`** - Approve token allowance for settlements (protected)
 - **POST `/api/v1/admin/withdrawals`** - Perform an admin withdrawal (protected)
+- **GET `/api/v1/admin/whitelist`** - List current admins (protected)
 - **POST `/api/v1/admin/whitelist`** - Add a new admin (protected)
 - **DELETE `/api/v1/admin/whitelist`** - Remove an admin (protected)
 - **GET `/api/v1/admin/fees`** - Get fee configuration (protected)
@@ -1066,6 +1067,10 @@ curl http://localhost:3000/api/v1/admin/balances \
 
 # Admin: Get solver config snapshot (protected)
 curl http://localhost:3000/api/v1/admin/config \
+  -H "Authorization: Bearer $TOKEN"
+
+# Admin: Get admin whitelist (protected)
+curl http://localhost:3000/api/v1/admin/whitelist \
   -H "Authorization: Bearer $TOKEN"
 ```
 
