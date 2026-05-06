@@ -30,6 +30,19 @@
   "delivery": {
     "implementations": {
       "evm_alloy": {
+        "fee_policy": {
+          "chains": {
+            "31337": {
+              "priority_fee_fallback": "100000000",
+              "quote_cost_strategy": "buffered_effective_125"
+            },
+            "31338": {
+              "priority_fee_fallback": "100000000",
+              "quote_cost_strategy": "buffered_effective_125"
+            }
+          },
+          "default_speed": "fast"
+        },
         "network_ids": [
           31337,
           31338
