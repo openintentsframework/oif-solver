@@ -12,7 +12,7 @@ use regex::Regex;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use solver_types::{networks::deserialize_networks, NetworksConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use thiserror::Error;
@@ -319,6 +319,10 @@ pub struct GasFlowUnits {
 	pub open: Option<u64>,
 	/// Optional override for fill step gas units
 	pub fill: Option<u64>,
+	/// Optional override for post-fill settlement step gas units
+	pub post_fill: Option<u64>,
+	/// Optional override for pre-claim settlement step gas units
+	pub pre_claim: Option<u64>,
 	/// Optional override for claim/finalize step gas units
 	#[serde(alias = "finalize")] // allow "finalize" as an alias in config
 	pub claim: Option<u64>,
@@ -348,12 +352,28 @@ fn default_rate_buffer_bps() -> u32 {
 	14 // 0.14%
 }
 
+fn default_live_post_fill_estimate_chain_ids() -> HashSet<u64> {
+	HashSet::new() // empty = disabled everywhere; opt-in per-chain
+}
+
 /// Gas configuration mapping flow identifiers to gas unit overrides.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GasConfig {
 	/// Map of flow key -> GasFlowUnits
 	/// Example keys: "permit2_escrow", "resource_lock"
 	pub flows: HashMap<String, GasFlowUnits>,
+	/// When true, quote-time pricing performs `eth_estimateGas` for the fill leg
+	/// and uses the result instead of `flows.<key>.fill`. Other legs stay static.
+	/// Defaults to true; flip to false via the admin API to disable the live path
+	/// on a chain where eth_estimateGas is unreliable.
+	#[serde(default = "default_true")]
+	pub live_fill_estimate_enabled: bool,
+	/// Set of chain IDs on which quote-time post-fill gas estimation
+	/// uses the stateOverride-based live path. Empty (default) = disabled
+	/// on all chains. Operators add chain IDs after validating the
+	/// OutputSettler's storage layout via the integration test.
+	#[serde(default = "default_live_post_fill_estimate_chain_ids")]
+	pub live_post_fill_estimate_chain_ids: HashSet<u64>,
 }
 
 /// Runtime rebalancing configuration.

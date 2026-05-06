@@ -86,6 +86,10 @@ fn map_delivery_error(label: &str, error: solver_delivery::DeliveryError) -> Bri
 		solver_delivery::DeliveryError::InsufficientNativeGas(_) => {
 			BridgeError::InsufficientNativeGas(msg)
 		},
+		// Nonce drift is transient: `next_nonce_for` resyncs against chain pending
+		// on the next tick. Folding it into `TransactionFailed` would mark the
+		// transfer terminally failed for what is just a one-shot resync miss.
+		solver_delivery::DeliveryError::NonceTooLow(_) => BridgeError::NonceTooLow(msg),
 		_ => BridgeError::TransactionFailed(msg),
 	}
 }
@@ -1733,6 +1737,29 @@ mod tests {
 				if reason.contains("Composer approve submit failed")
 					&& reason.contains("rpc down")
 		));
+	}
+
+	#[test]
+	fn map_delivery_error_preserves_nonce_too_low_as_transient() {
+		// `solver_delivery::DeliveryError::NonceTooLow` is documented as transient
+		// nonce drift that resyncs on the next call. Folding it into
+		// `BridgeError::TransactionFailed` (terminal) would mark the transfer as
+		// permanently failed for what's just a one-shot resync miss, so the
+		// mapping must surface the retryable variant instead.
+		let bridge_error = map_delivery_error(
+			"depositAndSend",
+			DeliveryError::NonceTooLow("server returned an error response: nonce too low".into()),
+		);
+
+		assert!(
+			matches!(
+				bridge_error,
+				BridgeError::NonceTooLow(reason)
+					if reason.contains("depositAndSend submit failed")
+						&& reason.contains("nonce too low")
+			),
+			"NonceTooLow must NOT collapse into terminal TransactionFailed",
+		);
 	}
 
 	#[tokio::test]

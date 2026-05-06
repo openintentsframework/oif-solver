@@ -19,6 +19,7 @@ use thiserror::Error;
 pub mod implementations {
 	pub mod evm {
 		pub mod alloy;
+		pub mod fees;
 		pub mod nonce;
 	}
 }
@@ -66,6 +67,131 @@ pub struct InsufficientNativeGasInfo {
 	pub max_fee_per_gas: Option<u128>,
 	pub gas_price: Option<u128>,
 	pub value_wei: String,
+}
+
+/// Fee model used by a chain at transaction submission time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeeModel {
+	Legacy,
+	Eip1559,
+}
+
+/// Speed target for EIP-1559 priority fee selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeeSpeed {
+	SafeLow,
+	Average,
+	Fast,
+	Fastest,
+}
+
+impl FeeSpeed {
+	pub fn reward_percentile(self) -> f64 {
+		match self {
+			FeeSpeed::SafeLow => 30.0,
+			FeeSpeed::Average => 50.0,
+			FeeSpeed::Fast => 85.0,
+			FeeSpeed::Fastest => 99.0,
+		}
+	}
+}
+
+/// Quote-cost policy for EIP-1559 chains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeeCostStrategy {
+	MaxFee,
+	Effective,
+	#[serde(rename = "buffered_effective_125")]
+	BufferedEffective125,
+}
+
+/// Effective fee parameters used for both quote costing and transaction submit.
+///
+/// For EIP-1559, `max_fee_per_gas` is used for submit and native-gas
+/// preflight. `cost_per_gas` is the quote-economics value selected by
+/// `FeeCostStrategy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeeParams {
+	pub chain_id: u64,
+	pub model: FeeModel,
+	pub gas_price: Option<u128>,
+	pub base_fee_per_gas: Option<u128>,
+	pub estimated_effective_fee_per_gas: Option<u128>,
+	pub max_fee_per_gas: Option<u128>,
+	pub max_priority_fee_per_gas: Option<u128>,
+	pub cost_per_gas: u128,
+}
+
+impl FeeParams {
+	pub fn legacy(chain_id: u64, gas_price: u128) -> Self {
+		Self {
+			chain_id,
+			model: FeeModel::Legacy,
+			gas_price: Some(gas_price),
+			base_fee_per_gas: None,
+			estimated_effective_fee_per_gas: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+			cost_per_gas: gas_price,
+		}
+	}
+
+	/// Build EIP-1559 fee params from estimator output (max_fee + priority)
+	/// plus the observed base fee, applying the chosen quote-cost strategy.
+	/// This is the single solver-specific constructor used by Task 2's
+	/// `SolverEip1559Estimator` and by callers that already have estimator output.
+	pub fn eip1559_with_strategy(
+		chain_id: u64,
+		max_fee_per_gas: u128,
+		max_priority_fee_per_gas: u128,
+		base_fee_per_gas: u128,
+		cost_strategy: FeeCostStrategy,
+	) -> Self {
+		let effective = base_fee_per_gas.saturating_add(max_priority_fee_per_gas);
+		let buffered_base = base_fee_per_gas.saturating_mul(125) / 100;
+		let buffered = buffered_base.saturating_add(max_priority_fee_per_gas);
+		let cost_per_gas = match cost_strategy {
+			FeeCostStrategy::MaxFee => max_fee_per_gas,
+			FeeCostStrategy::Effective => effective,
+			FeeCostStrategy::BufferedEffective125 => buffered.min(max_fee_per_gas),
+		}
+		.max(max_priority_fee_per_gas);
+
+		Self {
+			chain_id,
+			model: FeeModel::Eip1559,
+			gas_price: None,
+			base_fee_per_gas: Some(base_fee_per_gas),
+			estimated_effective_fee_per_gas: Some(effective.min(max_fee_per_gas)),
+			max_fee_per_gas: Some(max_fee_per_gas),
+			max_priority_fee_per_gas: Some(max_priority_fee_per_gas),
+			cost_per_gas,
+		}
+	}
+
+	/// Fill missing fee fields on a solver-generated transaction.
+	///
+	/// Explicit caller-provided fee fields win. This avoids breaking custom
+	/// paths that intentionally set their own fees.
+	pub fn apply_if_missing(&self, tx: &mut Transaction) {
+		match self.model {
+			FeeModel::Legacy => {
+				if tx.gas_price.is_none() {
+					tx.gas_price = self.gas_price;
+				}
+			},
+			FeeModel::Eip1559 => {
+				if tx.gas_price.is_none() {
+					tx.max_fee_per_gas = tx.max_fee_per_gas.or(self.max_fee_per_gas);
+					tx.max_priority_fee_per_gas = tx
+						.max_priority_fee_per_gas
+						.or(self.max_priority_fee_per_gas);
+				}
+			},
+		}
+	}
 }
 
 /// Callback for transaction monitoring events
@@ -172,10 +298,11 @@ pub trait DeliveryInterface: Send + Sync {
 		chain_id: u64,
 	) -> Result<TransactionReceipt, DeliveryError>;
 
-	/// Gets the current gas price for the network.
+	/// Gets effective fee parameters for quote costing, rebalance costing, and transaction submission.
 	///
-	/// Returns the recommended gas price in wei as a decimal string.
-	async fn get_gas_price(&self, chain_id: u64) -> Result<String, DeliveryError>;
+	/// This should return the same fee model and per-gas cost the implementation
+	/// will use when filling missing fee fields before signing a transaction.
+	async fn get_fee_params(&self, chain_id: u64) -> Result<FeeParams, DeliveryError>;
 
 	/// Gets the balance for an address.
 	///
@@ -214,6 +341,17 @@ pub trait DeliveryInterface: Send + Sync {
 	/// Estimates gas units for a transaction without submitting it.
 	/// Implementations should call the chain's estimateGas RPC with the provided transaction.
 	async fn estimate_gas(&self, tx: Transaction) -> Result<u64, DeliveryError>;
+
+	/// Estimate gas with a `stateOverride` applied (Alchemy/Geth/Erigon/Reth).
+	/// Use to simulate calls that depend on contract state that doesn't
+	/// yet exist (e.g. a quote-time post-fill simulation that needs a
+	/// fake fill record). No default impl — every backend explicitly
+	/// declares whether it supports overrides.
+	async fn estimate_gas_with_overrides(
+		&self,
+		tx: Transaction,
+		state_override: alloy_rpc_types::state::StateOverride,
+	) -> Result<u64, DeliveryError>;
 
 	/// Executes a contract call without sending a transaction.
 	///
@@ -354,14 +492,23 @@ impl DeliveryService {
 
 	/// Gets chain-specific data for the given chain ID.
 	///
-	/// Returns gas price, block number, and other chain state information.
+	/// Returns the resolved per-gas quote-cost (sourced from
+	/// [`FeeParams::cost_per_gas`]), block number, and other chain state
+	/// information. The `gas_price` field is no longer raw `eth_gasPrice`;
+	/// it now reflects the same `cost_per_gas` value used to price quote
+	/// economics so consumers comparing it against their own gas cap stay
+	/// conservative.
 	pub async fn get_chain_data(&self, chain_id: u64) -> Result<ChainData, DeliveryError> {
 		let implementation = self
 			.implementations
 			.get(&chain_id)
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
-		let gas_price = implementation.get_gas_price(chain_id).await?;
+		let gas_price = implementation
+			.get_fee_params(chain_id)
+			.await?
+			.cost_per_gas
+			.to_string();
 		let block_number = implementation.get_block_number(chain_id).await?;
 
 		Ok(ChainData {
@@ -424,16 +571,18 @@ impl DeliveryService {
 			.await
 	}
 
-	/// Gets the current gas price for a specific chain.
+	/// Gets effective fee parameters for a specific chain.
 	///
-	/// Returns the gas price as a string in wei.
-	pub async fn get_gas_price(&self, chain_id: u64) -> Result<String, DeliveryError> {
+	/// Returns the same fee params used by the implementation to fill missing
+	/// fee fields before signing. Use `cost_per_gas` for quote economics and
+	/// `max_fee_per_gas` for native-gas preflight.
+	pub async fn get_fee_params(&self, chain_id: u64) -> Result<FeeParams, DeliveryError> {
 		let implementation = self
 			.implementations
 			.get(&chain_id)
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
-		implementation.get_gas_price(chain_id).await
+		implementation.get_fee_params(chain_id).await
 	}
 
 	/// Gets the current block number for a specific chain.
@@ -456,6 +605,27 @@ impl DeliveryService {
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
 		implementation.estimate_gas(tx).await
+	}
+
+	/// Estimates gas for a transaction on the specified chain with a
+	/// `stateOverride` applied. Used to simulate calls whose execution
+	/// depends on state that doesn't yet exist on chain (e.g. a fake
+	/// post-fill record when quoting). The `chain_id` is used only to
+	/// pick the backend; the backend itself routes via `tx.chain_id`.
+	pub async fn estimate_gas_with_overrides(
+		&self,
+		chain_id: u64,
+		tx: Transaction,
+		state_override: alloy_rpc_types::state::StateOverride,
+	) -> Result<u64, DeliveryError> {
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
+
+		implementation
+			.estimate_gas_with_overrides(tx, state_override)
+			.await
 	}
 
 	/// Executes a contract call (eth_call) without sending a transaction.
@@ -502,5 +672,288 @@ impl DeliveryService {
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
 		implementation.get_logs(chain_id, filter).await
+	}
+}
+
+#[cfg(test)]
+mod fee_param_tests {
+	use super::*;
+	use alloy_primitives::U256;
+
+	fn empty_tx(chain_id: u64) -> Transaction {
+		Transaction {
+			to: None,
+			data: vec![],
+			value: U256::ZERO,
+			chain_id,
+			nonce: None,
+			gas_limit: Some(100_000),
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+		}
+	}
+
+	#[test]
+	fn apply_if_missing_legacy_fills_gas_price() {
+		let params = FeeParams::legacy(137, 5_000_000_000);
+		let mut tx = empty_tx(137);
+		params.apply_if_missing(&mut tx);
+		assert_eq!(tx.gas_price, Some(5_000_000_000));
+		assert_eq!(tx.max_fee_per_gas, None);
+		assert_eq!(tx.max_priority_fee_per_gas, None);
+	}
+
+	#[test]
+	fn apply_if_missing_legacy_does_not_override_explicit_gas_price() {
+		let params = FeeParams::legacy(137, 5_000_000_000);
+		let mut tx = empty_tx(137);
+		tx.gas_price = Some(9_999);
+		params.apply_if_missing(&mut tx);
+		assert_eq!(tx.gas_price, Some(9_999));
+	}
+
+	#[test]
+	fn apply_if_missing_eip1559_fills_max_and_priority() {
+		let params = FeeParams::eip1559_with_strategy(
+			1,
+			3_000_000_000,
+			2_000_000_000,
+			500_000_000,
+			FeeCostStrategy::BufferedEffective125,
+		);
+		let mut tx = empty_tx(1);
+		params.apply_if_missing(&mut tx);
+		assert_eq!(tx.max_fee_per_gas, Some(3_000_000_000));
+		assert_eq!(tx.max_priority_fee_per_gas, Some(2_000_000_000));
+		assert_eq!(tx.gas_price, None);
+	}
+
+	#[test]
+	fn apply_if_missing_eip1559_does_not_override_explicit_fees() {
+		let params = FeeParams::eip1559_with_strategy(
+			1,
+			3_000_000_000,
+			2_000_000_000,
+			500_000_000,
+			FeeCostStrategy::BufferedEffective125,
+		);
+		let mut tx = empty_tx(1);
+		tx.max_fee_per_gas = Some(7_777);
+		tx.max_priority_fee_per_gas = Some(8_888);
+		params.apply_if_missing(&mut tx);
+		assert_eq!(tx.max_fee_per_gas, Some(7_777));
+		assert_eq!(tx.max_priority_fee_per_gas, Some(8_888));
+	}
+
+	#[test]
+	fn fee_params_apply_eip1559_to_empty_transaction() {
+		let mut tx = Transaction {
+			chain_id: 1,
+			to: None,
+			data: vec![],
+			value: U256::ZERO,
+			nonce: None,
+			gas_limit: Some(21_000),
+			gas_price: None,
+			max_fee_per_gas: None,
+			max_priority_fee_per_gas: None,
+		};
+
+		let params = FeeParams::eip1559_with_strategy(
+			1,
+			2_500_000_000, // max_fee
+			2_000_000_000, // priority
+			500_000_000,   // base_fee
+			FeeCostStrategy::BufferedEffective125,
+		);
+		params.apply_if_missing(&mut tx);
+
+		assert_eq!(tx.gas_price, None);
+		assert_eq!(tx.max_fee_per_gas, Some(2_500_000_000));
+		assert_eq!(tx.max_priority_fee_per_gas, Some(2_000_000_000));
+	}
+
+	#[test]
+	fn fee_params_do_not_override_explicit_transaction_fees() {
+		let mut tx = Transaction {
+			chain_id: 1,
+			to: None,
+			data: vec![],
+			value: U256::ZERO,
+			nonce: None,
+			gas_limit: Some(21_000),
+			gas_price: None,
+			max_fee_per_gas: Some(9),
+			max_priority_fee_per_gas: Some(3),
+		};
+
+		let params = FeeParams::eip1559_with_strategy(
+			1,
+			2_500_000_000, // max_fee
+			2_000_000_000, // priority
+			500_000_000,   // base_fee
+			FeeCostStrategy::BufferedEffective125,
+		);
+		params.apply_if_missing(&mut tx);
+
+		assert_eq!(tx.max_fee_per_gas, Some(9));
+		assert_eq!(tx.max_priority_fee_per_gas, Some(3));
+	}
+
+	#[test]
+	fn apply_if_missing_eip1559_skipped_when_legacy_gas_price_set() {
+		// If a caller has chosen legacy gas_price explicitly, don't backfill 1559 fields.
+		let params = FeeParams::eip1559_with_strategy(
+			1,
+			3_000_000_000,
+			2_000_000_000,
+			500_000_000,
+			FeeCostStrategy::BufferedEffective125,
+		);
+		let mut tx = empty_tx(1);
+		tx.gas_price = Some(123);
+		params.apply_if_missing(&mut tx);
+		assert_eq!(tx.gas_price, Some(123));
+		assert_eq!(tx.max_fee_per_gas, None);
+		assert_eq!(tx.max_priority_fee_per_gas, None);
+	}
+
+	#[test]
+	fn cost_strategy_max_fee_returns_max() {
+		let p = FeeParams::eip1559_with_strategy(
+			1,
+			5_000_000_000,
+			2_000_000_000,
+			1_000_000_000,
+			FeeCostStrategy::MaxFee,
+		);
+		assert_eq!(p.cost_per_gas, 5_000_000_000);
+	}
+
+	#[test]
+	fn cost_strategy_effective_returns_base_plus_priority() {
+		let p = FeeParams::eip1559_with_strategy(
+			1,
+			5_000_000_000,
+			2_000_000_000,
+			1_000_000_000,
+			FeeCostStrategy::Effective,
+		);
+		assert_eq!(p.cost_per_gas, 1_000_000_000 + 2_000_000_000);
+	}
+
+	#[test]
+	fn cost_strategy_buffered_returns_125_base_plus_priority() {
+		let p = FeeParams::eip1559_with_strategy(
+			1,
+			5_000_000_000,
+			2_000_000_000,
+			1_000_000_000,
+			FeeCostStrategy::BufferedEffective125,
+		);
+		// 1.25 * 1_000_000_000 + 2_000_000_000 = 3_250_000_000
+		assert_eq!(p.cost_per_gas, 3_250_000_000);
+	}
+
+	#[test]
+	fn cost_strategy_buffered_caps_at_max_fee() {
+		// Buffered would exceed max_fee — should be capped.
+		let p = FeeParams::eip1559_with_strategy(
+			1,
+			3_000_000_000,
+			2_000_000_000,
+			10_000_000_000,
+			FeeCostStrategy::BufferedEffective125,
+		);
+		assert_eq!(p.cost_per_gas, 3_000_000_000);
+	}
+}
+
+#[cfg(test)]
+mod fee_param_proptests {
+	use super::*;
+	use alloy_primitives::U256;
+	use proptest::prelude::*;
+
+	fn arb_bytes(max_len: usize) -> impl Strategy<Value = Vec<u8>> {
+		prop::collection::vec(any::<u8>(), 0..=max_len)
+	}
+
+	proptest! {
+		#[test]
+		fn apply_if_missing_preserves_contract_call_fields(
+			chain_id in 1u64..10_000_000u64,
+			data in arb_bytes(512),
+			value in 0u128..1_000_000_000_000_000_000u128,
+			gas_limit in prop::option::of(21_000u64..5_000_000u64),
+			max_fee in 1u128..1_000_000_000_000u128,
+			priority in 0u128..100_000_000_000u128,
+		) {
+			let priority = priority.min(max_fee);
+			let mut tx = Transaction {
+				to: None,
+				data: data.clone(),
+				value: U256::from(value),
+				chain_id,
+				nonce: None,
+				gas_limit,
+				gas_price: None,
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+			};
+			let original = tx.clone();
+
+			FeeParams::eip1559_with_strategy(
+				chain_id,
+				max_fee,
+				priority,
+				1_000_000_000,
+				FeeCostStrategy::BufferedEffective125,
+			)
+			.apply_if_missing(&mut tx);
+
+			prop_assert_eq!(tx.to, original.to);
+			prop_assert_eq!(tx.data, original.data);
+			prop_assert_eq!(tx.value, original.value);
+			prop_assert_eq!(tx.chain_id, original.chain_id);
+			prop_assert_eq!(tx.gas_limit, original.gas_limit);
+		}
+
+		#[test]
+		fn apply_if_missing_is_idempotent(
+			chain_id in 1u64..10_000_000u64,
+			max_fee in 1u128..1_000_000_000_000u128,
+			priority in 0u128..100_000_000_000u128,
+		) {
+			let priority = priority.min(max_fee);
+			let params = FeeParams::eip1559_with_strategy(
+				chain_id,
+				max_fee,
+				priority,
+				1_000_000_000,
+				FeeCostStrategy::BufferedEffective125,
+			);
+			let mut once = Transaction {
+				to: None,
+				data: vec![1, 2, 3],
+				value: U256::ZERO,
+				chain_id,
+				nonce: None,
+				gas_limit: Some(100_000),
+				gas_price: None,
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+			};
+			let mut twice = once.clone();
+
+			params.apply_if_missing(&mut once);
+			params.apply_if_missing(&mut twice);
+			params.apply_if_missing(&mut twice);
+
+			prop_assert_eq!(once.gas_price, twice.gas_price);
+			prop_assert_eq!(once.max_fee_per_gas, twice.max_fee_per_gas);
+			prop_assert_eq!(once.max_priority_fee_per_gas, twice.max_priority_fee_per_gas);
+		}
 	}
 }

@@ -24,6 +24,10 @@ pub struct CostBreakdown {
 	pub gas_open: Decimal,
 	#[serde(with = "rust_decimal::serde::str")]
 	pub gas_fill: Decimal,
+	#[serde(default, with = "rust_decimal::serde::str")]
+	pub gas_post_fill: Decimal,
+	#[serde(default, with = "rust_decimal::serde::str")]
+	pub gas_pre_claim: Decimal,
 	#[serde(with = "rust_decimal::serde::str")]
 	pub gas_claim: Decimal,
 	#[serde(with = "rust_decimal::serde::str")]

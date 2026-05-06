@@ -139,12 +139,14 @@ pub async fn process_quote_request(
 		solver.storage().clone(),
 	);
 
+	let solver_address = solver.solver_address().clone();
 	let cost_context = cost_profit_service
 		.calculate_cost_context_for_flow_keys(
 			&request,
 			&validated_context,
 			config,
 			&resolved_flow_keys,
+			&solver_address,
 		)
 		.await
 		.map_err(|e| QuoteError::Internal(format!("Failed to calculate cost context: {e}")))?;
@@ -654,8 +656,12 @@ mod tests {
 
 		let mut mock_delivery_1 = MockDeliveryInterface::new();
 		mock_delivery_1
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("1000000000".to_string()) }));
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(
+					async move { Ok(solver_delivery::FeeParams::legacy(chain_id, 1_000_000_000)) },
+				)
+			});
 		mock_delivery_1
 			.expect_get_balance()
 			.returning(|_, _, _| Box::pin(async move { Ok("5000000000".to_string()) }));
@@ -663,11 +669,25 @@ mod tests {
 
 		let mut mock_delivery_137 = MockDeliveryInterface::new();
 		mock_delivery_137
-			.expect_get_gas_price()
-			.returning(|_| Box::pin(async move { Ok("1000000000".to_string()) }));
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(
+					async move { Ok(solver_delivery::FeeParams::legacy(chain_id, 1_000_000_000)) },
+				)
+			});
 		mock_delivery_137
 			.expect_get_balance()
 			.returning(|_, _, _| Box::pin(async move { Ok("5000000000".to_string()) }));
+		// Quote-time live fill estimation: return an error so the cost path
+		// silently falls back to the static `flows.<key>.fill` default. This
+		// preserves the test's pre-live-estimate behavior.
+		mock_delivery_137.expect_estimate_gas().returning(|_| {
+			Box::pin(async move {
+				Err(solver_delivery::DeliveryError::Network(
+					"test mock: live estimate unavailable".into(),
+				))
+			})
+		});
 		delivery_implementations.insert(
 			137,
 			Arc::new(mock_delivery_137) as Arc<dyn DeliveryInterface>,
@@ -754,8 +774,10 @@ mod tests {
 	fn create_test_cost_context() -> CostContext {
 		CostContext {
 			cost_breakdown: CostBreakdown {
-				gas_open: rust_decimal::Decimal::new(1, 2),   // 0.01
-				gas_fill: rust_decimal::Decimal::new(2, 2),   // 0.02
+				gas_open: rust_decimal::Decimal::new(1, 2), // 0.01
+				gas_fill: rust_decimal::Decimal::new(2, 2), // 0.02
+				gas_post_fill: rust_decimal::Decimal::ZERO,
+				gas_pre_claim: rust_decimal::Decimal::ZERO,
 				gas_claim: rust_decimal::Decimal::new(1, 2),  // 0.01
 				gas_buffer: rust_decimal::Decimal::new(4, 3), // 0.004
 				rate_buffer: rust_decimal::Decimal::ZERO,

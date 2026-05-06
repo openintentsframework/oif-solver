@@ -462,6 +462,9 @@ Token arrays may be empty at boot and can be populated later via admin APIs.
 ```
 
 Optional fee overrides can be set at the top level: `min_profitability_pct` (decimal string), `gas_buffer_bps`, `commission_bps`, and `rate_buffer_bps` (basis points).
+
+For per-chain EIP-1559 fee tuning (priority floor, fallback, percentile speed, gas-price cap), see [docs/fee-policy.md](docs/fee-policy.md). The solver auto-generates sensible defaults — you only need a `fee_policy` block in your bootstrap config if you want to override them.
+
 Optional network types are: `parent`, `hub`, and `new`.
 
 For non-seeded networks, the following fields are required per network:

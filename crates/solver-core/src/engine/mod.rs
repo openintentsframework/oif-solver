@@ -8,6 +8,7 @@ pub mod context;
 pub mod cost_profit;
 pub mod event_bus;
 pub mod lifecycle;
+pub mod post_fill_overrides;
 pub mod token_manager;
 
 use self::{cost_profit::CostProfitService, token_manager::TokenManager};
@@ -104,6 +105,25 @@ pub struct SolverEngine {
 /// This constant defines how many orders are batched together when
 /// submitting claim transactions to reduce gas costs.
 static CLAIM_BATCH: usize = 1;
+
+/// Returns true when the settlement error represents a transient post-fill
+/// failure — one that may succeed on a later attempt without any code or
+/// order changes. Marking such orders as `Failed` would lock in a real loss
+/// because the Fill has already settled on chain; only the claim half
+/// remains, and it just needs another attempt with a healthier signer.
+///
+/// Matches on the typed `SettlementError` variant rather than substring on
+/// a formatted message — drift in any error's `Display` impl would silently
+/// flip transient-recovery behavior to permanent-failure.
+///
+/// Currently identifies:
+/// - `InsufficientNativeGas` — signer balance changes outside the solver's view.
+fn is_transient_postfill_error(error: &crate::handlers::settlement::SettlementError) -> bool {
+	matches!(
+		error,
+		crate::handlers::settlement::SettlementError::InsufficientNativeGas(_)
+	)
+}
 
 impl SolverEngine {
 	/// Creates a new solver engine with the given services.
@@ -473,8 +493,26 @@ impl SolverEngine {
 							self.spawn_handler(&transaction_semaphore, move |engine| async move {
 								let order_id_clone = order_id.clone();
 								if let Err(e) = engine.settlement_handler.handle_post_fill_ready(order_id).await {
+									// Discriminate transient errors from permanent ones via
+									// the typed SettlementError variant — string-matching on
+									// a formatted message is brittle to Display drift.
+									// `InsufficientNativeGas` is the textbook transient: balance
+									// changes outside the solver's view, and marking Failed here
+									// would lock in a real loss (Fill already settled on chain;
+									// we just need to top up to claim). Leave the order in
+									// `Executed` so the next restart's recovery retries.
+									if is_transient_postfill_error(&e) {
+										let error_msg = format!("Failed to handle PostFillReady: {e}");
+										tracing::warn!(
+											order_id = %order_id_clone,
+											error = %error_msg,
+											"PostFill failed with a transient error; leaving order \
+											in Executed for the next recovery cycle to retry"
+										);
+										return Err(EngineError::Service(error_msg));
+									}
 									let error_msg = format!("Failed to handle PostFillReady: {e}");
-									// Attempt to mark order as failed
+									// Permanent failure → mark order Failed.
 									if let Err(state_err) = engine.state_machine
 										.transition_order_status(&order_id_clone, solver_types::OrderStatus::Failed(solver_types::TransactionType::PostFill, error_msg.clone()))
 										.await
@@ -666,6 +704,11 @@ impl SolverEngine {
 	/// Returns the solver address as a hex string with 0x prefix.
 	pub fn solver_address_hex(&self) -> String {
 		format!("0x{}", hex::encode(&self.solver_address.0))
+	}
+
+	/// Returns a reference to the solver's primary account address.
+	pub fn solver_address(&self) -> &solver_types::Address {
+		&self.solver_address
 	}
 
 	/// Helper method to spawn handler tasks with semaphore-based concurrency control.

@@ -30,3 +30,6 @@ solver-types = { path = "../solver-types" }
 thiserror = "2.0.17"
 tokio = { version = "1.0", features = ["rt-multi-thread"] }
 tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1"

@@ -176,3 +176,44 @@ All under `/api/v1/admin/rebalance/`. See `api-spec/rebalance-api.yaml` for the 
 ## Runtime Updates
 
 Global settings and per-pair thresholds can be updated at runtime via the PUT endpoints without restarting the solver. Changes are validated before persisting and take effect on the next monitor tick via hot-reload.
+
+## Enabling live post-fill gas estimation (per chain)
+
+The `live_post_fill_estimate_chain_ids` field on `GasConfig` is a set of destination chain IDs allowed to use the override-based `eth_estimateGas` path for the post-fill (Hyperlane `submit(...)`) leg. Empty set = the override path is disabled everywhere and the solver falls back to the static `gas.flows.<flow>.post_fill` default. Add chain IDs **one at a time** after validating each.
+
+The override path pre-populates the OutputSettler's `_fillRecords[orderId][outputHash]` slot via `stateOverride` so `eth_estimateGas` for a synthetic Hyperlane post-fill `submit(...)` returns a realistic gas number instead of reverting with `FillNotRecorded`. Storage layout assumed: slot index `1` for `_fillRecords`. If a chain redeploys the OutputSettler with a layout change (any new state variable inserted before `_fillRecords`), the integration test below MUST be re-run for that chain before its ID stays in the set.
+
+### 1. Verify storage layout against the destination chain RPC
+
+Run the live integration test against the destination chain whose ID you want to add. The test sends two `eth_estimateGas` calls for a synthetic post-fill `submit(...)` — one bare (which must revert) and one with the override (which must return realistic units):
+
+```bash
+OIF_LIVE_RPC=1 \
+OIF_TEST_DEST_RPC_URL=<destination_chain_rpc_url> \
+OIF_TEST_DEST_CHAIN_ID=<chain_id_to_validate> \
+OIF_TEST_ORIGIN_CHAIN_ID=<origin_chain_id> \
+OIF_TEST_OUTPUT_SETTLER=<output_settler_address_on_dest> \
+OIF_TEST_OUTPUT_ORACLE=<hyperlane_output_oracle_on_dest> \
+OIF_TEST_RECIPIENT_ORACLE=<hyperlane_input_oracle_on_origin> \
+cargo test -p solver-core --features test-helpers \
+    --test post_fill_override_integration -- --nocapture
+```
+
+The destination chain RPC MUST honor `eth_estimateGas` `stateOverride` (Alchemy, Infura, and self-hosted Geth/Reth all do; some lightweight providers strip it silently — if so, the test fails and the chain is unsafe to enable). If the test fails at the override step but the bare step reverted as expected, the override mechanism is broken on that chain and the chain ID must NOT be added.
+
+### 2. Add the chain ID via signed UpdateGasConfig
+
+Use the existing `PUT /config` admin endpoint (signed EIP-712 `UpdateGasConfig`) to APPEND the new chain ID to `live_post_fill_estimate_chain_ids` — do NOT replace the set, or you will silently disable previously-validated chains. Verify via `GET /config` immediately after that the set contains both the old and new IDs.
+
+### 3. Watch outcome events for 24h
+
+Every quote with the chain enabled emits exactly one structured `tracing` event with the constant message `"post-fill gas estimate"` and the `outcome=` field set to one of: `success`, `fallback_zero`, `fallback_error`, `skipped_build_tx`, `skipped_disabled`, `skipped_unsupported_chain`. The `chain_id=` field is also set on the surrounding `calculate_cost_context` span. Query log aggregation for the new chain over the next 24 hours:
+
+- `outcome=success` count per `chain_id` — should dominate.
+- `outcome=fallback_error` count per `chain_id` — should be `<1%` of total. Sustained `>5%` indicates a broken override path (RPC provider drift, layout change) and triggers rollback.
+- `outcome=fallback_zero` count per `chain_id` — should be `0` or near-zero. A non-trivial rate means the contract returned `0` units, which usually points at an oracle-side check we missed.
+- `delta_pct` distribution (only emitted on `success`) — should center near `0` with stddev `<30%`. A persistent positive bias `>30%` means the static default was too low; a persistent negative bias `<-30%` means we're now over-quoting and losing competitive edge.
+
+### 4. Promote, or roll back
+
+If the success rate is healthy and `delta_pct` is in band: promote the next chain on the list and repeat. If the failure rate exceeds threshold OR `delta_pct` is wildly off: roll back by emitting another signed `UpdateGasConfig` that REMOVES that chain ID from `live_post_fill_estimate_chain_ids`. Takes effect on the next quote. No deploy needed. The override path silently falls back to the static default for that chain, restoring today's behavior. If a layout change is suspected, re-run the integration test against the chain (Step 1) before considering re-enabling.

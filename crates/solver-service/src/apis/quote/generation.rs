@@ -2152,6 +2152,8 @@ mod tests {
 			cost_breakdown: CostBreakdown {
 				gas_open: Decimal::from_str("0.001").unwrap(),
 				gas_fill: Decimal::from_str("0.002").unwrap(),
+				gas_post_fill: Decimal::ZERO,
+				gas_pre_claim: Decimal::ZERO,
 				gas_claim: Decimal::from_str("0.001").unwrap(),
 				gas_buffer: Decimal::from_str("0.0005").unwrap(),
 				rate_buffer: Decimal::from_str("0.01").unwrap(),

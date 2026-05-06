@@ -441,18 +441,42 @@ pub fn merge_to_operator_config(
 			resource_lock: OperatorGasFlowUnits {
 				open: seed.defaults.gas_resource_lock.open,
 				fill: seed.defaults.gas_resource_lock.fill,
+				post_fill: seed.defaults.gas_resource_lock.post_fill,
+				pre_claim: seed.defaults.gas_resource_lock.pre_claim,
 				claim: seed.defaults.gas_resource_lock.claim,
 			},
 			permit2_escrow: OperatorGasFlowUnits {
 				open: seed.defaults.gas_permit2_escrow.open,
 				fill: seed.defaults.gas_permit2_escrow.fill,
+				post_fill: seed.defaults.gas_permit2_escrow.post_fill,
+				pre_claim: seed.defaults.gas_permit2_escrow.pre_claim,
 				claim: seed.defaults.gas_permit2_escrow.claim,
 			},
 			eip3009_escrow: OperatorGasFlowUnits {
 				open: seed.defaults.gas_eip3009_escrow.open,
 				fill: seed.defaults.gas_eip3009_escrow.fill,
+				post_fill: seed.defaults.gas_eip3009_escrow.post_fill,
+				pre_claim: seed.defaults.gas_eip3009_escrow.pre_claim,
 				claim: seed.defaults.gas_eip3009_escrow.claim,
 			},
+			// Prefer the bootstrap-config override; fall back to seed defaults.
+			// This lets operators seed `live_post_fill_estimate_chain_ids` at
+			// boot directly from their bootstrap JSON instead of requiring an
+			// admin EIP-712 call after startup.
+			live_fill_estimate_enabled: initializer
+				.live_fill_estimate_enabled
+				.unwrap_or(seed.defaults.live_fill_estimate_enabled),
+			live_post_fill_estimate_chain_ids: initializer
+				.live_post_fill_estimate_chain_ids
+				.as_deref()
+				.map(|ids| ids.iter().copied().collect())
+				.unwrap_or_else(|| {
+					seed.defaults
+						.live_post_fill_estimate_chain_ids
+						.iter()
+						.copied()
+						.collect()
+				}),
 		},
 		pricing: OperatorPricingConfig {
 			primary: seed.defaults.pricing_primary.to_string(),
@@ -480,6 +504,11 @@ pub fn merge_to_operator_config(
 			implementations: a.implementations.clone(),
 		}),
 		rebalance: initializer.rebalance.clone(),
+		// The bootstrap-config fee_policy block (if any) flows straight into
+		// OperatorConfig. From there `build_delivery_config_from_operator`
+		// merges it on top of the auto-generated defaults at runtime-config
+		// materialization time.
+		fee_policy: initializer.fee_policy.clone(),
 	})
 }
 
@@ -1100,7 +1129,10 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 		solver: build_solver_config_from_operator(operator_config, intake_disabled_override),
 		networks,
 		storage: build_storage_config_from_operator(&operator_config.solver_id),
-		delivery: build_delivery_config_from_operator(&chain_ids),
+		delivery: build_delivery_config_from_operator(
+			&chain_ids,
+			operator_config.fee_policy.as_ref(),
+		),
 		account: build_account_config_from_operator(operator_config.account.as_ref()),
 		discovery: build_discovery_config_from_operator(&chain_ids)?,
 		order: build_order_config_from_operator(),
@@ -1289,13 +1321,102 @@ fn build_storage_config_from_operator(solver_id: &str) -> StorageConfig {
 }
 
 /// Builds DeliveryConfig from operator config.
-fn build_delivery_config_from_operator(chain_ids: &[u64]) -> DeliveryConfig {
+///
+/// Emits the `fee_policy` block alongside `network_ids`. Every chain id in
+/// `network_ids` MUST have a matching entry under `fee_policy.chains` —
+/// `FeePolicyRegistry::from_config` rejects configs that don't, and the
+/// solver fails to start.
+///
+/// The auto-generated defaults are intentionally low (0.01 gwei priority
+/// floor + fallback) so the percentile-driven estimator drives the tip in
+/// every realistic regime. The 0.01 gwei floor is just an absolute backstop
+/// for the degenerate "RPC returned all zeros" case. Operators who want
+/// different values per chain pass a `fee_policy` block in their bootstrap
+/// config (see `SeedOverrides::fee_policy`); whatever fields they specify
+/// replace the defaults, whatever they omit keeps the default.
+fn build_delivery_config_from_operator(
+	chain_ids: &[u64],
+	override_: Option<&solver_types::FeePolicyOverride>,
+) -> DeliveryConfig {
+	// Absolute floor — kicks in only if RPC fee history returned all zeros.
+	// 0.01 gwei is 10× above the lowest tier mainnet validators accept and
+	// well below any realistic market priority, so it never wins against the
+	// percentile estimate during normal operation.
+	const DEFAULT_PRIORITY_WEI: &str = "10000000"; // 0.01 gwei
+	const DEFAULT_QUOTE_COST_STRATEGY: &str = "buffered_effective_125";
+	const DEFAULT_SPEED: &str = "fast";
+
 	let mut implementations = HashMap::new();
 
 	let network_ids_array =
 		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect());
 
-	let evm_alloy_config = json_object(vec![("network_ids", network_ids_array)]);
+	// Pre-resolve the per-chain overrides into a name-keyed lookup so we can
+	// merge them into the auto-generated entries below.
+	let chain_overrides: HashMap<&str, &solver_types::FeePolicyChainOverride> = override_
+		.map(|o| {
+			o.chains
+				.iter()
+				.map(|(k, v)| (k.as_str(), v))
+				.collect::<HashMap<_, _>>()
+		})
+		.unwrap_or_default();
+
+	let mut fee_policy_chains = serde_json::Map::new();
+	for chain_id in chain_ids {
+		let mut entry = serde_json::Map::new();
+		let key = chain_id.to_string();
+		let override_entry = chain_overrides.get(key.as_str()).copied();
+
+		// min_priority_fee_per_gas: same low default as fallback so the
+		// percentile drives priority everywhere. Operators can lift this on
+		// chains where they want a higher liveness floor.
+		let min_priority = override_entry
+			.and_then(|e| e.min_priority_fee_per_gas.clone())
+			.unwrap_or_else(|| DEFAULT_PRIORITY_WEI.to_string());
+		entry.insert(
+			"min_priority_fee_per_gas".to_string(),
+			serde_json::Value::String(min_priority),
+		);
+
+		let priority_fallback = override_entry
+			.and_then(|e| e.priority_fee_fallback.clone())
+			.unwrap_or_else(|| DEFAULT_PRIORITY_WEI.to_string());
+		entry.insert(
+			"priority_fee_fallback".to_string(),
+			serde_json::Value::String(priority_fallback),
+		);
+
+		let strategy = override_entry
+			.and_then(|e| e.quote_cost_strategy.clone())
+			.unwrap_or_else(|| DEFAULT_QUOTE_COST_STRATEGY.to_string());
+		entry.insert(
+			"quote_cost_strategy".to_string(),
+			serde_json::Value::String(strategy),
+		);
+
+		// gas_price_cap is omitted unless the operator explicitly supplies one.
+		// FeePolicyRegistry treats absence as "no ceiling", which is what we want.
+		if let Some(cap) = override_entry.and_then(|e| e.gas_price_cap.clone()) {
+			entry.insert("gas_price_cap".to_string(), serde_json::Value::String(cap));
+		}
+
+		fee_policy_chains.insert(key, serde_json::Value::Object(entry));
+	}
+
+	let default_speed = override_
+		.and_then(|o| o.default_speed.clone())
+		.unwrap_or_else(|| DEFAULT_SPEED.to_string());
+
+	let fee_policy = json_object(vec![
+		("default_speed", serde_json::Value::String(default_speed)),
+		("chains", serde_json::Value::Object(fee_policy_chains)),
+	]);
+
+	let evm_alloy_config = json_object(vec![
+		("network_ids", network_ids_array),
+		("fee_policy", fee_policy),
+	]);
 	implementations.insert("evm_alloy".to_string(), evm_alloy_config);
 
 	DeliveryConfig {
@@ -1956,6 +2077,8 @@ fn build_gas_config_from_operator(gas: &OperatorGasConfig) -> GasConfig {
 		GasFlowUnits {
 			open: Some(gas.resource_lock.open),
 			fill: Some(gas.resource_lock.fill),
+			post_fill: Some(gas.resource_lock.post_fill),
+			pre_claim: Some(gas.resource_lock.pre_claim),
 			claim: Some(gas.resource_lock.claim),
 		},
 	);
@@ -1965,6 +2088,8 @@ fn build_gas_config_from_operator(gas: &OperatorGasConfig) -> GasConfig {
 		GasFlowUnits {
 			open: Some(gas.permit2_escrow.open),
 			fill: Some(gas.permit2_escrow.fill),
+			post_fill: Some(gas.permit2_escrow.post_fill),
+			pre_claim: Some(gas.permit2_escrow.pre_claim),
 			claim: Some(gas.permit2_escrow.claim),
 		},
 	);
@@ -1974,11 +2099,17 @@ fn build_gas_config_from_operator(gas: &OperatorGasConfig) -> GasConfig {
 		GasFlowUnits {
 			open: Some(gas.eip3009_escrow.open),
 			fill: Some(gas.eip3009_escrow.fill),
+			post_fill: Some(gas.eip3009_escrow.post_fill),
+			pre_claim: Some(gas.eip3009_escrow.pre_claim),
 			claim: Some(gas.eip3009_escrow.claim),
 		},
 	);
 
-	GasConfig { flows }
+	GasConfig {
+		flows,
+		live_fill_estimate_enabled: gas.live_fill_estimate_enabled,
+		live_post_fill_estimate_chain_ids: gas.live_post_fill_estimate_chain_ids.clone(),
+	}
 }
 
 /// Builds ApiConfig from OperatorAdminConfig.
@@ -2249,6 +2380,8 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 				.map(|f| OperatorGasFlowUnits {
 					open: f.open.unwrap_or(0),
 					fill: f.fill.unwrap_or(0),
+					post_fill: f.post_fill.unwrap_or(0),
+					pre_claim: f.pre_claim.unwrap_or(0),
 					claim: f.claim.unwrap_or(0),
 				})
 				.unwrap_or_default(),
@@ -2258,6 +2391,8 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 				.map(|f| OperatorGasFlowUnits {
 					open: f.open.unwrap_or(0),
 					fill: f.fill.unwrap_or(0),
+					post_fill: f.post_fill.unwrap_or(0),
+					pre_claim: f.pre_claim.unwrap_or(0),
 					claim: f.claim.unwrap_or(0),
 				})
 				.unwrap_or_default(),
@@ -2267,14 +2402,20 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 				.map(|f| OperatorGasFlowUnits {
 					open: f.open.unwrap_or(0),
 					fill: f.fill.unwrap_or(0),
+					post_fill: f.post_fill.unwrap_or(0),
+					pre_claim: f.pre_claim.unwrap_or(0),
 					claim: f.claim.unwrap_or(0),
 				})
 				.unwrap_or_default(),
+			live_fill_estimate_enabled: g.live_fill_estimate_enabled,
+			live_post_fill_estimate_chain_ids: g.live_post_fill_estimate_chain_ids.clone(),
 		})
 		.unwrap_or(OperatorGasConfig {
 			resource_lock: OperatorGasFlowUnits::default(),
 			permit2_escrow: OperatorGasFlowUnits::default(),
 			eip3009_escrow: OperatorGasFlowUnits::default(),
+			live_fill_estimate_enabled: true,
+			live_post_fill_estimate_chain_ids: HashSet::new(),
 		});
 
 	// Extract pricing config
@@ -2348,6 +2489,10 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		auth_enabled,
 		account,
 		rebalance: extract_rebalance_config(config.rebalance.as_ref())?,
+		// Legacy `Config` shape doesn't carry a fee-policy override block —
+		// the runtime config it built was the source of truth. Round-tripping
+		// here keeps OperatorConfig on the auto-generated defaults.
+		fee_policy: None,
 	})
 }
 
@@ -3250,7 +3395,53 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		}
+	}
+
+	#[test]
+	fn bootstrap_config_overrides_live_post_fill_estimate_chain_ids() {
+		// Verify the bootstrap-config path: when SeedOverrides supplies the
+		// chain-ids set, merge_to_operator_config uses it instead of falling
+		// back to SeedDefaults (currently empty by default).
+		let mut overrides = test_seed_overrides();
+		overrides.live_post_fill_estimate_chain_ids = Some(vec![11155420, 84532]);
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).expect("build ok");
+
+		// HashSet — any order is fine; both must be present.
+		assert!(op_config
+			.gas
+			.live_post_fill_estimate_chain_ids
+			.contains(&11155420));
+		assert!(op_config
+			.gas
+			.live_post_fill_estimate_chain_ids
+			.contains(&84532));
+		assert_eq!(op_config.gas.live_post_fill_estimate_chain_ids.len(), 2);
+	}
+
+	#[test]
+	fn bootstrap_config_falls_back_to_seed_default_when_chain_ids_omitted() {
+		// When the bootstrap config doesn't set the field, the seed default
+		// applies (currently `&[]` in COMMON_DEFAULTS — empty set).
+		let overrides = test_seed_overrides();
+		assert!(overrides.live_post_fill_estimate_chain_ids.is_none());
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).expect("build ok");
+		assert!(op_config.gas.live_post_fill_estimate_chain_ids.is_empty());
+	}
+
+	#[test]
+	fn bootstrap_config_overrides_live_fill_estimate_enabled() {
+		// Verify `live_fill_estimate_enabled` can also be controlled at boot.
+		let mut overrides = test_seed_overrides();
+		overrides.live_fill_estimate_enabled = Some(false);
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).expect("build ok");
+		assert!(!op_config.gas.live_fill_estimate_enabled);
 	}
 
 	#[test]
@@ -3364,6 +3555,9 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -3421,6 +3615,9 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -3472,6 +3669,9 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -3514,6 +3714,9 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -3602,6 +3805,9 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -3821,6 +4027,9 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -3884,6 +4093,9 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -3972,6 +4184,9 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -4035,6 +4250,9 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -4104,6 +4322,9 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -4223,6 +4444,9 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -4352,6 +4576,9 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4419,6 +4646,9 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4480,6 +4710,9 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4576,6 +4809,9 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4681,6 +4917,9 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4845,6 +5084,9 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4981,6 +5223,9 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5081,6 +5326,9 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5203,6 +5451,9 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5356,6 +5607,9 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -5400,6 +5654,9 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -5458,6 +5715,9 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -5509,6 +5769,9 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -5577,6 +5840,9 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -5682,6 +5948,8 @@ mod tests {
 				resource_lock: OperatorGasFlowUnits::default(),
 				permit2_escrow: OperatorGasFlowUnits::default(),
 				eip3009_escrow: OperatorGasFlowUnits::default(),
+				live_fill_estimate_enabled: true,
+				live_post_fill_estimate_chain_ids: HashSet::new(),
 			},
 			pricing: OperatorPricingConfig {
 				primary: "coingecko".to_string(),
@@ -5701,6 +5969,7 @@ mod tests {
 			auth_enabled: false,
 			account: None,
 			rebalance: None,
+			fee_policy: None,
 		};
 
 		// Add only one network
@@ -5878,12 +6147,142 @@ mod tests {
 	#[test]
 	fn test_build_delivery_config_from_operator() {
 		let chain_ids = vec![1, 10, 137];
-		let delivery = build_delivery_config_from_operator(&chain_ids);
+		let delivery = build_delivery_config_from_operator(&chain_ids, None);
 
 		assert!(delivery.implementations.contains_key("evm_alloy"));
 		let evm_config = delivery.implementations.get("evm_alloy").unwrap();
 		let network_ids = evm_config.get("network_ids").unwrap().as_array().unwrap();
 		assert_eq!(network_ids.len(), 3);
+
+		// Every chain id in `network_ids` MUST have a matching `fee_policy.chains`
+		// entry — `FeePolicyRegistry::from_config` enforces this at startup.
+		let fee_policy = evm_config.get("fee_policy").expect("fee_policy emitted");
+		assert_eq!(
+			fee_policy.get("default_speed").and_then(|v| v.as_str()),
+			Some("fast")
+		);
+		let chains = fee_policy
+			.get("chains")
+			.and_then(|v| v.as_object())
+			.expect("fee_policy.chains is an object");
+
+		// Default policy is intentionally low: same 0.01 gwei value for both
+		// the floor and the fallback so the percentile-driven estimate drives
+		// priority in every realistic regime.
+		for chain_id in &chain_ids {
+			let entry = chains
+				.get(&chain_id.to_string())
+				.unwrap_or_else(|| panic!("fee_policy entry missing for chain {chain_id}"));
+			assert_eq!(
+				entry
+					.get("min_priority_fee_per_gas")
+					.and_then(|v| v.as_str()),
+				Some("10000000"),
+				"chain {chain_id} should default to 0.01 gwei floor",
+			);
+			assert_eq!(
+				entry.get("priority_fee_fallback").and_then(|v| v.as_str()),
+				Some("10000000"),
+				"chain {chain_id} should default to 0.01 gwei fallback",
+			);
+			assert_eq!(
+				entry.get("quote_cost_strategy").and_then(|v| v.as_str()),
+				Some("buffered_effective_125")
+			);
+			// gas_price_cap is omitted by default (no ceiling).
+			assert!(entry.get("gas_price_cap").is_none());
+		}
+	}
+
+	#[test]
+	fn test_build_delivery_config_applies_per_chain_override() {
+		// Bootstrap config can override defaults per-chain. Whatever the
+		// operator specifies replaces; whatever they omit keeps the default.
+		use solver_types::{FeePolicyChainOverride, FeePolicyOverride};
+		use std::collections::HashMap as StdHashMap;
+
+		let mut chains = StdHashMap::new();
+		chains.insert(
+			"1".to_string(),
+			FeePolicyChainOverride {
+				min_priority_fee_per_gas: Some("2000000000".to_string()),
+				priority_fee_fallback: None, // keep default
+				quote_cost_strategy: None,
+				gas_price_cap: Some("300000000000".to_string()),
+			},
+		);
+		chains.insert(
+			"747474".to_string(),
+			FeePolicyChainOverride {
+				min_priority_fee_per_gas: None,
+				priority_fee_fallback: Some("100000000".to_string()),
+				quote_cost_strategy: None,
+				gas_price_cap: None,
+			},
+		);
+		let override_ = FeePolicyOverride {
+			default_speed: Some("fastest".to_string()),
+			chains,
+		};
+
+		let chain_ids = vec![1, 10, 747474];
+		let delivery = build_delivery_config_from_operator(&chain_ids, Some(&override_));
+		let evm = delivery.implementations.get("evm_alloy").unwrap();
+		let fee_policy = evm.get("fee_policy").unwrap();
+
+		// Top-level override applied.
+		assert_eq!(
+			fee_policy.get("default_speed").and_then(|v| v.as_str()),
+			Some("fastest")
+		);
+
+		let chains = fee_policy
+			.get("chains")
+			.and_then(|v| v.as_object())
+			.unwrap();
+
+		// Mainnet: floor lifted to 2 gwei, cap added, fallback kept at default.
+		let mainnet = chains.get("1").unwrap();
+		assert_eq!(
+			mainnet
+				.get("min_priority_fee_per_gas")
+				.and_then(|v| v.as_str()),
+			Some("2000000000")
+		);
+		assert_eq!(
+			mainnet
+				.get("priority_fee_fallback")
+				.and_then(|v| v.as_str()),
+			Some("10000000"),
+			"omitted fallback should keep the 0.01 gwei default",
+		);
+		assert_eq!(
+			mainnet.get("gas_price_cap").and_then(|v| v.as_str()),
+			Some("300000000000")
+		);
+
+		// Chain 10 has no override entry → all defaults.
+		let chain10 = chains.get("10").unwrap();
+		assert_eq!(
+			chain10
+				.get("min_priority_fee_per_gas")
+				.and_then(|v| v.as_str()),
+			Some("10000000")
+		);
+		assert!(chain10.get("gas_price_cap").is_none());
+
+		// Katana: only fallback overridden, floor stays at default.
+		let katana = chains.get("747474").unwrap();
+		assert_eq!(
+			katana
+				.get("min_priority_fee_per_gas")
+				.and_then(|v| v.as_str()),
+			Some("10000000")
+		);
+		assert_eq!(
+			katana.get("priority_fee_fallback").and_then(|v| v.as_str()),
+			Some("100000000")
+		);
 	}
 
 	#[test]
@@ -6016,18 +6415,26 @@ mod tests {
 			resource_lock: OperatorGasFlowUnits {
 				open: 100,
 				fill: 200,
+				post_fill: 250,
+				pre_claim: 275,
 				claim: 300,
 			},
 			permit2_escrow: OperatorGasFlowUnits {
 				open: 400,
 				fill: 500,
+				post_fill: 550,
+				pre_claim: 575,
 				claim: 600,
 			},
 			eip3009_escrow: OperatorGasFlowUnits {
 				open: 700,
 				fill: 800,
+				post_fill: 850,
+				pre_claim: 875,
 				claim: 900,
 			},
+			live_fill_estimate_enabled: true,
+			live_post_fill_estimate_chain_ids: HashSet::new(),
 		};
 
 		let gas = build_gas_config_from_operator(&op_gas);
@@ -6521,6 +6928,9 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			rebalance: None,
+			live_fill_estimate_enabled: None,
+			live_post_fill_estimate_chain_ids: None,
+			fee_policy: None,
 		};
 
 		// Step 1: merge_config should create Config with KMS account

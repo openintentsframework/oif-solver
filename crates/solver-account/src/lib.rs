@@ -5,9 +5,7 @@
 //! such as address retrieval and transaction signing.
 
 use async_trait::async_trait;
-use solver_types::{
-	Address, ConfigSchema, ImplementationRegistry, SecretString, Signature, Transaction,
-};
+use solver_types::{Address, ImplementationRegistry};
 use std::future::Future;
 use std::pin::Pin;
 use thiserror::Error;
@@ -43,50 +41,20 @@ pub enum AccountError {
 /// Trait defining the interface for account implementations.
 ///
 /// This trait must be implemented by any account implementation that wants to integrate
-/// with the solver system. It provides methods for retrieving account addresses
-/// and signing transactions and messages.
+/// with the solver system. It provides methods for retrieving the account address and
+/// obtaining a unified signer for use by the delivery layer.
 #[async_trait]
 #[cfg_attr(feature = "testing", mockall::automock)]
 pub trait AccountInterface: Send + Sync {
-	/// Returns the configuration schema for this account implementation.
-	///
-	/// This allows each implementation to define its own configuration requirements
-	/// with specific validation rules. The schema is used to validate TOML configuration
-	/// before initializing the account implementation.
-	fn config_schema(&self) -> Box<dyn ConfigSchema>;
-
 	/// Retrieves the address associated with this account.
 	///
 	/// Returns the account's address or an error if the address cannot be retrieved.
 	async fn address(&self) -> Result<Address, AccountError>;
 
-	/// Signs a transaction using the account's private key.
-	///
-	/// Takes a reference to a transaction and returns a signature that can be used
-	/// to authorize the transaction execution.
-	async fn sign_transaction(&self, tx: &Transaction) -> Result<Signature, AccountError>;
-
-	/// Signs an arbitrary message using the account's private key.
-	///
-	/// Takes a byte slice representing the message and returns a signature.
-	/// This is useful for message authentication and verification purposes.
-	async fn sign_message(&self, message: &[u8]) -> Result<Signature, AccountError>;
-
 	/// Returns a unified signer for use with Alloy's EthereumWallet.
 	///
 	/// This is the preferred way to get signing capability for the delivery layer.
 	fn signer(&self) -> AccountSigner;
-
-	/// Returns the private key as a SecretString with 0x prefix.
-	///
-	/// # Panics
-	/// Panics if called on a KMS signer (use `signer()` instead).
-	///
-	/// # Deprecated
-	/// Use `signer()` instead - this method is not supported for KMS.
-	fn get_private_key(&self) -> SecretString {
-		panic!("get_private_key() not supported - use signer() instead")
-	}
 }
 
 /// The return type for async account factory functions.
@@ -155,27 +123,11 @@ impl AccountService {
 		self.implementation.address().await
 	}
 
-	/// Signs a transaction using the managed account.
-	///
-	/// This method delegates to the underlying implementation's sign_transaction method.
-	pub async fn sign(&self, tx: &Transaction) -> Result<Signature, AccountError> {
-		self.implementation.sign_transaction(tx).await
-	}
-
 	/// Returns a unified signer for use with the delivery layer.
 	///
 	/// This is the preferred way to get signing capability.
 	pub fn signer(&self) -> AccountSigner {
 		self.implementation.signer()
-	}
-
-	/// Returns the private key as a SecretString.
-	///
-	/// This is used by delivery implementations for transaction signing.
-	#[deprecated(note = "Use signer() instead - not supported for KMS")]
-	#[allow(deprecated)]
-	pub fn get_private_key(&self) -> SecretString {
-		self.implementation.get_private_key()
 	}
 }
 
@@ -230,47 +182,6 @@ mod tests {
 
 		let address = service.get_address().await.unwrap();
 		assert!(!address.0.is_empty());
-	}
-
-	#[tokio::test]
-	async fn test_account_service_sign() {
-		use alloy_primitives::U256;
-		use implementations::local::create_account;
-
-		let config = local_account_config();
-		let account = create_account(&config).await.unwrap();
-		let service = AccountService::new(account);
-
-		let tx = Transaction {
-			to: Some(Address(vec![0u8; 20])),
-			value: U256::ZERO,
-			data: vec![],
-			gas_limit: Some(21000),
-			gas_price: Some(1000000000),
-			nonce: Some(0),
-			chain_id: 1,
-			max_fee_per_gas: None,
-			max_priority_fee_per_gas: None,
-		};
-
-		let signature = service.sign(&tx).await.unwrap();
-		assert!(!signature.0.is_empty());
-	}
-
-	#[tokio::test]
-	#[allow(deprecated)]
-	async fn test_account_service_get_private_key() {
-		use implementations::local::create_account;
-
-		let config = local_account_config();
-		let account = create_account(&config).await.unwrap();
-		let service = AccountService::new(account);
-
-		let key = service.get_private_key();
-		key.with_exposed(|s| {
-			assert!(s.starts_with("0x"));
-			assert_eq!(s.len(), 66); // 0x + 64 hex chars
-		});
 	}
 
 	#[tokio::test]

@@ -3,22 +3,31 @@
 //! This module provides concrete implementations of the DeliveryInterface trait,
 //! supporting blockchain transaction submission and monitoring using the Alloy library.
 
+use crate::implementations::evm::fees::{
+	FeePolicyConfig, FeePolicyRegistry, SolverEip1559Estimator,
+};
+// Re-import directly because the schema validator below builds a transient
+// `FeePolicyRegistry` purely to surface field-level wei-parse errors. Going
+// through `from_config` keeps validation and runtime conversion behind a
+// single source of truth — there's exactly one place that decides what
+// "valid" looks like.
 use crate::implementations::evm::nonce::{
 	classify_submission_outcome, ResettableNonceManager, SubmissionOutcome,
 };
 use crate::{
-	DeliveryError, DeliveryInterface, InsufficientNativeGasInfo, TransactionMonitoringEvent,
-	TransactionTrackingWithConfig,
+	DeliveryError, DeliveryInterface, FeeParams, InsufficientNativeGasInfo,
+	TransactionMonitoringEvent, TransactionTrackingWithConfig,
 };
-use alloy_network::EthereumWallet;
+use alloy_consensus::BlockHeader;
+use alloy_network::{BlockResponse, EthereumWallet};
 use alloy_primitives::{Address, Bytes, FixedBytes, B256, U256};
 use alloy_provider::{
 	fillers::{ChainIdFiller, GasFiller},
 	DynProvider, Provider, ProviderBuilder,
 };
 use alloy_rpc_client::RpcClient;
-use alloy_rpc_types::TransactionRequest;
-use alloy_transport::layers::{RateLimitRetryPolicy, RetryBackoffLayer};
+use alloy_rpc_types::{BlockNumberOrTag, TransactionRequest};
+use alloy_transport::layers::RetryBackoffLayer;
 use alloy_transport::TransportError;
 use async_trait::async_trait;
 use solver_account::AccountSigner;
@@ -27,14 +36,13 @@ use solver_types::{
 	TransactionHash, TransactionReceipt,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Interval between receipt-polling attempts inside `monitor_transaction`.
 /// 2 seconds matches typical Ethereum mainnet block time and is short enough
 /// not to materially delay confirmation reporting on faster chains.
 const TX_CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
-const ETHEREUM_MAINNET_CHAIN_ID: u64 = 1;
-const MAINNET_PRIORITY_FEE_FLOOR_WEI: u128 = 2_000_000_000;
 
 /// Drift-monitor parameters. The monitor periodically compares local nonce
 /// cache against chain pending. Some lead is normal during in-flight
@@ -72,39 +80,6 @@ enum PollOutcome {
 	Indeterminate(String),
 }
 
-fn should_apply_mainnet_priority_fee_floor(tx: &SolverTransaction) -> bool {
-	tx.chain_id == ETHEREUM_MAINNET_CHAIN_ID
-		&& tx.gas_price.is_none()
-		&& (tx.max_fee_per_gas.is_none()
-			|| tx
-				.max_priority_fee_per_gas
-				.is_none_or(|priority| priority < MAINNET_PRIORITY_FEE_FLOOR_WEI))
-}
-
-fn apply_mainnet_priority_fee_floor(
-	tx: &mut SolverTransaction,
-	estimated_max_fee_per_gas: u128,
-) -> bool {
-	if !should_apply_mainnet_priority_fee_floor(tx) {
-		return false;
-	}
-
-	let priority_fee = tx
-		.max_priority_fee_per_gas
-		.unwrap_or_default()
-		.max(MAINNET_PRIORITY_FEE_FLOOR_WEI);
-	let min_max_fee = estimated_max_fee_per_gas.saturating_add(priority_fee);
-	let max_fee = tx
-		.max_fee_per_gas
-		.unwrap_or_default()
-		.max(min_max_fee)
-		.max(priority_fee);
-
-	tx.max_priority_fee_per_gas = Some(priority_fee);
-	tx.max_fee_per_gas = Some(max_fee);
-	true
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NativeGasBudget {
 	gas_budget_wei: U256,
@@ -127,6 +102,76 @@ fn native_gas_shortfall(balance: U256, required: U256) -> Option<U256> {
 	(balance < required).then(|| required.saturating_sub(balance))
 }
 
+/// One cached fee-params entry. `inserted_at` is captured at insertion time and
+/// compared against TTL on read; we use `std::time::Instant` so tests can pass an
+/// explicit `now` to exercise expiry without sleeping.
+#[derive(Debug, Clone)]
+struct CachedFeeParams {
+	params: FeeParams,
+	inserted_at: Instant,
+}
+
+/// Short-lived per-chain cache for `get_fee_params` results.
+///
+/// The motivation is documented in the plan (Task 4): moving from `eth_gasPrice`
+/// to `feeHistory` + latest-block reads increases quote-time RPC pressure.
+/// A short TTL preserves freshness while damping per-quote RPC load. Caching
+/// is keyed by `chain_id` only — fee policy is currently per-chain, not
+/// per-caller, so no further keying is required.
+#[derive(Debug, Default)]
+struct FeeParamsCache {
+	entries: tokio::sync::RwLock<HashMap<u64, CachedFeeParams>>,
+}
+
+impl FeeParamsCache {
+	/// Look up a cached entry, returning it only if it was inserted within `ttl`
+	/// of `now`. Stale or missing entries return `None`. Purely a read; no
+	/// eviction is performed (entries are overwritten on the next successful
+	/// `insert`, and per-chain footprint is bounded by the number of supported
+	/// chains).
+	async fn get(&self, chain_id: u64, ttl: Duration, now: Instant) -> Option<FeeParams> {
+		let guard = self.entries.read().await;
+		guard.get(&chain_id).and_then(|cached| {
+			let age = now.saturating_duration_since(cached.inserted_at);
+			if age <= ttl {
+				Some(cached.params.clone())
+			} else {
+				None
+			}
+		})
+	}
+
+	/// Insert or overwrite the entry for `chain_id`. `inserted_at` is taken
+	/// from the caller so the freshly-resolved `FeeParams` and the cache
+	/// timestamp share a single clock reading (see `get_fee_params`).
+	async fn insert(&self, chain_id: u64, params: FeeParams, inserted_at: Instant) {
+		let mut guard = self.entries.write().await;
+		guard.insert(
+			chain_id,
+			CachedFeeParams {
+				params,
+				inserted_at,
+			},
+		);
+	}
+}
+
+/// TTL defaults for the fee-params cache, per the plan (Task 4 Step 2).
+///
+/// - Mainnet: 3s. Block time ~12s; fee history within 3s is fresh enough for
+///   quotes and amortizes the extra RPC round-trips compared to `eth_gasPrice`.
+/// - Katana (747474): 1s. Sub-second blocks; keep cache short to avoid
+///   under-quoting on fast fee shifts.
+/// - Other chains: 2s. Conservative default that still cuts per-quote RPC
+///   pressure roughly in half on a 12s block-time chain.
+fn fee_params_cache_ttl(chain_id: u64) -> Duration {
+	match chain_id {
+		1 => Duration::from_secs(3),
+		747474 => Duration::from_secs(1),
+		_ => Duration::from_secs(2),
+	}
+}
+
 /// Alloy-based EVM delivery implementation.
 ///
 /// This implementation uses the Alloy library to submit and monitor transactions
@@ -142,6 +187,14 @@ pub struct AlloyDelivery {
 	/// Signer address per chain — needed to call `eth_getTransactionCount(from, "pending")`
 	/// for the resync path. The signer itself stays inside the provider's wallet filler.
 	signer_addresses: HashMap<u64, Address>,
+	/// Short-lived per-chain cache of resolved `FeeParams`. See
+	/// `FeeParamsCache` and `fee_params_cache_ttl` for rationale and TTL
+	/// defaults.
+	fee_params_cache: Arc<FeeParamsCache>,
+	/// Validated per-chain fee policy. Sourced from the required
+	/// `fee_policy` block in the delivery config; missing entries for any
+	/// configured network are a startup error (see `FeePolicyRegistry`).
+	fee_policy: FeePolicyRegistry,
 }
 
 /// What the broadcast wrapper should do with the local nonce cache,
@@ -342,6 +395,7 @@ impl AlloyDelivery {
 		networks: &NetworksConfig,
 		signers: HashMap<u64, AccountSigner>,
 		default_signer: AccountSigner,
+		fee_policy_config: &FeePolicyConfig,
 	) -> Result<Self, DeliveryError> {
 		// Validate at least one network
 		if network_ids.is_empty() {
@@ -349,6 +403,12 @@ impl AlloyDelivery {
 				"At least one network_id must be specified".to_string(),
 			));
 		}
+
+		// Validate fee policy covers every requested chain. Missing entries
+		// are a hard startup error — there is no implicit `default_for_chain`
+		// fallback per the production invariant.
+		let fee_policy = FeePolicyRegistry::from_config(fee_policy_config, &network_ids)
+			.map_err(|e| DeliveryError::Network(format!("Invalid fee_policy: {e}")))?;
 
 		let mut providers = HashMap::new();
 		let mut nonce_managers = HashMap::new();
@@ -383,24 +443,17 @@ impl AlloyDelivery {
 			let signer_address = chain_signer.address();
 			let wallet = EthereumWallet::from(chain_signer);
 
-			// Configure retry layer for handling network errors, rate limits, and execution reverts
-			// Extend the default rate limit policy to also retry execution reverts during transaction submission
-			let retry_policy = RateLimitRetryPolicy::default().or(|error: &TransportError| {
-				match error {
-					TransportError::ErrorResp(payload) => {
-						// Retry execution reverts (error code 3) that may be temporary
-						// These often occur during transaction submission due to network congestion or contract state issues
-						payload.code == 3 && payload.message.contains("execution reverted")
-					},
-					_ => false,
-				}
-			});
-
-			let retry_layer = RetryBackoffLayer::new_with_policy(
-				3,    // max_retry: retry up to 3 times for transaction submission (more conservative)
-				1500, // backoff: slightly longer initial backoff for transaction retries
+			// Retry only the rate-limit / transient cases (default policy). Execution
+			// reverts on read-only calls (eth_estimateGas / eth_call) are deterministic
+			// — retrying wastes the CU budget and stretches every subsequent call's
+			// backoff. Submission-revert handling is now done at the application layer
+			// by `classify_submission_outcome` (see nonce.rs), which routes
+			// definitely-rejected reverts to the cache-rollback policy without needing
+			// blind RPC-layer retries.
+			let retry_layer = RetryBackoffLayer::new(
+				3,    // max_retry
+				1500, // backoff (ms, doubles each retry)
 				10,   // cups: compute units per second
-				retry_policy,
 			);
 
 			// Create RPC client with retry capabilities
@@ -467,6 +520,8 @@ impl AlloyDelivery {
 			providers,
 			nonce_managers,
 			signer_addresses,
+			fee_params_cache: Arc::new(FeeParamsCache::default()),
+			fee_policy,
 		})
 	}
 
@@ -582,23 +637,42 @@ impl ConfigSchema for AlloyDeliverySchema {
 	fn validate(&self, config: &serde_json::Value) -> Result<(), solver_types::ValidationError> {
 		let schema = Schema::new(
 			// Required fields
-			vec![Field::new(
-				"network_ids",
-				FieldType::Array(Box::new(FieldType::Integer {
-					min: Some(1),
-					max: None,
-				})),
-			)
-			.with_validator(|value| {
-				if let Some(arr) = value.as_array() {
-					if arr.is_empty() {
-						return Err("network_ids cannot be empty".to_string());
+			vec![
+				Field::new(
+					"network_ids",
+					FieldType::Array(Box::new(FieldType::Integer {
+						min: Some(1),
+						max: None,
+					})),
+				)
+				.with_validator(|value| {
+					if let Some(arr) = value.as_array() {
+						if arr.is_empty() {
+							return Err("network_ids cannot be empty".to_string());
+						}
+						Ok(())
+					} else {
+						Err("network_ids must be an array".to_string())
 					}
-					Ok(())
-				} else {
-					Err("network_ids must be an array".to_string())
-				}
-			})],
+				}),
+				// `fee_policy` is required for every Alloy delivery instance.
+				// We don't enumerate every leaf field via `FieldType::Table`
+				// here — the schema layer can't represent string-typed wei
+				// values cleanly. Instead we deserialize into `FeePolicyConfig`
+				// AND build a transient `FeePolicyRegistry` (with no required
+				// chain ids — that completeness check is enforced at startup
+				// against the live `network_ids`). The registry build is what
+				// actually parses the wei strings, so any field-level error
+				// surfaces with the offending field name in the message.
+				Field::new("fee_policy", FieldType::Table(Schema::new(vec![], vec![])))
+					.with_validator(|value| {
+						let cfg = serde_json::from_value::<FeePolicyConfig>(value.clone())
+							.map_err(|e| format!("fee_policy is invalid: {e}"))?;
+						FeePolicyRegistry::from_config(&cfg, &[])
+							.map_err(|e| format!("fee_policy is invalid: {e}"))?;
+						Ok(())
+					}),
+			],
 			// Optional fields
 			vec![Field::new(
 				"accounts",
@@ -651,20 +725,19 @@ impl DeliveryInterface for AlloyDelivery {
 		let from = self.get_signer_address(chain_id)?;
 
 		let mut tx_attempt = tx.clone();
-		if should_apply_mainnet_priority_fee_floor(&tx_attempt) {
-			let estimate = provider.estimate_eip1559_fees().await.map_err(|e| {
-				DeliveryError::Network(format!("Failed to estimate EIP-1559 fees: {e}"))
-			})?;
-			if apply_mainnet_priority_fee_floor(&mut tx_attempt, estimate.max_fee_per_gas) {
-				tracing::info!(
-					chain_id,
-					nonce = ?tx_attempt.nonce,
-					max_fee_per_gas = ?tx_attempt.max_fee_per_gas,
-					max_priority_fee_per_gas = ?tx_attempt.max_priority_fee_per_gas,
-					"Applied Ethereum mainnet priority fee floor"
-				);
-			}
-		}
+		let fee_params = self.get_fee_params(chain_id).await?;
+		fee_params.apply_if_missing(&mut tx_attempt);
+
+		tracing::info!(
+			chain_id,
+			nonce = ?tx_attempt.nonce,
+			fee_model = ?fee_params.model,
+			gas_price = ?tx_attempt.gas_price,
+			max_fee_per_gas = ?tx_attempt.max_fee_per_gas,
+			max_priority_fee_per_gas = ?tx_attempt.max_priority_fee_per_gas,
+			cost_per_gas = fee_params.cost_per_gas,
+			"Applied transaction fee policy"
+		);
 
 		// PRE-SUBMIT DIAGNOSTIC SNAPSHOT.
 		// Captures the signer's native balance and chain pending nonce before
@@ -1084,18 +1157,134 @@ impl DeliveryInterface for AlloyDelivery {
 		}
 	}
 
-	/// Gets the current gas price for the network.
+	/// Gets effective fee parameters for the network.
 	///
-	/// Returns the recommended gas price in wei as a decimal string.
-	async fn get_gas_price(&self, chain_id: u64) -> Result<String, DeliveryError> {
+	/// EIP-1559 path: pulls the `eth_feeHistory` window at the policy's
+	/// configured percentile, runs the rewards through `SolverEip1559Estimator`
+	/// (median-of-nonzero + per-chain priority floor + projection), and applies
+	/// the chain's `quote_cost_strategy` to derive `cost_per_gas`.
+	///
+	/// Base-fee resolution mirrors alloy's `estimate_eip1559_fees_with` ladder:
+	/// prefer the value embedded in the fee-history response, fall back to the
+	/// latest block's `base_fee_per_gas`, and only downgrade to legacy
+	/// (`eth_gasPrice`) when neither is present.
+	///
+	/// On `feeHistory` RPC error we WARN and degrade to legacy `eth_gasPrice`
+	/// rather than failing the quote entirely. This degraded result is NOT
+	/// cached — we want the next quote to retry the EIP-1559 path.
+	async fn get_fee_params(&self, chain_id: u64) -> Result<FeeParams, DeliveryError> {
+		// Cache hit short-circuits the RPC round-trip(s). `now` is the single
+		// clock reading we use both for the lookup and (on miss) for the
+		// subsequent insert, so cache age is consistent with the resolved
+		// value's freshness.
+		let now = Instant::now();
+		let ttl = fee_params_cache_ttl(chain_id);
+		if let Some(params) = self.fee_params_cache.get(chain_id, ttl, now).await {
+			tracing::debug!(chain_id, "Fee params cache hit");
+			return Ok(params);
+		}
+		tracing::debug!(chain_id, "Fee params cache miss");
+
 		let provider = self.get_provider(chain_id)?;
+		// Per Task 8: the fee policy is sourced from required startup config,
+		// not hard-coded defaults. The registry is built against the same
+		// `network_ids` we constructed providers for, so a lookup here is
+		// guaranteed to succeed (any miss is a programmer error and panics).
+		let policy = self.fee_policy.policy_for_chain(chain_id).clone();
 
-		let gas_price = provider
-			.get_gas_price()
+		// Custom percentile: alloy's `estimate_eip1559_fees_with` hardcodes the
+		// 20th percentile internally, so we fetch fee history ourselves at the
+		// configured speed and feed it through our estimator.
+		let percentile = policy.speed.reward_percentile();
+		let history = match provider
+			.get_fee_history(10, BlockNumberOrTag::Latest, &[percentile])
 			.await
-			.map_err(|e| DeliveryError::Network(format!("Failed to get gas price: {e}")))?;
+		{
+			Ok(h) => h,
+			Err(e) => {
+				// feeHistory RPC failed. Degrade to legacy `eth_gasPrice` so
+				// quotes keep flowing, but DO NOT cache — we want the next
+				// quote to retry the EIP-1559 path.
+				let gp = provider.get_gas_price().await.map_err(|gas_err| {
+					DeliveryError::Network(format!(
+						"Failed to get fee history ({e}) and legacy gas price fallback ({gas_err})"
+					))
+				})?;
+				tracing::warn!(
+					chain_id,
+					error = %e,
+					gas_price = gp,
+					"Falling back to legacy gas price after feeHistory failure"
+				);
+				return Ok(FeeParams::legacy(chain_id, gp));
+			},
+		};
 
-		Ok(gas_price.to_string())
+		// Resolve base fee with the same fallback ladder alloy's
+		// `estimate_eip1559_fees_with` uses: prefer the value from the
+		// fee-history response; if it's missing or zero, fetch the latest
+		// block directly and read its `base_fee_per_gas`; only if THAT also
+		// has no base_fee do we conclude the chain is pre-1559 and downgrade
+		// to legacy. Without the intermediate step, an EIP-1559 chain whose
+		// feeHistory response happens to omit the base-fee column gets
+		// mispriced as legacy.
+		let base_fee: u128 = match history.latest_block_base_fee() {
+			Some(b) if b != 0 => b,
+			_ => {
+				let block = provider
+					.get_block_by_number(BlockNumberOrTag::Latest)
+					.await
+					.map_err(|e| {
+						DeliveryError::Network(format!("Failed to get latest block: {e}"))
+					})?;
+
+				let block_base_fee: Option<u128> =
+					block.and_then(|b| b.header().base_fee_per_gas().map(u128::from));
+
+				match block_base_fee {
+					Some(b) if b != 0 => b,
+					_ => {
+						// Genuinely pre-EIP-1559 chain (or no base_fee field).
+						let gp = provider.get_gas_price().await.map_err(|e| {
+							DeliveryError::Network(format!("Failed to get legacy gas price: {e}"))
+						})?;
+						let params = FeeParams::legacy(chain_id, gp);
+						tracing::debug!(chain_id, gas_price = gp, "Resolved legacy fee params");
+						self.fee_params_cache
+							.insert(chain_id, params.clone(), now)
+							.await;
+						return Ok(params);
+					},
+				}
+			},
+		};
+
+		let rewards = history.reward.unwrap_or_default();
+		let estimator = SolverEip1559Estimator {
+			policy: policy.clone(),
+		};
+		let est = estimator.estimate(base_fee, &rewards);
+
+		let params = FeeParams::eip1559_with_strategy(
+			chain_id,
+			est.max_fee_per_gas,
+			est.max_priority_fee_per_gas,
+			base_fee,
+			policy.quote_cost_strategy,
+		);
+
+		tracing::debug!(
+			chain_id,
+			max_fee_per_gas = ?params.max_fee_per_gas,
+			max_priority_fee_per_gas = ?params.max_priority_fee_per_gas,
+			cost_per_gas = params.cost_per_gas,
+			"Resolved EIP-1559 fee params"
+		);
+
+		self.fee_params_cache
+			.insert(chain_id, params.clone(), now)
+			.await;
+		Ok(params)
 	}
 
 	async fn get_balance(
@@ -1244,6 +1433,36 @@ impl DeliveryInterface for AlloyDelivery {
 			.estimate_gas(request)
 			.await
 			.map_err(|e| DeliveryError::Network(format!("Failed to estimate gas: {e}")))?;
+		Ok(gas)
+	}
+
+	async fn estimate_gas_with_overrides(
+		&self,
+		tx: SolverTransaction,
+		state_override: alloy_rpc_types::state::StateOverride,
+	) -> Result<u64, DeliveryError> {
+		// Mirror the existing estimate_gas impl: derive chain_id from
+		// tx.chain_id and route via self.get_provider(chain_id). Per
+		// the DeliveryInterface contract, this method is per-chain at
+		// the trait level but the impl multiplexes via the chain_id
+		// carried on the Transaction itself.
+		let chain_id = tx.chain_id;
+		let provider = self.get_provider(chain_id)?;
+
+		let request: TransactionRequest = tx.into();
+
+		// alloy 1.0.37 EthCall::overrides takes `impl Into<StateOverride>`,
+		// NOT `&StateOverride` — pass the value owned. The state_override
+		// arg isn't used after this point in the method, so consuming is
+		// fine. If a future alloy version changes the signature, swap to
+		// `.overrides_opt(Some(state_override))`.
+		let gas = provider
+			.estimate_gas(request)
+			.overrides(state_override)
+			.await
+			.map_err(|e| {
+				DeliveryError::Network(format!("Failed to estimate gas with overrides: {e}"))
+			})?;
 		Ok(gas)
 	}
 
@@ -1512,6 +1731,17 @@ pub fn create_http_delivery(
 		));
 	}
 
+	// Parse the required `fee_policy` block. Schema validation already
+	// rejected configs without it, but full deserialization here gives
+	// the constructor a typed `FeePolicyConfig` to hand to the registry.
+	let fee_policy_value = config.get("fee_policy").ok_or_else(|| {
+		DeliveryError::Network(
+			"fee_policy is required for evm_alloy delivery configuration".to_string(),
+		)
+	})?;
+	let fee_policy_config: FeePolicyConfig = serde_json::from_value(fee_policy_value.clone())
+		.map_err(|e| DeliveryError::Network(format!("Invalid fee_policy: {e}")))?;
+
 	// Clone the signers for use in the async block
 	let default_signer = default_signer.clone();
 	let network_signers = network_signers.clone();
@@ -1519,7 +1749,14 @@ pub fn create_http_delivery(
 	// Create delivery service synchronously, but the actual connection happens async
 	let delivery = tokio::task::block_in_place(|| {
 		tokio::runtime::Handle::current().block_on(async {
-			AlloyDelivery::new(network_ids, networks, network_signers, default_signer).await
+			AlloyDelivery::new(
+				network_ids,
+				networks,
+				network_signers,
+				default_signer,
+				&fee_policy_config,
+			)
+			.await
 		})
 	})?;
 
@@ -1541,7 +1778,77 @@ impl solver_types::ImplementationRegistry for Registry {
 impl crate::DeliveryRegistry for Registry {}
 
 #[cfg(test)]
+mod fee_params_cache_tests {
+	//! Direct tests for the per-chain `FeeParamsCache`. These exercise the
+	//! freshness/expiry contract with explicit `Instant` values — no provider
+	//! mock or async sleep is needed because both `get` and `insert` accept
+	//! the clock reading from the caller.
+	use super::*;
+
+	#[tokio::test]
+	async fn fee_params_cache_returns_fresh_entry() {
+		let cache = FeeParamsCache::default();
+		let params = FeeParams::legacy(1, 1_000_000_000);
+		let now = Instant::now();
+
+		cache.insert(1, params.clone(), now).await;
+		let cached = cache.get(1, Duration::from_secs(3), now).await;
+
+		assert_eq!(cached, Some(params));
+	}
+
+	#[tokio::test]
+	async fn fee_params_cache_expires_stale_entry() {
+		let cache = FeeParamsCache::default();
+		let params = FeeParams::legacy(1, 1_000_000_000);
+		let now = Instant::now();
+
+		cache.insert(1, params, now - Duration::from_secs(10)).await;
+		let cached = cache.get(1, Duration::from_secs(3), now).await;
+
+		assert_eq!(cached, None);
+	}
+
+	#[tokio::test]
+	async fn fee_params_cache_miss_when_chain_absent() {
+		// Sanity: looking up a chain we never inserted yields None even at t=0.
+		let cache = FeeParamsCache::default();
+		let now = Instant::now();
+		assert_eq!(cache.get(42, Duration::from_secs(3), now).await, None);
+	}
+
+	#[tokio::test]
+	async fn fee_params_cache_overwrites_existing_entry() {
+		// Confirms `insert` is overwrite, not append-with-staleness — the
+		// `get_fee_params` happy path relies on this so a fresh resolve
+		// always shadows any prior cached value.
+		let cache = FeeParamsCache::default();
+		let now = Instant::now();
+		let stale = FeeParams::legacy(1, 1);
+		let fresh = FeeParams::legacy(1, 2_000_000_000);
+
+		cache.insert(1, stale, now - Duration::from_secs(10)).await;
+		cache.insert(1, fresh.clone(), now).await;
+
+		assert_eq!(cache.get(1, Duration::from_secs(3), now).await, Some(fresh));
+	}
+
+	#[test]
+	fn fee_params_cache_ttl_per_chain() {
+		// Defaults documented in the plan (Task 4 Step 2).
+		assert_eq!(fee_params_cache_ttl(1), Duration::from_secs(3));
+		assert_eq!(fee_params_cache_ttl(747474), Duration::from_secs(1));
+		assert_eq!(fee_params_cache_ttl(137), Duration::from_secs(2));
+		assert_eq!(fee_params_cache_ttl(42161), Duration::from_secs(2));
+	}
+}
+
+#[cfg(test)]
 mod tests {
+	// Note: unit-level coverage of `estimate_gas_with_overrides` is deferred to
+	// Task 6's live integration test — this crate has no `wiremock` or
+	// `alloy-node-bindings` dev-dependency, so a mock RPC harness isn't
+	// available here.
 	use super::*;
 	use alloy_signer_local::PrivateKeySigner;
 	use solver_types::utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder};
@@ -1568,12 +1875,41 @@ mod tests {
 		AccountSigner::Local(private_key_signer)
 	}
 
+	/// Test helper: build a `FeePolicyConfig` covering chain 1 (with a
+	/// mainnet-style priority floor) and 137 (the only other chain id any
+	/// existing test requests). Mirrors the production schema so tests
+	/// exercise the same deserialization path as real configs.
+	fn test_fee_policy() -> FeePolicyConfig {
+		serde_json::from_value(serde_json::json!({
+			"default_speed": "fast",
+			"chains": {
+				"1": {
+					"min_priority_fee_per_gas": "2000000000",
+					"priority_fee_fallback": "100000000",
+					"quote_cost_strategy": "buffered_effective_125"
+				},
+				"137": {
+					"priority_fee_fallback": "100000000",
+					"quote_cost_strategy": "buffered_effective_125"
+				}
+			}
+		}))
+		.expect("test fee policy must be valid")
+	}
+
 	#[tokio::test]
 	async fn test_alloy_delivery_new_success() {
 		let networks = create_test_networks();
 		let signer = create_test_signer();
 
-		let result = AlloyDelivery::new(vec![1], &networks, HashMap::new(), signer).await;
+		let result = AlloyDelivery::new(
+			vec![1],
+			&networks,
+			HashMap::new(),
+			signer,
+			&test_fee_policy(),
+		)
+		.await;
 
 		assert!(result.is_ok());
 		let delivery = result.unwrap();
@@ -1585,12 +1921,35 @@ mod tests {
 		let networks = NetworksConfigBuilder::new().build();
 		let signer = create_test_signer();
 
-		let result = AlloyDelivery::new(vec![], &networks, HashMap::new(), signer).await;
+		let result = AlloyDelivery::new(
+			vec![],
+			&networks,
+			HashMap::new(),
+			signer,
+			&test_fee_policy(),
+		)
+		.await;
 
 		assert!(matches!(result, Err(DeliveryError::Network(_))));
 		if let Err(DeliveryError::Network(msg)) = result {
 			assert!(msg.contains("At least one network_id must be specified"));
 		}
+	}
+
+	/// JSON shape of a `fee_policy` block that satisfies schema validation
+	/// for chain id 1. Mirrors the production schema documented in the
+	/// plan so the schema tests exercise a realistic config.
+	fn schema_fee_policy_value() -> serde_json::Value {
+		serde_json::json!({
+			"default_speed": "fast",
+			"chains": {
+				"1": {
+					"min_priority_fee_per_gas": "2000000000",
+					"priority_fee_fallback": "100000000",
+					"quote_cost_strategy": "buffered_effective_125"
+				}
+			}
+		})
 	}
 
 	#[test]
@@ -1602,11 +1961,12 @@ mod tests {
 				"network_ids".to_string(),
 				serde_json::Value::Array(vec![serde_json::Value::from(1)]),
 			);
+			table.insert("fee_policy".to_string(), schema_fee_policy_value());
 			table
 		});
 
 		let result = schema.validate(&config);
-		assert!(result.is_ok());
+		assert!(result.is_ok(), "expected ok, got {result:?}");
 	}
 
 	#[test]
@@ -1615,6 +1975,7 @@ mod tests {
 		let config = serde_json::Value::Object({
 			let mut table = serde_json::Map::new();
 			table.insert("network_ids".to_string(), serde_json::Value::Array(vec![]));
+			table.insert("fee_policy".to_string(), schema_fee_policy_value());
 			table
 		});
 
@@ -1626,6 +1987,42 @@ mod tests {
 			.contains("network_ids cannot be empty"));
 	}
 
+	#[test]
+	fn test_config_schema_validation_missing_fee_policy_fails() {
+		// Per Task 8: configs without `fee_policy` MUST fail validation.
+		let schema = AlloyDeliverySchema;
+		let config = serde_json::json!({
+			"network_ids": [1],
+		});
+		let err = schema.validate(&config).expect_err("missing fee_policy");
+		assert!(
+			err.to_string().contains("fee_policy"),
+			"expected error mentioning fee_policy, got: {err}"
+		);
+	}
+
+	#[test]
+	fn test_config_schema_validation_invalid_fee_policy_decimal_fails() {
+		// Schema validation delegates fee_policy parsing to the deserializer,
+		// so a bad wei string surfaces with the offending field name.
+		let schema = AlloyDeliverySchema;
+		let config = serde_json::json!({
+			"network_ids": [1],
+			"fee_policy": {
+				"default_speed": "fast",
+				"chains": {
+					"1": {
+						"min_priority_fee_per_gas": "2000000000",
+						"priority_fee_fallback": "not-a-number",
+						"quote_cost_strategy": "buffered_effective_125"
+					}
+				}
+			}
+		});
+		let err = schema.validate(&config).expect_err("invalid wei string");
+		assert!(err.to_string().contains("fee_policy"));
+	}
+
 	#[tokio::test(flavor = "multi_thread")]
 	async fn test_create_http_delivery_success() {
 		let config = serde_json::Value::Object({
@@ -1634,6 +2031,7 @@ mod tests {
 				"network_ids".to_string(),
 				serde_json::Value::Array(vec![serde_json::Value::from(1)]),
 			);
+			table.insert("fee_policy".to_string(), schema_fee_policy_value());
 			table
 		});
 
@@ -1642,7 +2040,55 @@ mod tests {
 		let network_signers = HashMap::new();
 
 		let result = create_http_delivery(&config, &networks, &default_signer, &network_signers);
-		assert!(result.is_ok());
+		assert!(result.is_ok(), "expected ok, got {:?}", result.err());
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_create_http_delivery_fails_without_fee_policy() {
+		// The factory MUST reject configs that omit `fee_policy`, even if
+		// `network_ids` is present and valid. Production invariant from
+		// the plan (line ~53) — no default fallback.
+		let config = serde_json::json!({
+			"network_ids": [1],
+		});
+		let networks = create_test_networks();
+		let default_signer = create_test_signer();
+		let network_signers = HashMap::new();
+
+		let result = create_http_delivery(&config, &networks, &default_signer, &network_signers);
+		let err = result.err().expect("missing fee_policy must fail");
+		assert!(
+			err.to_string().contains("fee_policy"),
+			"error must mention fee_policy: {err}"
+		);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_create_http_delivery_fails_when_chain_missing_in_fee_policy() {
+		// Configured network 137 has no entry in fee_policy.chains — the
+		// registry must refuse to start.
+		let config = serde_json::json!({
+			"network_ids": [1, 137],
+			"fee_policy": {
+				"default_speed": "fast",
+				"chains": {
+					"1": {
+						"priority_fee_fallback": "100000000",
+						"quote_cost_strategy": "buffered_effective_125"
+					}
+				}
+			}
+		});
+		let networks = create_test_networks();
+		let default_signer = create_test_signer();
+		let network_signers = HashMap::new();
+
+		let result = create_http_delivery(&config, &networks, &default_signer, &network_signers);
+		let err = result.err().expect("missing chain entry must fail");
+		assert!(
+			err.to_string().contains("137"),
+			"error must mention the missing chain id: {err}"
+		);
 	}
 
 	#[test]
@@ -1825,7 +2271,14 @@ mod tests {
 				.add_network(1, NetworkConfigBuilder::new().build())
 				.build();
 			let signer = create_test_signer();
-			AlloyDelivery::new(vec![1], &networks, HashMap::new(), signer).await
+			AlloyDelivery::new(
+				vec![1],
+				&networks,
+				HashMap::new(),
+				signer,
+				&test_fee_policy(),
+			)
+			.await
 		}
 
 		/// Test that get_provider returns correct provider for configured chain
@@ -1856,8 +2309,14 @@ mod tests {
 				.build();
 			let signer = create_test_signer();
 
-			let delivery =
-				AlloyDelivery::new(vec![1, 137], &networks, HashMap::new(), signer).await;
+			let delivery = AlloyDelivery::new(
+				vec![1, 137],
+				&networks,
+				HashMap::new(),
+				signer,
+				&test_fee_policy(),
+			)
+			.await;
 
 			assert!(delivery.is_ok());
 			let delivery = delivery.unwrap();
@@ -1883,8 +2342,14 @@ mod tests {
 			let mut network_signers = HashMap::new();
 			network_signers.insert(137u64, network_signer);
 
-			let delivery =
-				AlloyDelivery::new(vec![1, 137], &networks, network_signers, default_signer).await;
+			let delivery = AlloyDelivery::new(
+				vec![1, 137],
+				&networks,
+				network_signers,
+				default_signer,
+				&test_fee_policy(),
+			)
+			.await;
 
 			assert!(delivery.is_ok());
 		}
@@ -2228,6 +2693,10 @@ mod tests {
 		#[test]
 		fn test_config_multiple_network_ids() {
 			let schema = AlloyDeliverySchema;
+			// Schema validation only checks shape, not fee_policy chain
+			// completeness — that's a startup invariant enforced by
+			// `FeePolicyRegistry::from_config`. The single-chain
+			// `schema_fee_policy_value` is therefore enough here.
 			let config = serde_json::Value::Object({
 				let mut table = serde_json::Map::new();
 				table.insert(
@@ -2238,11 +2707,12 @@ mod tests {
 						serde_json::Value::from(42161),
 					]),
 				);
+				table.insert("fee_policy".to_string(), schema_fee_policy_value());
 				table
 			});
 
 			let result = schema.validate(&config);
-			assert!(result.is_ok());
+			assert!(result.is_ok(), "expected ok, got {result:?}");
 		}
 
 		#[test]
@@ -2256,14 +2726,20 @@ mod tests {
 					"network_ids".to_string(),
 					serde_json::Value::Array(vec![serde_json::Value::from(1)]),
 				);
+				table.insert("fee_policy".to_string(), schema_fee_policy_value());
 				table
 			});
-			assert!(schema.validate(&valid_config).is_ok());
+			assert!(
+				schema.validate(&valid_config).is_ok(),
+				"expected ok, got {:?}",
+				schema.validate(&valid_config)
+			);
 
 			// Invalid config (empty array) should fail
 			let invalid_config = serde_json::Value::Object({
 				let mut table = serde_json::Map::new();
 				table.insert("network_ids".to_string(), serde_json::Value::Array(vec![]));
+				table.insert("fee_policy".to_string(), schema_fee_policy_value());
 				table
 			});
 			assert!(schema.validate(&invalid_config).is_err());
@@ -2307,69 +2783,6 @@ mod tests {
 	mod transaction_conversion_tests {
 		use super::*;
 		use alloy_primitives::U256;
-
-		#[test]
-		fn applies_mainnet_priority_fee_floor_when_gas_fields_are_missing() {
-			let mut tx = SolverTransaction {
-				to: Some(solver_types::Address(vec![0x12; 20])),
-				data: vec![0xab, 0xcd],
-				value: U256::ZERO,
-				chain_id: ETHEREUM_MAINNET_CHAIN_ID,
-				nonce: None,
-				gas_limit: Some(50_000),
-				gas_price: None,
-				max_fee_per_gas: None,
-				max_priority_fee_per_gas: None,
-			};
-
-			assert!(apply_mainnet_priority_fee_floor(&mut tx, 1_100_000_000));
-
-			assert_eq!(
-				tx.max_priority_fee_per_gas,
-				Some(MAINNET_PRIORITY_FEE_FLOOR_WEI)
-			);
-			assert_eq!(tx.max_fee_per_gas, Some(3_100_000_000));
-		}
-
-		#[test]
-		fn leaves_non_mainnet_transactions_on_alloy_defaults() {
-			let mut tx = SolverTransaction {
-				to: Some(solver_types::Address(vec![0x12; 20])),
-				data: vec![],
-				value: U256::ZERO,
-				chain_id: 747474,
-				nonce: None,
-				gas_limit: Some(50_000),
-				gas_price: None,
-				max_fee_per_gas: None,
-				max_priority_fee_per_gas: None,
-			};
-
-			assert!(!apply_mainnet_priority_fee_floor(&mut tx, 1_100_000_000));
-
-			assert_eq!(tx.max_priority_fee_per_gas, None);
-			assert_eq!(tx.max_fee_per_gas, None);
-		}
-
-		#[test]
-		fn preserves_higher_mainnet_priority_fee_but_sets_missing_max_fee() {
-			let mut tx = SolverTransaction {
-				to: Some(solver_types::Address(vec![0x12; 20])),
-				data: vec![],
-				value: U256::ZERO,
-				chain_id: ETHEREUM_MAINNET_CHAIN_ID,
-				nonce: None,
-				gas_limit: Some(50_000),
-				gas_price: None,
-				max_fee_per_gas: None,
-				max_priority_fee_per_gas: Some(3_000_000_000),
-			};
-
-			assert!(apply_mainnet_priority_fee_floor(&mut tx, 1_100_000_000));
-
-			assert_eq!(tx.max_priority_fee_per_gas, Some(3_000_000_000));
-			assert_eq!(tx.max_fee_per_gas, Some(4_100_000_000));
-		}
 
 		#[test]
 		fn native_gas_budget_uses_eip1559_max_fee_plus_value() {

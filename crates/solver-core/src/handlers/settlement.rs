@@ -32,6 +32,14 @@ pub enum SettlementError {
 	Service(String),
 	#[error("State error: {0}")]
 	State(String),
+	/// Transient delivery failure caused by the signer being short on
+	/// native gas at submission time. Distinguished from `Service` so
+	/// callers (e.g. the engine's PostFillReady handler) can route this
+	/// to a retry-on-recovery path instead of marking the order Failed.
+	/// The underlying `DeliveryError::InsufficientNativeGas` payload is
+	/// preserved for diagnostics.
+	#[error("Insufficient native gas: {0}")]
+	InsufficientNativeGas(Box<solver_delivery::InsufficientNativeGasInfo>),
 }
 
 /// Handler for processing settlement operations.
@@ -210,7 +218,15 @@ impl SettlementHandler {
 					.delivery
 					.deliver(post_fill_tx.clone(), Some(tracking))
 					.await
-					.map_err(|e| SettlementError::Service(e.to_string()))?;
+					.map_err(|e| match e {
+						// Preserve the typed transient-failure variant so the
+						// engine's PostFillReady handler can distinguish it
+						// from a permanent failure without string matching.
+						solver_delivery::DeliveryError::InsufficientNativeGas(info) => {
+							SettlementError::InsufficientNativeGas(info)
+						},
+						other => SettlementError::Service(other.to_string()),
+					})?;
 
 				// Store tx hash
 				self.state_machine
