@@ -1,0 +1,162 @@
+---
+name: E2E
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+    paths-ignore:
+      - docs/**
+      - "**.md"
+      - .github/**
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - docs/**
+      - "**.md"
+      - .github/**
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build
+    if: ${{ github.event.pull_request.draft == false || github.event_name != 'pull_request' }}
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      forge-cache-key: ${{ steps.oif-contracts-sha.outputs.key }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout solver
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Checkout oif-contracts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: openintentsframework/oif-contracts
+          path: oif-contracts
+          # forge-std, permit2, the-compact, openzeppelin-contracts, broadcaster
+          submodules: recursive
+          # Pin to a SHA for stricter reproducibility; default tracks main.
+          ref: main
+
+      # Forge cache key invalidates on any change to oif-contracts source or
+      # any submodule. Exposed as job output so e2e shards restore the same
+      # key without re-checking out oif-contracts.
+      - name: Resolve oif-contracts source SHA for cache key
+        id: oif-contracts-sha
+        working-directory: oif-contracts
+        run: |
+          sha="$(git rev-parse HEAD)"
+          submods="$(git submodule status --recursive | awk '{print $1}' | sort | sha1sum | awk '{print $1}')"
+          echo "key=${sha}-${submods}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache forge build output
+        id: forge-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            oif-contracts/out
+            oif-contracts/cache
+          key: forge-build-${{ runner.os }}-${{ steps.oif-contracts-sha.outputs.key }}
+          restore-keys: |
+            forge-build-${{ runner.os }}-
+
+      - name: Install Foundry (anvil + forge)
+        uses: foundry-rs/foundry-toolchain@de808b1eea699e761c404bda44ba8f21aba30b2c # v1.4.0
+        with:
+          version: stable
+
+      - name: Build oif-contracts
+        if: steps.forge-cache.outputs.cache-hit != 'true'
+        run: forge build
+        working-directory: oif-contracts
+
+      - name: Prepare Rust toolchain
+        uses: ./.github/actions/prepare
+
+      - name: Build solver + all e2e test binaries
+        run: |
+          cargo build -p solver-service --bin solver --locked
+          cargo test -p solver-e2e-tests --tests --no-run --locked
+
+  e2e:
+    name: e2e (${{ matrix.test }})
+    needs: build
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - happy_e2e_open_fill_settle
+          - submit_e2e_hyperlane
+          - permit2_e2e
+          - eip3009_e2e
+          - deny_list_e2e
+          - failure_e2e_onchain
+          - failure_e2e_settlement
+          - api_e2e_orders
+          - admin_api_e2e
+    services:
+      # Only admin_api_e2e uses Redis; others ignore REDIS_URL via
+      # `redis_url_or_skip`. Cheaper to start it in every shard than to fork
+      # the matrix.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      REDIS_URL: redis://127.0.0.1:6379
+      OIF_CONTRACTS_PATH: ${{ github.workspace }}/oif-contracts
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout solver
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # `fail-on-cache-miss` so a missing upstream save fails loudly rather
+      # than silently triggering a rebuild path that doesn't exist here.
+      - name: Restore forge build output
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            oif-contracts/out
+            oif-contracts/cache
+          key: forge-build-${{ runner.os }}-${{ needs.build.outputs.forge-cache-key }}
+          fail-on-cache-miss: true
+
+      # anvil is a runtime dependency; forge isn't needed since out/ is restored.
+      - name: Install Foundry (anvil)
+        uses: foundry-rs/foundry-toolchain@de808b1eea699e761c404bda44ba8f21aba30b2c # v1.4.0
+        with:
+          version: stable
+
+      - name: Prepare Rust toolchain
+        uses: ./.github/actions/prepare
+
+      - name: Run e2e
+        run: |
+          cargo test -p solver-e2e-tests --test ${{ matrix.test }} \
+            --locked -- --ignored --test-threads=1 --nocapture
