@@ -1239,14 +1239,50 @@ fn build_storage_config_from_operator(solver_id: &str) -> StorageConfig {
 	]);
 	implementations.insert("redis".to_string(), redis_config);
 
+	// File implementation. Registered unconditionally so it's available when
+	// `STORAGE_BACKEND=file` selects it as the primary. `STORAGE_PATH` mirrors
+	// the env var read by `solver_storage::StoreConfig::from_env()` so the
+	// seed-config layer and the runtime layer agree on a single root.
+	//
+	// We append `solver_id` as a subdirectory so two solvers on the same host
+	// (or successive E2E tests reusing a shared root) don't share the same
+	// orders/intents directory — matching the per-solver isolation Redis gets
+	// from `key_prefix`.
+	let storage_root =
+		std::env::var("STORAGE_PATH").unwrap_or_else(|_| "./data/storage".to_string());
+	let storage_path = std::path::Path::new(&storage_root)
+		.join(solver_id)
+		.to_string_lossy()
+		.into_owned();
+	let file_config = json_object(vec![
+		("storage_path", serde_json::Value::String(storage_path)),
+		("ttl_orders", int(0)),
+		("ttl_intents", int(86400)),
+		("ttl_order_by_tx_hash", int(86400)),
+	]);
+	implementations.insert("file".to_string(), file_config);
+
 	// Memory implementation (fallback for testing)
 	implementations.insert(
 		"memory".to_string(),
 		serde_json::Value::Object(serde_json::Map::new()),
 	);
 
+	// Pick the primary backend from STORAGE_BACKEND, mirroring
+	// `StoreConfig::from_env()`. Default remains `redis` so existing
+	// deployments are unaffected.
+	let primary = match std::env::var("STORAGE_BACKEND")
+		.unwrap_or_else(|_| "redis".to_string())
+		.to_lowercase()
+		.as_str()
+	{
+		"file" => "file".to_string(),
+		"memory" => "memory".to_string(),
+		_ => "redis".to_string(),
+	};
+
 	StorageConfig {
-		primary: "redis".to_string(),
+		primary,
 		implementations,
 		cleanup_interval_seconds: 3600,
 	}
@@ -1863,9 +1899,50 @@ fn build_pricing_config_from_operator(pricing: &OperatorPricingConfig) -> Pricin
 	)]);
 	implementations.insert("defillama".to_string(), defillama_config);
 
+	// Mock implementation. Registered unconditionally so it can be selected
+	// as primary via `PRICING_PRIMARY=mock` for tests/demos. Includes
+	// built-in prices for TOKA/USD, TOKB/USD, ETH/USD — see
+	// `solver_pricing::implementations::mock::MockPricing`.
+	implementations.insert(
+		"mock".to_string(),
+		serde_json::Value::Object(serde_json::Map::new()),
+	);
+
+	// `PRICING_PRIMARY` env var overrides whatever the operator config or
+	// COMMON_DEFAULTS specifies. Mirrors the `STORAGE_BACKEND` pattern: an
+	// opt-in escape hatch for non-network-bound runs (tests, local demos)
+	// without changing default deployment behavior.
+	//
+	// Compute the override once and branch off `Option::is_some` consistently
+	// for both primary and fallbacks. Empty / whitespace-only values count as
+	// "no override" — otherwise `PRICING_PRIMARY=""` would silently wipe
+	// fallbacks while leaving primary unchanged, which is a confusing partial
+	// behavior change from the default path.
+	let primary_override = std::env::var("PRICING_PRIMARY").ok().and_then(|v| {
+		let trimmed = v.trim().to_lowercase();
+		(!trimmed.is_empty()).then_some(trimmed)
+	});
+	let primary = primary_override
+		.clone()
+		.unwrap_or_else(|| pricing.primary.clone());
+
+	// `PRICING_FALLBACKS` (comma-separated) similarly overrides fallbacks.
+	// When `PRICING_PRIMARY=mock` is set without explicit fallbacks, it's
+	// almost always desired to drop network-bound fallbacks too — otherwise
+	// a primary success still leaves the dead network providers registered.
+	let fallbacks = match std::env::var("PRICING_FALLBACKS") {
+		Ok(value) => value
+			.split(',')
+			.map(|s| s.trim().to_lowercase())
+			.filter(|s| !s.is_empty())
+			.collect(),
+		Err(_) if primary_override.is_some() => Vec::new(),
+		Err(_) => pricing.fallbacks.clone(),
+	};
+
 	PricingConfig {
-		primary: pricing.primary.clone(),
-		fallbacks: pricing.fallbacks.clone(),
+		primary,
+		fallbacks,
 		implementations,
 	}
 }
@@ -5853,16 +5930,53 @@ mod tests {
 	#[test]
 	#[serial_test::serial(env_redis)]
 	fn test_build_storage_config_from_operator() {
+		// Without STORAGE_BACKEND set the default is `redis`. Capture/clear
+		// the env var explicitly so the test is deterministic regardless of
+		// what the parent shell exports.
+		let _guard = EnvVarGuard::capture("STORAGE_BACKEND");
+		std::env::remove_var("STORAGE_BACKEND");
 		let storage = build_storage_config_from_operator("test-solver");
 
 		assert_eq!(storage.primary, "redis");
 		assert!(storage.implementations.contains_key("redis"));
 		assert!(storage.implementations.contains_key("memory"));
+		assert!(storage.implementations.contains_key("file"));
 
 		// Verify key_prefix is set to solver_id
 		let redis_config = storage.implementations.get("redis").unwrap();
 		let key_prefix = redis_config.get("key_prefix").unwrap().as_str().unwrap();
 		assert_eq!(key_prefix, "test-solver");
+	}
+
+	#[test]
+	#[serial_test::serial(env_redis)]
+	fn test_build_storage_config_from_operator_selects_file_backend() {
+		// STORAGE_BACKEND=file makes the runtime storage layer mirror the
+		// seed-storage layer (`StoreConfig::from_env`), which is what
+		// crates/solver-e2e-tests relies on for hermetic file-backed runs.
+		let _guard_backend = EnvVarGuard::capture("STORAGE_BACKEND");
+		let _guard_path = EnvVarGuard::capture("STORAGE_PATH");
+		std::env::set_var("STORAGE_BACKEND", "file");
+		std::env::set_var("STORAGE_PATH", "/tmp/test-storage-path");
+
+		let storage = build_storage_config_from_operator("test-solver");
+
+		assert_eq!(storage.primary, "file");
+		let file_config = storage.implementations.get("file").unwrap();
+		let storage_path = file_config.get("storage_path").unwrap().as_str().unwrap();
+		// Per-solver subdirectory mirrors the Redis `key_prefix=solver_id` pattern.
+		assert_eq!(storage_path, "/tmp/test-storage-path/test-solver");
+	}
+
+	#[test]
+	#[serial_test::serial(env_redis)]
+	fn test_build_storage_config_from_operator_selects_memory_backend() {
+		let _guard = EnvVarGuard::capture("STORAGE_BACKEND");
+		std::env::set_var("STORAGE_BACKEND", "memory");
+
+		let storage = build_storage_config_from_operator("test-solver");
+
+		assert_eq!(storage.primary, "memory");
 	}
 
 	#[test]
@@ -5931,7 +6045,14 @@ mod tests {
 	}
 
 	#[test]
+	#[serial_test::serial(env_pricing)]
 	fn test_build_pricing_config_from_operator() {
+		// Default behavior — preserved when neither override env var is set.
+		let _g_primary = EnvVarGuard::capture("PRICING_PRIMARY");
+		let _g_fallbacks = EnvVarGuard::capture("PRICING_FALLBACKS");
+		std::env::remove_var("PRICING_PRIMARY");
+		std::env::remove_var("PRICING_FALLBACKS");
+
 		let op_pricing = OperatorPricingConfig {
 			primary: "coingecko".to_string(),
 			fallbacks: vec!["defillama".to_string()],
@@ -5945,6 +6066,55 @@ mod tests {
 		assert_eq!(pricing.fallbacks, vec!["defillama".to_string()]);
 		assert!(pricing.implementations.contains_key("coingecko"));
 		assert!(pricing.implementations.contains_key("defillama"));
+		// `mock` is now registered unconditionally so PRICING_PRIMARY=mock
+		// can select it without further config.
+		assert!(pricing.implementations.contains_key("mock"));
+	}
+
+	#[test]
+	#[serial_test::serial(env_pricing)]
+	fn test_build_pricing_config_env_override_to_mock() {
+		// PRICING_PRIMARY=mock without explicit PRICING_FALLBACKS clears
+		// the fallback list — the user almost always wants offline pricing
+		// in this case (tests, demos), so leaving CoinGecko/DefiLlama as
+		// fallbacks would silently re-introduce network dependency.
+		let _g_primary = EnvVarGuard::capture("PRICING_PRIMARY");
+		let _g_fallbacks = EnvVarGuard::capture("PRICING_FALLBACKS");
+		std::env::set_var("PRICING_PRIMARY", "mock");
+		std::env::remove_var("PRICING_FALLBACKS");
+
+		let op_pricing = OperatorPricingConfig {
+			primary: "coingecko".to_string(),
+			fallbacks: vec!["defillama".to_string()],
+			cache_duration_seconds: 120,
+			custom_prices: HashMap::new(),
+		};
+
+		let pricing = build_pricing_config_from_operator(&op_pricing);
+
+		assert_eq!(pricing.primary, "mock");
+		assert!(pricing.fallbacks.is_empty(), "fallbacks should be cleared");
+	}
+
+	#[test]
+	#[serial_test::serial(env_pricing)]
+	fn test_build_pricing_config_explicit_fallbacks_override() {
+		let _g_primary = EnvVarGuard::capture("PRICING_PRIMARY");
+		let _g_fallbacks = EnvVarGuard::capture("PRICING_FALLBACKS");
+		std::env::set_var("PRICING_PRIMARY", "mock");
+		std::env::set_var("PRICING_FALLBACKS", "coingecko,defillama");
+
+		let op_pricing = OperatorPricingConfig {
+			primary: "coingecko".to_string(),
+			fallbacks: vec![],
+			cache_duration_seconds: 120,
+			custom_prices: HashMap::new(),
+		};
+
+		let pricing = build_pricing_config_from_operator(&op_pricing);
+
+		assert_eq!(pricing.primary, "mock");
+		assert_eq!(pricing.fallbacks, vec!["coingecko", "defillama"]);
 	}
 
 	#[test]
