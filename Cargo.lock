@@ -5060,6 +5060,7 @@ dependencies = [
  "solver-account",
  "solver-bridge",
  "solver-config",
+ "solver-core",
  "solver-delivery",
  "solver-discovery",
  "solver-order",
