@@ -1976,8 +1976,8 @@ mod tests {
 			.as_array()
 			.expect("should be an array");
 
-		// UpdateGasConfig should have 18 fields
-		assert_eq!(gas_config.len(), 18);
+		// UpdateGasConfig should have 19 fields
+		assert_eq!(gas_config.len(), 19);
 
 		let names: Vec<&str> = gas_config
 			.iter()
