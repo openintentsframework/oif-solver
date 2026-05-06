@@ -146,6 +146,7 @@ pub use solver_types::api::{
 	PostOrderResponseStatus, SignatureType,
 };
 pub use solver_types::utils::eip712::{reconstruct_eip3009_digest, reconstruct_permit2_digest};
+pub use solver_types::InteropAddress;
 
 // =============================================================================
 // Chain layout — hardcoded to match config/demo.json conventions
