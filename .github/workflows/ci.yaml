@@ -18,7 +18,6 @@ on:
     paths-ignore:
       - docs/**
       - "**.md"
-      - .github/**
 # run concurrency group for the workflow
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
