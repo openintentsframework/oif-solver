@@ -149,7 +149,7 @@ This is what the actual transaction was signed with. For a single intent, expect
 - `max_priority_fee_per_gas` should match either:
   - your configured `min_priority_fee_per_gas` (when network is quieter than your floor), or
   - the percentile estimate from `eth_feeHistory` (when network is busier).
-- `max_fee_per_gas ≈ base_fee × 1.25 + max_priority_fee_per_gas`. If you set a `gas_price_cap` and the network is hot, expect `max_fee_per_gas == cap`.
+- `max_fee_per_gas ≈ base_fee × 2 + max_priority_fee_per_gas`. If you set a `gas_price_cap` and the network is hot, expect `max_fee_per_gas == cap`.
 - Quote-time and submit-time values for the same chain should match within the cache TTL window (3s mainnet, 1s Katana, 2s others). Mismatch beyond that = a fresh resolution between quote and submit.
 
 ## Troubleshooting
