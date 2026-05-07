@@ -362,6 +362,15 @@ pub async fn handle_set_admin_role(
 	let versioned = state.config_store.get().await.map_err(config_store_error)?;
 	let mut operator_config = versioned.data;
 
+	let demoting_full_admin = operator_config.admin.role_for(&contents.account)
+		== Some(AdminRole::Admin)
+		&& contents.role != AdminRole::Admin;
+	if demoting_full_admin && operator_config.admin.admin_addresses().len() <= 1 {
+		return Err(AdminAuthError::InvalidMessage(
+			"Cannot demote the last admin".to_string(),
+		));
+	}
+
 	operator_config
 		.admin
 		.set_role(contents.account, contents.role);

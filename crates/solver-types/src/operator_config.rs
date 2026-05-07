@@ -786,10 +786,28 @@ impl OperatorAdminConfig {
 	}
 
 	/// Set a wallet role in the typed whitelist.
+	///
+	/// Unlike `upsert_admin_role` (which preserves admin-wins semantics for
+	/// config-load merges), this performs a faithful assignment: an explicit
+	/// admin action may demote Admin → ReadOnly. Returns true if the stored
+	/// role changed.
 	pub fn set_role(&mut self, address: Address, role: AdminRole) -> bool {
-		let changed = self.role_for(&address) != Some(role);
-		upsert_admin_role(&mut self.whitelist, address, role);
-		changed
+		if let Some(entry) = self
+			.whitelist
+			.iter_mut()
+			.find(|entry| entry.address == address)
+		{
+			if entry.role == role {
+				false
+			} else {
+				entry.role = role;
+				true
+			}
+		} else {
+			self.whitelist
+				.push(AdminWhitelistEntry { address, role });
+			true
+		}
 	}
 
 	/// Remove an admin address.
