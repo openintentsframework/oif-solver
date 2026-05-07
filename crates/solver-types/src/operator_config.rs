@@ -804,8 +804,7 @@ impl OperatorAdminConfig {
 				true
 			}
 		} else {
-			self.whitelist
-				.push(AdminWhitelistEntry { address, role });
+			self.whitelist.push(AdminWhitelistEntry { address, role });
 			true
 		}
 	}
