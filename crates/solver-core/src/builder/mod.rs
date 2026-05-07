@@ -55,6 +55,71 @@ fn blocked_signer_from_error(
 	}
 }
 
+/// Merges a known authoritative blocker (from the failing approval call)
+/// with the result of a per-chain native-balance scan. Any chain showing a
+/// strictly-zero balance is added; the primary blocker takes precedence
+/// for its own chain so a non-zero but insufficient balance is still
+/// reported correctly.
+fn merge_blocked_signers(
+	primary: Option<crate::engine::startup_readiness::BlockedSigner>,
+	solver_address: &str,
+	chain_balances: Vec<(u64, String)>,
+) -> Vec<crate::engine::startup_readiness::BlockedSigner> {
+	use crate::engine::startup_readiness::BlockedSigner;
+	use std::collections::HashSet;
+
+	let mut result: Vec<BlockedSigner> = Vec::new();
+	let mut seen: HashSet<u64> = HashSet::new();
+
+	if let Some(primary) = primary {
+		seen.insert(primary.chain_id);
+		result.push(primary);
+	}
+
+	for (chain_id, balance_wei) in chain_balances {
+		if seen.contains(&chain_id) {
+			continue;
+		}
+		if balance_wei == "0" {
+			result.push(BlockedSigner {
+				chain_id,
+				signer: solver_address.to_string(),
+				balance_wei,
+			});
+			seen.insert(chain_id);
+		}
+	}
+
+	result
+}
+
+/// Reads native balances on every configured chain for `solver_address`
+/// and merges with `primary` (the chain whose approval call actually
+/// errored, if known) to produce the full set of blocked signers for the
+/// frontend. Per-chain RPC failures are logged and skipped, never
+/// propagated — a degraded RPC must not turn into a startup crash.
+async fn discover_blocked_signers(
+	delivery: &Arc<solver_delivery::DeliveryService>,
+	networks: &solver_types::NetworksConfig,
+	solver_address: &str,
+	primary: Option<crate::engine::startup_readiness::BlockedSigner>,
+) -> Vec<crate::engine::startup_readiness::BlockedSigner> {
+	let mut chain_balances: Vec<(u64, String)> = Vec::with_capacity(networks.len());
+	for chain_id in networks.keys() {
+		match delivery.get_balance(*chain_id, solver_address, None).await {
+			Ok(balance) => chain_balances.push((*chain_id, balance)),
+			Err(error) => {
+				tracing::debug!(
+					chain_id = chain_id,
+					error = %error,
+					"Could not read native balance during blocked-signer scan; skipping chain"
+				);
+			},
+		}
+	}
+	merge_blocked_signers(primary, solver_address, chain_balances)
+}
+
 /// Errors that can occur during solver engine construction.
 ///
 /// These errors indicate problems with configuration or missing required components
@@ -596,8 +661,9 @@ impl SolverBuilder {
 		// don't crash startup — log a warning and retry in the background so the
 		// API stays up while an operator funds the signer. The deferred state is
 		// surfaced through the engine's startup readiness handle (see below).
-		let mut deferred_blocked_signer: Option<crate::engine::startup_readiness::BlockedSigner> =
-			None;
+		let solver_address_str = solver_address.to_string();
+		let mut deferred_blocked_signers: Vec<crate::engine::startup_readiness::BlockedSigner> =
+			Vec::new();
 		match token_manager.ensure_approvals().await {
 			Ok(()) => {
 				tracing::info!(
@@ -613,7 +679,13 @@ impl SolverBuilder {
 					"Startup token approvals deferred: signer lacks native gas. \
 					 Retrying every 30s in the background."
 				);
-				deferred_blocked_signer = blocked_signer_from_error(&e);
+				deferred_blocked_signers = discover_blocked_signers(
+					&delivery,
+					&self.static_config.networks,
+					&solver_address_str,
+					blocked_signer_from_error(&e),
+				)
+				.await;
 			},
 			Err(e) => {
 				tracing::error!(
@@ -761,6 +833,9 @@ impl SolverBuilder {
 		};
 
 		let retry_token_manager = Arc::clone(&token_manager);
+		let retry_delivery = Arc::clone(&delivery);
+		let retry_networks = self.static_config.networks.clone();
+		let retry_solver_address_str = solver_address_str.clone();
 
 		let engine = SolverEngine::new(
 			self.dynamic_config,
@@ -781,13 +856,15 @@ impl SolverBuilder {
 		// If startup approvals were deferred for native gas, publish the
 		// blocked-signer state on the engine's readiness handle and spawn the
 		// retry loop. Using the engine's shared handle means /health reflects
-		// updates without any extra plumbing.
-		if let Some(blocked_signer) = deferred_blocked_signer {
+		// updates without any extra plumbing. Each retry tick re-scans every
+		// configured chain so the frontend sees signers drop off the list as
+		// the operator funds them, not just one at a time.
+		if !deferred_blocked_signers.is_empty() {
 			let handle = engine.startup_readiness_handle();
 			*handle.write().await =
-				crate::engine::startup_readiness::StartupReadiness::waiting_for_native_gas(vec![
-					blocked_signer,
-				]);
+				crate::engine::startup_readiness::StartupReadiness::waiting_for_native_gas(
+					deferred_blocked_signers,
+				);
 			let retry_handle = Arc::clone(&handle);
 			tokio::spawn(async move {
 				loop {
@@ -808,10 +885,17 @@ impl SolverBuilder {
 								error = %retry_err,
 								"Still waiting for native gas to complete startup approvals"
 							);
-							if let Some(updated) = blocked_signer_from_error(&retry_err) {
+							let blocked = discover_blocked_signers(
+								&retry_delivery,
+								&retry_networks,
+								&retry_solver_address_str,
+								blocked_signer_from_error(&retry_err),
+							)
+							.await;
+							if !blocked.is_empty() {
 								*retry_handle.write().await =
 									crate::engine::startup_readiness::StartupReadiness::waiting_for_native_gas(
-										vec![updated],
+										blocked,
 									);
 							}
 						},
@@ -925,5 +1009,75 @@ mod tests {
 		let err = TokenManagerError::ParseError("nope".to_string());
 
 		assert!(blocked_signer_from_error(&err).is_none());
+	}
+
+	#[test]
+	fn merge_blocked_signers_lists_every_zero_balance_chain() {
+		let merged = merge_blocked_signers(
+			None,
+			"0xsolver",
+			vec![(1, "0".to_string()), (10, "0".to_string())],
+		);
+
+		assert_eq!(merged.len(), 2);
+		assert!(merged
+			.iter()
+			.any(|s| s.chain_id == 1 && s.balance_wei == "0"));
+		assert!(merged
+			.iter()
+			.any(|s| s.chain_id == 10 && s.balance_wei == "0"));
+	}
+
+	#[test]
+	fn merge_blocked_signers_preserves_primary_authoritative_balance() {
+		use crate::engine::startup_readiness::BlockedSigner;
+
+		// Primary error reports a non-zero but insufficient balance on chain 1.
+		// The naive scan also sees that balance as non-zero, so it would skip
+		// chain 1 — we must keep the primary's record.
+		let primary = Some(BlockedSigner {
+			chain_id: 1,
+			signer: "0xsolver".to_string(),
+			balance_wei: "500".to_string(),
+		});
+
+		let merged = merge_blocked_signers(
+			primary,
+			"0xsolver",
+			vec![(1, "500".to_string()), (10, "0".to_string())],
+		);
+
+		assert_eq!(merged.len(), 2);
+		let chain1 = merged.iter().find(|s| s.chain_id == 1).unwrap();
+		assert_eq!(chain1.balance_wei, "500"); // primary's value preserved, not duplicated
+		assert!(merged
+			.iter()
+			.any(|s| s.chain_id == 10 && s.balance_wei == "0"));
+	}
+
+	#[test]
+	fn merge_blocked_signers_omits_funded_chains() {
+		let merged = merge_blocked_signers(
+			None,
+			"0xsolver",
+			vec![
+				(1, "1000000000000000000".to_string()), // 1 ETH — funded
+				(10, "0".to_string()),
+			],
+		);
+
+		assert_eq!(merged.len(), 1);
+		assert_eq!(merged[0].chain_id, 10);
+	}
+
+	#[test]
+	fn merge_blocked_signers_empty_when_everything_funded_and_no_primary() {
+		let merged = merge_blocked_signers(
+			None,
+			"0xsolver",
+			vec![(1, "1000".to_string()), (10, "1".to_string())],
+		);
+
+		assert!(merged.is_empty());
 	}
 }
