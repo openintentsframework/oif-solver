@@ -26,6 +26,17 @@ fn native_gas_reserve_shortfall(balance: U256, configured_reserve: U256) -> Opti
 	(balance < configured_reserve).then(|| configured_reserve.saturating_sub(balance))
 }
 
+/// Returns true when a token manager error was caused by the signer lacking
+/// native gas to submit an approval transaction.
+fn is_insufficient_native_gas(error: &crate::engine::token_manager::TokenManagerError) -> bool {
+	matches!(
+		error,
+		crate::engine::token_manager::TokenManagerError::DeliveryError(
+			DeliveryError::InsufficientNativeGas(_)
+		)
+	)
+}
+
 /// Errors that can occur during solver engine construction.
 ///
 /// These errors indicate problems with configuration or missing required components
@@ -563,7 +574,9 @@ impl SolverBuilder {
 			}
 		}
 
-		// Ensure all token approvals are set
+		// Ensure all token approvals are set. If the signer has no native gas,
+		// don't crash startup — log a warning and retry in the background so the
+		// API stays up while an operator funds the signer.
 		match token_manager.ensure_approvals().await {
 			Ok(()) => {
 				tracing::info!(
@@ -571,6 +584,43 @@ impl SolverBuilder {
 					networks = self.static_config.networks.len(),
 					"Token manager initialized with approvals"
 				);
+			},
+			Err(e) if is_insufficient_native_gas(&e) => {
+				tracing::warn!(
+					component = "token_manager",
+					error = %e,
+					"Startup token approvals deferred: signer lacks native gas. \
+					 Retrying every 30s in the background."
+				);
+				let retry_token_manager = Arc::clone(&token_manager);
+				tokio::spawn(async move {
+					loop {
+						tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+						match retry_token_manager.ensure_approvals().await {
+							Ok(()) => {
+								tracing::info!(
+									component = "token_manager",
+									"Startup token approvals completed after native gas became available"
+								);
+								return;
+							},
+							Err(retry_err) if is_insufficient_native_gas(&retry_err) => {
+								tracing::debug!(
+									component = "token_manager",
+									error = %retry_err,
+									"Still waiting for native gas to complete startup approvals"
+								);
+							},
+							Err(retry_err) => {
+								tracing::error!(
+									component = "token_manager",
+									error = %retry_err,
+									"Startup approval retry failed with non-gas error"
+								);
+							},
+						}
+					}
+				});
 			},
 			Err(e) => {
 				tracing::error!(
@@ -756,5 +806,36 @@ mod tests {
 			native_gas_reserve_shortfall(U256::from(31u64), U256::from(30u64)),
 			None
 		);
+	}
+
+	#[test]
+	fn is_insufficient_native_gas_matches_delivery_native_gas_error() {
+		use crate::engine::token_manager::TokenManagerError;
+		use solver_delivery::{DeliveryError, InsufficientNativeGasInfo};
+
+		let err = TokenManagerError::DeliveryError(DeliveryError::InsufficientNativeGas(Box::new(
+			InsufficientNativeGasInfo {
+				chain_id: 8453,
+				signer: "0xsolver".to_string(),
+				balance_wei: "0".to_string(),
+				required_wei: "1000".to_string(),
+				shortfall_wei: "1000".to_string(),
+				gas_limit: None,
+				max_fee_per_gas: None,
+				gas_price: None,
+				value_wei: "0".to_string(),
+			},
+		)));
+
+		assert!(is_insufficient_native_gas(&err));
+	}
+
+	#[test]
+	fn is_insufficient_native_gas_rejects_unrelated_errors() {
+		use crate::engine::token_manager::TokenManagerError;
+
+		let err = TokenManagerError::ParseError("nope".to_string());
+
+		assert!(!is_insufficient_native_gas(&err));
 	}
 }
