@@ -743,7 +743,7 @@ pub fn reconstruct_eip3009_digest(
 /// - RemoveToken
 /// - Withdraw
 /// - UpdateNetwork
-/// - AddAdmin
+/// - SetAdminRole
 /// - RemoveAdmin
 /// - UpdateFeeConfig
 /// - UpdateGasConfig
@@ -793,8 +793,9 @@ pub fn admin_eip712_types() -> serde_json::Value {
 			{"name": "nonce", "type": "uint256"},
 			{"name": "deadline", "type": "uint256"}
 		],
-		"AddAdmin": [
-			{"name": "newAdmin", "type": "address"},
+		"SetAdminRole": [
+			{"name": "account", "type": "address"},
+			{"name": "role", "type": "string"},
 			{"name": "nonce", "type": "uint256"},
 			{"name": "deadline", "type": "uint256"}
 		],
@@ -1876,7 +1877,7 @@ mod tests {
 		assert!(obj.contains_key("RemoveToken"));
 		assert!(obj.contains_key("Withdraw"));
 		assert!(obj.contains_key("UpdateNetwork"));
-		assert!(obj.contains_key("AddAdmin"));
+		assert!(obj.contains_key("SetAdminRole"));
 		assert!(obj.contains_key("RemoveAdmin"));
 		assert!(obj.contains_key("UpdateFeeConfig"));
 		assert!(obj.contains_key("UpdateGasConfig"));
@@ -1945,6 +1946,31 @@ mod tests {
 			.and_then(|field| field["type"].as_str())
 			.unwrap();
 		assert_eq!(tokens_type, "AddTokenItem[]");
+	}
+
+	#[test]
+	fn test_admin_eip712_types_set_admin_role_fields() {
+		let types = admin_eip712_types();
+		let set_admin_role = types["SetAdminRole"]
+			.as_array()
+			.expect("should be an array");
+
+		assert_eq!(set_admin_role.len(), 4);
+
+		let fields: Vec<(&str, &str)> = set_admin_role
+			.iter()
+			.map(|field| {
+				(
+					field["name"].as_str().unwrap(),
+					field["type"].as_str().unwrap(),
+				)
+			})
+			.collect();
+
+		assert!(fields.contains(&("account", "address")));
+		assert!(fields.contains(&("role", "string")));
+		assert!(fields.contains(&("nonce", "uint256")));
+		assert!(fields.contains(&("deadline", "uint256")));
 	}
 
 	#[test]

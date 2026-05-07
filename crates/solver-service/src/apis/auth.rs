@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use solver_config::Config;
 use solver_storage::nonce_store::NonceStore;
-use solver_types::AuthScope;
+use solver_types::{AdminRole, AdminWhitelistEntry, AuthScope};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -481,19 +481,21 @@ pub async fn verify_siwe_token(
 		},
 	}
 
-	if !runtime.admin_addresses.contains(&siwe.address) {
-		return (
-			StatusCode::FORBIDDEN,
-			Json(json!({
-				"error": "SIWE signer is not an authorized admin"
-			})),
-		)
-			.into_response();
-	}
+	let scopes = match resolve_siwe_scopes(&runtime, &siwe.address) {
+		Some(scopes) => scopes,
+		None => {
+			return (
+				StatusCode::FORBIDDEN,
+				Json(json!({
+					"error": "SIWE signer is not an authorized admin or read-only user"
+				})),
+			)
+				.into_response();
+		},
+	};
 
 	let expires_in = TOKEN_DEFAULT_TTL_SECONDS.min(TOKEN_MAX_TTL_SECONDS);
 	let subject = siwe.address.to_string();
-	let scopes = vec![AuthScope::AdminAll];
 	let access_token = match jwt_service.generate_access_token_with_ttl_seconds(
 		&subject,
 		scopes.clone(),
@@ -554,7 +556,38 @@ struct SiweRuntimeConfig {
 	domain: String,
 	chain_id: u64,
 	nonce_ttl_seconds: u64,
-	admin_addresses: Vec<alloy_primitives::Address>,
+	whitelist: Vec<AdminWhitelistEntry>,
+}
+
+impl SiweRuntimeConfig {
+	fn role_for(&self, address: &alloy_primitives::Address) -> Option<AdminRole> {
+		if self
+			.whitelist
+			.iter()
+			.any(|entry| entry.address == *address && entry.role == AdminRole::Admin)
+		{
+			Some(AdminRole::Admin)
+		} else if self
+			.whitelist
+			.iter()
+			.any(|entry| entry.address == *address && entry.role == AdminRole::ReadOnly)
+		{
+			Some(AdminRole::ReadOnly)
+		} else {
+			None
+		}
+	}
+}
+
+fn resolve_siwe_scopes(
+	runtime: &SiweRuntimeConfig,
+	address: &alloy_primitives::Address,
+) -> Option<Vec<AuthScope>> {
+	match runtime.role_for(address) {
+		Some(AdminRole::Admin) => Some(vec![AuthScope::AdminAll]),
+		Some(AdminRole::ReadOnly) => Some(vec![AuthScope::AdminRead]),
+		None => None,
+	}
 }
 
 async fn siwe_dependencies(
@@ -664,7 +697,7 @@ async fn resolve_siwe_runtime_config(
 		domain,
 		chain_id,
 		nonce_ttl_seconds: admin.nonce_ttl_seconds,
-		admin_addresses: admin.admin_addresses.clone(),
+		whitelist: admin.normalized_whitelist(),
 	})
 }
 
@@ -766,7 +799,7 @@ mod tests {
 	use serde_json::Value;
 	use solver_config::{ApiConfig, ApiImplementations, ConfigBuilder};
 	use solver_storage::{nonce_store::create_nonce_store, StoreConfig};
-	use solver_types::{AdminConfig, AuthConfig, SecretString};
+	use solver_types::{AdminConfig, AdminRole, AdminWhitelistEntry, AuthConfig, SecretString};
 	use std::sync::Arc;
 	use tokio::sync::RwLock;
 
@@ -801,6 +834,26 @@ mod tests {
 		admin_addresses: Vec<alloy_primitives::Address>,
 		siwe_nonce_store: Option<Arc<NonceStore>>,
 	) -> SiweAuthState {
+		create_test_siwe_state_with_whitelist(
+			jwt_service,
+			admin_enabled,
+			admin_addresses
+				.into_iter()
+				.map(|address| AdminWhitelistEntry {
+					address,
+					role: AdminRole::Admin,
+				})
+				.collect(),
+			siwe_nonce_store,
+		)
+	}
+
+	fn create_test_siwe_state_with_whitelist(
+		jwt_service: Option<Arc<JwtService>>,
+		admin_enabled: bool,
+		whitelist: Vec<AdminWhitelistEntry>,
+		siwe_nonce_store: Option<Arc<NonceStore>>,
+	) -> SiweAuthState {
 		let auth_config = AuthConfig {
 			enabled: true,
 			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars-long"),
@@ -813,7 +866,7 @@ mod tests {
 				domain: "localhost".to_string(),
 				chain_id: Some(1),
 				nonce_ttl_seconds: 300,
-				admin_addresses,
+				whitelist,
 			}),
 		};
 
@@ -1307,6 +1360,48 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn test_verify_siwe_token_returns_read_only_scope_for_read_only_wallet() {
+		let jwt_service = create_test_jwt_service_with(true, false);
+		let signer = create_test_siwe_signer();
+		let nonce_store =
+			Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
+		let (request, _nonce_id) = create_signed_siwe_verify_request(&nonce_store, &signer).await;
+		let signer_address = signer.address();
+
+		let state = create_test_siwe_state_with_whitelist(
+			Some(jwt_service.clone()),
+			true,
+			vec![AdminWhitelistEntry {
+				address: signer_address,
+				role: AdminRole::ReadOnly,
+			}],
+			Some(nonce_store),
+		);
+
+		let response = verify_siwe_token(State(state), Json(request)).await;
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::OK);
+
+		let json_body = extract_json_from_body(body).await;
+		let register_response: RegisterResponse = serde_json::from_value(json_body).unwrap();
+		assert_eq!(register_response.scopes, vec!["admin-read"]);
+
+		let access_claims = jwt_service
+			.validate_token(&register_response.access_token)
+			.unwrap();
+		assert_eq!(access_claims.scope, vec![AuthScope::AdminRead]);
+		assert!(JwtService::check_scope(
+			&access_claims,
+			&AuthScope::AdminRead
+		));
+		assert!(!JwtService::check_scope(
+			&access_claims,
+			&AuthScope::AdminAll
+		));
+	}
+
+	#[tokio::test]
 	async fn test_verify_siwe_token_refresh_token_can_be_used_with_auth_refresh() {
 		let jwt_service = create_test_jwt_service_with(true, false);
 		let signer = create_test_siwe_signer();
@@ -1531,7 +1626,10 @@ mod tests {
 		let (parts, body) = response_obj.into_parts();
 		assert_eq!(parts.status, StatusCode::FORBIDDEN);
 		let json_body = extract_json_from_body(body).await;
-		assert_eq!(json_body["error"], "SIWE signer is not an authorized admin");
+		assert_eq!(
+			json_body["error"],
+			"SIWE signer is not an authorized admin or read-only user"
+		);
 	}
 
 	#[tokio::test]
@@ -1695,7 +1793,16 @@ mod tests {
 				// Mirrors seed-overrides shape where chain_id can be omitted.
 				chain_id: None,
 				nonce_ttl_seconds: 300,
-				admin_addresses: vec![admin_1, admin_2],
+				whitelist: vec![
+					AdminWhitelistEntry {
+						address: admin_1,
+						role: AdminRole::Admin,
+					},
+					AdminWhitelistEntry {
+						address: admin_2,
+						role: AdminRole::Admin,
+					},
+				],
 			}),
 		};
 
@@ -1719,6 +1826,51 @@ mod tests {
 		assert_eq!(runtime.domain, "localhost");
 		assert_eq!(runtime.nonce_ttl_seconds, 300);
 		assert_eq!(runtime.chain_id, 1); // fallback when chain_id is omitted
-		assert_eq!(runtime.admin_addresses, vec![admin_1, admin_2]);
+		assert_eq!(
+			runtime
+				.whitelist
+				.iter()
+				.map(|entry| entry.address)
+				.collect::<Vec<_>>(),
+			vec![admin_1, admin_2]
+		);
+	}
+
+	#[test]
+	fn test_resolve_siwe_scopes_by_role() {
+		let admin = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+			.parse::<alloy_primitives::Address>()
+			.unwrap();
+		let read_only = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+			.parse::<alloy_primitives::Address>()
+			.unwrap();
+		let unknown = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC"
+			.parse::<alloy_primitives::Address>()
+			.unwrap();
+		let runtime = SiweRuntimeConfig {
+			domain: "localhost".to_string(),
+			chain_id: 1,
+			nonce_ttl_seconds: 300,
+			whitelist: vec![
+				AdminWhitelistEntry {
+					address: admin,
+					role: AdminRole::Admin,
+				},
+				AdminWhitelistEntry {
+					address: read_only,
+					role: AdminRole::ReadOnly,
+				},
+			],
+		};
+
+		assert_eq!(
+			resolve_siwe_scopes(&runtime, &admin),
+			Some(vec![AuthScope::AdminAll])
+		);
+		assert_eq!(
+			resolve_siwe_scopes(&runtime, &read_only),
+			Some(vec![AuthScope::AdminRead])
+		);
+		assert_eq!(resolve_siwe_scopes(&runtime, &unknown), None);
 	}
 }

@@ -6,6 +6,7 @@
 use alloy_primitives::{Address, FixedBytes, U256};
 use alloy_sol_types::sol;
 use serde::{Deserialize, Serialize};
+use solver_types::AdminRole;
 use thiserror::Error;
 
 /// Errors that can occur when computing EIP-712 hashes for admin actions.
@@ -105,9 +106,10 @@ sol! {
 		uint256 deadline;
 	}
 
-	/// Add an admin address
-	struct AddAdmin {
-		address newAdmin;
+		/// Set an admin whitelist role
+		struct SetAdminRole {
+			address account;
+		string role;
 		uint256 nonce;
 		uint256 deadline;
 	}
@@ -299,22 +301,24 @@ impl RemoveTokenContents {
 	}
 }
 
-/// AddAdmin action contents
+/// SetAdminRole action contents
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AddAdminContents {
-	pub new_admin: Address,
+pub struct SetAdminRoleContents {
+	pub account: Address,
+	pub role: AdminRole,
 	#[serde(with = "string_or_number")]
 	pub nonce: u64,
 	#[serde(with = "string_or_number")]
 	pub deadline: u64,
 }
 
-impl AddAdminContents {
+impl SetAdminRoleContents {
 	/// Convert to EIP-712 struct for hashing
-	pub fn to_eip712(&self) -> AddAdmin {
-		AddAdmin {
-			newAdmin: self.new_admin,
+	pub fn to_eip712(&self) -> SetAdminRole {
+		SetAdminRole {
+			account: self.account,
+			role: self.role.to_string(),
 			nonce: U256::from(self.nonce),
 			deadline: U256::from(self.deadline),
 		}
@@ -654,7 +658,7 @@ impl AdminAction for RemoveTokenContents {
 	}
 }
 
-impl AdminAction for AddAdminContents {
+impl AdminAction for SetAdminRoleContents {
 	fn nonce(&self) -> u64 {
 		self.nonce
 	}
@@ -664,7 +668,7 @@ impl AdminAction for AddAdminContents {
 	}
 
 	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError> {
-		Ok(AddAdminContents::struct_hash(self))
+		Ok(SetAdminRoleContents::struct_hash(self))
 	}
 }
 
@@ -1367,9 +1371,10 @@ mod tests {
 	}
 
 	#[test]
-	fn test_add_admin_struct_hash() {
-		let contents = AddAdminContents {
-			new_admin: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap(),
+	fn test_set_admin_role_struct_hash() {
+		let contents = SetAdminRoleContents {
+			account: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap(),
+			role: AdminRole::ReadOnly,
 			nonce: 1,
 			deadline: 1706184000,
 		};
@@ -1378,6 +1383,9 @@ mod tests {
 		assert_eq!(hash.len(), 32);
 		let hash2 = contents.struct_hash();
 		assert_eq!(hash, hash2);
+
+		let eip712 = contents.to_eip712();
+		assert_eq!(eip712.role, "read-only");
 	}
 
 	#[test]
@@ -1413,9 +1421,10 @@ mod tests {
 	}
 
 	#[test]
-	fn test_add_admin_admin_action_trait() {
-		let contents = AddAdminContents {
-			new_admin: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap(),
+	fn test_set_admin_role_admin_action_trait() {
+		let contents = SetAdminRoleContents {
+			account: Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap(),
+			role: AdminRole::Admin,
 			nonce: 42,
 			deadline: 1706184000,
 		};
