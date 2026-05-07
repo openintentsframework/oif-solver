@@ -12,6 +12,8 @@
 use alloy_primitives::Address;
 use solver_storage::nonce_store::NonceStore;
 use solver_types::AdminConfig;
+#[cfg(test)]
+use solver_types::{AdminRole, AdminWhitelistEntry};
 use std::sync::Arc;
 
 use super::error::AdminAuthError;
@@ -178,7 +180,10 @@ mod tests {
 			domain: "test.example.com".to_string(),
 			chain_id: Some(1),
 			nonce_ttl_seconds: 300,
-			admin_addresses: vec![admin_address],
+			whitelist: vec![AdminWhitelistEntry {
+				address: admin_address,
+				role: AdminRole::Admin,
+			}],
 		};
 
 		let verifier = AdminActionVerifier::new(nonce_store.clone(), admin_config, 1);
@@ -224,7 +229,10 @@ mod tests {
 			domain: "test.example.com".to_string(),
 			chain_id: Some(1),
 			nonce_ttl_seconds: 300,
-			admin_addresses: vec![admin_address],
+			whitelist: vec![AdminWhitelistEntry {
+				address: admin_address,
+				role: AdminRole::Admin,
+			}],
 		};
 
 		let verifier = AdminActionVerifier::new(nonce_store.clone(), admin_config, 1);
@@ -262,7 +270,10 @@ mod tests {
 			domain: "test.example.com".to_string(),
 			chain_id: Some(1),
 			nonce_ttl_seconds: 300,
-			admin_addresses: vec![other_address], // Different address
+			whitelist: vec![AdminWhitelistEntry {
+				address: other_address,
+				role: AdminRole::Admin,
+			}], // Different address
 		};
 
 		let verifier = AdminActionVerifier::new(nonce_store.clone(), admin_config, 1);

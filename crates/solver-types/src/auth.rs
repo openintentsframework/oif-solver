@@ -22,6 +22,8 @@ pub enum AuthScope {
 	CreateQuotes,
 	/// Permission to read quotes
 	ReadQuotes,
+	/// Admin read scope - grants read-only access to admin data endpoints
+	AdminRead,
 	/// Admin scope - grants all permissions
 	AdminAll,
 }
@@ -43,6 +45,7 @@ impl fmt::Display for AuthScope {
 			AuthScope::CreateOrders => "create-orders",
 			AuthScope::CreateQuotes => "create-quotes",
 			AuthScope::ReadQuotes => "read-quotes",
+			AuthScope::AdminRead => "admin-read",
 			AuthScope::AdminAll => "admin-all",
 		};
 		write!(f, "{scope_str}")
@@ -58,10 +61,53 @@ impl FromStr for AuthScope {
 			"create-orders" => Ok(AuthScope::CreateOrders),
 			"create-quotes" => Ok(AuthScope::CreateQuotes),
 			"read-quotes" => Ok(AuthScope::ReadQuotes),
+			"admin-read" => Ok(AuthScope::AdminRead),
 			"admin-all" => Ok(AuthScope::AdminAll),
 			_ => Err(format!("Unknown scope: {s}")),
 		}
 	}
+}
+
+/// Administrative wallet role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AdminRole {
+	/// Full admin access.
+	Admin,
+	/// Read-only admin data access.
+	ReadOnly,
+}
+
+impl fmt::Display for AdminRole {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		let role = match self {
+			AdminRole::Admin => "admin",
+			AdminRole::ReadOnly => "read-only",
+		};
+		write!(f, "{role}")
+	}
+}
+
+impl FromStr for AdminRole {
+	type Err = String;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		match s {
+			"admin" => Ok(AdminRole::Admin),
+			"read-only" => Ok(AdminRole::ReadOnly),
+			_ => Err(format!("Unknown admin role: {s}")),
+		}
+	}
+}
+
+/// Typed admin whitelist entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminWhitelistEntry {
+	/// Wallet address.
+	pub address: Address,
+	/// Role granted to the wallet.
+	pub role: AdminRole,
 }
 
 /// JWT claims structure for token validation
@@ -126,7 +172,7 @@ fn default_public_register_enabled() -> bool {
 /// This configuration enables admins to authenticate using their Ethereum
 /// wallet signatures. Works for both SIWE session-based and per-action
 /// signature approaches.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AdminConfig {
 	/// Enable admin authentication
 	#[serde(default)]
@@ -147,13 +193,44 @@ pub struct AdminConfig {
 	#[serde(default = "default_nonce_ttl")]
 	pub nonce_ttl_seconds: u64,
 
-	/// List of authorized admin wallet addresses.
-	/// Only these addresses can perform admin operations.
-	pub admin_addresses: Vec<Address>,
+	/// Typed admin whitelist entries.
+	#[serde(default)]
+	pub whitelist: Vec<AdminWhitelistEntry>,
 }
 
 fn default_nonce_ttl() -> u64 {
 	300
+}
+
+impl<'de> Deserialize<'de> for AdminConfig {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		#[derive(Deserialize)]
+		struct AdminConfigInput {
+			#[serde(default)]
+			enabled: bool,
+			domain: String,
+			#[serde(default)]
+			chain_id: Option<u64>,
+			#[serde(default = "default_nonce_ttl")]
+			nonce_ttl_seconds: u64,
+			#[serde(default)]
+			admin_addresses: Vec<Address>,
+			#[serde(default)]
+			whitelist: Vec<AdminWhitelistEntry>,
+		}
+
+		let input = AdminConfigInput::deserialize(deserializer)?;
+		Ok(Self {
+			enabled: input.enabled,
+			domain: input.domain,
+			chain_id: input.chain_id,
+			nonce_ttl_seconds: input.nonce_ttl_seconds,
+			whitelist: normalize_admin_whitelist(&input.admin_addresses, &input.whitelist),
+		})
+	}
 }
 
 impl AdminConfig {
@@ -165,12 +242,75 @@ impl AdminConfig {
 	/// Comparison is done on the raw bytes, which is case-insensitive
 	/// and handles checksummed vs non-checksummed addresses correctly.
 	pub fn is_admin(&self, address: &Address) -> bool {
-		self.enabled && self.admin_addresses.iter().any(|a| a == address)
+		self.enabled && self.role_for(address) == Some(AdminRole::Admin)
+	}
+
+	/// Resolve an address to its configured admin role.
+	///
+	/// Admin wins over read-only if duplicate legacy/typed entries exist.
+	pub fn role_for(&self, address: &Address) -> Option<AdminRole> {
+		if self
+			.whitelist
+			.iter()
+			.any(|entry| entry.address == *address && entry.role == AdminRole::Admin)
+		{
+			Some(AdminRole::Admin)
+		} else if self
+			.whitelist
+			.iter()
+			.any(|entry| entry.address == *address && entry.role == AdminRole::ReadOnly)
+		{
+			Some(AdminRole::ReadOnly)
+		} else {
+			None
+		}
+	}
+
+	/// Return the normalized typed whitelist.
+	pub fn normalized_whitelist(&self) -> Vec<AdminWhitelistEntry> {
+		self.whitelist.clone()
 	}
 
 	/// Get the number of configured admin addresses.
 	pub fn admin_count(&self) -> usize {
-		self.admin_addresses.len()
+		self.normalized_whitelist()
+			.iter()
+			.filter(|entry| entry.role == AdminRole::Admin)
+			.count()
+	}
+}
+
+/// Normalize legacy admin addresses and typed whitelist entries into a set.
+///
+/// Set semantics are by address. Admin wins over read-only.
+pub fn normalize_admin_whitelist(
+	admin_addresses: &[Address],
+	whitelist: &[AdminWhitelistEntry],
+) -> Vec<AdminWhitelistEntry> {
+	let mut entries: Vec<AdminWhitelistEntry> = Vec::new();
+
+	for entry in whitelist {
+		upsert_admin_role(&mut entries, entry.address, entry.role);
+	}
+	for address in admin_addresses {
+		upsert_admin_role(&mut entries, *address, AdminRole::Admin);
+	}
+
+	entries
+}
+
+/// Upsert one role into a whitelist, with Admin winning over ReadOnly.
+pub fn upsert_admin_role(
+	whitelist: &mut Vec<AdminWhitelistEntry>,
+	address: Address,
+	role: AdminRole,
+) {
+	if let Some(entry) = whitelist.iter_mut().find(|entry| entry.address == address) {
+		if role == AdminRole::Admin || entry.role != AdminRole::Admin {
+			entry.role = role;
+		}
+	} else {
+		whitelist.push(AdminWhitelistEntry { address, role });
 	}
 }
 
@@ -181,7 +321,7 @@ impl Default for AdminConfig {
 			domain: String::new(),
 			chain_id: None,
 			nonce_ttl_seconds: default_nonce_ttl(),
-			admin_addresses: Vec::new(),
+			whitelist: Vec::new(),
 		}
 	}
 }
@@ -202,7 +342,10 @@ mod tests {
 			domain: "solver.example.com".to_string(),
 			chain_id: None,
 			nonce_ttl_seconds: 300,
-			admin_addresses: vec![admin_addr],
+			whitelist: vec![AdminWhitelistEntry {
+				address: admin_addr,
+				role: AdminRole::Admin,
+			}],
 		};
 
 		assert!(config.is_admin(&admin_addr));
@@ -220,7 +363,16 @@ mod tests {
 			domain: "solver.example.com".to_string(),
 			chain_id: None,
 			nonce_ttl_seconds: 300,
-			admin_addresses: vec![admin1, admin2],
+			whitelist: vec![
+				AdminWhitelistEntry {
+					address: admin1,
+					role: AdminRole::Admin,
+				},
+				AdminWhitelistEntry {
+					address: admin2,
+					role: AdminRole::Admin,
+				},
+			],
 		};
 
 		assert!(config.is_admin(&admin1));
@@ -239,7 +391,10 @@ mod tests {
 			domain: "solver.example.com".to_string(),
 			chain_id: None,
 			nonce_ttl_seconds: 300,
-			admin_addresses: vec![admin_addr],
+			whitelist: vec![AdminWhitelistEntry {
+				address: admin_addr,
+				role: AdminRole::Admin,
+			}],
 		};
 
 		// Should return false because enabled = false
@@ -253,7 +408,7 @@ mod tests {
 		assert!(!config.enabled);
 		assert!(config.domain.is_empty());
 		assert_eq!(config.nonce_ttl_seconds, 300);
-		assert!(config.admin_addresses.is_empty());
+		assert!(config.whitelist.is_empty());
 	}
 
 	#[test]
@@ -265,7 +420,10 @@ mod tests {
 			domain: "solver.example.com".to_string(),
 			chain_id: Some(1),
 			nonce_ttl_seconds: 600,
-			admin_addresses: vec![admin_addr],
+			whitelist: vec![AdminWhitelistEntry {
+				address: admin_addr,
+				role: AdminRole::Admin,
+			}],
 		};
 
 		let json = serde_json::to_string(&config).unwrap();
@@ -275,7 +433,33 @@ mod tests {
 		assert_eq!(parsed.domain, config.domain);
 		assert_eq!(parsed.chain_id, config.chain_id);
 		assert_eq!(parsed.nonce_ttl_seconds, config.nonce_ttl_seconds);
-		assert_eq!(parsed.admin_addresses, config.admin_addresses);
+		assert_eq!(parsed.whitelist, config.whitelist);
+	}
+
+	#[test]
+	fn test_admin_read_scope_semantics() {
+		assert!(AuthScope::AdminAll.grants(&AuthScope::AdminRead));
+		assert!(!AuthScope::AdminRead.grants(&AuthScope::AdminAll));
+		assert_eq!(
+			"admin-read".parse::<AuthScope>().unwrap(),
+			AuthScope::AdminRead
+		);
+		assert_eq!(AuthScope::AdminRead.to_string(), "admin-read");
+	}
+
+	#[test]
+	fn test_normalize_admin_whitelist_admin_wins() {
+		let admin_addr = Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
+		let entries = normalize_admin_whitelist(
+			&[admin_addr],
+			&[AdminWhitelistEntry {
+				address: admin_addr,
+				role: AdminRole::ReadOnly,
+			}],
+		);
+
+		assert_eq!(entries.len(), 1);
+		assert_eq!(entries[0].role, AdminRole::Admin);
 	}
 
 	#[test]

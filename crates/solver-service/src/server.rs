@@ -5,9 +5,9 @@
 
 use crate::{
 	apis::admin::{
-		handle_add_admin, handle_add_token, handle_add_tokens, handle_approve_tokens,
-		handle_get_balances, handle_get_config, handle_get_fees, handle_get_gas, handle_get_nonce,
-		handle_get_types, handle_get_whitelist, handle_remove_admin, handle_remove_token,
+		handle_add_token, handle_add_tokens, handle_approve_tokens, handle_get_balances,
+		handle_get_config, handle_get_fees, handle_get_gas, handle_get_nonce, handle_get_types,
+		handle_get_whitelist, handle_remove_admin, handle_remove_token, handle_set_admin_role,
 		handle_update_fees, handle_update_gas, handle_withdrawal, AdminApiState,
 	},
 	apis::health::handle_health,
@@ -348,36 +348,10 @@ pub async fn start_server(
 
 	// Add admin routes if enabled
 	if let Some(admin_state) = admin_state {
-		let mut admin_protected_routes = Router::new()
-			.route("/config", get(handle_get_config))
-			.route("/balances", get(handle_get_balances))
-			.route("/nonce", get(handle_get_nonce).post(handle_get_nonce))
-			.route("/types", get(handle_get_types))
-			.route(
-				"/whitelist",
-				get(handle_get_whitelist)
-					.post(handle_add_admin)
-					.delete(handle_remove_admin),
-			)
-			.route("/tokens/batch", post(handle_add_tokens))
-			.route("/tokens", post(handle_add_token))
-			.route("/tokens", delete(handle_remove_token))
-			.route("/tokens/approve", post(handle_approve_tokens))
-			.route("/withdrawals", post(handle_withdrawal))
-			.route("/fees", get(handle_get_fees))
-			.route("/fees", put(handle_update_fees))
-			.route("/gas", get(handle_get_gas))
-			.route("/gas", put(handle_update_gas));
-
-		let rebalance_routes = axum::Router::new()
+		let rebalance_read_routes = axum::Router::new()
 			.route(
 				"/config",
-				axum::routing::get(crate::apis::rebalance::handle_get_rebalance_config)
-					.put(crate::apis::rebalance::handle_update_rebalance_config),
-			)
-			.route(
-				"/config/threshold",
-				axum::routing::put(crate::apis::rebalance::handle_update_rebalance_threshold),
+				axum::routing::get(crate::apis::rebalance::handle_get_rebalance_config),
 			)
 			.route(
 				"/status",
@@ -386,6 +360,16 @@ pub async fn start_server(
 			.route(
 				"/transfers",
 				axum::routing::get(crate::apis::rebalance::handle_get_rebalance_transfers),
+			);
+
+		let rebalance_write_routes = axum::Router::new()
+			.route(
+				"/config",
+				axum::routing::put(crate::apis::rebalance::handle_update_rebalance_config),
+			)
+			.route(
+				"/config/threshold",
+				axum::routing::put(crate::apis::rebalance::handle_update_rebalance_threshold),
 			)
 			.route(
 				"/trigger",
@@ -396,11 +380,41 @@ pub async fn start_server(
 				axum::routing::post(crate::apis::rebalance::handle_resolve_transfer),
 			);
 
-		admin_protected_routes = admin_protected_routes.nest("/rebalance", rebalance_routes);
+		let mut admin_read_routes = Router::new()
+			.route("/config", get(handle_get_config))
+			.route("/balances", get(handle_get_balances))
+			.route("/nonce", get(handle_get_nonce))
+			.route("/types", get(handle_get_types))
+			.route("/whitelist", get(handle_get_whitelist))
+			.route("/fees", get(handle_get_fees))
+			.route("/gas", get(handle_get_gas))
+			.nest("/rebalance", rebalance_read_routes);
+
+		let mut admin_write_routes = Router::new()
+			.route("/nonce", post(handle_get_nonce))
+			.route(
+				"/whitelist",
+				post(handle_set_admin_role).delete(handle_remove_admin),
+			)
+			.route("/tokens/batch", post(handle_add_tokens))
+			.route("/tokens", post(handle_add_token))
+			.route("/tokens", delete(handle_remove_token))
+			.route("/tokens/approve", post(handle_approve_tokens))
+			.route("/withdrawals", post(handle_withdrawal))
+			.route("/fees", put(handle_update_fees))
+			.route("/gas", put(handle_update_gas))
+			.nest("/rebalance", rebalance_write_routes);
 
 		// Admin routes always require JWT authentication, regardless of order auth settings.
 		if let Some(jwt) = &jwt_service {
-			admin_protected_routes = admin_protected_routes.layer(middleware::from_fn_with_state(
+			admin_read_routes = admin_read_routes.layer(middleware::from_fn_with_state(
+				AuthState {
+					jwt_service: jwt.clone(),
+					required_scope: solver_types::AuthScope::AdminRead,
+				},
+				auth_middleware,
+			));
+			admin_write_routes = admin_write_routes.layer(middleware::from_fn_with_state(
 				AuthState {
 					jwt_service: jwt.clone(),
 					required_scope: solver_types::AuthScope::AdminAll,
@@ -409,7 +423,9 @@ pub async fn start_server(
 			));
 		}
 
-		let admin_routes = admin_protected_routes.with_state(admin_state);
+		let admin_routes = admin_read_routes
+			.merge(admin_write_routes)
+			.with_state(admin_state);
 
 		api_routes = api_routes.nest("/admin", admin_routes);
 		tracing::info!("Admin routes registered at /api/v1/admin/*");

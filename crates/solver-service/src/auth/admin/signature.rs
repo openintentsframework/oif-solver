@@ -8,6 +8,8 @@ use alloy_signer::Signature;
 
 use super::error::AdminAuthError;
 use solver_types::AdminConfig;
+#[cfg(test)]
+use solver_types::{AdminRole, AdminWhitelistEntry};
 
 /// Recover Ethereum address from an EIP-191 personal_sign signature.
 ///
@@ -154,7 +156,10 @@ mod tests {
 			domain: "test.example.com".to_string(),
 			chain_id: Some(1),
 			nonce_ttl_seconds: 300,
-			admin_addresses: vec![signer.address()],
+			whitelist: vec![AdminWhitelistEntry {
+				address: signer.address(),
+				role: AdminRole::Admin,
+			}],
 		};
 
 		let sig = signer.sign_message_sync(message).unwrap();
@@ -175,7 +180,10 @@ mod tests {
 			domain: "test.example.com".to_string(),
 			chain_id: Some(1),
 			nonce_ttl_seconds: 300,
-			admin_addresses: vec![other_address], // Different address
+			whitelist: vec![AdminWhitelistEntry {
+				address: other_address,
+				role: AdminRole::Admin,
+			}], // Different address
 		};
 
 		let sig = signer.sign_message_sync(b"test message").unwrap();

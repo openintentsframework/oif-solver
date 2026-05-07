@@ -1300,6 +1300,7 @@ fn build_seed_overrides(
 			domain: "localhost".to_string(),
 			chain_id: Some(ORIGIN_CHAIN_ID),
 			admin_addresses: vec![parse_address(SOLVER_ADDRESS)?],
+			whitelist: Vec::new(),
 			nonce_ttl_seconds: None,
 			withdrawals: Default::default(),
 		})
