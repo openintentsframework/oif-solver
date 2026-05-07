@@ -37,12 +37,9 @@ impl ChainFeePolicy {
 }
 
 // Note: we deliberately do NOT carry an `average_block_time_ms` here.
-// The 1.25× base-fee projection in `SolverEip1559Estimator::estimate`
-// is "absorb one block of base-fee movement," which is roughly the same
-// per-block adjustment ratio across every EIP-1559 chain (the protocol
-// caps base-fee changes at 1.125×). If a future strategy needs a
-// per-chain projection multiplier, add the field then — not as
-// speculative config now.
+// The 2× base-fee projection in `SolverEip1559Estimator::estimate`
+// follows alloy's default headroom. If a future strategy needs a per-chain
+// projection multiplier, add the field then — not as speculative config now.
 
 /// Errors returned when parsing/validating a [`FeePolicyConfig`] into a
 /// [`FeePolicyRegistry`]. Each variant carries enough context (chain id,
@@ -253,10 +250,8 @@ impl SolverEip1559Estimator {
 			.max(self.policy.min_priority_fee_per_gas.unwrap_or(0))
 			.max(self.policy.priority_fee_fallback);
 
-		// Project base fee one block forward at 1.25x. We picked 1.25 over
-		// alloy's default 2x to avoid systematically over-quoting; rationale
-		// is documented in the Quote Cost Strategy section.
-		let projected_base = base_fee.saturating_mul(125) / 100;
+		// Project base fee forward using alloy's default 2x headroom.
+		let projected_base = base_fee.saturating_mul(2);
 		let raw_max = projected_base.saturating_add(priority);
 		let max_fee = self
 			.policy
@@ -305,6 +300,21 @@ mod tests {
 		let estimator = SolverEip1559Estimator { policy };
 		let est = estimator.estimate(30_000_000, &[]);
 		assert!(est.max_priority_fee_per_gas > 0);
+	}
+
+	#[test]
+	fn eip1559_estimator_projects_base_fee_at_2x() {
+		let policy = ChainFeePolicy::default_for_chain(1);
+		let estimator = SolverEip1559Estimator { policy };
+		let rewards = vec![vec![100_000_000u128]];
+		let base_fee = 500_000_000u128;
+
+		let est = estimator.estimate(base_fee, &rewards);
+
+		assert_eq!(
+			est.max_fee_per_gas,
+			base_fee.saturating_mul(2) + 100_000_000
+		);
 	}
 
 	#[test]
