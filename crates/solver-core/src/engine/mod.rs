@@ -9,9 +9,14 @@ pub mod cost_profit;
 pub mod event_bus;
 pub mod lifecycle;
 pub mod post_fill_overrides;
+pub mod startup_readiness;
 pub mod token_manager;
 
-use self::{cost_profit::CostProfitService, token_manager::TokenManager};
+use self::{
+	cost_profit::CostProfitService,
+	startup_readiness::{SharedStartupReadiness, StartupReadiness},
+	token_manager::TokenManager,
+};
 use crate::handlers::{IntentHandler, OrderHandler, SettlementHandler, TransactionHandler};
 use crate::recovery::RecoveryService;
 use crate::state::OrderStateMachine;
@@ -98,6 +103,11 @@ pub struct SolverEngine {
 		Arc<tokio::sync::RwLock<solver_bridge::monitor::RebalanceMonitorStatus>>,
 	/// The solver's Ethereum address.
 	pub(crate) solver_address: solver_types::Address,
+	/// Public-facing startup readiness state. Defaults to `ready()`. The
+	/// builder writes a non-ready value here when startup approvals are
+	/// blocked on native gas; the retry loop flips it back when the next
+	/// approval pass succeeds.
+	pub(crate) startup_readiness: SharedStartupReadiness,
 }
 
 /// Number of orders to batch together for claim operations.
@@ -236,6 +246,7 @@ impl SolverEngine {
 			rebalance_monitor_status: Arc::new(tokio::sync::RwLock::new(
 				solver_bridge::monitor::RebalanceMonitorStatus::default(),
 			)),
+			startup_readiness: Arc::new(RwLock::new(StartupReadiness::ready())),
 		}
 	}
 
@@ -711,6 +722,20 @@ impl SolverEngine {
 		&self.solver_address
 	}
 
+	/// Returns a snapshot of the current startup readiness state. Cheap —
+	/// takes a read lock, clones, and releases. Safe to call from hot
+	/// paths like the health endpoint.
+	pub async fn startup_readiness(&self) -> StartupReadiness {
+		self.startup_readiness.read().await.clone()
+	}
+
+	/// Returns the shared handle for the startup readiness state. Used by
+	/// the builder to seed the initial value and hand a clone to the
+	/// background approval retry loop.
+	pub fn startup_readiness_handle(&self) -> SharedStartupReadiness {
+		Arc::clone(&self.startup_readiness)
+	}
+
 	/// Helper method to spawn handler tasks with semaphore-based concurrency control.
 	///
 	/// This method:
@@ -1044,5 +1069,94 @@ mod tests {
 			handler_error.to_string(),
 			"Handler error: test handler error"
 		);
+	}
+
+	#[tokio::test]
+	async fn engine_startup_readiness_defaults_to_ready() {
+		let (
+			dynamic_config,
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+		) = create_mock_services().await;
+
+		let engine = SolverEngine::new(
+			dynamic_config,
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+			None,
+		);
+
+		let snapshot = engine.startup_readiness().await;
+
+		assert!(snapshot.approvals_ready);
+		assert!(snapshot.reason.is_none());
+		assert!(snapshot.blocked_signers.is_empty());
+	}
+
+	#[tokio::test]
+	async fn engine_startup_readiness_handle_propagates_writes_to_getter() {
+		use crate::engine::startup_readiness::{BlockedSigner, StartupReadiness};
+
+		let (
+			dynamic_config,
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+		) = create_mock_services().await;
+
+		let engine = SolverEngine::new(
+			dynamic_config,
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+			None,
+		);
+
+		let handle = engine.startup_readiness_handle();
+		*handle.write().await = StartupReadiness::waiting_for_native_gas(vec![BlockedSigner {
+			chain_id: 1,
+			signer: "0xabc".to_string(),
+			balance_wei: "0".to_string(),
+		}]);
+
+		let snapshot = engine.startup_readiness().await;
+		assert!(!snapshot.approvals_ready);
+		assert_eq!(snapshot.reason.as_deref(), Some("waiting_for_native_gas"));
+		assert_eq!(snapshot.blocked_signers.len(), 1);
+		assert_eq!(snapshot.blocked_signers[0].chain_id, 1);
 	}
 }

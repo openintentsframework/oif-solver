@@ -37,6 +37,24 @@ fn is_insufficient_native_gas(error: &crate::engine::token_manager::TokenManager
 	)
 }
 
+/// Pulls the chain id, signer address, and current balance out of a token
+/// manager error caused by insufficient native gas. Returns `None` for any
+/// other error variant.
+fn blocked_signer_from_error(
+	error: &crate::engine::token_manager::TokenManagerError,
+) -> Option<crate::engine::startup_readiness::BlockedSigner> {
+	match error {
+		crate::engine::token_manager::TokenManagerError::DeliveryError(
+			DeliveryError::InsufficientNativeGas(info),
+		) => Some(crate::engine::startup_readiness::BlockedSigner {
+			chain_id: info.chain_id,
+			signer: info.signer.clone(),
+			balance_wei: info.balance_wei.clone(),
+		}),
+		_ => None,
+	}
+}
+
 /// Errors that can occur during solver engine construction.
 ///
 /// These errors indicate problems with configuration or missing required components
@@ -576,7 +594,10 @@ impl SolverBuilder {
 
 		// Ensure all token approvals are set. If the signer has no native gas,
 		// don't crash startup — log a warning and retry in the background so the
-		// API stays up while an operator funds the signer.
+		// API stays up while an operator funds the signer. The deferred state is
+		// surfaced through the engine's startup readiness handle (see below).
+		let mut deferred_blocked_signer: Option<crate::engine::startup_readiness::BlockedSigner> =
+			None;
 		match token_manager.ensure_approvals().await {
 			Ok(()) => {
 				tracing::info!(
@@ -592,35 +613,7 @@ impl SolverBuilder {
 					"Startup token approvals deferred: signer lacks native gas. \
 					 Retrying every 30s in the background."
 				);
-				let retry_token_manager = Arc::clone(&token_manager);
-				tokio::spawn(async move {
-					loop {
-						tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-						match retry_token_manager.ensure_approvals().await {
-							Ok(()) => {
-								tracing::info!(
-									component = "token_manager",
-									"Startup token approvals completed after native gas became available"
-								);
-								return;
-							},
-							Err(retry_err) if is_insufficient_native_gas(&retry_err) => {
-								tracing::debug!(
-									component = "token_manager",
-									error = %retry_err,
-									"Still waiting for native gas to complete startup approvals"
-								);
-							},
-							Err(retry_err) => {
-								tracing::error!(
-									component = "token_manager",
-									error = %retry_err,
-									"Startup approval retry failed with non-gas error"
-								);
-							},
-						}
-					}
-				});
+				deferred_blocked_signer = blocked_signer_from_error(&e);
 			},
 			Err(e) => {
 				tracing::error!(
@@ -767,7 +760,9 @@ impl SolverBuilder {
 			None
 		};
 
-		Ok(SolverEngine::new(
+		let retry_token_manager = Arc::clone(&token_manager);
+
+		let engine = SolverEngine::new(
 			self.dynamic_config,
 			self.static_config,
 			storage,
@@ -781,7 +776,58 @@ impl SolverBuilder {
 			EventBus::new(1000),
 			token_manager,
 			bridge_service,
-		))
+		);
+
+		// If startup approvals were deferred for native gas, publish the
+		// blocked-signer state on the engine's readiness handle and spawn the
+		// retry loop. Using the engine's shared handle means /health reflects
+		// updates without any extra plumbing.
+		if let Some(blocked_signer) = deferred_blocked_signer {
+			let handle = engine.startup_readiness_handle();
+			*handle.write().await =
+				crate::engine::startup_readiness::StartupReadiness::waiting_for_native_gas(vec![
+					blocked_signer,
+				]);
+			let retry_handle = Arc::clone(&handle);
+			tokio::spawn(async move {
+				loop {
+					tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+					match retry_token_manager.ensure_approvals().await {
+						Ok(()) => {
+							tracing::info!(
+								component = "token_manager",
+								"Startup token approvals completed after native gas became available"
+							);
+							*retry_handle.write().await =
+								crate::engine::startup_readiness::StartupReadiness::ready();
+							return;
+						},
+						Err(retry_err) if is_insufficient_native_gas(&retry_err) => {
+							tracing::debug!(
+								component = "token_manager",
+								error = %retry_err,
+								"Still waiting for native gas to complete startup approvals"
+							);
+							if let Some(updated) = blocked_signer_from_error(&retry_err) {
+								*retry_handle.write().await =
+									crate::engine::startup_readiness::StartupReadiness::waiting_for_native_gas(
+										vec![updated],
+									);
+							}
+						},
+						Err(retry_err) => {
+							tracing::error!(
+								component = "token_manager",
+								error = %retry_err,
+								"Startup approval retry failed with non-gas error"
+							);
+						},
+					}
+				}
+			});
+		}
+
+		Ok(engine)
 	}
 }
 
@@ -837,5 +883,47 @@ mod tests {
 		let err = TokenManagerError::ParseError("nope".to_string());
 
 		assert!(!is_insufficient_native_gas(&err));
+	}
+
+	#[test]
+	fn blocked_signer_from_native_gas_error_uses_chain_signer_balance() {
+		use crate::engine::startup_readiness::BlockedSigner;
+		use crate::engine::token_manager::TokenManagerError;
+		use solver_delivery::{DeliveryError, InsufficientNativeGasInfo};
+
+		let err = TokenManagerError::DeliveryError(DeliveryError::InsufficientNativeGas(Box::new(
+			InsufficientNativeGasInfo {
+				chain_id: 8453,
+				signer: "0xsolver".to_string(),
+				balance_wei: "1000000000000".to_string(),
+				required_wei: "5000000000000".to_string(),
+				shortfall_wei: "4000000000000".to_string(),
+				gas_limit: None,
+				max_fee_per_gas: None,
+				gas_price: None,
+				value_wei: "0".to_string(),
+			},
+		)));
+
+		let signer =
+			blocked_signer_from_error(&err).expect("native gas error yields blocked signer");
+
+		assert_eq!(
+			signer,
+			BlockedSigner {
+				chain_id: 8453,
+				signer: "0xsolver".to_string(),
+				balance_wei: "1000000000000".to_string(),
+			}
+		);
+	}
+
+	#[test]
+	fn blocked_signer_from_unrelated_error_is_none() {
+		use crate::engine::token_manager::TokenManagerError;
+
+		let err = TokenManagerError::ParseError("nope".to_string());
+
+		assert!(blocked_signer_from_error(&err).is_none());
 	}
 }

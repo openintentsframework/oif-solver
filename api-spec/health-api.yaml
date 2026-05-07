@@ -1,0 +1,290 @@
+openapi: 3.0.3
+info:
+  title: OIF Solver Health API
+  description: |
+    Health check endpoint for the OIF Solver. Reports storage readiness,
+    Redis persistence status (when applicable), and startup readiness so
+    operators and frontends can detect process-up-but-not-yet-operational
+    states such as "waiting on signer to be funded with native gas".
+  version: 1.0.0
+servers:
+  - url: http://localhost:3000
+    description: Local development server
+  - url: https://api.solver.example.com
+    description: Production server (replace with actual URL)
+
+paths:
+  /health:
+    get:
+      summary: Solver health check
+      description: |
+        Returns the solver's health, storage readiness, and startup readiness.
+
+        - `200 OK` indicates the API process is alive and storage is reachable.
+        - `503 Service Unavailable` indicates storage or another core dependency
+          is not ready.
+        - The `startup` block reports whether startup token approvals have
+          completed. While `approvals_ready: false`, the API is still up and
+          read-only/admin endpoints work, but submitted orders cannot be
+          filled until the listed signers are funded with native gas.
+      operationId: getHealth
+      tags:
+        - Health
+      responses:
+        "200":
+          description: |
+            Storage is ready. The response may still indicate that startup
+            approvals are pending (`startup.approvals_ready == false`).
+            Frontends should inspect `startup` to decide whether to surface a
+            "fund this address" prompt.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              examples:
+                healthy:
+                  summary: Fully operational
+                  value:
+                    status: "healthy"
+                    storage:
+                      backend: "Redis"
+                      ready: true
+                      checks: []
+                      details: {}
+                    redis:
+                      connected: true
+                      persistence_enabled: true
+                      rdb_enabled: true
+                      aof_enabled: false
+                    solver_id: "my-solver"
+                    version: "0.1.0"
+                    startup:
+                      approvals_ready: true
+                waiting_for_native_gas:
+                  summary: Process up, startup approvals deferred
+                  value:
+                    status: "healthy"
+                    storage:
+                      backend: "Redis"
+                      ready: true
+                      checks: []
+                      details: {}
+                    redis:
+                      connected: true
+                      persistence_enabled: true
+                      rdb_enabled: true
+                      aof_enabled: false
+                    solver_id: "my-solver"
+                    version: "0.1.0"
+                    startup:
+                      approvals_ready: false
+                      reason: "waiting_for_native_gas"
+                      blocked_signers:
+                        - chain_id: 1
+                          signer: "0x3c0189d526e484824881217322048c055cb20f29"
+                          balance_wei: "0"
+        "503":
+          description: |
+            Storage or another core dependency is not ready. The body still
+            includes the `startup` block when available so callers can
+            distinguish "storage broken" from "waiting on funding".
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: "unhealthy"
+                storage:
+                  backend: "Redis"
+                  ready: false
+                  checks: []
+                  details: {}
+                  error: "Connection refused"
+                redis:
+                  connected: false
+                  persistence_enabled: false
+                  rdb_enabled: false
+                  aof_enabled: false
+                  error: "Connection refused"
+                solver_id: "my-solver"
+                version: "0.1.0"
+                startup:
+                  approvals_ready: true
+
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      description: Solver health, storage readiness, and startup readiness.
+      required:
+        - status
+        - storage
+        - solver_id
+        - version
+        - startup
+      properties:
+        status:
+          type: string
+          enum: ["healthy", "unhealthy"]
+          description: |
+            Overall health status. `healthy` means storage is ready; the
+            startup block must be inspected separately to know whether
+            startup approvals have completed.
+          example: "healthy"
+        storage:
+          $ref: "#/components/schemas/StorageHealth"
+        redis:
+          $ref: "#/components/schemas/RedisHealth"
+          nullable: true
+          description: Present only when the storage backend is Redis.
+        solver_id:
+          type: string
+          description: Solver ID from configuration.
+          example: "my-solver"
+        version:
+          type: string
+          description: Application version.
+          example: "0.1.0"
+        startup:
+          $ref: "#/components/schemas/StartupReadiness"
+
+    StorageHealth:
+      type: object
+      description: Generic storage backend health.
+      required:
+        - backend
+        - ready
+        - checks
+        - details
+      properties:
+        backend:
+          type: string
+          description: Backend name.
+          example: "Redis"
+        ready:
+          type: boolean
+          description: Whether the backend is ready for operation.
+          example: true
+        checks:
+          type: array
+          description: Individual readiness checks.
+          items:
+            $ref: "#/components/schemas/ReadinessCheck"
+        details:
+          type: object
+          description: Additional details for debugging.
+          additionalProperties:
+            type: string
+        error:
+          type: string
+          nullable: true
+          description: Optional error message when readiness check failed.
+
+    ReadinessCheck:
+      type: object
+      required:
+        - name
+        - passed
+        - status
+      properties:
+        name:
+          type: string
+          example: "connectivity"
+        passed:
+          type: boolean
+          example: true
+        status:
+          type: string
+          example: "CONNECTED"
+        message:
+          type: string
+          nullable: true
+
+    RedisHealth:
+      type: object
+      description: Redis-specific health info, only populated for Redis backends.
+      required:
+        - connected
+        - persistence_enabled
+        - rdb_enabled
+        - aof_enabled
+      properties:
+        connected:
+          type: boolean
+          example: true
+        persistence_enabled:
+          type: boolean
+          description: True when either RDB or AOF persistence is enabled.
+          example: true
+        rdb_enabled:
+          type: boolean
+          example: true
+        aof_enabled:
+          type: boolean
+          example: false
+        error:
+          type: string
+          nullable: true
+
+    StartupReadiness:
+      type: object
+      description: |
+        Whether the solver completed its startup token approvals.
+        `approvals_ready: true` is the steady state. When the signer lacks
+        native gas at startup, `approvals_ready: false` is reported with a
+        list of `blocked_signers` so a frontend can prompt the operator to
+        fund the listed addresses. The solver retries approvals every 30
+        seconds in the background and flips back to `approvals_ready: true`
+        once they succeed.
+      required:
+        - approvals_ready
+      properties:
+        approvals_ready:
+          type: boolean
+          description: True when startup token approvals have completed.
+          example: false
+        reason:
+          type: string
+          nullable: true
+          description: |
+            Machine-readable reason while `approvals_ready` is false. Omitted
+            when approvals are ready.
+          enum: ["waiting_for_native_gas"]
+          example: "waiting_for_native_gas"
+        blocked_signers:
+          type: array
+          description: |
+            Per-signer detail explaining why startup approvals could not run.
+            Omitted when approvals are ready.
+          items:
+            $ref: "#/components/schemas/BlockedSigner"
+
+    BlockedSigner:
+      type: object
+      description: A signer that needs to be funded with native gas.
+      required:
+        - chain_id
+        - signer
+        - balance_wei
+      properties:
+        chain_id:
+          type: integer
+          format: int64
+          description: Chain on which the signer needs native gas.
+          example: 1
+        signer:
+          type: string
+          pattern: "^0x[a-fA-F0-9]{40}$"
+          description: Signer address to fund.
+          example: "0x3c0189d526e484824881217322048c055cb20f29"
+        balance_wei:
+          type: string
+          description: Current native balance in wei (decimal string).
+          example: "0"
+
+tags:
+  - name: Health
+    description: |
+      Health check endpoint for monitoring dashboards, load-balancer probes,
+      and frontends that need to detect deferred-startup conditions like
+      "waiting for the signer to be funded".
