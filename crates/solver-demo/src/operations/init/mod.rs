@@ -775,7 +775,7 @@ fn generate_demo_config(
 				"discovery": "offchain_eip7683"
 			},
 			"auth": {
-				"enabled": true,
+				"orders_auth_enabled": true,
 				"jwt_secret": "${JWT_SECRET:-MySuperDuperSecureSecret123!}",
 				"access_token_expiry_hours": 1,
 				"refresh_token_expiry_hours": 720,
