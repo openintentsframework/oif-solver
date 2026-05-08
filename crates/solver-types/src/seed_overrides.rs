@@ -22,7 +22,7 @@
 //!       "rpc_urls": ["https://user-rpc.com"]
 //!     }
 //!   ],
-//!   "auth_enabled": true,
+//!   "orders_auth_enabled": true,
 //!   "min_profitability_pct": "2.0",
 //!   "gas_buffer_bps": 1500,
 //!   "admin": {
@@ -80,10 +80,13 @@ pub struct SeedOverrides {
 	#[serde(default)]
 	pub admin: Option<AdminOverride>,
 
-	/// Enable JWT authentication on API routes.
-	/// When true, orders and protected admin endpoints require a JWT.
+	/// Enable JWT authentication on the public Orders API.
+	///
+	/// When true, `POST /orders` and `GET /orders/{id}` require a JWT with the
+	/// matching scope. Independent of [`AdminOverride::enabled`] — admin SIWE
+	/// login works whenever `admin.enabled` is true, regardless of this flag.
 	#[serde(default)]
-	pub auth_enabled: Option<bool>,
+	pub orders_auth_enabled: Option<bool>,
 
 	/// Minimum profitability percentage (e.g., 1.0 = 1%).
 	/// If not set, uses seed default (typically 1.0%).
@@ -706,7 +709,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -744,7 +747,7 @@ mod tests {
 			}],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -787,7 +790,7 @@ mod tests {
 			}],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
@@ -870,7 +873,7 @@ mod tests {
 			}],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			commission_bps: None,
