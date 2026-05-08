@@ -858,11 +858,12 @@ sequenceDiagram
 #### Health
 
 - **GET `/health`** - Health check endpoint
-  - Returns solver health status including Redis connectivity and persistence info
-  - Response:
+  - Returns solver health status including storage readiness, Redis persistence info, and startup readiness.
+  - **Steady-state response (fully operational):**
     ```json
     {
       "status": "healthy",
+      "storage": { "backend": "Redis", "ready": true, "checks": [], "details": {} },
       "redis": {
         "connected": true,
         "persistence_enabled": true,
@@ -870,10 +871,29 @@ sequenceDiagram
         "aof_enabled": false
       },
       "solver_id": "my-solver",
-      "version": "0.1.0"
+      "version": "0.1.0",
+      "startup": { "approvals_ready": true }
     }
     ```
-  - Status codes: `200 OK` (healthy), `503 Service Unavailable` (unhealthy)
+  - **While the signer needs native gas to complete startup approvals**, the API stays up and HTTP `200 OK` is returned, but `startup.approvals_ready` is `false` and `blocked_signers` lists the addresses that need funding. The solver retries approvals every 30 seconds and the field flips to `true` automatically once they succeed.
+    ```json
+    {
+      "status": "healthy",
+      "storage": { "backend": "Redis", "ready": true, "checks": [], "details": {} },
+      "redis": { "connected": true, "persistence_enabled": true, "rdb_enabled": true, "aof_enabled": false },
+      "solver_id": "my-solver",
+      "version": "0.1.0",
+      "startup": {
+        "approvals_ready": false,
+        "reason": "waiting_for_native_gas",
+        "blocked_signers": [
+          { "chain_id": 1, "signer": "0x3c0189...", "balance_wei": "0" }
+        ]
+      }
+    }
+    ```
+  - Frontends should branch on `startup.approvals_ready`, not on the HTTP status, to surface a "fund this address" prompt.
+  - Status codes: `200 OK` when storage is ready (regardless of startup readiness), `503 Service Unavailable` when storage or another core dependency is not ready.
 
 #### Admin API (Wallet-Based Authentication)
 
