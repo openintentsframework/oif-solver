@@ -6,6 +6,7 @@
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Serialize;
+use solver_core::engine::startup_readiness::StartupReadiness;
 use solver_storage::{check_storage_readiness, PersistencePolicy, ReadinessCheck, StoreConfig};
 use std::collections::HashMap;
 
@@ -25,6 +26,11 @@ pub struct HealthResponse {
 	pub solver_id: String,
 	/// Application version
 	pub version: String,
+	/// Startup readiness state. `approvals_ready: true` when the solver
+	/// completed its startup token approvals; `false` while it is waiting
+	/// on the signer to be funded with native gas. Frontends can poll
+	/// `/health` and prompt the operator using `blocked_signers`.
+	pub startup: StartupReadiness,
 }
 
 /// Redis health status.
@@ -61,14 +67,17 @@ pub struct StorageHealth {
 
 /// GET /health - Full health check endpoint.
 ///
-/// Returns detailed health information including Redis status.
-/// Used for monitoring dashboards and alerting.
+/// Returns storage readiness, Redis persistence info, and startup
+/// readiness. Used for monitoring dashboards, load-balancer probes, and
+/// frontends that need to detect deferred-startup conditions (e.g.
+/// "waiting for the signer to be funded with native gas").
 ///
-/// # Response
+/// # Response (steady state)
 ///
 /// ```json
 /// {
 ///   "status": "healthy",
+///   "storage": { "backend": "Redis", "ready": true, "checks": [], "details": {} },
 ///   "redis": {
 ///     "connected": true,
 ///     "persistence_enabled": true,
@@ -76,15 +85,41 @@ pub struct StorageHealth {
 ///     "aof_enabled": false
 ///   },
 ///   "solver_id": "my-solver",
-///   "version": "0.1.0"
+///   "version": "0.1.0",
+///   "startup": { "approvals_ready": true }
+/// }
+/// ```
+///
+/// # Response (waiting on native gas)
+///
+/// HTTP status remains `200 OK` so load balancers do not flap. Frontends
+/// should branch on `startup.approvals_ready` to detect the deferred state.
+///
+/// ```json
+/// {
+///   "status": "healthy",
+///   "storage": { "backend": "Redis", "ready": true, "checks": [], "details": {} },
+///   "solver_id": "my-solver",
+///   "version": "0.1.0",
+///   "startup": {
+///     "approvals_ready": false,
+///     "reason": "waiting_for_native_gas",
+///     "blocked_signers": [
+///       { "chain_id": 1, "signer": "0x...", "balance_wei": "0" }
+///     ]
+///   }
 /// }
 /// ```
 ///
 /// # Status Codes
 ///
-/// - `200 OK` - Healthy (Redis connected)
-/// - `503 Service Unavailable` - Unhealthy (Redis disconnected)
+/// - `200 OK` - Storage is ready. `startup.approvals_ready` may still be
+///   `false` if startup token approvals are deferred for native gas.
+/// - `503 Service Unavailable` - Storage or another core dependency is
+///   not ready.
 pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
+	let startup = state.solver.startup_readiness().await;
+
 	let store_config = match StoreConfig::from_env() {
 		Ok(config) => config,
 		Err(e) => {
@@ -100,6 +135,7 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 				redis: None,
 				solver_id: state.config.read().await.solver.id.clone(),
 				version: env!("CARGO_PKG_VERSION").to_string(),
+				startup: startup.clone(),
 			};
 
 			return (StatusCode::SERVICE_UNAVAILABLE, Json(response));
@@ -168,6 +204,7 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 		redis: redis_health,
 		solver_id,
 		version: env!("CARGO_PKG_VERSION").to_string(),
+		startup,
 	};
 
 	let status_code = if response.status == "healthy" {
@@ -182,6 +219,65 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn health_response_includes_startup_field_when_waiting_for_native_gas() {
+		use solver_core::engine::startup_readiness::{BlockedSigner, StartupReadiness};
+
+		let response = HealthResponse {
+			status: "healthy".to_string(),
+			storage: StorageHealth {
+				backend: "Memory".to_string(),
+				ready: true,
+				checks: Vec::new(),
+				details: HashMap::new(),
+				error: None,
+			},
+			redis: None,
+			solver_id: "test-solver".to_string(),
+			version: "0.1.0".to_string(),
+			startup: StartupReadiness::waiting_for_native_gas(vec![BlockedSigner {
+				chain_id: 8453,
+				signer: "0xsolver".to_string(),
+				balance_wei: "0".to_string(),
+			}]),
+		};
+
+		let json = serde_json::to_string(&response).unwrap();
+
+		assert!(json.contains("\"startup\""));
+		assert!(json.contains("\"approvals_ready\":false"));
+		assert!(json.contains("\"reason\":\"waiting_for_native_gas\""));
+		assert!(json.contains("\"chain_id\":8453"));
+		assert!(json.contains("\"signer\":\"0xsolver\""));
+		assert!(json.contains("\"balance_wei\":\"0\""));
+	}
+
+	#[test]
+	fn health_response_omits_blocked_signers_when_ready() {
+		use solver_core::engine::startup_readiness::StartupReadiness;
+
+		let response = HealthResponse {
+			status: "healthy".to_string(),
+			storage: StorageHealth {
+				backend: "Memory".to_string(),
+				ready: true,
+				checks: Vec::new(),
+				details: HashMap::new(),
+				error: None,
+			},
+			redis: None,
+			solver_id: "test-solver".to_string(),
+			version: "0.1.0".to_string(),
+			startup: StartupReadiness::ready(),
+		};
+
+		let json = serde_json::to_string(&response).unwrap();
+
+		assert!(json.contains("\"approvals_ready\":true"));
+		assert!(!json.contains("blocked_signers"));
+		assert!(!json.contains("\"reason\""));
+	}
 
 	#[test]
 	fn test_health_response_serialization_healthy() {
@@ -203,6 +299,7 @@ mod tests {
 			}),
 			solver_id: "test-solver".to_string(),
 			version: "0.1.0".to_string(),
+			startup: solver_core::engine::startup_readiness::StartupReadiness::ready(),
 		};
 
 		let json = serde_json::to_string(&response).unwrap();
@@ -236,6 +333,7 @@ mod tests {
 			}),
 			solver_id: "test-solver".to_string(),
 			version: "0.1.0".to_string(),
+			startup: solver_core::engine::startup_readiness::StartupReadiness::ready(),
 		};
 
 		let json = serde_json::to_string(&response).unwrap();
@@ -423,6 +521,7 @@ mod tests {
 			redis: None,
 			solver_id: "test-solver".to_string(),
 			version: "0.1.0".to_string(),
+			startup: solver_core::engine::startup_readiness::StartupReadiness::ready(),
 		};
 
 		let json = serde_json::to_string(&response).unwrap();
@@ -451,6 +550,7 @@ mod tests {
 			redis: None,
 			solver_id: "file-solver".to_string(),
 			version: "0.1.0".to_string(),
+			startup: solver_core::engine::startup_readiness::StartupReadiness::ready(),
 		};
 
 		let json = serde_json::to_string(&response).unwrap();
