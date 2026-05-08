@@ -4134,6 +4134,7 @@ dependencies = [
  "tokio-rustls 0.26.2",
  "tokio-util",
  "url",
+ "webpki-roots 1.0.2",
 ]
 
 [[package]]
@@ -5267,6 +5268,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rust_decimal",
+ "rustls 0.23.31",
  "secp256k1 0.31.1",
  "serde",
  "serde_json",

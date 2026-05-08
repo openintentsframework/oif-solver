@@ -84,6 +84,13 @@ struct Args {
 /// 5. Runs the solver until interrupted
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+	// Install the rustls crypto provider before any TLS connections are made.
+	// Required for TLS-enabled Redis (e.g. AWS MemoryDB) — without this, the
+	// first TLS handshake panics with "no process-level CryptoProvider available".
+	rustls::crypto::aws_lc_rs::default_provider()
+		.install_default()
+		.expect("failed to install rustls crypto provider");
+
 	let args = Args::parse();
 
 	// Initialize tracing with env filter
