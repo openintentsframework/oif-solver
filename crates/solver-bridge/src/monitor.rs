@@ -221,7 +221,10 @@ impl RebalanceMonitor {
 				// stays NeedsIntervention.
 				if !transfer.wrap_submit_attempted && transfer.wrap_tx_hash.is_none() {
 					transfer.wrap_submit_attempted = true;
-					self.bridge_service.storage().save_transfer(&transfer).await?;
+					self.bridge_service
+						.storage()
+						.save_transfer(&transfer)
+						.await?;
 					let _permit = self.transaction_semaphore.acquire().await.map_err(|e| {
 						crate::BridgeError::TransactionFailed(format!(
 							"Failed to acquire semaphore for wrap resubmit: {e}"
@@ -229,9 +232,11 @@ impl RebalanceMonitor {
 					})?;
 					match bridge_impl.wrap_native(&transfer).await {
 						Ok(tx_hash) => {
-							transfer.wrap_tx_hash =
-								Some(format!("0x{}", hex::encode(&tx_hash.0)));
-							self.bridge_service.storage().save_transfer(&transfer).await?;
+							transfer.wrap_tx_hash = Some(format!("0x{}", hex::encode(&tx_hash.0)));
+							self.bridge_service
+								.storage()
+								.save_transfer(&transfer)
+								.await?;
 							tracing::info!(
 								transfer_id = %transfer.id,
 								"Wrap re-submitted after prior dropped tx"
@@ -248,7 +253,10 @@ impl RebalanceMonitor {
 						},
 						Err(crate::BridgeError::NonceTooLow(reason)) => {
 							transfer.wrap_submit_attempted = false;
-							self.bridge_service.storage().save_transfer(&transfer).await?;
+							self.bridge_service
+								.storage()
+								.save_transfer(&transfer)
+								.await?;
 							tracing::warn!(
 								transfer_id = %transfer.id,
 								reason = %reason,
@@ -305,10 +313,7 @@ impl RebalanceMonitor {
 									"Wrap confirmed; advancing to Submitted and submitting bridge"
 								);
 								self.bridge_service
-									.update_transfer(
-										&mut transfer,
-										BridgeTransferStatus::Submitted,
-									)
+									.update_transfer(&mut transfer, BridgeTransferStatus::Submitted)
 									.await?;
 								// Continue the orchestration via the existing
 								// resume helper — reconstructs BridgeRequest +
@@ -345,9 +350,7 @@ impl RebalanceMonitor {
 							{
 								Ok(false) => {
 									transfer.wrap_missing_checks += 1;
-									if transfer.wrap_missing_checks
-										>= WRAP_MISSING_CHECKS_MAX
-									{
+									if transfer.wrap_missing_checks >= WRAP_MISSING_CHECKS_MAX {
 										tracing::warn!(
 											transfer_id = %transfer.id,
 											"WrapPending: wrap tx missing from chain for {WRAP_MISSING_CHECKS_MAX} ticks — clearing for resubmit"
@@ -925,9 +928,8 @@ impl RebalanceMonitor {
 							.is_some();
 						if dest_has_wrapper {
 							if let Some(hash_str) = transfer.redeem_tx_hash.as_ref() {
-								let hash_bytes = hex::decode(
-									hash_str.strip_prefix("0x").unwrap_or(hash_str),
-								);
+								let hash_bytes =
+									hex::decode(hash_str.strip_prefix("0x").unwrap_or(hash_str));
 								if let Ok(hash_bytes) = hash_bytes {
 									let tx_hash_obj = solver_types::TransactionHash(hash_bytes);
 									if let Ok(receipt) = self
@@ -937,8 +939,7 @@ impl RebalanceMonitor {
 									{
 										match bridge_impl.parse_redeem_assets(&receipt) {
 											Ok(assets) => {
-												transfer.unwrap_amount =
-													Some(assets.to_string());
+												transfer.unwrap_amount = Some(assets.to_string());
 												new_status = BridgeTransferStatus::UnwrapPending;
 												tracing::info!(
 													transfer_id = %transfer.id,
@@ -952,9 +953,10 @@ impl RebalanceMonitor {
 													error = %e,
 													"parse_redeem_assets failed; escalating to NeedsIntervention"
 												);
-												new_status = BridgeTransferStatus::NeedsIntervention(
-													format!("redeem receipt parse failed: {e}"),
-												);
+												new_status =
+													BridgeTransferStatus::NeedsIntervention(
+														format!("redeem receipt parse failed: {e}"),
+													);
 											},
 										}
 									}
@@ -1065,7 +1067,9 @@ impl RebalanceMonitor {
 								let dest_has_wrapper = transfer
 									.route_snapshot
 									.as_ref()
-									.and_then(|r| Self::route_wrapper_address(r, transfer.dest_chain))
+									.and_then(|r| {
+										Self::route_wrapper_address(r, transfer.dest_chain)
+									})
 									.is_some();
 								let new_status = if transfer.is_composer_flow == Some(true) {
 									if dest_has_wrapper {
@@ -1196,7 +1200,10 @@ impl RebalanceMonitor {
 						// Persist the crash-window marker BEFORE broadcast so we
 						// can escalate (not auto-retry) on the ambiguous case.
 						transfer.redeem_submit_attempted = true;
-						self.bridge_service.storage().save_transfer(&transfer).await?;
+						self.bridge_service
+							.storage()
+							.save_transfer(&transfer)
+							.await?;
 
 						match self.delivery.deliver(redeem_tx, None).await {
 							Ok(tx_hash) => {
@@ -1263,7 +1270,10 @@ impl RebalanceMonitor {
 				&& transfer.unwrap_tx_hash.is_none()
 			{
 				transfer.unwrap_submit_attempted = true;
-				self.bridge_service.storage().save_transfer(&transfer).await?;
+				self.bridge_service
+					.storage()
+					.save_transfer(&transfer)
+					.await?;
 				let _permit = self.transaction_semaphore.acquire().await.map_err(|e| {
 					crate::BridgeError::TransactionFailed(format!(
 						"Failed to acquire semaphore for unwrap: {e}"
@@ -1271,8 +1281,7 @@ impl RebalanceMonitor {
 				})?;
 				match bridge_impl.unwrap_native(&transfer).await {
 					Ok(tx_hash) => {
-						transfer.unwrap_tx_hash =
-							Some(format!("0x{}", hex::encode(&tx_hash.0)));
+						transfer.unwrap_tx_hash = Some(format!("0x{}", hex::encode(&tx_hash.0)));
 						tracing::info!(
 							transfer_id = %transfer.id,
 							"Unwrap submitted"
@@ -1583,8 +1592,7 @@ impl RebalanceMonitor {
 				// (round-1..8 design) wins when present; legacy chain-keyed
 				// `bridge_config` is the fallback for USDC-style pairs.
 				let (is_composer, vault_addr) = if let Some(route) = pair.bridge_route.as_ref() {
-					let composer_chain =
-						route.get("composer_chain_id").and_then(|v| v.as_u64());
+					let composer_chain = route.get("composer_chain_id").and_then(|v| v.as_u64());
 					let is_composer = composer_chain == Some(source_side.chain_id);
 					let vault = route
 						.get("vault")
@@ -1635,16 +1643,15 @@ impl RebalanceMonitor {
 				// target. For non-composer (inbound), the existing scan path
 				// already falls back to `vault_address` so we keep the pair
 				// token here (which is what the existing tests expect).
-				let delivery_scan_token: String = if is_composer
-					&& dest_side.token_address.eq_ignore_ascii_case(zero_str)
-				{
-					pair.bridge_route
-						.as_ref()
-						.and_then(|r| Self::route_wrapper_address(r, dest_side.chain_id))
-						.unwrap_or_else(|| dest_side.token_address.clone())
-				} else {
-					dest_side.token_address.clone()
-				};
+				let delivery_scan_token: String =
+					if is_composer && dest_side.token_address.eq_ignore_ascii_case(zero_str) {
+						pair.bridge_route
+							.as_ref()
+							.and_then(|r| Self::route_wrapper_address(r, dest_side.chain_id))
+							.unwrap_or_else(|| dest_side.token_address.clone())
+					} else {
+						dest_side.token_address.clone()
+					};
 
 				let metadata = crate::types::TransferMetadata {
 					source_token_address: effective_source_token,
@@ -1717,9 +1724,7 @@ impl RebalanceMonitor {
 				.await;
 		}
 		// Native side: native + wrapper balance.
-		let native = delivery
-			.get_balance(chain_id, solver_address, None)
-			.await?;
+		let native = delivery.get_balance(chain_id, solver_address, None).await?;
 		let wrapper = bridge_route.and_then(|r| Self::route_wrapper_address(r, chain_id));
 		let wrapper_balance = match wrapper {
 			Some(addr) => delivery
@@ -1736,10 +1741,7 @@ impl RebalanceMonitor {
 	/// Bridge-generic helper: look up the wrapper address for a given chain on
 	/// a per-pair `bridge_route` JSON blob. Returns `None` when the route is
 	/// absent, the side isn't found, or the side has no wrapper.
-	fn route_wrapper_address(
-		route: &serde_json::Value,
-		chain_id: u64,
-	) -> Option<String> {
+	fn route_wrapper_address(route: &serde_json::Value, chain_id: u64) -> Option<String> {
 		for side_key in ["chain_a", "chain_b"] {
 			let Some(side) = route.get(side_key) else {
 				continue;

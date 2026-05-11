@@ -1361,6 +1361,7 @@ mod tests {
 			target_balance_b: "1000000".to_string(),
 			deviation_band_bps: 2000,
 			max_bridge_amount: "500000".to_string(),
+			bridge_route: None,
 		};
 
 		// pair_id is the value set by the operator, not derived
@@ -1387,6 +1388,7 @@ mod tests {
 			target_balance_b: "1000000".to_string(),
 			deviation_band_bps: 2000,
 			max_bridge_amount: "500000".to_string(),
+			bridge_route: None,
 		};
 
 		let bridged_usdc = RebalancePairConfig {
@@ -1406,6 +1408,7 @@ mod tests {
 			target_balance_b: "1000000".to_string(),
 			deviation_band_bps: 2000,
 			max_bridge_amount: "500000".to_string(),
+			bridge_route: None,
 		};
 
 		// Distinct pair_ids — no collision

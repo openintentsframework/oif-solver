@@ -301,16 +301,10 @@ mod tests {
 			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::Relaying)));
 		assert!(transfers
 			.iter()
-			.any(|transfer| matches!(
-				transfer.status,
-				BridgeTransferStatus::PendingRedemption
-			)));
+			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::PendingRedemption)));
 		assert!(transfers
 			.iter()
-			.any(|transfer| matches!(
-				transfer.status,
-				BridgeTransferStatus::UnwrapPending
-			)));
+			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::UnwrapPending)));
 		assert!(transfers
 			.iter()
 			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::NeedsIntervention(_))));
@@ -340,7 +334,10 @@ mod tests {
 
 		storage.save_transfer(&matching_submitted).await.unwrap();
 		storage.save_transfer(&matching_wrap_pending).await.unwrap();
-		storage.save_transfer(&matching_unwrap_pending).await.unwrap();
+		storage
+			.save_transfer(&matching_unwrap_pending)
+			.await
+			.unwrap();
 		storage.save_transfer(&matching_intervention).await.unwrap();
 		storage.save_transfer(&other_pair).await.unwrap();
 
@@ -361,10 +358,7 @@ mod tests {
 			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::Submitted)));
 		assert!(transfers
 			.iter()
-			.any(|transfer| matches!(
-				transfer.status,
-				BridgeTransferStatus::UnwrapPending
-			)));
+			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::UnwrapPending)));
 		assert!(transfers
 			.iter()
 			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::NeedsIntervention(_))));

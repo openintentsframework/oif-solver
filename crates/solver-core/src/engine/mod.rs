@@ -389,22 +389,23 @@ impl SolverEngine {
 							Vec::with_capacity(rebalance.pairs.len());
 						let mut convert_err: Option<String> = None;
 						for p in &rebalance.pairs {
-							let parse =
-								|hex_str: &str, field: &str| -> Result<alloy_primitives::Address, String> {
-									let s = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-									let bytes = hex::decode(s).map_err(|e| {
-										format!("pair '{}' {} not hex: {e}", p.pair_id, field)
-									})?;
-									if bytes.len() != 20 {
-										return Err(format!(
-											"pair '{}' {} not 20 bytes",
-											p.pair_id, field
-										));
-									}
-									let mut arr = [0u8; 20];
-									arr.copy_from_slice(&bytes);
-									Ok(alloy_primitives::Address::from(arr))
-								};
+							let parse = |hex_str: &str,
+							             field: &str|
+							 -> Result<alloy_primitives::Address, String> {
+								let s = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+								let bytes = hex::decode(s).map_err(|e| {
+									format!("pair '{}' {} not hex: {e}", p.pair_id, field)
+								})?;
+								if bytes.len() != 20 {
+									return Err(format!(
+										"pair '{}' {} not 20 bytes",
+										p.pair_id, field
+									));
+								}
+								let mut arr = [0u8; 20];
+								arr.copy_from_slice(&bytes);
+								Ok(alloy_primitives::Address::from(arr))
+							};
 							let chain_a = match (
 								parse(&p.chain_a.token_address, "chain_a.token_address"),
 								parse(&p.chain_a.oft_address, "chain_a.oft_address"),

@@ -496,7 +496,10 @@ pub async fn handle_trigger_rebalance(
 	let (is_composer, vault_addr) = if let Some(route) = pair.bridge_route.as_ref() {
 		let composer_chain = route.get("composer_chain_id").and_then(|v| v.as_u64());
 		let is_composer = composer_chain == Some(request.source_chain);
-		let vault = route.get("vault").and_then(|v| v.as_str()).map(|s| s.to_string());
+		let vault = route
+			.get("vault")
+			.and_then(|v| v.as_str())
+			.map(|s| s.to_string());
 		(is_composer, vault)
 	} else {
 		let is_composer = rebalance_config
@@ -531,14 +534,21 @@ pub async fn handle_trigger_rebalance(
 		pair.bridge_route
 			.as_ref()
 			.and_then(|r| {
-				let key = if r.get("chain_a").and_then(|s| s.get("chain_id")).and_then(|v| v.as_u64())
+				let key = if r
+					.get("chain_a")
+					.and_then(|s| s.get("chain_id"))
+					.and_then(|v| v.as_u64())
 					== Some(request.source_chain)
 				{
 					"chain_a"
 				} else {
 					"chain_b"
 				};
-				r.get(key).and_then(|s| s.get("wrapper")).and_then(|w| w.get("address")).and_then(|a| a.as_str()).map(String::from)
+				r.get(key)
+					.and_then(|s| s.get("wrapper"))
+					.and_then(|w| w.get("address"))
+					.and_then(|a| a.as_str())
+					.map(String::from)
 			})
 			.unwrap_or_else(|| source_side.token_address.to_string())
 	} else {

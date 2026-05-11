@@ -538,10 +538,10 @@ impl LayerZeroBridge {
 	/// Resolve which side of the route corresponds to `target_chain`. Returns
 	/// `BridgeError::Config` if the chain isn't part of the route — config
 	/// validation should have caught this earlier.
-	fn resolve_side<'r>(
-		route: &'r types::LayerZeroBridgeRoute,
+	fn resolve_side(
+		route: &types::LayerZeroBridgeRoute,
 		target_chain: u64,
-	) -> Result<&'r types::SideRoute, BridgeError> {
+	) -> Result<&types::SideRoute, BridgeError> {
 		route.resolve_side(target_chain).ok_or_else(|| {
 			BridgeError::Config(format!(
 				"transfer chain {target_chain} not in route (route has {} and {})",
@@ -611,7 +611,12 @@ impl LayerZeroBridge {
 		receiver: Address,
 		owner: Address,
 	) -> solver_types::Transaction {
-		let data = contracts::redeemCall { shares, receiver, owner }.abi_encode();
+		let data = contracts::redeemCall {
+			shares,
+			receiver,
+			owner,
+		}
+		.abi_encode();
 		build_tx(chain_id, vault_address, data, U256::ZERO, None)
 	}
 
@@ -922,7 +927,8 @@ impl BridgeInterface for LayerZeroBridge {
 
 		match wrapper.strategy {
 			types::WrapStrategy::Weth9 => {
-				let tx = Self::build_weth9_deposit_tx(transfer.source_chain, wrapper.address, amount);
+				let tx =
+					Self::build_weth9_deposit_tx(transfer.source_chain, wrapper.address, amount);
 				self.delivery
 					.deliver(tx, None)
 					.await
@@ -946,7 +952,8 @@ impl BridgeInterface for LayerZeroBridge {
 
 		match wrapper.strategy {
 			types::WrapStrategy::Weth9 => {
-				let tx = Self::build_weth9_withdraw_tx(transfer.dest_chain, wrapper.address, amount);
+				let tx =
+					Self::build_weth9_withdraw_tx(transfer.dest_chain, wrapper.address, amount);
 				self.delivery
 					.deliver(tx, None)
 					.await
@@ -1023,8 +1030,8 @@ impl BridgeInterface for LayerZeroBridge {
 			let Some(route_json) = &pair.bridge_route else {
 				continue;
 			};
-			let route: types::LayerZeroBridgeRoute =
-				serde_json::from_value(route_json.clone()).map_err(|e| {
+			let route: types::LayerZeroBridgeRoute = serde_json::from_value(route_json.clone())
+				.map_err(|e| {
 					BridgeError::Config(format!(
 						"pair '{}': invalid LayerZeroBridgeRoute JSON: {e}",
 						pair.pair_id
@@ -1051,7 +1058,10 @@ impl BridgeInterface for LayerZeroBridge {
 			{
 				return Err(BridgeError::Config(format!(
 					"pair '{}': composer_chain_id {} matches neither pair side ({}, {})",
-					pair.pair_id, route.composer_chain_id, pair.chain_a.chain_id, pair.chain_b.chain_id
+					pair.pair_id,
+					route.composer_chain_id,
+					pair.chain_a.chain_id,
+					pair.chain_b.chain_id
 				)));
 			}
 
@@ -1083,8 +1093,13 @@ impl BridgeInterface for LayerZeroBridge {
 				("chain_b", &pair.chain_b, &route.chain_b),
 			] {
 				let call_data = contracts::approvalRequiredCall {}.abi_encode();
-				let call_tx =
-					build_tx(pair_side.chain_id, pair_side.oft_address, call_data, U256::ZERO, None);
+				let call_tx = build_tx(
+					pair_side.chain_id,
+					pair_side.oft_address,
+					call_data,
+					U256::ZERO,
+					None,
+				);
 				let result = self
 					.delivery
 					.contract_call(pair_side.chain_id, call_tx)
@@ -1095,8 +1110,8 @@ impl BridgeInterface for LayerZeroBridge {
 							pair.pair_id, label, pair_side.chain_id
 						))
 					})?;
-				let decoded =
-					contracts::approvalRequiredCall::abi_decode_returns(&result).map_err(|e| {
+				let decoded = contracts::approvalRequiredCall::abi_decode_returns(&result)
+					.map_err(|e| {
 						BridgeError::Config(format!(
 							"pair '{}' {}: decode approvalRequired returned bytes failed: {e}",
 							pair.pair_id, label
@@ -1116,11 +1131,13 @@ impl BridgeInterface for LayerZeroBridge {
 
 			// (e) Composer immutables: VAULT() and SHARE_OFT() must match.
 			let composer_chain = route.composer_chain_id;
-			let vault_call =
-				contracts::IVaultComposerSync::VAULTCall {}.abi_encode();
+			let vault_call = contracts::IVaultComposerSync::VAULTCall {}.abi_encode();
 			let vault_tx = build_tx(composer_chain, route.composer, vault_call, U256::ZERO, None);
-			let vault_result =
-				self.delivery.contract_call(composer_chain, vault_tx).await.map_err(|e| {
+			let vault_result = self
+				.delivery
+				.contract_call(composer_chain, vault_tx)
+				.await
+				.map_err(|e| {
 					BridgeError::Config(format!(
 						"pair '{}': composer.VAULT() call failed: {e}",
 						pair.pair_id
@@ -1129,7 +1146,10 @@ impl BridgeInterface for LayerZeroBridge {
 			let composer_vault =
 				contracts::IVaultComposerSync::VAULTCall::abi_decode_returns(&vault_result)
 					.map_err(|e| {
-						BridgeError::Config(format!("pair '{}': decode VAULT() failed: {e}", pair.pair_id))
+						BridgeError::Config(format!(
+							"pair '{}': decode VAULT() failed: {e}",
+							pair.pair_id
+						))
 					})?;
 			if composer_vault != route.vault {
 				return Err(BridgeError::Config(format!(
@@ -1145,10 +1165,14 @@ impl BridgeInterface for LayerZeroBridge {
 				(&pair.chain_b, &route.chain_b)
 			};
 
-			let share_oft_call =
-				contracts::IVaultComposerSync::SHARE_OFTCall {}.abi_encode();
-			let share_oft_tx =
-				build_tx(composer_chain, route.composer, share_oft_call, U256::ZERO, None);
+			let share_oft_call = contracts::IVaultComposerSync::SHARE_OFTCall {}.abi_encode();
+			let share_oft_tx = build_tx(
+				composer_chain,
+				route.composer,
+				share_oft_call,
+				U256::ZERO,
+				None,
+			);
 			let share_oft_result = self
 				.delivery
 				.contract_call(composer_chain, share_oft_tx)
@@ -1183,22 +1207,24 @@ impl BridgeInterface for LayerZeroBridge {
 			};
 			let asset_call = contracts::IVaultComposerSync::ASSET_ERC20Call {}.abi_encode();
 			let asset_tx = build_tx(composer_chain, route.composer, asset_call, U256::ZERO, None);
-			let asset_result =
-				self.delivery.contract_call(composer_chain, asset_tx).await.map_err(|e| {
+			let asset_result = self
+				.delivery
+				.contract_call(composer_chain, asset_tx)
+				.await
+				.map_err(|e| {
 					BridgeError::Config(format!(
 						"pair '{}': composer.ASSET_ERC20() call failed: {e}",
 						pair.pair_id
 					))
 				})?;
-			let composer_asset = contracts::IVaultComposerSync::ASSET_ERC20Call::abi_decode_returns(
-				&asset_result,
-			)
-			.map_err(|e| {
-				BridgeError::Config(format!(
-					"pair '{}': decode ASSET_ERC20() failed: {e}",
-					pair.pair_id
-				))
-			})?;
+			let composer_asset =
+				contracts::IVaultComposerSync::ASSET_ERC20Call::abi_decode_returns(&asset_result)
+					.map_err(|e| {
+					BridgeError::Config(format!(
+						"pair '{}': decode ASSET_ERC20() failed: {e}",
+						pair.pair_id
+					))
+				})?;
 			if composer_asset != expected_vault_asset {
 				return Err(BridgeError::Config(format!(
 					"pair '{}': composer.ASSET_ERC20() = {} but vault-side expected asset = {} \
@@ -1209,8 +1235,13 @@ impl BridgeInterface for LayerZeroBridge {
 
 			// (g) vault.asset() must agree with composer.ASSET_ERC20().
 			let vault_asset_call = contracts::assetCall {}.abi_encode();
-			let vault_asset_tx =
-				build_tx(composer_chain, route.vault, vault_asset_call, U256::ZERO, None);
+			let vault_asset_tx = build_tx(
+				composer_chain,
+				route.vault,
+				vault_asset_call,
+				U256::ZERO,
+				None,
+			);
 			let vault_asset_result = self
 				.delivery
 				.contract_call(composer_chain, vault_asset_tx)
@@ -1319,8 +1350,13 @@ impl BridgeInterface for LayerZeroBridge {
 				),
 			] {
 				let peers_call = contracts::peersCall { eid: remote_eid }.abi_encode();
-				let peers_tx =
-					build_tx(query_chain, oft_side.oft_address, peers_call, U256::ZERO, None);
+				let peers_tx = build_tx(
+					query_chain,
+					oft_side.oft_address,
+					peers_call,
+					U256::ZERO,
+					None,
+				);
 				let peers_result = self
 					.delivery
 					.contract_call(query_chain, peers_tx)
@@ -1331,11 +1367,13 @@ impl BridgeInterface for LayerZeroBridge {
 							pair.pair_id, label, remote_eid
 						))
 					})?;
-				let peer_bytes = contracts::peersCall::abi_decode_returns(&peers_result)
-					.map_err(|e| {
+				let peer_bytes =
+					contracts::peersCall::abi_decode_returns(&peers_result).map_err(|e| {
 						BridgeError::Config(format!(
 							"pair '{}' {}: decode peers() failed: {e}",
-							pair.pair_id, label, e = e
+							pair.pair_id,
+							label,
+							e = e
 						))
 					})?;
 				// peers() returns bytes32; last 20 bytes are the address.
@@ -1548,7 +1586,10 @@ mod tests {
 		});
 
 		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
-		let result = bridge.bridge_asset(&request, &Default::default()).await.unwrap();
+		let result = bridge
+			.bridge_asset(&request, &Default::default())
+			.await
+			.unwrap();
 
 		assert_eq!(result.tx_hash, format!("0x{}", hex::encode(vec![0x11; 32])));
 		let submitted = submitted.lock().unwrap();
@@ -1631,7 +1672,10 @@ mod tests {
 		});
 
 		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
-		bridge.bridge_asset(&request, &Default::default()).await.unwrap();
+		bridge
+			.bridge_asset(&request, &Default::default())
+			.await
+			.unwrap();
 
 		let submitted = submitted.lock().unwrap();
 		assert_eq!(submitted.len(), 2);
@@ -1691,7 +1735,10 @@ mod tests {
 		});
 
 		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
-		bridge.bridge_asset(&request, &Default::default()).await.unwrap();
+		bridge
+			.bridge_asset(&request, &Default::default())
+			.await
+			.unwrap();
 
 		let submitted = submitted.lock().unwrap();
 		assert_eq!(submitted.len(), 2);
@@ -1746,7 +1793,10 @@ mod tests {
 		});
 
 		let bridge = bridge_with_two_chain_delivery(mock, None);
-		let result = bridge.bridge_asset(&request, &Default::default()).await.unwrap();
+		let result = bridge
+			.bridge_asset(&request, &Default::default())
+			.await
+			.unwrap();
 
 		assert_eq!(result.tx_hash, format!("0x{}", hex::encode(vec![0x22; 32])));
 		let submitted = submitted.lock().unwrap();
@@ -1816,7 +1866,10 @@ mod tests {
 		mock.expect_estimate_gas().times(0);
 
 		let bridge = bridge_with_two_chain_delivery(mock, None);
-		bridge.bridge_asset(&request, &Default::default()).await.unwrap();
+		bridge
+			.bridge_asset(&request, &Default::default())
+			.await
+			.unwrap();
 
 		let submitted = submitted.lock().unwrap();
 		assert_eq!(submitted.len(), 2);
@@ -2214,7 +2267,10 @@ mod tests {
 		}
 
 		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
-		let quoted = bridge.estimate_fee(&request, &Default::default()).await.unwrap();
+		let quoted = bridge
+			.estimate_fee(&request, &Default::default())
+			.await
+			.unwrap();
 
 		assert_eq!(quoted, fee);
 		let tx = call_target
@@ -2241,7 +2297,10 @@ mod tests {
 		}
 
 		let bridge = bridge_with_two_chain_delivery(mock, None);
-		let quoted = bridge.estimate_fee(&request, &Default::default()).await.unwrap();
+		let quoted = bridge
+			.estimate_fee(&request, &Default::default())
+			.await
+			.unwrap();
 
 		assert_eq!(quoted, fee);
 		let tx = call_target

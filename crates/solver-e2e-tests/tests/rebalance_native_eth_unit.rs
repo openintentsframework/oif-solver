@@ -170,7 +170,7 @@ fn withdraw_event_decodes_assets_field() {
 			b
 		}),
 	);
-	let topics_vec = vec![topics_raw.0, topics_raw.1, topics_raw.2, topics_raw.3];
+	let topics_vec = [topics_raw.0, topics_raw.1, topics_raw.2, topics_raw.3];
 
 	// (assets, shares) ABI-encoded as the non-indexed data
 	let mut data_bytes = Vec::new();
@@ -182,7 +182,10 @@ fn withdraw_event_decodes_assets_field() {
 	assert_eq!(decoded.sender, log_data.sender);
 	assert_eq!(decoded.receiver, log_data.receiver);
 	assert_eq!(decoded.owner, log_data.owner);
-	assert_eq!(decoded.assets, log_data.assets, "assets field is the value to feed WETH.withdraw");
+	assert_eq!(
+		decoded.assets, log_data.assets,
+		"assets field is the value to feed WETH.withdraw"
+	);
 	assert_eq!(decoded.shares, log_data.shares);
 	// Critically: assets != shares — vault redeem can return a different amount.
 	assert_ne!(

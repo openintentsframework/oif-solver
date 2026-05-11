@@ -166,7 +166,10 @@ fn delivery_scan_token_is_vault_for_non_composer_inbound() {
 	let route = weth_vbeth_route();
 	let vault = route["vault"].as_str().unwrap();
 	let weth = route["chain_a"]["wrapper"]["address"].as_str().unwrap();
-	assert_ne!(vault, weth, "delivery-scan token must be the vault, not WETH");
+	assert_ne!(
+		vault, weth,
+		"delivery-scan token must be the vault, not WETH"
+	);
 	assert_eq!(vault, "0x2DC70fb75b88d2eB4715bc06E1595E6D97c34DFF");
 }
 
@@ -207,9 +210,11 @@ fn fixture_route_matches_production_config_shape() {
 	);
 	// And the pair MUST declare native sides (zero token addresses).
 	assert_eq!(
-		eth_pair["chain_a"]["token_address"], "0x0000000000000000000000000000000000000000"
+		eth_pair["chain_a"]["token_address"],
+		"0x0000000000000000000000000000000000000000"
 	);
 	assert_eq!(
-		eth_pair["chain_b"]["token_address"], "0x0000000000000000000000000000000000000000"
+		eth_pair["chain_b"]["token_address"],
+		"0x0000000000000000000000000000000000000000"
 	);
 }

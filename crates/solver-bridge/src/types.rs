@@ -317,9 +317,11 @@ pub struct PendingBridgeTransfer {
 	#[serde(default)]
 	pub unwrap_missing_checks: u32,
 	/// Actual asset amount to unwrap. Source depends on flow:
-	///   - composer flow: observed from destination-chain Transfer event in `Relaying`;
-	///   - non-composer flow: parsed by the bridge impl from the ERC-4626 `Withdraw`
-	///     event in the redeem tx logs (see `BridgeInterface::parse_redeem_assets`).
+	///
+	/// - composer flow: observed from destination-chain Transfer event in `Relaying`;
+	/// - non-composer flow: parsed by the bridge impl from the ERC-4626 `Withdraw`
+	///   event in the redeem tx logs (see `BridgeInterface::parse_redeem_assets`).
+	///
 	/// Receipts do NOT expose Solidity return values; this is always from event logs.
 	#[serde(default)]
 	pub unwrap_amount: Option<String>,

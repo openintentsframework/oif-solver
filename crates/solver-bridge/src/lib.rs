@@ -377,8 +377,7 @@ impl BridgeService {
 				},
 				Err(BridgeError::InsufficientNativeGas(reason)) => {
 					transfer.wrap_submit_attempted = false; // pre-broadcast: safe to roll back
-					transfer
-						.transition_to(BridgeTransferStatus::NeedsIntervention(reason.clone()));
+					transfer.transition_to(BridgeTransferStatus::NeedsIntervention(reason.clone()));
 					self.storage.save_transfer(&transfer).await?;
 					return Err(BridgeError::InsufficientNativeGas(reason));
 				},
