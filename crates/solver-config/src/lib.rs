@@ -423,6 +423,11 @@ pub struct RebalancePairConfig {
 	pub deviation_band_bps: u32,
 	/// Maximum amount per bridge operation (decimal string).
 	pub max_bridge_amount: String,
+	/// Bridge-implementation-opaque route blob (per-pair). Forwarded as-is to
+	/// `OperatorRebalancePairConfig.bridge_route`. For LayerZero this carries
+	/// composer/vault/per-side wrapper + approval_required.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub bridge_route: Option<serde_json::Value>,
 }
 
 /// One side of a runtime rebalance pair.

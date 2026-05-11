@@ -490,20 +490,30 @@ pub async fn handle_trigger_rebalance(
 		recipient,
 	};
 
-	// Build metadata for delivery detection and redeem path
-	let is_composer = rebalance_config
-		.bridge_config
-		.as_ref()
-		.and_then(|bc| bc.get("composer_addresses"))
-		.and_then(|ca| ca.get(request.source_chain.to_string()))
-		.is_some();
-	let vault_addr = rebalance_config
-		.bridge_config
-		.as_ref()
-		.and_then(|bc| bc.get("vault_addresses"))
-		.and_then(|va| va.get(dest_side.chain_id.to_string()))
-		.and_then(|v| v.as_str())
-		.map(|s| s.to_string());
+	// Determine composer-flow + vault address. Per-pair `bridge_route` (round-1..8
+	// design) wins when present; legacy chain-keyed `bridge_config` is the
+	// fallback for USDC-style pairs that haven't migrated.
+	let (is_composer, vault_addr) = if let Some(route) = pair.bridge_route.as_ref() {
+		let composer_chain = route.get("composer_chain_id").and_then(|v| v.as_u64());
+		let is_composer = composer_chain == Some(request.source_chain);
+		let vault = route.get("vault").and_then(|v| v.as_str()).map(|s| s.to_string());
+		(is_composer, vault)
+	} else {
+		let is_composer = rebalance_config
+			.bridge_config
+			.as_ref()
+			.and_then(|bc| bc.get("composer_addresses"))
+			.and_then(|ca| ca.get(request.source_chain.to_string()))
+			.is_some();
+		let vault_addr = rebalance_config
+			.bridge_config
+			.as_ref()
+			.and_then(|bc| bc.get("vault_addresses"))
+			.and_then(|va| va.get(dest_side.chain_id.to_string()))
+			.and_then(|v| v.as_str())
+			.map(|s| s.to_string());
+		(is_composer, vault_addr)
+	};
 
 	if !is_composer && vault_addr.is_none() {
 		return Err(AdminAuthError::InvalidMessage(
@@ -511,11 +521,65 @@ pub async fn handle_trigger_rebalance(
 		));
 	}
 
+	// Effective tokens: for native pair sides (token_address == 0x000…), read
+	// the wrapper address from the route. For inbound non-composer flow, the
+	// delivery-scan target on the destination is `route.vault` (shares), NOT
+	// the wrapper — that's what the existing `check_status` event scan watches
+	// during `Relaying`.
+	let zero_addr = alloy_primitives::Address::ZERO;
+	let effective_source_token: String = if source_side.token_address == zero_addr {
+		pair.bridge_route
+			.as_ref()
+			.and_then(|r| {
+				let key = if r.get("chain_a").and_then(|s| s.get("chain_id")).and_then(|v| v.as_u64())
+					== Some(request.source_chain)
+				{
+					"chain_a"
+				} else {
+					"chain_b"
+				};
+				r.get(key).and_then(|s| s.get("wrapper")).and_then(|w| w.get("address")).and_then(|a| a.as_str()).map(String::from)
+			})
+			.unwrap_or_else(|| source_side.token_address.to_string())
+	} else {
+		source_side.token_address.to_string()
+	};
+	// For composer (outbound) flow on a native dest, the wrapper arrives at the
+	// solver — that's the Transfer-event scan target. For non-composer flow,
+	// the existing scan logic falls back to `vault_address` so the pair token
+	// works here (and matches existing test expectations).
+	let delivery_scan_token: String = if is_composer && dest_side.token_address == zero_addr {
+		pair.bridge_route
+			.as_ref()
+			.and_then(|r| {
+				let key = if r
+					.get("chain_a")
+					.and_then(|s| s.get("chain_id"))
+					.and_then(|v| v.as_u64())
+					== Some(request.dest_chain)
+				{
+					"chain_a"
+				} else {
+					"chain_b"
+				};
+				r.get(key)
+					.and_then(|s| s.get("wrapper"))
+					.and_then(|w| w.get("address"))
+					.and_then(|a| a.as_str())
+					.map(String::from)
+			})
+			.unwrap_or_else(|| dest_side.token_address.to_string())
+	} else {
+		dest_side.token_address.to_string()
+	};
+
 	let metadata = solver_bridge::types::TransferMetadata {
-		dest_token_address: dest_side.token_address.to_string(),
+		source_token_address: effective_source_token,
+		dest_token_address: delivery_scan_token,
 		dest_oft_address: dest_side.oft_address.to_string(),
 		is_composer_flow: is_composer,
 		vault_address: vault_addr,
+		bridge_route: pair.bridge_route.clone(),
 	};
 
 	match bridge_service
@@ -820,6 +884,7 @@ mod tests {
 		async fn bridge_asset(
 			&self,
 			request: &BridgeRequest,
+			_metadata: &solver_bridge::types::TransferMetadata,
 		) -> Result<BridgeDepositResult, BridgeError> {
 			self.recorded_requests.lock().unwrap().push(request.clone());
 			Ok(BridgeDepositResult {
@@ -836,7 +901,11 @@ mod tests {
 			Ok(transfer.status.clone())
 		}
 
-		async fn estimate_fee(&self, _request: &BridgeRequest) -> Result<U256, BridgeError> {
+		async fn estimate_fee(
+			&self,
+			_request: &BridgeRequest,
+			_metadata: &solver_bridge::types::TransferMetadata,
+		) -> Result<U256, BridgeError> {
 			Ok(U256::ZERO)
 		}
 	}
@@ -1023,6 +1092,7 @@ mod tests {
 					target_balance_b: "1000000".to_string(),
 					deviation_band_bps: 2000,
 					max_bridge_amount: "500000".to_string(),
+					bridge_route: None,
 				}],
 				bridge_config: Some(serde_json::json!({
 					"composer_addresses": {},

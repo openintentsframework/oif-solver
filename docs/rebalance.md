@@ -74,7 +74,7 @@ Add a `rebalance` section to your bootstrap config JSON:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `chain_id` | u64 | Yes | Chain ID. Must exist in the solver's `networks` config. |
-| `token_address` | string | Yes | ERC-20 token contract address (for balance queries and approvals) |
+| `token_address` | string | Yes | ERC-20 token contract address (for balance queries and approvals). **Use `0x000…0000` to declare this side as native** (see "Native-asset pairs" below). |
 | `oft_address` | string | Yes | LayerZero OFT contract address (for quoteSend/send operations) |
 
 ### Bridge Config (LayerZero)
@@ -83,8 +83,94 @@ Add a `rebalance` section to your bootstrap config JSON:
 |-------|------|----------|-------------|
 | `endpoint_ids` | object | Yes | Maps chain_id (as string key) to LayerZero Endpoint ID (EID). E.g., `{"1": 30101, "42161": 30110}` |
 | `lz_receive_gas` | u128 | No | Gas limit for lzReceive on destination (default: 200000) |
-| `composer_addresses` | object | No | Maps chain_id to OVault Composer contract address. Chains with a composer use the deposit+bridge flow. |
-| `vault_addresses` | object | No | Maps chain_id to ERC-4626 vault contract address. Required for non-composer flows that need vault redemption. |
+| `composer_addresses` | object | No | **Legacy chain-keyed shape.** Maps chain_id to OVault Composer contract address. Used by pairs that don't declare a per-pair `bridge_route`. Prefer per-pair routing for new pairs. |
+| `vault_addresses` | object | No | **Legacy chain-keyed shape.** Maps chain_id to ERC-4626 vault contract address. Used by non-composer flows that don't declare a per-pair `bridge_route`. |
+
+### Per-pair `bridge_route` (required for native-asset pairs and recommended for new pairs)
+
+A pair can carry its own routing data in `bridge_route`. This supersedes the legacy chain-keyed `composer_addresses` / `vault_addresses` and is **required** when either side is native (token_address = `0x000…`). The route is opaque at the generic config level — the bridge implementation deserializes its own shape.
+
+For LayerZero, the shape is:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `composer` | string | Yes | OVault Composer address on the vault's chain. |
+| `composer_chain_id` | u64 | Yes | Chain ID where the composer + vault live. Must match one of the pair's chain IDs. |
+| `vault` | address | Yes | ERC-4626 vault address. Must equal `composer.VAULT()`. |
+| `chain_a` | object | Yes | Route data for the side whose `chain_id` matches `pair.chain_a.chain_id`. |
+| `chain_b` | object | Yes | Route data for `pair.chain_b`. |
+
+Each `chain_a`/`chain_b` block:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `chain_id` | u64 | Yes | Mirrors the pair side's chain_id (self-describing). |
+| `approval_required` | bool | Yes | Whether the OFT on this side needs `approve` before `send`. Verified at startup against `IOFT.approvalRequired()`. |
+| `wrapper` | object | When native | Required when this side's `token_address` is `0x000…`. Carries the WETH9-compatible wrapper address and strategy. |
+
+The `wrapper` block:
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `address` | string | Yes | Wrapper contract address (e.g., WETH on Ethereum, vbETH on Katana). Must expose WETH9 `deposit()` / `withdraw(uint256)`. |
+| `strategy` | enum | Yes | Currently only `"Weth9"`. Scaffolded so non-WETH9 wrappers can be added later. |
+
+### Native-asset pairs (e.g., native ETH ↔ native ETH)
+
+When the asset on either side is the chain's native token, set that side's `token_address` to the zero address and declare a `bridge_route` whose corresponding `chain_a`/`chain_b` block carries a `wrapper`. The solver automatically wraps native to the ERC-20 wrapper before the bridge and unwraps on the destination side.
+
+Example (native ETH on Ethereum ↔ native ETH on Katana via the WETH/vbETH OVault):
+
+```json
+{
+  "pair_id": "eth-native-katana",
+  "chain_a": {
+    "chain_id": 1,
+    "token_address": "0x0000000000000000000000000000000000000000",
+    "oft_address":   "0x8F45F7ACD4b9FC0B446902790F304d444dfF949b"
+  },
+  "chain_b": {
+    "chain_id": 747474,
+    "token_address": "0x0000000000000000000000000000000000000000",
+    "oft_address":   "0x694D1697F6909361775139357d99fb60B5cab683"
+  },
+  "target_balance_a": "1000000000000000000",
+  "target_balance_b": "1000000000000000000",
+  "deviation_band_bps": 3000,
+  "max_bridge_amount": "500000000000000000",
+  "bridge_route": {
+    "composer":          "0xC4c76Ae67f7d0f741B56d013D14359A6C7b7De11",
+    "composer_chain_id": 1,
+    "vault":             "0x2DC70fb75b88d2eB4715bc06E1595E6D97c34DFF",
+    "chain_a": {
+      "chain_id": 1,
+      "approval_required": true,
+      "wrapper": { "address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "strategy": "Weth9" }
+    },
+    "chain_b": {
+      "chain_id": 747474,
+      "approval_required": false,
+      "wrapper": { "address": "0xEE7D8BCFb72bC1880D0Cf19822eB0A2e6577aB62", "strategy": "Weth9" }
+    }
+  }
+}
+```
+
+The solver's logical balance for a native side is `eth_getBalance + wrapper.balanceOf` so funds parked in the wrapper during an in-flight unwrap are not missed by the threshold check. `min_native_gas_reserve` continues to count native ETH only.
+
+### Startup preflight
+
+When a pair carries a `bridge_route`, the engine runs an async preflight at startup that cross-checks the declared route against on-chain state:
+
+- `IOFT.approvalRequired()` on each side's OFT must match the declared `approval_required`.
+- `composer.VAULT()` must equal `route.vault`.
+- `composer.SHARE_OFT()` must equal the vault-side `oft_address` (catches the common mistake of putting the Asset OFT in the slot where the Share OFT Adapter belongs).
+- `composer.ASSET_ERC20()` must equal the vault-side wrapper (for native sides) or pair token (for ERC-20 sides).
+- `vault.asset()` must equal `composer.ASSET_ERC20()`.
+- Remote-side `OFT.token()` must equal the remote side's wrapper or pair token.
+- `peers(remote_eid)` is set in both directions and matches the configured remote OFT.
+
+If any of these fail, the engine refuses to start the rebalance monitor with a specific error message naming the offending pair, side, and the on-chain vs declared mismatch. Legacy pairs without `bridge_route` skip preflight.
 
 ## How It Works
 
@@ -106,22 +192,43 @@ When a balance exceeds `upper_bound`, the surplus is bridged to the other side, 
 
 ### Transfer Lifecycle
 
+ERC-20 pairs (e.g., USDC):
+
 ```
-Submitted --> Relaying --> Completed                        (Composer flow)
-Submitted --> Relaying --> PendingRedemption --> Completed   (OFT send + vault redeem flow)
-     |            |              |
-     v            v              v
-  Failed    NeedsIntervention  NeedsIntervention
+Submitted --> Relaying --> Completed                              (Composer / outbound)
+Submitted --> Relaying --> PendingRedemption --> Completed         (OFT send + vault redeem)
 ```
+
+Native-asset pairs (e.g., ETH ↔ ETH via WETH/vbETH) add `WrapPending` before and `UnwrapPending` after:
+
+```
+WrapPending --> Submitted --> Relaying --> UnwrapPending --> Completed                       (Composer / outbound)
+WrapPending --> Submitted --> Relaying --> PendingRedemption --> UnwrapPending --> Completed (Non-composer / inbound)
+```
+
+Any non-terminal state can transition to `Failed` (unrecoverable, no funds at risk) or `NeedsIntervention` (admin-resolvable).
 
 | Status | Description |
 |--------|-------------|
-| `submitted` | Bridge tx submitted, awaiting source chain confirmation |
-| `relaying` | Confirmed on source; LayerZero delivering to destination |
-| `pending_redemption` | Shares arrived on destination; vault redeem tx needed (non-composer flows only) |
-| `completed` | Final tokens available in solver wallet |
-| `failed` | Unrecoverable error, no funds at risk |
-| `needs_intervention` | Timed out or retry exhausted; admin must resolve |
+| `wrap_pending` | Native source: `WETH.deposit{value}` / `vbETH.deposit{value}` submitted, awaiting confirmation. |
+| `submitted` | Bridge tx submitted, awaiting source chain confirmation. |
+| `relaying` | Confirmed on source; LayerZero delivering to destination. |
+| `pending_redemption` | Shares arrived on destination; vault redeem tx needed (non-composer flow only). |
+| `unwrap_pending` | Native destination: `vbETH.withdraw` / `WETH.withdraw` submitted to convert wrapper back to native. |
+| `completed` | Final tokens available in solver wallet. |
+| `failed` | Unrecoverable error, no funds at risk. |
+| `needs_intervention` | Timed out, ambiguous broadcast, or retry exhausted — admin must resolve. |
+
+#### Crash-window discipline
+
+Each tx-submission phase (`approve`, `bridge`, `wrap`, `redeem`, `unwrap`) persists a `*_submit_attempted` marker BEFORE the broadcast and the tx hash AFTER. If the process crashes between the two saves:
+
+- If the error path is pre-broadcast (`InsufficientNativeGas`, `NonceTooLow`), the marker rolls back and the phase retries cleanly.
+- If the error is ambiguous (generic), the marker stays set and the next monitor tick escalates to `NeedsIntervention` rather than risk a double-submit.
+
+#### Dropped-tx recovery
+
+After a phase tx hash is persisted, the monitor polls the receipt every tick. If `get_receipt` fails, it falls back to `tx_exists`. After `WRAP_MISSING_CHECKS_MAX` / `UNWRAP_MISSING_CHECKS_MAX` (3) consecutive `Ok(false)` responses, the hash and marker are cleared and the phase re-submits on the next tick.
 
 ### Safety Guards
 
@@ -131,7 +238,8 @@ Submitted --> Relaying --> PendingRedemption --> Completed   (OFT send + vault r
 | Max pending | No new auto-rebalances if `max_pending_transfers` active transfers exist |
 | Per-pair lock | Only one active transfer per pair_id at a time |
 | Transaction semaphore | Bridge and redeem transactions are serialized to prevent nonce conflicts |
-| Timeout escalation | Transfers stuck >30 min (Submitted/Relaying) or >24h (PendingRedemption) escalate to NeedsIntervention |
+| Timeout escalation | Transfers stuck >30 min (Submitted/Relaying/WrapPending/UnwrapPending) or >24h (PendingRedemption) escalate to NeedsIntervention |
+| Preflight | At startup, pairs with `bridge_route` are cross-checked against on-chain state (composer/vault/OFT/peer wiring + `approvalRequired`). Mismatches refuse the engine boot. |
 | Approve-phase timeout | An approve tx that has been broadcast (or has a stored hash) but never advances the bridge phase within `APPROVE_PHASE_TIMEOUT_SECS` (1h) escalates to NeedsIntervention. Guard fires on `approve_was_broadcast OR approve_tx_hash.is_some()` so a stored hash with the flag unset cannot bypass the timeout. |
 | Allowance precheck fallback | A transient RPC failure during the pre-broadcast allowance read defaults to `0` and falls through to approve, instead of escalating. ERC-20 approve is a *set* operation — a redundant approve is a safe operational fallback. |
 | Malformed approve hash | If `approve_tx_hash` is stored but cannot be decoded as 32 hex bytes, the monitor escalates to NeedsIntervention rather than retrying — corrupt state must not be auto-recovered. |

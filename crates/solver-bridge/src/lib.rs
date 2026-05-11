@@ -21,7 +21,7 @@ pub mod types;
 use crate::storage::BridgeStorage;
 use crate::types::{
 	BridgeDepositResult, BridgeRequest, BridgeTransferStatus, PendingBridgeTransfer,
-	RebalanceTrigger,
+	RebalanceTrigger, TransferMetadata,
 };
 use alloy_primitives::U256;
 use async_trait::async_trait;
@@ -109,16 +109,27 @@ impl From<solver_storage::StorageError> for BridgeError {
 
 /// Pluggable bridge interface. Implementations handle the protocol-specific
 /// details (LayerZero OFT, Hyperlane Warp, AggLayer, etc.).
+///
+/// Native-asset support: `wrap_native` / `unwrap_native` / `redeem_shares` /
+/// `parse_redeem_assets` are protocol-only methods used when a pair side is
+/// native (`token_address == 0x000…`) and routes through a wrapper (e.g.,
+/// WETH on Ethereum, vbETH on Katana). `preflight` runs once at engine
+/// startup to cross-check operator-declared route data against on-chain state.
+/// `bridge_asset` / `estimate_fee` take `&TransferMetadata` so the per-pair
+/// route is available at submit/quote time.
 #[async_trait]
 pub trait BridgeInterface: Send + Sync {
 	/// Returns all supported (source_chain, dest_chain) pairs.
 	fn supported_routes(&self) -> Vec<(u64, u64)>;
 
 	/// Execute a cross-chain bridge transfer.
-	/// Handles approval, fee quoting, and submission internally.
+	/// Handles approval, fee quoting, and submission internally. The `metadata`
+	/// carries the per-pair `bridge_route` so the implementation can deserialize
+	/// the correct composer/vault/wrapper addresses for this transfer.
 	async fn bridge_asset(
 		&self,
 		request: &BridgeRequest,
+		metadata: &TransferMetadata,
 	) -> Result<BridgeDepositResult, BridgeError>;
 
 	/// Check the current status of a pending transfer.
@@ -128,7 +139,83 @@ pub trait BridgeInterface: Send + Sync {
 	) -> Result<BridgeTransferStatus, BridgeError>;
 
 	/// Estimate the bridge fee for a transfer (in native gas token).
-	async fn estimate_fee(&self, request: &BridgeRequest) -> Result<U256, BridgeError>;
+	/// Takes `&TransferMetadata` so fee quoting uses the per-pair composer
+	/// address from the route, not a chain-keyed lookup.
+	async fn estimate_fee(
+		&self,
+		request: &BridgeRequest,
+		metadata: &TransferMetadata,
+	) -> Result<U256, BridgeError>;
+
+	// --- Native-asset rebalance methods (default impls so non-LayerZero impls
+	//     don't have to override). ----------------------------------------
+
+	/// Wrap source-side native asset into the configured wrapper (e.g.,
+	/// `WETH.deposit{value: amount}` on Ethereum, `vbETH.deposit{value}` on Katana).
+	/// Returns the wrap tx hash. Persistence and crash-window handling live in
+	/// `BridgeService`; this method only builds and submits the tx.
+	#[allow(unused_variables)]
+	async fn wrap_native(
+		&self,
+		transfer: &PendingBridgeTransfer,
+	) -> Result<solver_types::TransactionHash, BridgeError> {
+		Err(BridgeError::Config(
+			"wrap_native not supported by this bridge implementation".into(),
+		))
+	}
+
+	/// Unwrap destination-side wrapper to native asset
+	/// (e.g., `vbETH.withdraw(amount)` on Katana, `WETH.withdraw(amount)` on Ethereum).
+	#[allow(unused_variables)]
+	async fn unwrap_native(
+		&self,
+		transfer: &PendingBridgeTransfer,
+	) -> Result<solver_types::TransactionHash, BridgeError> {
+		Err(BridgeError::Config(
+			"unwrap_native not supported by this bridge implementation".into(),
+		))
+	}
+
+	/// Submit `vault.redeem(received_shares, solver, solver)` on the destination
+	/// chain for the non-composer inbound flow. Returns the redeem tx hash;
+	/// `BridgeService` polls the receipt then calls `parse_redeem_assets`.
+	#[allow(unused_variables)]
+	async fn redeem_shares(
+		&self,
+		transfer: &PendingBridgeTransfer,
+	) -> Result<solver_types::TransactionHash, BridgeError> {
+		Err(BridgeError::Config(
+			"redeem_shares not supported by this bridge implementation".into(),
+		))
+	}
+
+	/// Parse the asset amount paid out by a redeem tx from its receipt logs.
+	/// The bridge implementation owns the ABI binding (ERC-4626 `Withdraw` event
+	/// for LayerZero OVault) — this keeps `BridgeService` generic.
+	///
+	/// Receipts do NOT expose Solidity return values; this method MUST read from
+	/// `receipt.logs`, not from any imaginary return field.
+	#[allow(unused_variables)]
+	fn parse_redeem_assets(
+		&self,
+		receipt: &solver_types::TransactionReceipt,
+	) -> Result<U256, BridgeError> {
+		Err(BridgeError::Config(
+			"parse_redeem_assets not supported by this bridge implementation".into(),
+		))
+	}
+
+	/// One-shot startup cross-check. Verifies operator-declared route data against
+	/// on-chain state for every pair using this bridge. Invoked once by the engine
+	/// after `DeliveryService` is up, before the rebalance monitor starts.
+	/// Default returns `Ok(())` so impls without preflight needs don't have to override.
+	#[allow(unused_variables)]
+	async fn preflight(
+		&self,
+		pairs: &[solver_types::OperatorRebalancePairConfig],
+	) -> Result<(), BridgeError> {
+		Ok(())
+	}
 }
 
 /// Bridge factory function type (mirrors the solver's pluggable factory pattern).
@@ -156,6 +243,31 @@ impl BridgeService {
 			implementations,
 			storage: BridgeStorage::new(storage_service, solver_id),
 		}
+	}
+
+	/// Inspect a `TransferMetadata.bridge_route` JSON blob for a wrapper on the
+	/// `source_chain` side. Bridge-generic by convention:
+	/// `route.<chain_key>.wrapper.address` is a hex string when that side is
+	/// native. Returns false when the metadata has no route or the side has no
+	/// wrapper (legacy ERC-20 pairs).
+	fn route_has_source_wrapper(metadata: &TransferMetadata, source_chain: u64) -> bool {
+		let Some(route) = metadata.bridge_route.as_ref() else {
+			return false;
+		};
+		for side_key in ["chain_a", "chain_b"] {
+			let Some(side) = route.get(side_key) else {
+				continue;
+			};
+			let chain_id = side.get("chain_id").and_then(|v| v.as_u64()).unwrap_or(0);
+			if chain_id == source_chain {
+				return side
+					.get("wrapper")
+					.and_then(|w| w.get("address"))
+					.and_then(|a| a.as_str())
+					.is_some();
+			}
+		}
+		false
 	}
 
 	/// Get a bridge implementation by name.
@@ -187,17 +299,29 @@ impl BridgeService {
 			None, // message_guid set after submission
 			None, // fee_paid set after confirmation
 		);
-		// Populate metadata for delivery detection and redeem path
-		transfer.dest_token_address = Some(metadata.dest_token_address);
-		transfer.dest_oft_address = Some(metadata.dest_oft_address);
+		// Populate metadata for delivery detection and redeem path.
+		// Clone to avoid partially moving — `metadata` is still needed below for
+		// `bridge.bridge_asset(request, &metadata)`.
+		transfer.dest_token_address = Some(metadata.dest_token_address.clone());
+		transfer.dest_oft_address = Some(metadata.dest_oft_address.clone());
 		transfer.is_composer_flow = Some(metadata.is_composer_flow);
-		transfer.vault_address = metadata.vault_address;
+		transfer.vault_address = metadata.vault_address.clone();
+		// Snapshot the per-pair route at submission so the resume path uses the
+		// same routing even if config changes mid-flight.
+		transfer.route_snapshot = metadata.bridge_route.clone();
 		// Source-side request fields. Snapshot from `request`. The monitor's
 		// resume path reads these to reconstruct `BridgeRequest` after a crash.
-		transfer.source_token_address = Some(format!(
-			"0x{}",
-			hex::encode(request.source_token.as_slice())
-		));
+		// Prefer the caller-supplied effective source token from metadata —
+		// for native pairs this is the wrapper address (e.g., WETH) instead of
+		// the zero address that lives in `request.source_token`.
+		transfer.source_token_address = if !metadata.source_token_address.is_empty() {
+			Some(metadata.source_token_address.clone())
+		} else {
+			Some(format!(
+				"0x{}",
+				hex::encode(request.source_token.as_slice())
+			))
+		};
 		transfer.source_oft_address =
 			Some(format!("0x{}", hex::encode(request.source_oft.as_slice())));
 		transfer.recipient_address =
@@ -211,11 +335,87 @@ impl BridgeService {
 		// than auto-retry — auto-retrying could double-broadcast the deposit at
 		// a fresh nonce. Rolled back on Err(ApprovePending) and Err(ApproveReverted)
 		// below, since neither path actually broadcasts the deposit.
+		// Native-source wrap step (when the route declares a source wrapper).
+		// Submits `wrap_native`, persists `wrap_tx_hash`, and leaves the
+		// transfer in `WrapPending`. The monitor picks it up next tick:
+		// polls the wrap receipt, then transitions Submitted and triggers
+		// the bridge call via the existing `run_bridge_asset_after_approve`
+		// resume path. This split keeps `rebalance_token` short and ensures
+		// the wrap is verified on-chain before any composer interaction.
+		//
+		// Crash-window discipline mirrors the bridge submit:
+		//   - persist `wrap_submit_attempted = true` BEFORE the call
+		//   - on Ok: persist `wrap_tx_hash`, return — monitor handles receipt
+		//   - on pre-broadcast errors: roll the marker back, escalate
+		//   - on ambiguous errors: keep the marker set, escalate to
+		//     NeedsIntervention so the monitor doesn't auto-retry the wrap
+		if metadata.bridge_route.is_some()
+			&& transfer.wrap_tx_hash.is_none()
+			&& Self::route_has_source_wrapper(&metadata, request.source_chain)
+		{
+			transfer.status = BridgeTransferStatus::WrapPending;
+			transfer.wrap_submit_attempted = true;
+			self.storage.save_transfer(&transfer).await?;
+
+			match bridge.wrap_native(&transfer).await {
+				Ok(hash) => {
+					transfer.wrap_tx_hash = Some(format!("0x{}", hex::encode(&hash.0)));
+					transfer.updated_at = std::time::SystemTime::now()
+						.duration_since(std::time::UNIX_EPOCH)
+						.unwrap_or_default()
+						.as_secs();
+					self.storage.save_transfer(&transfer).await?;
+					tracing::info!(
+						transfer_id = %transfer.id,
+						"Wrap submitted; monitor will poll the receipt and advance to Submitted"
+					);
+					// Return the transfer here. The monitor's WrapPending branch
+					// finishes the rest of the orchestration once the receipt
+					// confirms, so callers see the same lifecycle they get on
+					// the approve-then-bridge resume path.
+					return Ok(transfer);
+				},
+				Err(BridgeError::InsufficientNativeGas(reason)) => {
+					transfer.wrap_submit_attempted = false; // pre-broadcast: safe to roll back
+					transfer
+						.transition_to(BridgeTransferStatus::NeedsIntervention(reason.clone()));
+					self.storage.save_transfer(&transfer).await?;
+					return Err(BridgeError::InsufficientNativeGas(reason));
+				},
+				Err(BridgeError::NonceTooLow(reason)) => {
+					transfer.wrap_submit_attempted = false;
+					if let Err(save_err) = self.storage.save_transfer(&transfer).await {
+						tracing::warn!(
+							transfer_id = %transfer.id,
+							error = %save_err,
+							"Failed to persist NonceTooLow rollback on wrap"
+						);
+					}
+					return Err(BridgeError::NonceTooLow(reason));
+				},
+				Err(err) => {
+					// Ambiguous error: tx MAY have broadcast. Keep marker set;
+					// admin resolves manually.
+					transfer.transition_to(BridgeTransferStatus::NeedsIntervention(format!(
+						"wrap submit attempted but bridge returned generic error: {err}; possible deposit broadcast — verify chain before retry"
+					)));
+					if let Err(save_err) = self.storage.save_transfer(&transfer).await {
+						tracing::warn!(
+							transfer_id = %transfer.id,
+							error = %save_err,
+							"Failed to persist NeedsIntervention after wrap error"
+						);
+					}
+					return Err(err);
+				},
+			}
+		}
+
 		transfer.bridge_submit_attempted = true;
 		self.storage.save_transfer(&transfer).await?;
 
 		// Execute the bridge transfer
-		let result = match bridge.bridge_asset(request).await {
+		let result = match bridge.bridge_asset(request, &metadata).await {
 			Ok(result) => result,
 			Err(BridgeError::ApprovePending { tx_hash }) => {
 				let now = std::time::SystemTime::now()
@@ -560,6 +760,7 @@ mod tests {
 		async fn bridge_asset(
 			&self,
 			_request: &BridgeRequest,
+			_metadata: &TransferMetadata,
 		) -> Result<BridgeDepositResult, BridgeError> {
 			if let Some(events) = &self.events {
 				let mut events = events.lock().unwrap();
@@ -585,7 +786,11 @@ mod tests {
 				.expect("check_status_result not configured")
 		}
 
-		async fn estimate_fee(&self, _request: &BridgeRequest) -> Result<U256, BridgeError> {
+		async fn estimate_fee(
+			&self,
+			_request: &BridgeRequest,
+			_metadata: &TransferMetadata,
+		) -> Result<U256, BridgeError> {
 			self.estimate_fee_result
 				.lock()
 				.unwrap()
@@ -631,6 +836,7 @@ mod tests {
 			dest_oft_address: "0x4444444444444444444444444444444444444444".to_string(),
 			is_composer_flow: true,
 			vault_address: None,
+			..Default::default()
 		}
 	}
 
@@ -1288,6 +1494,7 @@ mod tests {
 			async fn bridge_asset(
 				&self,
 				_request: &BridgeRequest,
+				_metadata: &TransferMetadata,
 			) -> Result<BridgeDepositResult, BridgeError> {
 				// Snapshot the most recent saved state — this is what storage held
 				// at the moment we entered bridge_asset.
@@ -1306,7 +1513,11 @@ mod tests {
 				unreachable!()
 			}
 
-			async fn estimate_fee(&self, _request: &BridgeRequest) -> Result<U256, BridgeError> {
+			async fn estimate_fee(
+				&self,
+				_request: &BridgeRequest,
+				_metadata: &TransferMetadata,
+			) -> Result<U256, BridgeError> {
 				unreachable!()
 			}
 		}

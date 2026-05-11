@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
-use crate::types::{BridgeRequest, BridgeTransferStatus, PendingBridgeTransfer, RebalanceTrigger};
+use crate::types::{
+	BridgeRequest, BridgeTransferStatus, PendingBridgeTransfer, RebalanceTrigger, TransferMetadata,
+};
 use alloy_primitives::{Address, U256};
 use solver_config::{RebalanceConfig, RebalancePairConfig, RebalancePairSideConfig};
 use solver_delivery::{DeliveryService, MockDeliveryInterface};
@@ -72,8 +74,19 @@ pub fn rebalance_config() -> RebalanceConfig {
 			target_balance_b: "1000000".to_string(),
 			deviation_band_bps: 2000,
 			max_bridge_amount: "500000".to_string(),
+			bridge_route: None,
 		}],
 		bridge_config: None,
+	}
+}
+
+pub fn bridge_metadata() -> TransferMetadata {
+	TransferMetadata {
+		dest_token_address: "0x3333333333333333333333333333333333333333".to_string(),
+		dest_oft_address: "0x4444444444444444444444444444444444444444".to_string(),
+		is_composer_flow: true,
+		vault_address: None,
+		..Default::default()
 	}
 }
 

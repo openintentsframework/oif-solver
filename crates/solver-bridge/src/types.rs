@@ -33,9 +33,19 @@ pub struct BridgeRequest {
 
 /// Metadata needed for the delivery detection and redeem completion path.
 /// Must be provided by the caller (monitor or admin API) when initiating a transfer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TransferMetadata {
+	/// Source token/share contract address — the **effective** ERC-20 the solver
+	/// approves/balances on the source chain. For ERC-20 pairs this is the pair's
+	/// `token_address`; for native pairs it's the wrapper (e.g., WETH on Ethereum).
+	/// `0x000…` is invalid here — callers must populate the effective address.
+	/// Defaults to empty string so legacy construction sites that haven't been
+	/// updated still compile during the multi-phase migration.
+	#[allow(dead_code)]
+	pub source_token_address: String,
 	/// Destination token/share contract address (for Transfer event scanning).
+	/// For composer flow this is the wrapper/pair token; for non-composer (Kat→Eth)
+	/// flow this is the vault shares contract (`route.vault`).
 	pub dest_token_address: String,
 	/// Destination OFT contract address.
 	pub dest_oft_address: String,
@@ -43,6 +53,9 @@ pub struct TransferMetadata {
 	pub is_composer_flow: bool,
 	/// Vault address on destination chain (only needed for Katana→ETH redeem path).
 	pub vault_address: Option<String>,
+	/// Bridge-implementation-opaque route blob (per-pair). Deserialized by the
+	/// bridge impl. For LayerZero this is `LayerZeroBridgeRoute`.
+	pub bridge_route: Option<serde_json::Value>,
 }
 
 /// Result from initiating a bridge transfer.
@@ -58,18 +71,25 @@ pub struct BridgeDepositResult {
 
 /// Transfer state machine.
 ///
-/// For Katana -> Ethereum, the flow adds a redemption step:
-///   Submitted -> Relaying -> PendingRedemption -> Completed
-/// For Ethereum -> Katana (via Composer):
-///   Submitted -> Relaying -> Completed
+/// For ERC-20 pairs (e.g., USDC), the flow is:
+///   Submitted -> Relaying -> [PendingRedemption (Kat->ETH only)] -> Completed
+///
+/// For native pairs (e.g., ETH<->ETH via WETH/vbETH), wrap and unwrap phases bracket the bridge:
+///   WrapPending -> Submitted -> Relaying -> [PendingRedemption] -> UnwrapPending -> Completed
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum BridgeTransferStatus {
+	/// Source-side native asset is being wrapped (e.g., ETH -> WETH or ETH -> vbETH).
+	/// Only used when the pair's source side is native (`token_address == 0x000…`).
+	WrapPending,
 	/// Bridge tx submitted, awaiting source chain confirmation.
 	Submitted,
 	/// Confirmed on source; LayerZero delivering to destination.
 	Relaying,
 	/// Shares arrived on Ethereum; vault redeem tx needed (Katana->ETH only).
 	PendingRedemption,
+	/// Destination-side wrapper is being unwrapped (e.g., vbETH -> ETH or WETH -> ETH).
+	/// Only used when the pair's destination side is native.
+	UnwrapPending,
 	/// Final tokens available in solver wallet.
 	Completed,
 	/// Unrecoverable error, no funds at risk.
@@ -82,9 +102,11 @@ pub enum BridgeTransferStatus {
 impl std::fmt::Display for BridgeTransferStatus {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
+			Self::WrapPending => write!(f, "wrap_pending"),
 			Self::Submitted => write!(f, "submitted"),
 			Self::Relaying => write!(f, "relaying"),
 			Self::PendingRedemption => write!(f, "pending_redemption"),
+			Self::UnwrapPending => write!(f, "unwrap_pending"),
 			Self::Completed => write!(f, "completed"),
 			Self::Failed(_) => write!(f, "failed"),
 			Self::NeedsIntervention(_) => write!(f, "needs_intervention"),
@@ -257,6 +279,50 @@ pub struct PendingBridgeTransfer {
 	/// matches `BridgeRequest::min_amount` semantics. `None` means no floor.
 	#[serde(default)]
 	pub min_amount: Option<String>,
+
+	// --- Native-asset rebalance fields (e.g., native ETH <-> native ETH via WETH/vbETH wrappers) ---
+	/// Bridge-impl-opaque route snapshot, captured at submission. Resume uses
+	/// this instead of re-reading config so config edits don't affect in-flight transfers.
+	#[serde(default)]
+	pub route_snapshot: Option<serde_json::Value>,
+	/// Crash-window marker for the wrap phase. Mirrors `bridge_submit_attempted`:
+	/// set BEFORE calling `bridge.wrap_native`; if we crash between the call and
+	/// the next save (which would write `wrap_tx_hash`), the monitor escalates to
+	/// `NeedsIntervention` rather than risking a double-wrap. Rolled back on
+	/// pre-broadcast errors only.
+	#[serde(default)]
+	pub wrap_submit_attempted: bool,
+	/// Source-chain wrap tx hash (e.g., `WETH.deposit{value: amount}` on Eth,
+	/// or `vbETH.deposit{value: amount}` on Katana).
+	#[serde(default)]
+	pub wrap_tx_hash: Option<String>,
+	/// Number of consecutive polls where the stored wrap tx was not found on-chain.
+	/// Mirrors `submitted_missing_checks`: after `WRAP_MISSING_CHECKS_MAX` misses
+	/// the hash is cleared so a fresh submit can run on the next tick.
+	#[serde(default)]
+	pub wrap_missing_checks: u32,
+	/// Crash-window marker for the redeem phase (non-composer inbound flow).
+	/// Mirrors `bridge_submit_attempted`. Distinct from `redeem_tx_hash` so we can
+	/// detect "redeem tx was attempted but no hash persisted" on restart.
+	#[serde(default)]
+	pub redeem_submit_attempted: bool,
+	/// Crash-window marker for the unwrap phase. Same shape as the wrap marker.
+	#[serde(default)]
+	pub unwrap_submit_attempted: bool,
+	/// Destination-chain unwrap tx hash (e.g., `vbETH.withdraw(amount)` on Katana
+	/// or `WETH.withdraw(amount)` on Ethereum).
+	#[serde(default)]
+	pub unwrap_tx_hash: Option<String>,
+	/// Number of consecutive polls where the stored unwrap tx was not found on-chain.
+	#[serde(default)]
+	pub unwrap_missing_checks: u32,
+	/// Actual asset amount to unwrap. Source depends on flow:
+	///   - composer flow: observed from destination-chain Transfer event in `Relaying`;
+	///   - non-composer flow: parsed by the bridge impl from the ERC-4626 `Withdraw`
+	///     event in the redeem tx logs (see `BridgeInterface::parse_redeem_assets`).
+	/// Receipts do NOT expose Solidity return values; this is always from event logs.
+	#[serde(default)]
+	pub unwrap_amount: Option<String>,
 }
 
 impl PendingBridgeTransfer {
@@ -317,6 +383,15 @@ impl PendingBridgeTransfer {
 			source_oft_address: None,
 			recipient_address: None,
 			min_amount: None,
+			route_snapshot: None,
+			wrap_submit_attempted: false,
+			wrap_tx_hash: None,
+			wrap_missing_checks: 0,
+			redeem_submit_attempted: false,
+			unwrap_submit_attempted: false,
+			unwrap_tx_hash: None,
+			unwrap_missing_checks: 0,
+			unwrap_amount: None,
 		}
 	}
 

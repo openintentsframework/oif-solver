@@ -680,6 +680,13 @@ pub struct OperatorRebalancePairConfig {
 
 	/// Maximum amount per bridge operation (decimal string in nominal units).
 	pub max_bridge_amount: String,
+
+	/// Bridge-implementation-opaque route blob (per-pair). Deserialized by the
+	/// bridge implementation referenced in `OperatorRebalanceConfig.implementation`.
+	/// For LayerZero this is `LayerZeroBridgeRoute` (composer, vault, per-side
+	/// wrapper + approval_required). Static — requires restart to change.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub bridge_route: Option<serde_json::Value>,
 }
 
 /// One side of a rebalance pair.

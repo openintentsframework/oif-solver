@@ -37,6 +37,19 @@ const PENDING_REDEMPTION_TIMEOUT_SECS: u64 = 24 * 3600;
 /// Max retries for PendingRedemption before NeedsIntervention.
 const MAX_REDEEM_RETRIES: u32 = 3;
 
+/// Absolute upper bound on the wrap and unwrap phases. Mirrors
+/// `SUBMITTED_TIMEOUT_SECS`: a wrap or unwrap that's been live without
+/// confirmation past this point is either stuck in the mempool at too low a
+/// gas price or the persisted hash points to a dropped tx — admin action only.
+const WRAP_TIMEOUT_SECS: u64 = 30 * 60;
+const UNWRAP_TIMEOUT_SECS: u64 = 30 * 60;
+
+/// Threshold for consecutive `tx_exists() == Ok(false)` polls before a wrap or
+/// unwrap is considered dropped from the mempool and the hash is cleared so a
+/// fresh submit can run. Mirrors `submitted_missing_checks` (max 3).
+const WRAP_MISSING_CHECKS_MAX: u32 = 3;
+const UNWRAP_MISSING_CHECKS_MAX: u32 = 3;
+
 fn is_source_transaction_missing(reason: &str) -> bool {
 	reason.contains("Source transaction not found") || reason.contains("Source transaction missing")
 }
@@ -167,6 +180,204 @@ impl RebalanceMonitor {
 
 		for mut transfer in active {
 			let age = now.saturating_sub(transfer.updated_at);
+
+			// (W) WRAP CRASH-WINDOW + RECEIPT POLL + DROPPED-TX + TIMEOUT.
+			// Native-source pairs submit a wrap before the bridge. Cases:
+			//
+			//   - Marker set, hash None → process crashed between pre/post save.
+			//     Ambiguous broadcast — escalate to NeedsIntervention.
+			//
+			//   - Age > WRAP_TIMEOUT_SECS → stuck (slow gas or bad hash). Escalate.
+			//
+			//   - Hash set → poll receipt; if not yet available, use `tx_exists`
+			//     to distinguish "still in mempool" from "dropped/evicted".
+			//     After WRAP_MISSING_CHECKS_MAX consecutive Ok(false) results,
+			//     clear the hash so the next tick can re-submit cleanly. On
+			//     receipt success → Submitted + bridge_asset. On revert → Failed.
+			if matches!(transfer.status, BridgeTransferStatus::WrapPending) {
+				if transfer.wrap_submit_attempted && transfer.wrap_tx_hash.is_none() {
+					tracing::warn!(
+						transfer_id = %transfer.id,
+						"WrapPending: marker set but no tx_hash — ambiguous broadcast"
+					);
+					self.bridge_service
+						.update_transfer(
+							&mut transfer,
+							BridgeTransferStatus::NeedsIntervention(
+								"wrap submit attempted but no tx_hash persisted — verify chain before retry"
+									.to_string(),
+							),
+						)
+						.await?;
+					continue;
+				}
+				// Resubmit path: both fields cleared (e.g., the previous tick's
+				// dropped-tx handler cleared them after WRAP_MISSING_CHECKS_MAX
+				// misses). Mirrors the UnwrapPending resubmit branch so dropped
+				// wrap txs auto-recover instead of stranding in WrapPending until
+				// the absolute timeout. Crash-window discipline matches
+				// `BridgeService::rebalance_token`: persist
+				// `wrap_submit_attempted = true` BEFORE the call; ambiguous error
+				// stays NeedsIntervention.
+				if !transfer.wrap_submit_attempted && transfer.wrap_tx_hash.is_none() {
+					transfer.wrap_submit_attempted = true;
+					self.bridge_service.storage().save_transfer(&transfer).await?;
+					let _permit = self.transaction_semaphore.acquire().await.map_err(|e| {
+						crate::BridgeError::TransactionFailed(format!(
+							"Failed to acquire semaphore for wrap resubmit: {e}"
+						))
+					})?;
+					match bridge_impl.wrap_native(&transfer).await {
+						Ok(tx_hash) => {
+							transfer.wrap_tx_hash =
+								Some(format!("0x{}", hex::encode(&tx_hash.0)));
+							self.bridge_service.storage().save_transfer(&transfer).await?;
+							tracing::info!(
+								transfer_id = %transfer.id,
+								"Wrap re-submitted after prior dropped tx"
+							);
+						},
+						Err(crate::BridgeError::InsufficientNativeGas(reason)) => {
+							transfer.wrap_submit_attempted = false; // pre-broadcast: safe rollback
+							self.bridge_service
+								.update_transfer(
+									&mut transfer,
+									BridgeTransferStatus::NeedsIntervention(reason),
+								)
+								.await?;
+						},
+						Err(crate::BridgeError::NonceTooLow(reason)) => {
+							transfer.wrap_submit_attempted = false;
+							self.bridge_service.storage().save_transfer(&transfer).await?;
+							tracing::warn!(
+								transfer_id = %transfer.id,
+								reason = %reason,
+								"Wrap resubmit hit nonce drift; retry next tick"
+							);
+						},
+						Err(err) => {
+							// Ambiguous: keep marker set.
+							self.bridge_service
+								.update_transfer(
+									&mut transfer,
+									BridgeTransferStatus::NeedsIntervention(format!(
+										"wrap resubmit attempted but bridge returned generic error: {err}"
+									)),
+								)
+								.await?;
+						},
+					}
+					continue;
+				}
+				if age > WRAP_TIMEOUT_SECS {
+					tracing::warn!(
+						transfer_id = %transfer.id,
+						age_secs = age,
+						"WrapPending exceeded WRAP_TIMEOUT_SECS — escalating"
+					);
+					self.bridge_service
+						.update_transfer(
+							&mut transfer,
+							BridgeTransferStatus::NeedsIntervention(
+								"wrap tx not confirmed after WRAP_TIMEOUT_SECS".to_string(),
+							),
+						)
+						.await?;
+					continue;
+				}
+				if let Some(hash_str) = transfer.wrap_tx_hash.as_ref() {
+					let Ok(hash_bytes) =
+						hex::decode(hash_str.strip_prefix("0x").unwrap_or(hash_str))
+					else {
+						continue;
+					};
+					let tx_hash_obj = solver_types::TransactionHash(hash_bytes.clone());
+					match self
+						.delivery
+						.get_receipt(&tx_hash_obj, transfer.source_chain)
+						.await
+					{
+						Ok(receipt) => {
+							transfer.wrap_missing_checks = 0;
+							if receipt.success {
+								tracing::info!(
+									transfer_id = %transfer.id,
+									"Wrap confirmed; advancing to Submitted and submitting bridge"
+								);
+								self.bridge_service
+									.update_transfer(
+										&mut transfer,
+										BridgeTransferStatus::Submitted,
+									)
+									.await?;
+								// Continue the orchestration via the existing
+								// resume helper — reconstructs BridgeRequest +
+								// TransferMetadata from persisted fields and
+								// calls bridge_asset with the same crash-window
+								// discipline as the original submit path.
+								self.run_bridge_asset_after_approve(
+									&mut transfer,
+									bridge_impl.as_ref(),
+									now,
+								)
+								.await?;
+							} else {
+								self.bridge_service
+									.update_transfer(
+										&mut transfer,
+										BridgeTransferStatus::Failed(
+											"wrap tx reverted".to_string(),
+										),
+									)
+									.await?;
+							}
+						},
+						Err(_) => {
+							// Receipt not yet available. Check whether the tx
+							// still exists on-chain — if not, it was dropped
+							// and we need to clear the hash so the next tick
+							// can resubmit. Threshold mirrors `Submitted`'s
+							// `submitted_missing_checks` rule.
+							match self
+								.delivery
+								.tx_exists(&tx_hash_obj, transfer.source_chain)
+								.await
+							{
+								Ok(false) => {
+									transfer.wrap_missing_checks += 1;
+									if transfer.wrap_missing_checks
+										>= WRAP_MISSING_CHECKS_MAX
+									{
+										tracing::warn!(
+											transfer_id = %transfer.id,
+											"WrapPending: wrap tx missing from chain for {WRAP_MISSING_CHECKS_MAX} ticks — clearing for resubmit"
+										);
+										transfer.wrap_tx_hash = None;
+										transfer.wrap_submit_attempted = false;
+										transfer.wrap_missing_checks = 0;
+										self.bridge_service
+											.storage()
+											.save_transfer(&transfer)
+											.await?;
+									} else {
+										self.bridge_service
+											.storage()
+											.save_transfer(&transfer)
+											.await?;
+									}
+								},
+								_ => {
+									// tx_exists returned Ok(true) or Err — still
+									// pending in mempool. Will recheck next tick;
+									// the absolute WRAP_TIMEOUT_SECS guard above
+									// is the upper bound.
+								},
+							}
+						},
+					}
+				}
+				continue;
+			}
 
 			// (0) DEPOSIT CRASH-WINDOW GUARD — HIGHEST priority.
 			// We marked the transfer "about to call bridge_asset" but never persisted
@@ -698,6 +909,60 @@ impl RebalanceMonitor {
 						transfer.redeem_missing_since = None;
 					}
 
+					// Native-dest redeem intercept (non-composer inbound flow): when
+					// PendingRedemption is about to transition to Completed AND the
+					// destination side has a wrapper, parse the actual asset amount
+					// from the redeem receipt's ERC-4626 Withdraw event and divert
+					// to UnwrapPending so the unwrap step can run.
+					let mut new_status = new_status;
+					if matches!(transfer.status, BridgeTransferStatus::PendingRedemption)
+						&& matches!(new_status, BridgeTransferStatus::Completed)
+					{
+						let dest_has_wrapper = transfer
+							.route_snapshot
+							.as_ref()
+							.and_then(|r| Self::route_wrapper_address(r, transfer.dest_chain))
+							.is_some();
+						if dest_has_wrapper {
+							if let Some(hash_str) = transfer.redeem_tx_hash.as_ref() {
+								let hash_bytes = hex::decode(
+									hash_str.strip_prefix("0x").unwrap_or(hash_str),
+								);
+								if let Ok(hash_bytes) = hash_bytes {
+									let tx_hash_obj = solver_types::TransactionHash(hash_bytes);
+									if let Ok(receipt) = self
+										.delivery
+										.get_receipt(&tx_hash_obj, transfer.dest_chain)
+										.await
+									{
+										match bridge_impl.parse_redeem_assets(&receipt) {
+											Ok(assets) => {
+												transfer.unwrap_amount =
+													Some(assets.to_string());
+												new_status = BridgeTransferStatus::UnwrapPending;
+												tracing::info!(
+													transfer_id = %transfer.id,
+													assets = %assets,
+													"Redeem confirmed; diverting to UnwrapPending"
+												);
+											},
+											Err(e) => {
+												tracing::warn!(
+													transfer_id = %transfer.id,
+													error = %e,
+													"parse_redeem_assets failed; escalating to NeedsIntervention"
+												);
+												new_status = BridgeTransferStatus::NeedsIntervention(
+													format!("redeem receipt parse failed: {e}"),
+												);
+											},
+										}
+									}
+								}
+							}
+						}
+					}
+
 					self.bridge_service
 						.update_transfer(&mut transfer, new_status)
 						.await?;
@@ -797,8 +1062,20 @@ impl RebalanceMonitor {
 									received_shares = %received,
 									"Delivery detected on destination chain"
 								);
+								let dest_has_wrapper = transfer
+									.route_snapshot
+									.as_ref()
+									.and_then(|r| Self::route_wrapper_address(r, transfer.dest_chain))
+									.is_some();
 								let new_status = if transfer.is_composer_flow == Some(true) {
-									BridgeTransferStatus::Completed
+									if dest_has_wrapper {
+										// Native composer flow: the wrapper IS what arrived;
+										// queue the unwrap step to convert to native.
+										transfer.unwrap_amount = Some(received.to_string());
+										BridgeTransferStatus::UnwrapPending
+									} else {
+										BridgeTransferStatus::Completed
+									}
 								} else {
 									BridgeTransferStatus::PendingRedemption
 								};
@@ -819,6 +1096,31 @@ impl RebalanceMonitor {
 						},
 					}
 				}
+			}
+
+			// Redeem crash-window guard. Mirrors the bridge submit / wrap rule:
+			// if a previous tick set `redeem_submit_attempted=true` and then
+			// the process died before `redeem_tx_hash` was persisted, the
+			// redeem MAY have broadcast at a nonce we can't recover. Escalate
+			// to NeedsIntervention rather than risking a second submit.
+			if matches!(transfer.status, BridgeTransferStatus::PendingRedemption)
+				&& transfer.redeem_submit_attempted
+				&& transfer.redeem_tx_hash.is_none()
+			{
+				tracing::warn!(
+					transfer_id = %transfer.id,
+					"PendingRedemption: redeem marker set but no tx_hash — ambiguous broadcast"
+				);
+				self.bridge_service
+					.update_transfer(
+						&mut transfer,
+						BridgeTransferStatus::NeedsIntervention(
+							"redeem submit attempted but no tx_hash persisted — verify chain before retry"
+								.to_string(),
+						),
+					)
+					.await?;
+				continue;
 			}
 
 			// Redeem submission: for PendingRedemption without a redeem tx, submit vault redeem
@@ -891,6 +1193,11 @@ impl RebalanceMonitor {
 							))
 						})?;
 
+						// Persist the crash-window marker BEFORE broadcast so we
+						// can escalate (not auto-retry) on the ambiguous case.
+						transfer.redeem_submit_attempted = true;
+						self.bridge_service.storage().save_transfer(&transfer).await?;
+
 						match self.delivery.deliver(redeem_tx, None).await {
 							Ok(tx_hash) => {
 								transfer.redeem_tx_hash =
@@ -902,11 +1209,12 @@ impl RebalanceMonitor {
 							},
 							// Residual nonce drift after the delivery layer's resync retry.
 							// This is transient — the next monitor tick will retry once the
-							// nonce manager has caught up. Do NOT count it as a redeem
-							// business failure; leaving failure_count untouched keeps the
-							// transfer in PendingRedemption instead of escalating to
-							// NeedsIntervention.
+							// nonce manager has caught up. Pre-broadcast failure, so it's
+							// safe to roll the crash-window marker back. Without the rollback
+							// the next tick would see attempted=true && hash=None and
+							// escalate to NeedsIntervention.
 							Err(solver_delivery::DeliveryError::NonceTooLow(reason)) => {
+								transfer.redeem_submit_attempted = false;
 								tracing::warn!(
 									transfer_id = %transfer.id,
 									reason = %reason,
@@ -914,12 +1222,177 @@ impl RebalanceMonitor {
 								);
 							},
 							Err(e) => {
+								// Generic error: ambiguous. Marker stays set so the
+								// next tick's crash-window guard will escalate.
 								transfer.failure_count += 1;
 								tracing::warn!(
 									transfer_id = %transfer.id,
 									failure_count = transfer.failure_count,
 									"Redeem submission failed: {e}"
 								);
+							},
+						}
+					}
+				}
+			}
+
+			// UnwrapPending handler. Same crash-window discipline as wrap and
+			// bridge submit: if marker is set but no hash is persisted, the
+			// process crashed mid-broadcast and we MUST NOT auto-retry
+			// (would risk a double-unwrap). Escalate to NeedsIntervention.
+			if matches!(transfer.status, BridgeTransferStatus::UnwrapPending)
+				&& transfer.unwrap_submit_attempted
+				&& transfer.unwrap_tx_hash.is_none()
+			{
+				tracing::warn!(
+					transfer_id = %transfer.id,
+					"UnwrapPending: marker set but no tx_hash — ambiguous broadcast"
+				);
+				self.bridge_service
+					.update_transfer(
+						&mut transfer,
+						BridgeTransferStatus::NeedsIntervention(
+							"unwrap submit attempted but no tx_hash persisted — verify chain before retry"
+								.to_string(),
+						),
+					)
+					.await?;
+				continue;
+			}
+			if matches!(transfer.status, BridgeTransferStatus::UnwrapPending)
+				&& transfer.unwrap_tx_hash.is_none()
+			{
+				transfer.unwrap_submit_attempted = true;
+				self.bridge_service.storage().save_transfer(&transfer).await?;
+				let _permit = self.transaction_semaphore.acquire().await.map_err(|e| {
+					crate::BridgeError::TransactionFailed(format!(
+						"Failed to acquire semaphore for unwrap: {e}"
+					))
+				})?;
+				match bridge_impl.unwrap_native(&transfer).await {
+					Ok(tx_hash) => {
+						transfer.unwrap_tx_hash =
+							Some(format!("0x{}", hex::encode(&tx_hash.0)));
+						tracing::info!(
+							transfer_id = %transfer.id,
+							"Unwrap submitted"
+						);
+					},
+					Err(crate::BridgeError::InsufficientNativeGas(reason)) => {
+						transfer.unwrap_submit_attempted = false; // pre-broadcast
+						self.bridge_service
+							.update_transfer(
+								&mut transfer,
+								BridgeTransferStatus::NeedsIntervention(reason),
+							)
+							.await?;
+					},
+					Err(crate::BridgeError::NonceTooLow(reason)) => {
+						transfer.unwrap_submit_attempted = false;
+						tracing::warn!(
+							transfer_id = %transfer.id,
+							reason = %reason,
+							"Unwrap submission hit nonce drift; retry next tick"
+						);
+					},
+					Err(err) => {
+						// Ambiguous: leave marker set, escalate to NeedsIntervention.
+						self.bridge_service
+							.update_transfer(
+								&mut transfer,
+								BridgeTransferStatus::NeedsIntervention(format!(
+									"unwrap submit attempted but bridge returned generic error: {err}"
+								)),
+							)
+							.await?;
+					},
+				}
+			} else if matches!(transfer.status, BridgeTransferStatus::UnwrapPending) {
+				// Absolute timeout: a stuck or dropped unwrap eventually escalates
+				// rather than blocking the pair indefinitely.
+				if age > UNWRAP_TIMEOUT_SECS {
+					tracing::warn!(
+						transfer_id = %transfer.id,
+						age_secs = age,
+						"UnwrapPending exceeded UNWRAP_TIMEOUT_SECS — escalating"
+					);
+					self.bridge_service
+						.update_transfer(
+							&mut transfer,
+							BridgeTransferStatus::NeedsIntervention(
+								"unwrap tx not confirmed after UNWRAP_TIMEOUT_SECS".to_string(),
+							),
+						)
+						.await?;
+					continue;
+				}
+				// Poll the unwrap tx receipt. If not yet available, check
+				// `tx_exists` to distinguish "still in mempool" from "dropped"
+				// and clear the hash after UNWRAP_MISSING_CHECKS_MAX misses so
+				// a fresh submit can run.
+				if let Some(hash_str) = transfer.unwrap_tx_hash.as_ref() {
+					if let Ok(hash_bytes) =
+						hex::decode(hash_str.strip_prefix("0x").unwrap_or(hash_str))
+					{
+						let tx_hash_obj = solver_types::TransactionHash(hash_bytes.clone());
+						match self
+							.delivery
+							.get_receipt(&tx_hash_obj, transfer.dest_chain)
+							.await
+						{
+							Ok(receipt) => {
+								transfer.unwrap_missing_checks = 0;
+								if receipt.success {
+									self.bridge_service
+										.update_transfer(
+											&mut transfer,
+											BridgeTransferStatus::Completed,
+										)
+										.await?;
+									tracing::info!(
+										transfer_id = %transfer.id,
+										"Unwrap confirmed; transfer Completed"
+									);
+								} else {
+									self.bridge_service
+										.update_transfer(
+											&mut transfer,
+											BridgeTransferStatus::NeedsIntervention(
+												"unwrap tx reverted".to_string(),
+											),
+										)
+										.await?;
+								}
+							},
+							Err(_) => {
+								// Receipt not yet available — check existence.
+								match self
+									.delivery
+									.tx_exists(&tx_hash_obj, transfer.dest_chain)
+									.await
+								{
+									Ok(false) => {
+										transfer.unwrap_missing_checks += 1;
+										if transfer.unwrap_missing_checks
+											>= UNWRAP_MISSING_CHECKS_MAX
+										{
+											tracing::warn!(
+												transfer_id = %transfer.id,
+												"UnwrapPending: tx missing for {UNWRAP_MISSING_CHECKS_MAX} ticks — clearing for resubmit"
+											);
+											transfer.unwrap_tx_hash = None;
+											transfer.unwrap_submit_attempted = false;
+											transfer.unwrap_missing_checks = 0;
+										}
+										self.bridge_service
+											.storage()
+											.save_transfer(&transfer)
+											.await?;
+									},
+									_ => {
+										// Still in mempool or transient RPC error.
+									},
+								}
 							},
 						}
 					}
@@ -972,23 +1445,31 @@ impl RebalanceMonitor {
 				continue;
 			}
 
-			// Query balances
-			let balance_a = self
-				.delivery
-				.get_balance(
-					pair.chain_a.chain_id,
-					solver_address,
-					Some(&pair.chain_a.token_address),
-				)
-				.await;
-			let balance_b = self
-				.delivery
-				.get_balance(
-					pair.chain_b.chain_id,
-					solver_address,
-					Some(&pair.chain_b.token_address),
-				)
-				.await;
+			// Query balances. For native pair sides (`token_address` is the zero
+			// address), use `eth_getBalance` (token=None) and add the wrapper's
+			// ERC-20 balance — the "logical" native balance must include funds
+			// temporarily parked in the wrapper during an in-flight unwrap.
+			// `min_native_gas_reserve` continues to use native-only balance and
+			// is checked separately later in this monitor loop.
+			let zero_str = "0x0000000000000000000000000000000000000000";
+			let balance_a = Self::logical_balance(
+				&self.delivery,
+				pair.chain_a.chain_id,
+				solver_address,
+				&pair.chain_a.token_address,
+				pair.bridge_route.as_ref(),
+				zero_str,
+			)
+			.await;
+			let balance_b = Self::logical_balance(
+				&self.delivery,
+				pair.chain_b.chain_id,
+				solver_address,
+				&pair.chain_b.token_address,
+				pair.bridge_route.as_ref(),
+				zero_str,
+			)
+			.await;
 
 			let (balance_a, balance_b) = match (balance_a, balance_b) {
 				(Ok(a), Ok(b)) => {
@@ -1098,20 +1579,34 @@ impl RebalanceMonitor {
 					))
 				})?;
 
-				// Build metadata for delivery detection and redeem path
-				let is_composer = config
-					.bridge_config
-					.as_ref()
-					.and_then(|bc| bc.get("composer_addresses"))
-					.and_then(|ca| ca.get(source_side.chain_id.to_string()))
-					.is_some();
-				let vault_addr = config
-					.bridge_config
-					.as_ref()
-					.and_then(|bc| bc.get("vault_addresses"))
-					.and_then(|va| va.get(dest_side.chain_id.to_string()))
-					.and_then(|v| v.as_str())
-					.map(|s| s.to_string());
+				// Determine composer-flow + vault address. Per-pair `bridge_route`
+				// (round-1..8 design) wins when present; legacy chain-keyed
+				// `bridge_config` is the fallback for USDC-style pairs.
+				let (is_composer, vault_addr) = if let Some(route) = pair.bridge_route.as_ref() {
+					let composer_chain =
+						route.get("composer_chain_id").and_then(|v| v.as_u64());
+					let is_composer = composer_chain == Some(source_side.chain_id);
+					let vault = route
+						.get("vault")
+						.and_then(|v| v.as_str())
+						.map(|s| s.to_string());
+					(is_composer, vault)
+				} else {
+					let is_composer = config
+						.bridge_config
+						.as_ref()
+						.and_then(|bc| bc.get("composer_addresses"))
+						.and_then(|ca| ca.get(source_side.chain_id.to_string()))
+						.is_some();
+					let vault_addr = config
+						.bridge_config
+						.as_ref()
+						.and_then(|bc| bc.get("vault_addresses"))
+						.and_then(|va| va.get(dest_side.chain_id.to_string()))
+						.and_then(|v| v.as_str())
+						.map(|s| s.to_string());
+					(is_composer, vault_addr)
+				};
 
 				if !is_composer && vault_addr.is_none() {
 					tracing::warn!(
@@ -1122,11 +1617,42 @@ impl RebalanceMonitor {
 					continue;
 				}
 
+				// Effective tokens for native pairs:
+				//   - source = wrapper address (for approve/balance)
+				//   - dest = wrapper (composer flow) or vault shares (non-composer)
+				let zero_str = "0x0000000000000000000000000000000000000000";
+				let effective_source_token: String =
+					if source_side.token_address.eq_ignore_ascii_case(zero_str) {
+						pair.bridge_route
+							.as_ref()
+							.and_then(|r| Self::route_wrapper_address(r, source_side.chain_id))
+							.unwrap_or_else(|| source_side.token_address.clone())
+					} else {
+						source_side.token_address.clone()
+					};
+				// For composer (outbound) flow on a native dest, the wrapper is
+				// what arrives at the solver — that's the Transfer-event scan
+				// target. For non-composer (inbound), the existing scan path
+				// already falls back to `vault_address` so we keep the pair
+				// token here (which is what the existing tests expect).
+				let delivery_scan_token: String = if is_composer
+					&& dest_side.token_address.eq_ignore_ascii_case(zero_str)
+				{
+					pair.bridge_route
+						.as_ref()
+						.and_then(|r| Self::route_wrapper_address(r, dest_side.chain_id))
+						.unwrap_or_else(|| dest_side.token_address.clone())
+				} else {
+					dest_side.token_address.clone()
+				};
+
 				let metadata = crate::types::TransferMetadata {
-					dest_token_address: dest_side.token_address.clone(),
+					source_token_address: effective_source_token,
+					dest_token_address: delivery_scan_token,
 					dest_oft_address: dest_side.oft_address.clone(),
 					is_composer_flow: is_composer,
 					vault_address: vault_addr,
+					bridge_route: pair.bridge_route.clone(),
 				};
 
 				match self
@@ -1172,6 +1698,64 @@ impl RebalanceMonitor {
 	/// Used by the resume-after-approve path so the monitor can re-run
 	/// `bridge_asset` with the same shape as the original submission, even
 	/// across solver restarts and config changes.
+	/// Logical balance for rebalance accounting on a pair side. For native
+	/// sides (token_address == 0x000…) this is `eth_getBalance + wrapper.balanceOf`,
+	/// so funds parked in a wrapper during an in-flight unwrap aren't missed.
+	/// For ERC-20 sides this is just `IERC20(token).balanceOf(solver)`, matching
+	/// the previous behavior.
+	async fn logical_balance(
+		delivery: &solver_delivery::DeliveryService,
+		chain_id: u64,
+		solver_address: &str,
+		token_address: &str,
+		bridge_route: Option<&serde_json::Value>,
+		zero_str: &str,
+	) -> Result<String, solver_delivery::DeliveryError> {
+		if !token_address.eq_ignore_ascii_case(zero_str) {
+			return delivery
+				.get_balance(chain_id, solver_address, Some(token_address))
+				.await;
+		}
+		// Native side: native + wrapper balance.
+		let native = delivery
+			.get_balance(chain_id, solver_address, None)
+			.await?;
+		let wrapper = bridge_route.and_then(|r| Self::route_wrapper_address(r, chain_id));
+		let wrapper_balance = match wrapper {
+			Some(addr) => delivery
+				.get_balance(chain_id, solver_address, Some(&addr))
+				.await
+				.unwrap_or_else(|_| "0".to_string()),
+			None => "0".to_string(),
+		};
+		let native_u = U256::from_str_radix(&native, 10).unwrap_or(U256::ZERO);
+		let wrapper_u = U256::from_str_radix(&wrapper_balance, 10).unwrap_or(U256::ZERO);
+		Ok((native_u + wrapper_u).to_string())
+	}
+
+	/// Bridge-generic helper: look up the wrapper address for a given chain on
+	/// a per-pair `bridge_route` JSON blob. Returns `None` when the route is
+	/// absent, the side isn't found, or the side has no wrapper.
+	fn route_wrapper_address(
+		route: &serde_json::Value,
+		chain_id: u64,
+	) -> Option<String> {
+		for side_key in ["chain_a", "chain_b"] {
+			let Some(side) = route.get(side_key) else {
+				continue;
+			};
+			let side_chain = side.get("chain_id").and_then(|v| v.as_u64()).unwrap_or(0);
+			if side_chain == chain_id {
+				return side
+					.get("wrapper")
+					.and_then(|w| w.get("address"))
+					.and_then(|a| a.as_str())
+					.map(String::from);
+			}
+		}
+		None
+	}
+
 	fn reconstruct_bridge_request(
 		transfer: &crate::types::PendingBridgeTransfer,
 	) -> Result<crate::types::BridgeRequest, String> {
@@ -1223,6 +1807,22 @@ impl RebalanceMonitor {
 			min_amount,
 			recipient,
 		})
+	}
+
+	/// Rebuild a `TransferMetadata` from a persisted transfer for the resume path.
+	/// `bridge_route` is read from `route_snapshot` (captured at submission), so
+	/// resume uses the same routing as the original call even if config changes.
+	fn reconstruct_metadata(
+		transfer: &crate::types::PendingBridgeTransfer,
+	) -> crate::types::TransferMetadata {
+		crate::types::TransferMetadata {
+			source_token_address: transfer.source_token_address.clone().unwrap_or_default(),
+			dest_token_address: transfer.dest_token_address.clone().unwrap_or_default(),
+			dest_oft_address: transfer.dest_oft_address.clone().unwrap_or_default(),
+			is_composer_flow: transfer.is_composer_flow.unwrap_or(false),
+			vault_address: transfer.vault_address.clone(),
+			bridge_route: transfer.route_snapshot.clone(),
+		}
 	}
 
 	/// Reconstruct a `BridgeRequest` from a transfer's persisted fields and
@@ -1281,8 +1881,23 @@ impl RebalanceMonitor {
 			))
 		})?;
 
-		match bridge_impl.bridge_asset(&request).await {
+		let metadata = Self::reconstruct_metadata(transfer);
+		tracing::info!(
+			transfer_id = %transfer.id,
+			pair = %transfer.pair_id,
+			source_chain = transfer.source_chain,
+			dest_chain = transfer.dest_chain,
+			amount = %transfer.amount,
+			has_bridge_route = metadata.bridge_route.is_some(),
+			"Submitting bridge_asset (post-wrap or post-approve resume)"
+		);
+		match bridge_impl.bridge_asset(&request, &metadata).await {
 			Ok(result) => {
+				tracing::info!(
+					transfer_id = %transfer.id,
+					tx_hash = %result.tx_hash,
+					"bridge_asset OK — depositAndSend/OFT.send submitted"
+				);
 				transfer.tx_hash = Some(result.tx_hash);
 				transfer.message_guid = result.message_guid;
 				transfer.updated_at = now;
@@ -1336,6 +1951,11 @@ impl RebalanceMonitor {
 				// Pre-broadcast failure: no deposit/source tx was submitted.
 				// Keep the pair locked in NeedsIntervention with a clear operator
 				// reason, but do not abort the whole monitor tick.
+				tracing::warn!(
+					transfer_id = %transfer.id,
+					reason = %reason,
+					"bridge_asset blocked by insufficient native gas — likely lzFee + gas exceeds remaining native balance after wrap"
+				);
 				transfer.bridge_submit_attempted = false;
 				self.bridge_service
 					.update_transfer(
@@ -1401,6 +2021,7 @@ mod tests {
 		async fn bridge_asset(
 			&self,
 			request: &crate::types::BridgeRequest,
+			_metadata: &crate::types::TransferMetadata,
 		) -> Result<BridgeDepositResult, crate::BridgeError> {
 			self.recorded_requests.lock().unwrap().push(request.clone());
 			self.bridge_asset_results
@@ -1430,6 +2051,7 @@ mod tests {
 		async fn estimate_fee(
 			&self,
 			_request: &crate::types::BridgeRequest,
+			_metadata: &crate::types::TransferMetadata,
 		) -> Result<U256, crate::BridgeError> {
 			Ok(U256::ZERO)
 		}
