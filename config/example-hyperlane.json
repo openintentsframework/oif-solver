@@ -91,7 +91,5 @@
     "enabled": true,
     "domain": "localhost",
     "admin_addresses": ["0x<your-admin-wallet-address>"]
-  },
-
-  "auth_enabled": false
+  }
 }

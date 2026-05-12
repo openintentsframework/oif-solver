@@ -1,0 +1,194 @@
+---
+name: E2E
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+    paths-ignore:
+      - docs/**
+      - "**.md"
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - docs/**
+      - "**.md"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build
+    if: ${{ github.event.pull_request.draft == false || github.event_name != 'pull_request' }}
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      forge-cache-key: ${{ steps.oif-contracts-sha.outputs.key }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout solver
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Checkout oif-contracts
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: openintentsframework/oif-contracts
+          path: oif-contracts
+          # forge-std, permit2, the-compact, openzeppelin-contracts, broadcaster
+          submodules: recursive
+          # Tracks upstream main. Replace with a commit SHA if you need
+          # strict reproducibility across CI runs (cache key is keyed on the
+          # resolved SHA either way, so upstream changes invalidate cleanly).
+          ref: main
+
+      # Forge cache key invalidates on any change to oif-contracts source or
+      # any submodule. Exposed as job output so e2e shards restore the same
+      # key without re-checking out oif-contracts.
+      - name: Resolve oif-contracts source SHA for cache key
+        id: oif-contracts-sha
+        working-directory: oif-contracts
+        run: |
+          sha="$(git rev-parse HEAD)"
+          submods="$(git submodule status --recursive | awk '{print $1}' | sort | sha1sum | awk '{print $1}')"
+          echo "key=${sha}-${submods}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache forge build output
+        id: forge-cache
+        uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            oif-contracts/out
+            oif-contracts/cache
+          key: forge-build-${{ runner.os }}-${{ steps.oif-contracts-sha.outputs.key }}
+          restore-keys: |
+            forge-build-${{ runner.os }}-
+
+      - name: Install Foundry (anvil + forge)
+        uses: foundry-rs/foundry-toolchain@de808b1eea699e761c404bda44ba8f21aba30b2c # v1.4.0
+        with:
+          version: stable
+
+      - name: Build oif-contracts
+        if: steps.forge-cache.outputs.cache-hit != 'true'
+        run: forge build
+        working-directory: oif-contracts
+
+      # Inline rust-toolchain + rust-cache (instead of `prepare` composite)
+      # so we can pass `shared-key: e2e-suite`, which strips the per-job
+      # component from the cache key and lets the e2e matrix shards restore
+      # the build job's compiled `target/`.
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2.7.7
+        with:
+          shared-key: e2e-suite
+
+      - name: Build solver + all e2e test binaries
+        run: |
+          cargo build -p solver-service --bin solver --locked
+          cargo test -p solver-e2e-tests --tests --no-run --locked
+
+  e2e:
+    name: e2e (${{ matrix.test }})
+    needs: build
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - happy_e2e_open_fill_settle
+          - submit_e2e_hyperlane
+          - permit2_e2e
+          - eip3009_e2e
+          - deny_list_e2e
+          - failure_e2e_onchain
+          - failure_e2e_settlement
+          - api_e2e_orders
+          - admin_api_e2e
+    services:
+      # Only admin_api_e2e uses Redis; others ignore REDIS_URL via
+      # `redis_url_or_skip`. Cheaper to start it in every shard than to fork
+      # the matrix.
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      REDIS_URL: redis://127.0.0.1:6379
+      OIF_CONTRACTS_PATH: ${{ github.workspace }}/oif-contracts
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@ec9f2d5744a09debf3a187a3f4f675c53b671911 # v2.13.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout solver
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Restore forge build output
+        id: forge-cache
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            oif-contracts/out
+            oif-contracts/cache
+          key: forge-build-${{ runner.os }}-${{ needs.build.outputs.forge-cache-key }}
+
+      # anvil is needed at runtime; forge is only needed for the cache-miss
+      # fallback below.
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@de808b1eea699e761c404bda44ba8f21aba30b2c # v1.4.0
+        with:
+          version: stable
+
+      # Self-heal if the cache was evicted between the build job and now —
+      # rebuild oif-contracts in this shard instead of taking down the matrix.
+      - name: Checkout oif-contracts (cache miss fallback)
+        if: steps.forge-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: openintentsframework/oif-contracts
+          path: oif-contracts
+          submodules: recursive
+          ref: main
+
+      - name: Build oif-contracts (cache miss fallback)
+        if: steps.forge-cache.outputs.cache-hit != 'true'
+        run: forge build
+        working-directory: oif-contracts
+
+      # Same shared-key as the build job — restores its compiled target/.
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@f0deed1e0edfc6a9be95417288c0e1099b1eeec3 # v2.7.7
+        with:
+          shared-key: e2e-suite
+
+      - name: Run e2e
+        run: |
+          cargo test -p solver-e2e-tests --test ${{ matrix.test }} \
+            --locked -- --ignored --test-threads=1 --nocapture

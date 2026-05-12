@@ -118,11 +118,11 @@ pub async fn register_client(
 		},
 	};
 
-	if !jwt_service.config().enabled {
+	if !jwt_service.config().orders_auth_enabled {
 		return (
 			StatusCode::SERVICE_UNAVAILABLE,
 			Json(json!({
-				"error": "Authentication is disabled"
+				"error": "Public-client JWT authentication is disabled (orders_auth_enabled = false)"
 			})),
 		)
 			.into_response();
@@ -272,11 +272,11 @@ pub async fn refresh_token(
 		},
 	};
 
-	if !jwt_service.config().enabled {
+	if !jwt_service.config().orders_auth_enabled {
 		return (
 			StatusCode::SERVICE_UNAVAILABLE,
 			Json(json!({
-				"error": "Authentication is disabled"
+				"error": "Public-client JWT authentication is disabled (orders_auth_enabled = false)"
 			})),
 		)
 			.into_response();
@@ -593,6 +593,11 @@ fn resolve_siwe_scopes(
 async fn siwe_dependencies(
 	state: &SiweAuthState,
 ) -> Result<(Arc<JwtService>, Arc<NonceStore>, SiweRuntimeConfig), axum::response::Response> {
+	// SIWE admin login is gated solely by `auth.admin.enabled` (checked below
+	// in `resolve_siwe_runtime_config`). The orders-side JWT flag
+	// (`AuthConfig::orders_auth_enabled`) is intentionally NOT consulted here:
+	// an operator who only wants admin SIWE — with the public Orders API kept
+	// open — must be able to mint admin JWTs without flipping the orders gate.
 	let jwt_service = match &state.jwt_service {
 		Some(service) => service.clone(),
 		None => {
@@ -605,16 +610,6 @@ async fn siwe_dependencies(
 				.into_response());
 		},
 	};
-
-	if !jwt_service.config().enabled {
-		return Err((
-			StatusCode::SERVICE_UNAVAILABLE,
-			Json(json!({
-				"error": "Authentication is disabled"
-			})),
-		)
-			.into_response());
-	}
 
 	let nonce_store = match &state.siwe_nonce_store {
 		Some(store) => store.clone(),
@@ -805,11 +800,11 @@ mod tests {
 
 	// Helper function to create a test JWT service
 	fn create_test_jwt_service_with(
-		auth_enabled: bool,
+		orders_auth_enabled: bool,
 		public_register_enabled: bool,
 	) -> Arc<JwtService> {
 		let config = AuthConfig {
-			enabled: auth_enabled,
+			orders_auth_enabled,
 			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars-long"),
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,
@@ -855,7 +850,7 @@ mod tests {
 		siwe_nonce_store: Option<Arc<NonceStore>>,
 	) -> SiweAuthState {
 		let auth_config = AuthConfig {
-			enabled: true,
+			orders_auth_enabled: true,
 			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars-long"),
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,
@@ -1187,7 +1182,10 @@ mod tests {
 		let (parts, body) = response_obj.into_parts();
 		assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
 		let json_body = extract_json_from_body(body).await;
-		assert_eq!(json_body["error"], "Authentication is disabled");
+		assert_eq!(
+			json_body["error"],
+			"Public-client JWT authentication is disabled (orders_auth_enabled = false)"
+		);
 	}
 
 	#[tokio::test]
@@ -1290,7 +1288,10 @@ mod tests {
 		let (parts, body) = response_obj.into_parts();
 		assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
 		let json_body = extract_json_from_body(body).await;
-		assert_eq!(json_body["error"], "Authentication is disabled");
+		assert_eq!(
+			json_body["error"],
+			"Public-client JWT authentication is disabled (orders_auth_enabled = false)"
+		);
 	}
 
 	#[tokio::test]
@@ -1458,8 +1459,13 @@ mod tests {
 		assert_eq!(refreshed_refresh_claims.scope, vec![AuthScope::AdminAll]);
 	}
 
+	/// Locks in the API-separation hot-fix on the verify path: SIWE verify must
+	/// proceed past the dependency gate when `admin.enabled = true` even if
+	/// `orders_auth_enabled = false`. With an empty payload, verification
+	/// itself fails downstream, but the failure must NOT be the 503 "auth
+	/// disabled" gate that the old code returned.
 	#[tokio::test]
-	async fn test_verify_siwe_token_auth_disabled() {
+	async fn test_verify_siwe_token_passes_gate_when_only_admin_enabled() {
 		let jwt_service = create_test_jwt_service_with(false, false);
 		let nonce_store =
 			Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
@@ -1471,11 +1477,13 @@ mod tests {
 
 		let response = verify_siwe_token(State(state), Json(request)).await;
 		let response_obj = response.into_response();
-		let (parts, body) = response_obj.into_parts();
-		assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
-
-		let json_body = extract_json_from_body(body).await;
-		assert_eq!(json_body["error"], "Authentication is disabled");
+		let (parts, _body) = response_obj.into_parts();
+		assert_ne!(
+			parts.status,
+			StatusCode::SERVICE_UNAVAILABLE,
+			"SIWE verify must not 503 just because orders_auth_enabled=false; \
+			 admin.enabled=true is sufficient to enter the verify path"
+		);
 	}
 
 	#[tokio::test]
@@ -1512,6 +1520,46 @@ mod tests {
 			.message
 			.contains(&format!("Nonce: {}", nonce_response.nonce)));
 
+		let nonce_id = super::parse_siwe_nonce(&nonce_response.nonce).unwrap();
+		assert!(nonce_store.exists(nonce_id).await.unwrap());
+	}
+
+	/// Locks in the API-separation hot-fix: SIWE admin login must work when
+	/// `admin.enabled = true` even if `orders_auth_enabled = false`. Operators
+	/// who want admin-only auth (public Orders API kept open) are a supported
+	/// configuration; before the fix this returned 503 because both checks
+	/// shared a single flag.
+	#[tokio::test]
+	async fn test_issue_siwe_nonce_works_when_only_admin_enabled() {
+		let jwt_service = create_test_jwt_service_with(false, false);
+		let signer = create_test_siwe_signer();
+		let nonce_store =
+			Arc::new(create_nonce_store(StoreConfig::Memory, "test-solver", 300).unwrap());
+		let state = create_test_siwe_state(
+			Some(jwt_service),
+			true,
+			vec![signer.address()],
+			Some(nonce_store.clone()),
+		);
+
+		let response = issue_siwe_nonce(
+			State(state),
+			Json(SiweNonceRequest {
+				address: signer.address().to_string(),
+			}),
+		)
+		.await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(
+			parts.status,
+			StatusCode::OK,
+			"SIWE must succeed when only admin is enabled (orders_auth_enabled=false)"
+		);
+
+		let json_body = extract_json_from_body(body).await;
+		let nonce_response: SiweNonceResponse = serde_json::from_value(json_body).unwrap();
 		let nonce_id = super::parse_siwe_nonce(&nonce_response.nonce).unwrap();
 		assert!(nonce_store.exists(nonce_id).await.unwrap());
 	}
@@ -1781,7 +1829,7 @@ mod tests {
 			.unwrap();
 
 		let auth_config = AuthConfig {
-			enabled: true,
+			orders_auth_enabled: true,
 			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars-long"),
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,

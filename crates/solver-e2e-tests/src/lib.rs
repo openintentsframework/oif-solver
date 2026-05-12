@@ -1316,7 +1316,7 @@ fn build_seed_overrides(
 		routing_defaults: None,
 		account: None,
 		admin,
-		auth_enabled: Some(options.enable_admin_api),
+		orders_auth_enabled: Some(options.enable_admin_api),
 		min_profitability_pct: None,
 		gas_buffer_bps: None,
 		commission_bps: None,

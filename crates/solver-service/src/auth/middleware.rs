@@ -154,7 +154,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_middleware_with_valid_token() {
 		let config = AuthConfig {
-			enabled: true,
+			orders_auth_enabled: true,
 			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars"),
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,
@@ -187,7 +187,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_middleware_without_token() {
 		let config = AuthConfig {
-			enabled: true,
+			orders_auth_enabled: true,
 			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars"),
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,
@@ -215,7 +215,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_middleware_with_wrong_scope() {
 		let config = AuthConfig {
-			enabled: true,
+			orders_auth_enabled: true,
 			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars"),
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,
@@ -248,7 +248,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_admin_all_grants_admin_read_route() {
 		let config = AuthConfig {
-			enabled: true,
+			orders_auth_enabled: true,
 			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars"),
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,
@@ -280,7 +280,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_admin_read_does_not_grant_admin_all_route() {
 		let config = AuthConfig {
-			enabled: true,
+			orders_auth_enabled: true,
 			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars"),
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,

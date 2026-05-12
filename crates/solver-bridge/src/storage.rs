@@ -42,9 +42,11 @@ impl BridgeStorage {
 	/// Build storage indexes for a transfer.
 	fn build_indexes(transfer: &PendingBridgeTransfer) -> StorageIndexes {
 		let status_str = match &transfer.status {
+			BridgeTransferStatus::WrapPending => "wrap_pending",
 			BridgeTransferStatus::Submitted => "submitted",
 			BridgeTransferStatus::Relaying => "relaying",
 			BridgeTransferStatus::PendingRedemption => "pending_redemption",
+			BridgeTransferStatus::UnwrapPending => "unwrap_pending",
 			BridgeTransferStatus::Completed => "completed",
 			BridgeTransferStatus::Failed(_) => "failed",
 			BridgeTransferStatus::NeedsIntervention(_) => "needs_intervention",
@@ -101,9 +103,11 @@ impl BridgeStorage {
 		let mut active = Vec::new();
 
 		for status in &[
+			"wrap_pending",
 			"submitted",
 			"relaying",
 			"pending_redemption",
+			"unwrap_pending",
 			"needs_intervention",
 		] {
 			let filter = QueryFilter::Equals(
@@ -252,27 +256,55 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_bridge_storage_get_active_transfers_includes_needs_intervention() {
+	async fn test_bridge_storage_get_active_transfers_includes_all_active_statuses() {
 		let (storage, _) = make_storage();
 
+		let mut wrap_pending = pending_transfer(BridgeTransferStatus::WrapPending);
+		wrap_pending.id = "wrap-pending-1".to_string();
+		wrap_pending.pair_id = "eth-katana".to_string();
 		let mut submitted = pending_transfer(BridgeTransferStatus::Submitted);
 		submitted.id = "submitted-1".to_string();
 		submitted.pair_id = "eth-katana".to_string();
+		let mut relaying = pending_transfer(BridgeTransferStatus::Relaying);
+		relaying.id = "relaying-1".to_string();
+		relaying.pair_id = "eth-katana".to_string();
+		let mut pending_redemption = pending_transfer(BridgeTransferStatus::PendingRedemption);
+		pending_redemption.id = "pending-redemption-1".to_string();
+		pending_redemption.pair_id = "eth-katana".to_string();
+		let mut unwrap_pending = pending_transfer(BridgeTransferStatus::UnwrapPending);
+		unwrap_pending.id = "unwrap-pending-1".to_string();
+		unwrap_pending.pair_id = "eth-katana".to_string();
 		let mut intervention = pending_transfer(BridgeTransferStatus::NeedsIntervention(
 			"manual review".to_string(),
 		));
 		intervention.id = "intervention-1".to_string();
 		intervention.pair_id = "eth-katana".to_string();
 
+		storage.save_transfer(&wrap_pending).await.unwrap();
 		storage.save_transfer(&submitted).await.unwrap();
+		storage.save_transfer(&relaying).await.unwrap();
+		storage.save_transfer(&pending_redemption).await.unwrap();
+		storage.save_transfer(&unwrap_pending).await.unwrap();
 		storage.save_transfer(&intervention).await.unwrap();
 
 		let transfers = storage.get_active_transfers().await.unwrap();
 
-		assert_eq!(transfers.len(), 2);
+		assert_eq!(transfers.len(), 6);
+		assert!(transfers
+			.iter()
+			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::WrapPending)));
 		assert!(transfers
 			.iter()
 			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::Submitted)));
+		assert!(transfers
+			.iter()
+			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::Relaying)));
+		assert!(transfers
+			.iter()
+			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::PendingRedemption)));
+		assert!(transfers
+			.iter()
+			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::UnwrapPending)));
 		assert!(transfers
 			.iter()
 			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::NeedsIntervention(_))));
@@ -285,6 +317,12 @@ mod tests {
 		let mut matching_submitted = pending_transfer(BridgeTransferStatus::Submitted);
 		matching_submitted.id = "match-submitted".to_string();
 		matching_submitted.pair_id = "eth-katana".to_string();
+		let mut matching_wrap_pending = pending_transfer(BridgeTransferStatus::WrapPending);
+		matching_wrap_pending.id = "match-wrap-pending".to_string();
+		matching_wrap_pending.pair_id = "eth-katana".to_string();
+		let mut matching_unwrap_pending = pending_transfer(BridgeTransferStatus::UnwrapPending);
+		matching_unwrap_pending.id = "match-unwrap-pending".to_string();
+		matching_unwrap_pending.pair_id = "eth-katana".to_string();
 		let mut matching_intervention = pending_transfer(BridgeTransferStatus::NeedsIntervention(
 			"manual review".to_string(),
 		));
@@ -295,6 +333,11 @@ mod tests {
 		other_pair.pair_id = "arb-eth".to_string();
 
 		storage.save_transfer(&matching_submitted).await.unwrap();
+		storage.save_transfer(&matching_wrap_pending).await.unwrap();
+		storage
+			.save_transfer(&matching_unwrap_pending)
+			.await
+			.unwrap();
 		storage.save_transfer(&matching_intervention).await.unwrap();
 		storage.save_transfer(&other_pair).await.unwrap();
 
@@ -303,13 +346,19 @@ mod tests {
 			.await
 			.unwrap();
 
-		assert_eq!(transfers.len(), 2);
+		assert_eq!(transfers.len(), 4);
 		assert!(transfers
 			.iter()
 			.all(|transfer| transfer.pair_id == "eth-katana"));
 		assert!(transfers
 			.iter()
+			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::WrapPending)));
+		assert!(transfers
+			.iter()
 			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::Submitted)));
+		assert!(transfers
+			.iter()
+			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::UnwrapPending)));
 		assert!(transfers
 			.iter()
 			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::NeedsIntervention(_))));

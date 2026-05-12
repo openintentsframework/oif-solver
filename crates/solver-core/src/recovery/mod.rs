@@ -5,6 +5,9 @@
 //! post-fill, pre-claim, claim), and resume processing of active orders.
 
 use crate::engine::event_bus::EventBus;
+use crate::state::order::{
+	FAILED_STATUS_KIND_INDEX_VALUE, FINALIZED_STATUS_KIND_INDEX_VALUE, STATUS_KIND_INDEX_FIELD,
+};
 use crate::state::OrderStateMachine;
 use alloy_primitives::hex;
 use solver_delivery::DeliveryService;
@@ -184,35 +187,9 @@ impl RecoveryService {
 	///
 	/// A vector of active orders that need recovery processing.
 	async fn load_active_orders(&self) -> Result<Vec<Order>, RecoveryError> {
-		// Define all terminal status values to exclude using proper serialization
-		let non_terminal_statuses = vec![
-			serde_json::to_value(OrderStatus::Finalized)
-				.expect("OrderStatus::Finalized serialization should not fail"),
-			serde_json::to_value(OrderStatus::Failed(
-				TransactionType::Prepare,
-				"Recovery failure".to_string(),
-			))
-			.expect("OrderStatus::Failed(Prepare) serialization should not fail"),
-			serde_json::to_value(OrderStatus::Failed(
-				TransactionType::Fill,
-				"Recovery failure".to_string(),
-			))
-			.expect("OrderStatus::Failed(Fill) serialization should not fail"),
-			serde_json::to_value(OrderStatus::Failed(
-				TransactionType::Claim,
-				"Recovery failure".to_string(),
-			))
-			.expect("OrderStatus::Failed(Claim) serialization should not fail"),
-			serde_json::to_value(OrderStatus::Failed(
-				TransactionType::PostFill,
-				"Recovery failure".to_string(),
-			))
-			.expect("OrderStatus::Failed(PostFill) serialization should not fail"),
-			serde_json::to_value(OrderStatus::Failed(
-				TransactionType::PreClaim,
-				"Recovery failure".to_string(),
-			))
-			.expect("OrderStatus::Failed(PreClaim) serialization should not fail"),
+		let terminal_status_kinds = vec![
+			serde_json::json!(FINALIZED_STATUS_KIND_INDEX_VALUE),
+			serde_json::json!(FAILED_STATUS_KIND_INDEX_VALUE),
 		];
 
 		// Query for all non-terminal orders
@@ -220,7 +197,7 @@ impl RecoveryService {
 			.storage
 			.query::<Order>(
 				StorageKey::Orders.as_str(),
-				QueryFilter::NotIn("status".to_string(), non_terminal_statuses),
+				QueryFilter::NotIn(STATUS_KIND_INDEX_FIELD.to_string(), terminal_status_kinds),
 			)
 			.await
 			.map_err(|e| RecoveryError::Storage(e.to_string()))?;
@@ -1023,6 +1000,54 @@ mod tests {
 		assert_eq!(orders.len(), 1);
 		assert_eq!(orders[0].id, "test_order_123");
 		assert_eq!(orders[0].status, OrderStatus::Pending);
+	}
+
+	#[tokio::test]
+	async fn load_active_orders_queries_canonical_status_kind_index() {
+		let mut mock_storage = MockStorageInterface::new();
+
+		mock_storage
+			.expect_query()
+			.withf(|namespace, filter| {
+				if namespace != "orders" {
+					return false;
+				}
+
+				matches!(
+					filter,
+					QueryFilter::NotIn(field, values)
+						if field == "status_kind"
+							&& values
+								== &vec![
+									serde_json::json!("finalized"),
+									serde_json::json!("failed"),
+								]
+				)
+			})
+			.times(1)
+			.returning(|_, _| Box::pin(async move { Ok(Vec::new()) }));
+
+		mock_storage
+			.expect_get_batch()
+			.times(1)
+			.withf(|keys| keys.is_empty())
+			.returning(|_| Box::pin(async move { Ok(Vec::new()) }));
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
+			HashMap::new();
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::new();
+		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
+		let event_bus = EventBus::new(100);
+
+		let recovery_service =
+			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+
+		let orders = recovery_service.load_active_orders().await.unwrap();
+		assert!(orders.is_empty());
 	}
 
 	#[tokio::test]

@@ -322,8 +322,8 @@ fn parse_u16_env_var(name: &str, default: u16) -> Result<u16, MergeError> {
 	}
 }
 
-fn load_public_register_enabled(auth_enabled: bool) -> Result<bool, MergeError> {
-	if !auth_enabled {
+fn load_public_register_enabled(orders_auth_enabled: bool) -> Result<bool, MergeError> {
+	if !orders_auth_enabled {
 		return Ok(false);
 	}
 
@@ -501,7 +501,7 @@ pub fn merge_to_operator_config(
 			deny_list: initializer.deny_list.clone(),
 		},
 		admin,
-		auth_enabled: initializer.auth_enabled.unwrap_or(false),
+		orders_auth_enabled: initializer.orders_auth_enabled.unwrap_or(false),
 		account: initializer.account.as_ref().map(|a| OperatorAccountConfig {
 			primary: a.primary.clone(),
 			implementations: a.implementations.clone(),
@@ -1143,7 +1143,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 		pricing: Some(build_pricing_config_from_operator(&operator_config.pricing)),
 		api: Some(build_api_config_from_operator(
 			&operator_config.admin,
-			operator_config.auth_enabled,
+			operator_config.orders_auth_enabled,
 		)?),
 		gas: Some(build_gas_config_from_operator(&operator_config.gas)),
 		rebalance: build_rebalance_config_from_operator(operator_config.rebalance.as_ref())?,
@@ -2118,10 +2118,10 @@ fn build_gas_config_from_operator(gas: &OperatorGasConfig) -> GasConfig {
 /// Builds ApiConfig from OperatorAdminConfig.
 fn build_api_config_from_operator(
 	admin: &OperatorAdminConfig,
-	auth_enabled: bool,
+	orders_auth_enabled: bool,
 ) -> Result<ApiConfig, MergeError> {
 	let api_port = parse_u16_env_var("SOLVER_API_PORT", 3000)?;
-	let auth = if admin.enabled || auth_enabled {
+	let auth = if admin.enabled || orders_auth_enabled {
 		// Read JWT secret from environment variable
 		let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| {
 			tracing::warn!(
@@ -2129,7 +2129,7 @@ fn build_api_config_from_operator(
 			);
 			uuid::Uuid::new_v4().to_string()
 		});
-		let public_register_enabled = load_public_register_enabled(auth_enabled)?;
+		let public_register_enabled = load_public_register_enabled(orders_auth_enabled)?;
 
 		let admin_config = if admin.enabled {
 			Some(solver_types::AdminConfig {
@@ -2144,7 +2144,7 @@ fn build_api_config_from_operator(
 		};
 
 		Some(solver_types::AuthConfig {
-			enabled: auth_enabled,
+			orders_auth_enabled,
 			jwt_secret: solver_types::SecretString::new(jwt_secret),
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720, // 30 days
@@ -2456,11 +2456,11 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		})
 		.unwrap_or_default();
 
-	let auth_enabled = config
+	let orders_auth_enabled = config
 		.api
 		.as_ref()
 		.and_then(|api| api.auth.as_ref())
-		.map(|auth| auth.enabled)
+		.map(|auth| auth.orders_auth_enabled)
 		.unwrap_or(false);
 
 	// Extract account config - only set if not using default local wallet
@@ -2489,7 +2489,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 			deny_list: config.solver.deny_list.clone(),
 		},
 		admin,
-		auth_enabled,
+		orders_auth_enabled,
 		account,
 		rebalance: extract_rebalance_config(config.rebalance.as_ref())?,
 		// Legacy `Config` shape doesn't carry a fee-policy override block —
@@ -2564,6 +2564,7 @@ fn build_rebalance_config_from_operator(
 			target_balance_b: p.target_balance_b.clone(),
 			deviation_band_bps: p.deviation_band_bps,
 			max_bridge_amount: p.max_bridge_amount.clone(),
+			bridge_route: p.bridge_route.clone(),
 		})
 		.collect();
 
@@ -2633,6 +2634,7 @@ fn extract_rebalance_config(
 			target_balance_b: p.target_balance_b.clone(),
 			deviation_band_bps: p.deviation_band_bps,
 			max_bridge_amount: p.max_bridge_amount.clone(),
+			bridge_route: p.bridge_route.clone(),
 		});
 	}
 
@@ -3389,7 +3391,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -3549,7 +3551,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -3609,7 +3611,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -3663,7 +3665,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -3708,7 +3710,7 @@ mod tests {
 			}],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -3799,7 +3801,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: Some(Decimal::from_str("2.5").unwrap()), // Override: 2.5%
 			gas_buffer_bps: Some(1500),                                     // Override: 15%
@@ -4021,7 +4023,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -4087,7 +4089,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -4178,7 +4180,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -4244,7 +4246,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -4316,7 +4318,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -4440,7 +4442,7 @@ mod tests {
 			routing_defaults: None,
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -4572,7 +4574,7 @@ mod tests {
 			routing_defaults: None,
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -4642,7 +4644,7 @@ mod tests {
 			routing_defaults: None,
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -4706,7 +4708,7 @@ mod tests {
 			routing_defaults: None,
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -4805,7 +4807,7 @@ mod tests {
 			routing_defaults: None,
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -4913,7 +4915,7 @@ mod tests {
 			routing_defaults: None,
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -5080,7 +5082,7 @@ mod tests {
 			routing_defaults: None,
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -5219,7 +5221,7 @@ mod tests {
 			routing_defaults: None,
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -5322,7 +5324,7 @@ mod tests {
 			routing_defaults: None,
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -5447,7 +5449,7 @@ mod tests {
 			routing_defaults: None,
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -5601,7 +5603,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -5648,7 +5650,7 @@ mod tests {
 			}],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -5709,7 +5711,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -5763,7 +5765,7 @@ mod tests {
 			],
 			account: None,
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -5835,7 +5837,7 @@ mod tests {
 				whitelist: Vec::new(),
 				withdrawals: solver_types::seed_overrides::WithdrawalsOverride::default(),
 			}),
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -6031,7 +6033,7 @@ mod tests {
 				deny_list: None,
 			},
 			admin: OperatorAdminConfig::default(),
-			auth_enabled: false,
+			orders_auth_enabled: false,
 			account: None,
 			rebalance: None,
 			fee_policy: None,
@@ -6613,7 +6615,7 @@ mod tests {
 
 		assert!(api.enabled);
 		let auth = api.auth.as_ref().unwrap();
-		assert!(auth.enabled);
+		assert!(auth.orders_auth_enabled);
 		assert!(auth.public_register_enabled);
 		let admin_config = auth.admin.as_ref().unwrap();
 		assert!(admin_config.enabled);
@@ -6800,7 +6802,7 @@ mod tests {
 
 	#[test]
 	#[serial]
-	fn test_auth_enabled_defaults_public_register_disabled() {
+	fn test_orders_auth_enabled_defaults_public_register_disabled() {
 		use std::env;
 
 		let original = env::var("AUTH_PUBLIC_REGISTER_ENABLED").ok();
@@ -6989,7 +6991,7 @@ mod tests {
 				},
 			}),
 			admin: None,
-			auth_enabled: None,
+			orders_auth_enabled: None,
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
@@ -7084,6 +7086,7 @@ mod tests {
 					target_balance_b: "1000000".to_string(),
 					deviation_band_bps: 2000,
 					max_bridge_amount: "500000".to_string(),
+					bridge_route: None,
 				},
 				solver_types::OperatorRebalancePairConfig {
 					pair_id: "eth-katana".to_string(),
@@ -7101,6 +7104,7 @@ mod tests {
 					target_balance_b: "1000000".to_string(),
 					deviation_band_bps: 2000,
 					max_bridge_amount: "500000".to_string(),
+					bridge_route: None,
 				},
 			],
 			bridge_config: None,
@@ -7139,6 +7143,7 @@ mod tests {
 				target_balance_b: "1000000".to_string(),
 				deviation_band_bps: 2000,
 				max_bridge_amount: "500000".to_string(),
+				bridge_route: None,
 			}],
 			bridge_config: None,
 		};
@@ -7176,6 +7181,7 @@ mod tests {
 				target_balance_b: "1000000".to_string(),
 				deviation_band_bps: 2000,
 				max_bridge_amount: "500000".to_string(),
+				bridge_route: None,
 			}],
 			bridge_config: None,
 		};

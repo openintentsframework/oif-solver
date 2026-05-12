@@ -9,6 +9,7 @@ pub mod types;
 
 use crate::types::{
 	BridgeDepositResult, BridgeRequest, BridgeTransferStatus, PendingBridgeTransfer,
+	TransferMetadata,
 };
 use crate::{BridgeError, BridgeInterface};
 use alloy_primitives::{Address, U256};
@@ -194,8 +195,21 @@ impl LayerZeroBridge {
 	async fn bridge_via_composer(
 		&self,
 		request: &BridgeRequest,
+		route: Option<&types::LayerZeroBridgeRoute>,
 	) -> Result<BridgeDepositResult, BridgeError> {
-		let composer_addr = self.get_composer(request.source_chain)?;
+		// Per-pair route wins when present (correct for native-ETH pairs whose
+		// composer differs from any USDC composer on the same chain). Legacy
+		// pairs without `bridge_route` fall back to chain-keyed lookups.
+		let composer_addr = match route {
+			Some(r) if r.composer_chain_id == request.source_chain => r.composer,
+			_ => self.get_composer(request.source_chain)?,
+		};
+		// Effective source token = wrapper for native sides, pair token otherwise.
+		let source_token = Self::effective_source_token(route, request);
+		// Composer flows consume the source ERC-20/wrapper via the composer
+		// contract, so approval is always required. The route-side
+		// `approval_required=false` flag only applies to direct OFT sends.
+		let approval_required = true;
 		let dest_eid = self.get_eid(request.dest_chain)?;
 		let to_bytes32 = address_to_bytes32(self.solver_address);
 		let extra_options = self.build_extra_options();
@@ -213,60 +227,73 @@ impl LayerZeroBridge {
 		// idempotency. Any approve failure surfaces cleanly through the
 		// existing ApproveSubmitFailed / ApproveReverted arms instead of
 		// silently stranding the transfer due to a precheck RPC blip.
-		let current_allowance = match self
-			.read_allowance(
-				request.source_chain,
-				request.source_token,
-				self.solver_address,
-				composer_addr,
-			)
-			.await
-		{
-			Ok(a) => a,
-			Err(e) => {
-				tracing::warn!(
-					chain_id = request.source_chain,
-					error = %e,
-					"read_allowance failed; falling through to approve path"
-				);
-				U256::ZERO
-			},
-		};
-
-		if current_allowance >= request.amount {
+		if !approval_required {
 			tracing::info!(
 				chain_id = request.source_chain,
-				current_allowance = %current_allowance,
-				requested = %request.amount,
-				"Allowance already sufficient; skipping Composer approve"
+				"Source OFT/wrapper declares approvalRequired=false; skipping Composer approve"
 			);
 		} else {
-			let approve_data = contracts::approveCall {
-				spender: composer_addr,
-				amount: request.amount,
-			}
-			.abi_encode();
-
-			let approve_tx = build_tx(
-				request.source_chain,
-				request.source_token,
-				approve_data,
-				U256::ZERO,
-				Some(ERC20_APPROVE_GAS_LIMIT),
-			);
-
-			self.submit_and_confirm(approve_tx, "Composer approve")
+			let current_allowance = match self
+				.read_allowance(
+					request.source_chain,
+					source_token,
+					self.solver_address,
+					composer_addr,
+				)
 				.await
-				.map_err(|e| match e {
-					BridgeError::InsufficientNativeGas(_) => e,
-					other => BridgeError::ApproveSubmitFailed {
-						error: other.to_string(),
-					},
-				})?;
+			{
+				Ok(a) => a,
+				Err(e) => {
+					tracing::warn!(
+						chain_id = request.source_chain,
+						error = %e,
+						"read_allowance failed; falling through to approve path"
+					);
+					U256::ZERO
+				},
+			};
+
+			if current_allowance >= request.amount {
+				tracing::info!(
+					chain_id = request.source_chain,
+					current_allowance = %current_allowance,
+					requested = %request.amount,
+					"Allowance already sufficient; skipping Composer approve"
+				);
+			} else {
+				let approve_data = contracts::approveCall {
+					spender: composer_addr,
+					amount: request.amount,
+				}
+				.abi_encode();
+
+				let approve_tx = build_tx(
+					request.source_chain,
+					source_token,
+					approve_data,
+					U256::ZERO,
+					Some(ERC20_APPROVE_GAS_LIMIT),
+				);
+
+				self.submit_and_confirm(approve_tx, "Composer approve")
+					.await
+					.map_err(|e| match e {
+						BridgeError::InsufficientNativeGas(_) => e,
+						other => BridgeError::ApproveSubmitFailed {
+							error: other.to_string(),
+						},
+					})?;
+			}
 		}
 
-		// Step 2: Estimate fee
-		let fee = self.estimate_fee(request).await?;
+		// Step 2: Estimate fee — pass the route through so quoteSend uses the
+		// per-pair composer, not chain-keyed `get_composer`.
+		let fee_metadata = TransferMetadata {
+			bridge_route: route
+				.map(|r| serde_json::to_value(r).expect("LayerZeroBridgeRoute is serializable")),
+			..Default::default()
+		};
+		let fee = self.estimate_fee(request, &fee_metadata).await?;
 
 		// Step 3: depositAndSend on Composer
 		let send_param = contracts::SendParam {
@@ -305,8 +332,9 @@ impl LayerZeroBridge {
 		})
 	}
 
-	/// Katana → ETH: approve shares to OFT (skipping when the existing
-	/// allowance is already sufficient), then call send().
+	/// Katana → ETH: approve shares to OFT (skipping when the existing allowance is
+	/// already sufficient OR when the route declares `approval_required: false`),
+	/// then call send().
 	///
 	/// The approve phase intentionally uses the historical synchronous
 	/// submit-and-confirm path. A timed-out approve is a pre-deposit failure,
@@ -315,7 +343,15 @@ impl LayerZeroBridge {
 	async fn bridge_via_oft_send(
 		&self,
 		request: &BridgeRequest,
+		route: Option<&types::LayerZeroBridgeRoute>,
 	) -> Result<BridgeDepositResult, BridgeError> {
+		// Effective source token = wrapper for native sides, pair token otherwise.
+		let source_token = Self::effective_source_token(route, request);
+		// Approval gating per route.
+		let approval_required = route
+			.and_then(|r| r.resolve_side(request.source_chain))
+			.map(|s| s.approval_required)
+			.unwrap_or(true);
 		let dest_eid = self.get_eid(request.dest_chain)?;
 		let to_bytes32 = address_to_bytes32(self.solver_address);
 		let extra_options = self.build_extra_options();
@@ -329,60 +365,72 @@ impl LayerZeroBridge {
 		// Same safe-operational-fallback rationale as bridge_via_composer:
 		// a transient RPC failure on the precheck must not promote to
 		// NeedsIntervention. See bridge_via_composer for the full comment.
-		let current_allowance = match self
-			.read_allowance(
-				request.source_chain,
-				request.source_token,
-				self.solver_address,
-				request.source_oft,
-			)
-			.await
-		{
-			Ok(a) => a,
-			Err(e) => {
-				tracing::warn!(
-					chain_id = request.source_chain,
-					error = %e,
-					"read_allowance failed; falling through to approve path"
-				);
-				U256::ZERO
-			},
-		};
-
-		if current_allowance >= request.amount {
+		if !approval_required {
 			tracing::info!(
 				chain_id = request.source_chain,
-				current_allowance = %current_allowance,
-				requested = %request.amount,
-				"Allowance already sufficient; skipping OFT approve"
+				"Source OFT declares approvalRequired=false (e.g., mint/burn adapter); skipping OFT approve"
 			);
 		} else {
-			let approve_data = contracts::approveCall {
-				spender: request.source_oft,
-				amount: request.amount,
-			}
-			.abi_encode();
-
-			let approve_tx = build_tx(
-				request.source_chain,
-				request.source_token,
-				approve_data,
-				U256::ZERO,
-				Some(ERC20_APPROVE_GAS_LIMIT),
-			);
-
-			self.submit_and_confirm(approve_tx, "OFT approve")
+			let current_allowance = match self
+				.read_allowance(
+					request.source_chain,
+					source_token,
+					self.solver_address,
+					request.source_oft,
+				)
 				.await
-				.map_err(|e| match e {
-					BridgeError::InsufficientNativeGas(_) => e,
-					other => BridgeError::ApproveSubmitFailed {
-						error: other.to_string(),
-					},
-				})?;
+			{
+				Ok(a) => a,
+				Err(e) => {
+					tracing::warn!(
+						chain_id = request.source_chain,
+						error = %e,
+						"read_allowance failed; falling through to approve path"
+					);
+					U256::ZERO
+				},
+			};
+
+			if current_allowance >= request.amount {
+				tracing::info!(
+					chain_id = request.source_chain,
+					current_allowance = %current_allowance,
+					requested = %request.amount,
+					"Allowance already sufficient; skipping OFT approve"
+				);
+			} else {
+				let approve_data = contracts::approveCall {
+					spender: request.source_oft,
+					amount: request.amount,
+				}
+				.abi_encode();
+
+				let approve_tx = build_tx(
+					request.source_chain,
+					source_token,
+					approve_data,
+					U256::ZERO,
+					Some(ERC20_APPROVE_GAS_LIMIT),
+				);
+
+				self.submit_and_confirm(approve_tx, "OFT approve")
+					.await
+					.map_err(|e| match e {
+						BridgeError::InsufficientNativeGas(_) => e,
+						other => BridgeError::ApproveSubmitFailed {
+							error: other.to_string(),
+						},
+					})?;
+			}
 		}
 
-		// Step 2: Estimate fee
-		let fee = self.estimate_fee(request).await?;
+		// Step 2: Estimate fee — thread the route through.
+		let fee_metadata = TransferMetadata {
+			bridge_route: route
+				.map(|r| serde_json::to_value(r).expect("LayerZeroBridgeRoute is serializable")),
+			..Default::default()
+		};
+		let fee = self.estimate_fee(request, &fee_metadata).await?;
 
 		// Step 3: OFT send()
 		let send_param = contracts::SendParam {
@@ -458,6 +506,126 @@ impl LayerZeroBridge {
 			))
 		})
 	}
+
+	// ------------------------------------------------------------------------
+	// Native-asset rebalance helpers.
+	//
+	// Read the per-pair route from `TransferMetadata.bridge_route` (or
+	// `PendingBridgeTransfer.route_snapshot` on the resume path) — never from
+	// the chain-keyed `LayerZeroBridgeConfig`. Behavior is gated on the
+	// route's per-side `wrapper` / `approval_required` fields.
+	// ------------------------------------------------------------------------
+
+	/// Deserialize the per-pair route from a metadata snapshot, returning an
+	/// explanatory error if the route is missing or malformed. None means the
+	/// caller is on the legacy chain-keyed path.
+	fn deserialize_route(
+		route_json: &Option<serde_json::Value>,
+	) -> Result<Option<types::LayerZeroBridgeRoute>, BridgeError> {
+		match route_json {
+			None => Ok(None),
+			Some(v) => serde_json::from_value::<types::LayerZeroBridgeRoute>(v.clone())
+				.map(Some)
+				.map_err(|e| {
+					BridgeError::Config(format!("invalid LayerZeroBridgeRoute JSON: {e}"))
+				}),
+		}
+	}
+
+	/// Resolve which side of the route corresponds to `target_chain`. Returns
+	/// `BridgeError::Config` if the chain isn't part of the route — config
+	/// validation should have caught this earlier.
+	fn resolve_side(
+		route: &types::LayerZeroBridgeRoute,
+		target_chain: u64,
+	) -> Result<&types::SideRoute, BridgeError> {
+		route.resolve_side(target_chain).ok_or_else(|| {
+			BridgeError::Config(format!(
+				"transfer chain {target_chain} not in route (route has {} and {})",
+				route.chain_a.chain_id, route.chain_b.chain_id
+			))
+		})
+	}
+
+	/// Effective source ERC-20 token. For native source sides this is the
+	/// wrapper (e.g., WETH on Ethereum); for ERC-20 sides it's the pair's
+	/// token. Falls back to `request.source_token` when no route is present
+	/// (legacy chain-keyed path).
+	fn effective_source_token(
+		route: Option<&types::LayerZeroBridgeRoute>,
+		request: &BridgeRequest,
+	) -> Address {
+		match route.and_then(|r| r.resolve_side(request.source_chain)) {
+			Some(side) => match &side.wrapper {
+				Some(w) => w.address,
+				None => request.source_token,
+			},
+			None => request.source_token,
+		}
+	}
+
+	/// Effective destination ERC-20 token. Mirror of `effective_source_token`.
+	#[allow(dead_code)]
+	fn effective_dest_token(
+		route: Option<&types::LayerZeroBridgeRoute>,
+		request: &BridgeRequest,
+	) -> Address {
+		match route.and_then(|r| r.resolve_side(request.dest_chain)) {
+			Some(side) => match &side.wrapper {
+				Some(w) => w.address,
+				None => request.dest_token,
+			},
+			None => request.dest_token,
+		}
+	}
+
+	/// Build a `WETH9.deposit{value: amount}` tx targeting `wrapper_address`
+	/// on `chain_id`. Used for both Ethereum-side WETH and Katana-side vbETH.
+	fn build_weth9_deposit_tx(
+		chain_id: u64,
+		wrapper_address: Address,
+		amount: U256,
+	) -> solver_types::Transaction {
+		let data = contracts::depositCall {}.abi_encode();
+		build_tx(chain_id, wrapper_address, data, amount, None)
+	}
+
+	/// Build a `WETH9.withdraw(amount)` tx.
+	fn build_weth9_withdraw_tx(
+		chain_id: u64,
+		wrapper_address: Address,
+		amount: U256,
+	) -> solver_types::Transaction {
+		let data = contracts::withdrawCall { amount }.abi_encode();
+		build_tx(chain_id, wrapper_address, data, U256::ZERO, None)
+	}
+
+	/// Build a `vault.redeem(shares, receiver, owner)` tx.
+	fn build_vault_redeem_tx(
+		chain_id: u64,
+		vault_address: Address,
+		shares: U256,
+		receiver: Address,
+		owner: Address,
+	) -> solver_types::Transaction {
+		let data = contracts::redeemCall {
+			shares,
+			receiver,
+			owner,
+		}
+		.abi_encode();
+		build_tx(chain_id, vault_address, data, U256::ZERO, None)
+	}
+
+	/// Parse a `U256` from a decimal-string field on the transfer (e.g.,
+	/// `received_shares`, `amount`, `unwrap_amount`).
+	fn parse_amount(field: &Option<String>, name: &str) -> Result<U256, BridgeError> {
+		let s = field
+			.as_deref()
+			.ok_or_else(|| BridgeError::Config(format!("missing {name} on transfer")))?;
+		U256::from_str_radix(s, 10)
+			.map_err(|e| BridgeError::Config(format!("invalid {name} '{s}': {e}")))
+	}
 }
 
 #[async_trait]
@@ -478,11 +646,22 @@ impl BridgeInterface for LayerZeroBridge {
 	async fn bridge_asset(
 		&self,
 		request: &BridgeRequest,
+		metadata: &TransferMetadata,
 	) -> Result<BridgeDepositResult, BridgeError> {
-		if self.is_composer_flow(request.source_chain) {
-			self.bridge_via_composer(request).await
+		// The wrap step (when the source side is native) is owned by
+		// `BridgeService::rebalance_token` and is run BEFORE this call, with
+		// `wrap_submit_attempted` / `wrap_tx_hash` persisted for crash safety.
+		// `bridge_asset` itself only performs the approve + composer/send tx.
+		let route = Self::deserialize_route(&metadata.bridge_route)?;
+		let route_ref = route.as_ref();
+		let is_composer = match route_ref {
+			Some(r) => r.composer_chain_id == request.source_chain,
+			None => self.is_composer_flow(request.source_chain),
+		};
+		if is_composer {
+			self.bridge_via_composer(request, route_ref).await
 		} else {
-			self.bridge_via_oft_send(request).await
+			self.bridge_via_oft_send(request, route_ref).await
 		}
 	}
 
@@ -627,7 +806,16 @@ impl BridgeInterface for LayerZeroBridge {
 		}
 	}
 
-	async fn estimate_fee(&self, request: &BridgeRequest) -> Result<U256, BridgeError> {
+	async fn estimate_fee(
+		&self,
+		request: &BridgeRequest,
+		metadata: &TransferMetadata,
+	) -> Result<U256, BridgeError> {
+		// When a per-pair route is provided, use its composer directly instead
+		// of the chain-keyed `get_composer(source_chain)` lookup — chain-keyed
+		// would silently pick the wrong composer for a pair like ETH/vbETH
+		// that lives on the same chain as USDC/vbUSDC.
+		let route = Self::deserialize_route(&metadata.bridge_route)?;
 		let dest_eid = self.get_eid(request.dest_chain)?;
 		let to_bytes32 = address_to_bytes32(self.solver_address);
 		let extra_options = self.build_extra_options();
@@ -645,7 +833,17 @@ impl BridgeInterface for LayerZeroBridge {
 			oftCmd: Vec::new().into(),
 		};
 
-		if self.is_composer_flow(request.source_chain) {
+		// Decide whether this is a composer flow:
+		//   - If a per-pair route is present, use it (it knows which chain holds
+		//     the composer + vault).
+		//   - Otherwise fall back to the legacy chain-keyed `is_composer_flow`.
+		let (is_composer, route_composer) = match route.as_ref() {
+			Some(r) if r.composer_chain_id == request.source_chain => (true, Some(r.composer)),
+			Some(_) => (false, None),
+			None => (self.is_composer_flow(request.source_chain), None),
+		};
+
+		if is_composer {
 			// Composer has its own quoteSend with different params
 			let quote_data = contracts::IVaultComposerSync::quoteSendCall {
 				from: self.solver_address,
@@ -655,9 +853,14 @@ impl BridgeInterface for LayerZeroBridge {
 			}
 			.abi_encode();
 
+			// Prefer the per-pair composer; fall back to chain-keyed for legacy pairs.
+			let composer_addr = match route_composer {
+				Some(addr) => addr,
+				None => self.get_composer(request.source_chain)?,
+			};
 			let call_tx = build_tx(
 				request.source_chain,
-				self.get_composer(request.source_chain)?,
+				composer_addr,
 				quote_data,
 				U256::ZERO,
 				None,
@@ -700,6 +903,497 @@ impl BridgeInterface for LayerZeroBridge {
 
 			Ok(decoded.nativeFee)
 		}
+	}
+
+	// ------------------------------------------------------------------------
+	// Native-asset rebalance trait methods.
+	// ------------------------------------------------------------------------
+
+	async fn wrap_native(
+		&self,
+		transfer: &PendingBridgeTransfer,
+	) -> Result<solver_types::TransactionHash, BridgeError> {
+		let route = Self::deserialize_route(&transfer.route_snapshot)?
+			.ok_or_else(|| BridgeError::Config("wrap_native: route_snapshot missing".into()))?;
+		let side = Self::resolve_side(&route, transfer.source_chain)?;
+		let wrapper = side
+			.wrapper
+			.as_ref()
+			.ok_or_else(|| BridgeError::Config("wrap_native: source side has no wrapper".into()))?;
+		let amount = Self::parse_amount(&Some(transfer.amount.clone()), "amount")?;
+
+		match wrapper.strategy {
+			types::WrapStrategy::Weth9 => {
+				let tx =
+					Self::build_weth9_deposit_tx(transfer.source_chain, wrapper.address, amount);
+				self.delivery
+					.deliver(tx, None)
+					.await
+					.map_err(|e| map_delivery_error("wrap_native", e))
+			},
+		}
+	}
+
+	async fn unwrap_native(
+		&self,
+		transfer: &PendingBridgeTransfer,
+	) -> Result<solver_types::TransactionHash, BridgeError> {
+		let route = Self::deserialize_route(&transfer.route_snapshot)?
+			.ok_or_else(|| BridgeError::Config("unwrap_native: route_snapshot missing".into()))?;
+		let side = Self::resolve_side(&route, transfer.dest_chain)?;
+		let wrapper = side
+			.wrapper
+			.as_ref()
+			.ok_or_else(|| BridgeError::Config("unwrap_native: dest side has no wrapper".into()))?;
+		let amount = Self::parse_amount(&transfer.unwrap_amount, "unwrap_amount")?;
+
+		match wrapper.strategy {
+			types::WrapStrategy::Weth9 => {
+				let tx =
+					Self::build_weth9_withdraw_tx(transfer.dest_chain, wrapper.address, amount);
+				self.delivery
+					.deliver(tx, None)
+					.await
+					.map_err(|e| map_delivery_error("unwrap_native", e))
+			},
+		}
+	}
+
+	async fn redeem_shares(
+		&self,
+		transfer: &PendingBridgeTransfer,
+	) -> Result<solver_types::TransactionHash, BridgeError> {
+		let route = Self::deserialize_route(&transfer.route_snapshot)?
+			.ok_or_else(|| BridgeError::Config("redeem_shares: route_snapshot missing".into()))?;
+		let shares = Self::parse_amount(&transfer.received_shares, "received_shares")?;
+		// Solver redeems shares it holds, sending the asset back to itself.
+		let tx = Self::build_vault_redeem_tx(
+			transfer.dest_chain,
+			route.vault,
+			shares,
+			self.solver_address,
+			self.solver_address,
+		);
+		self.delivery
+			.deliver(tx, None)
+			.await
+			.map_err(|e| map_delivery_error("redeem_shares", e))
+	}
+
+	fn parse_redeem_assets(
+		&self,
+		receipt: &solver_types::TransactionReceipt,
+	) -> Result<U256, BridgeError> {
+		// Receipts do NOT expose Solidity return values. Parse the canonical
+		// ERC-4626 Withdraw event from receipt logs.
+		use alloy_sol_types::SolEvent;
+		let target_topic0 = contracts::Withdraw::SIGNATURE_HASH;
+		for log in &receipt.logs {
+			if log.topics.is_empty() {
+				continue;
+			}
+			// `log.topics[0]` is an `H256`; compare its raw bytes against the
+			// pre-computed event signature hash.
+			if log.topics[0].0 != target_topic0.0 {
+				continue;
+			}
+			let alloy_topics: Vec<alloy_primitives::B256> = log
+				.topics
+				.iter()
+				.map(|t| alloy_primitives::B256::from(t.0))
+				.collect();
+			let decoded =
+				contracts::Withdraw::decode_raw_log(alloy_topics.iter().copied(), &log.data)
+					.map_err(|e| {
+						BridgeError::TransactionFailed(format!(
+							"failed to decode ERC-4626 Withdraw event: {e}"
+						))
+					})?;
+			return Ok(decoded.assets);
+		}
+		Err(BridgeError::TransactionFailed(
+			"redeem receipt parse failed: no ERC-4626 Withdraw event in logs".into(),
+		))
+	}
+
+	async fn preflight(
+		&self,
+		pairs: &[solver_types::OperatorRebalancePairConfig],
+	) -> Result<(), BridgeError> {
+		// Only validates pairs that carry an explicit `bridge_route`. Pairs on
+		// the legacy chain-keyed path skip preflight (their addresses come from
+		// `LayerZeroBridgeConfig.{composer,vault}_addresses`).
+		for pair in pairs {
+			let Some(route_json) = &pair.bridge_route else {
+				continue;
+			};
+			let route: types::LayerZeroBridgeRoute = serde_json::from_value(route_json.clone())
+				.map_err(|e| {
+					BridgeError::Config(format!(
+						"pair '{}': invalid LayerZeroBridgeRoute JSON: {e}",
+						pair.pair_id
+					))
+				})?;
+
+			// (a) route chain_ids must match pair chain_ids
+			if route.chain_a.chain_id != pair.chain_a.chain_id
+				|| route.chain_b.chain_id != pair.chain_b.chain_id
+			{
+				return Err(BridgeError::Config(format!(
+					"pair '{}': bridge_route chain IDs ({}, {}) don't match pair ({}, {})",
+					pair.pair_id,
+					route.chain_a.chain_id,
+					route.chain_b.chain_id,
+					pair.chain_a.chain_id,
+					pair.chain_b.chain_id
+				)));
+			}
+
+			// (b) composer_chain_id must match one of the pair sides
+			if route.composer_chain_id != pair.chain_a.chain_id
+				&& route.composer_chain_id != pair.chain_b.chain_id
+			{
+				return Err(BridgeError::Config(format!(
+					"pair '{}': composer_chain_id {} matches neither pair side ({}, {})",
+					pair.pair_id,
+					route.composer_chain_id,
+					pair.chain_a.chain_id,
+					pair.chain_b.chain_id
+				)));
+			}
+
+			// (c) If a native side declares a wrapper, the corresponding pair side's
+			// token_address must be the zero address.
+			for (label, pair_side, side_route) in [
+				("chain_a", &pair.chain_a, &route.chain_a),
+				("chain_b", &pair.chain_b, &route.chain_b),
+			] {
+				let is_native = pair_side.token_address == Address::ZERO;
+				if is_native && side_route.wrapper.is_none() {
+					return Err(BridgeError::Config(format!(
+						"pair '{}' {}: token is native but route side has no wrapper",
+						pair.pair_id, label
+					)));
+				}
+				if !is_native && side_route.wrapper.is_some() {
+					return Err(BridgeError::Config(format!(
+						"pair '{}' {}: token is ERC-20 ({}) but route side declares a wrapper",
+						pair.pair_id, label, pair_side.token_address
+					)));
+				}
+			}
+
+			// (d) approval_required cross-check via the configured OFT.
+			// Calls IOFT::approvalRequired() on each side's own chain_id.
+			for (label, pair_side, side_route) in [
+				("chain_a", &pair.chain_a, &route.chain_a),
+				("chain_b", &pair.chain_b, &route.chain_b),
+			] {
+				let call_data = contracts::approvalRequiredCall {}.abi_encode();
+				let call_tx = build_tx(
+					pair_side.chain_id,
+					pair_side.oft_address,
+					call_data,
+					U256::ZERO,
+					None,
+				);
+				let result = self
+					.delivery
+					.contract_call(pair_side.chain_id, call_tx)
+					.await
+					.map_err(|e| {
+						BridgeError::Config(format!(
+							"pair '{}' {}: approvalRequired() call failed on chain {}: {e}",
+							pair.pair_id, label, pair_side.chain_id
+						))
+					})?;
+				let decoded = contracts::approvalRequiredCall::abi_decode_returns(&result)
+					.map_err(|e| {
+						BridgeError::Config(format!(
+							"pair '{}' {}: decode approvalRequired returned bytes failed: {e}",
+							pair.pair_id, label
+						))
+					})?;
+				if decoded != side_route.approval_required {
+					return Err(BridgeError::Config(format!(
+						"pair '{}' {} OFT {}: approval_required declared {} but on-chain reports {}",
+						pair.pair_id,
+						label,
+						pair_side.oft_address,
+						side_route.approval_required,
+						decoded
+					)));
+				}
+			}
+
+			// (e) Composer immutables: VAULT() and SHARE_OFT() must match.
+			let composer_chain = route.composer_chain_id;
+			let vault_call = contracts::IVaultComposerSync::VAULTCall {}.abi_encode();
+			let vault_tx = build_tx(composer_chain, route.composer, vault_call, U256::ZERO, None);
+			let vault_result = self
+				.delivery
+				.contract_call(composer_chain, vault_tx)
+				.await
+				.map_err(|e| {
+					BridgeError::Config(format!(
+						"pair '{}': composer.VAULT() call failed: {e}",
+						pair.pair_id
+					))
+				})?;
+			let composer_vault =
+				contracts::IVaultComposerSync::VAULTCall::abi_decode_returns(&vault_result)
+					.map_err(|e| {
+						BridgeError::Config(format!(
+							"pair '{}': decode VAULT() failed: {e}",
+							pair.pair_id
+						))
+					})?;
+			if composer_vault != route.vault {
+				return Err(BridgeError::Config(format!(
+					"pair '{}': composer.VAULT() = {} but route.vault = {}",
+					pair.pair_id, composer_vault, route.vault
+				)));
+			}
+
+			// Identify which pair side is the vault-side (chain_id matches composer's).
+			let (vault_side, vault_route) = if composer_chain == pair.chain_a.chain_id {
+				(&pair.chain_a, &route.chain_a)
+			} else {
+				(&pair.chain_b, &route.chain_b)
+			};
+
+			let share_oft_call = contracts::IVaultComposerSync::SHARE_OFTCall {}.abi_encode();
+			let share_oft_tx = build_tx(
+				composer_chain,
+				route.composer,
+				share_oft_call,
+				U256::ZERO,
+				None,
+			);
+			let share_oft_result = self
+				.delivery
+				.contract_call(composer_chain, share_oft_tx)
+				.await
+				.map_err(|e| {
+					BridgeError::Config(format!(
+						"pair '{}': composer.SHARE_OFT() call failed: {e}",
+						pair.pair_id
+					))
+				})?;
+			let composer_share_oft =
+				contracts::IVaultComposerSync::SHARE_OFTCall::abi_decode_returns(&share_oft_result)
+					.map_err(|e| {
+						BridgeError::Config(format!(
+							"pair '{}': decode SHARE_OFT() failed: {e}",
+							pair.pair_id
+						))
+					})?;
+			if composer_share_oft != vault_side.oft_address {
+				return Err(BridgeError::Config(format!(
+					"pair '{}': composer.SHARE_OFT() = {} but vault-side oft_address = {} \
+					 (likely the Asset OFT was configured instead of the Share OFT Adapter)",
+					pair.pair_id, composer_share_oft, vault_side.oft_address
+				)));
+			}
+
+			// (f) composer.ASSET_ERC20() must match the vault-side expected asset
+			// (wrapper for native sides, pair token for ERC-20).
+			let expected_vault_asset: Address = match &vault_route.wrapper {
+				Some(w) => w.address,
+				None => vault_side.token_address,
+			};
+			let asset_call = contracts::IVaultComposerSync::ASSET_ERC20Call {}.abi_encode();
+			let asset_tx = build_tx(composer_chain, route.composer, asset_call, U256::ZERO, None);
+			let asset_result = self
+				.delivery
+				.contract_call(composer_chain, asset_tx)
+				.await
+				.map_err(|e| {
+					BridgeError::Config(format!(
+						"pair '{}': composer.ASSET_ERC20() call failed: {e}",
+						pair.pair_id
+					))
+				})?;
+			let composer_asset =
+				contracts::IVaultComposerSync::ASSET_ERC20Call::abi_decode_returns(&asset_result)
+					.map_err(|e| {
+					BridgeError::Config(format!(
+						"pair '{}': decode ASSET_ERC20() failed: {e}",
+						pair.pair_id
+					))
+				})?;
+			if composer_asset != expected_vault_asset {
+				return Err(BridgeError::Config(format!(
+					"pair '{}': composer.ASSET_ERC20() = {} but vault-side expected asset = {} \
+					 (wrong wrapper or pair token configured for the vault-side)",
+					pair.pair_id, composer_asset, expected_vault_asset
+				)));
+			}
+
+			// (g) vault.asset() must agree with composer.ASSET_ERC20().
+			let vault_asset_call = contracts::assetCall {}.abi_encode();
+			let vault_asset_tx = build_tx(
+				composer_chain,
+				route.vault,
+				vault_asset_call,
+				U256::ZERO,
+				None,
+			);
+			let vault_asset_result = self
+				.delivery
+				.contract_call(composer_chain, vault_asset_tx)
+				.await
+				.map_err(|e| {
+					BridgeError::Config(format!(
+						"pair '{}': vault.asset() call failed: {e}",
+						pair.pair_id
+					))
+				})?;
+			let vault_asset = contracts::assetCall::abi_decode_returns(&vault_asset_result)
+				.map_err(|e| {
+					BridgeError::Config(format!(
+						"pair '{}': decode vault.asset() failed: {e}",
+						pair.pair_id
+					))
+				})?;
+			if vault_asset != composer_asset {
+				return Err(BridgeError::Config(format!(
+					"pair '{}': vault.asset() = {} but composer.ASSET_ERC20() = {} \
+					 (route.vault and route.composer come from different deployments)",
+					pair.pair_id, vault_asset, composer_asset
+				)));
+			}
+
+			// (h) remote-side OFT.token() must match the remote expected token.
+			let (remote_side, remote_route) = if composer_chain == pair.chain_a.chain_id {
+				(&pair.chain_b, &route.chain_b)
+			} else {
+				(&pair.chain_a, &route.chain_a)
+			};
+			let expected_remote_token: Address = match &remote_route.wrapper {
+				Some(w) => w.address,
+				None => remote_side.token_address,
+			};
+			let token_call = contracts::tokenCall {}.abi_encode();
+			let token_tx = build_tx(
+				remote_side.chain_id,
+				remote_side.oft_address,
+				token_call,
+				U256::ZERO,
+				None,
+			);
+			let token_result = self
+				.delivery
+				.contract_call(remote_side.chain_id, token_tx)
+				.await
+				.map_err(|e| {
+					BridgeError::Config(format!(
+						"pair '{}': remote OFT.token() call failed: {e}",
+						pair.pair_id
+					))
+				})?;
+			let remote_oft_token = contracts::tokenCall::abi_decode_returns(&token_result)
+				.map_err(|e| {
+					BridgeError::Config(format!(
+						"pair '{}': decode remote OFT.token() failed: {e}",
+						pair.pair_id
+					))
+				})?;
+			if remote_oft_token != expected_remote_token {
+				return Err(BridgeError::Config(format!(
+					"pair '{}': remote OFT {}.token() = {} but expected {} \
+					 (wrong wrapper or pair token configured on the remote side)",
+					pair.pair_id, remote_side.oft_address, remote_oft_token, expected_remote_token
+				)));
+			}
+
+			// (i) Bidirectional peers() wiring: vault-side Share OFT and remote OFT
+			// must list each other as peers under each other's EID.
+			let vault_side_eid = *self
+				.config
+				.endpoint_ids
+				.get(&vault_side.chain_id)
+				.ok_or_else(|| {
+					BridgeError::Config(format!(
+						"pair '{}': no endpoint_id for chain {}",
+						pair.pair_id, vault_side.chain_id
+					))
+				})?;
+			let remote_side_eid = *self
+				.config
+				.endpoint_ids
+				.get(&remote_side.chain_id)
+				.ok_or_else(|| {
+					BridgeError::Config(format!(
+						"pair '{}': no endpoint_id for chain {}",
+						pair.pair_id, remote_side.chain_id
+					))
+				})?;
+
+			for (label, oft_side, query_chain, remote_eid, expected_remote_oft) in [
+				(
+					"vault-side",
+					vault_side,
+					vault_side.chain_id,
+					remote_side_eid,
+					remote_side.oft_address,
+				),
+				(
+					"remote-side",
+					remote_side,
+					remote_side.chain_id,
+					vault_side_eid,
+					vault_side.oft_address,
+				),
+			] {
+				let peers_call = contracts::peersCall { eid: remote_eid }.abi_encode();
+				let peers_tx = build_tx(
+					query_chain,
+					oft_side.oft_address,
+					peers_call,
+					U256::ZERO,
+					None,
+				);
+				let peers_result = self
+					.delivery
+					.contract_call(query_chain, peers_tx)
+					.await
+					.map_err(|e| {
+						BridgeError::Config(format!(
+							"pair '{}' {}: peers({}) call failed: {e}",
+							pair.pair_id, label, remote_eid
+						))
+					})?;
+				let peer_bytes =
+					contracts::peersCall::abi_decode_returns(&peers_result).map_err(|e| {
+						BridgeError::Config(format!(
+							"pair '{}' {}: decode peers() failed: {e}",
+							pair.pair_id,
+							label,
+							e = e
+						))
+					})?;
+				// peers() returns bytes32; last 20 bytes are the address.
+				let raw: [u8; 32] = peer_bytes.into();
+				let mut addr_bytes = [0u8; 20];
+				addr_bytes.copy_from_slice(&raw[12..]);
+				let peer_addr = Address::from(addr_bytes);
+				if peer_addr != expected_remote_oft {
+					return Err(BridgeError::Config(format!(
+						"pair '{}' {} OFT {}.peers({}) = {} but expected remote OFT {} \
+						 (peer wiring missing or mismatched)",
+						pair.pair_id,
+						label,
+						oft_side.oft_address,
+						remote_eid,
+						peer_addr,
+						expected_remote_oft
+					)));
+				}
+			}
+		}
+
+		Ok(())
 	}
 }
 
@@ -831,6 +1525,24 @@ mod tests {
 		})
 	}
 
+	fn lz_route(composer: Address, composer_chain_id: u64) -> types::LayerZeroBridgeRoute {
+		types::LayerZeroBridgeRoute {
+			composer,
+			composer_chain_id,
+			vault: Address::from([0xDD; 20]),
+			chain_a: types::SideRoute {
+				chain_id: 1,
+				approval_required: false,
+				wrapper: None,
+			},
+			chain_b: types::SideRoute {
+				chain_id: 747474,
+				approval_required: false,
+				wrapper: None,
+			},
+		}
+	}
+
 	#[tokio::test]
 	async fn test_bridge_via_composer_approves_source_token_and_calls_deposit_and_send_on_composer()
 	{
@@ -889,7 +1601,10 @@ mod tests {
 		});
 
 		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
-		let result = bridge.bridge_asset(&request).await.unwrap();
+		let result = bridge
+			.bridge_asset(&request, &Default::default())
+			.await
+			.unwrap();
 
 		assert_eq!(result.tx_hash, format!("0x{}", hex::encode(vec![0x11; 32])));
 		let submitted = submitted.lock().unwrap();
@@ -911,6 +1626,57 @@ mod tests {
 			contracts::address_to_bytes32(solver_address())
 		);
 		assert_eq!(submitted[1].gas_limit, Some(1_125_000));
+	}
+
+	#[tokio::test]
+	async fn test_bridge_via_composer_ignores_route_approval_false() {
+		let request = bridge_request();
+		let composer = Address::from([0xCC; 20]);
+		let route = lz_route(composer, request.source_chain);
+		let submitted = Arc::new(Mutex::new(Vec::<Transaction>::new()));
+		let mut mock = MockDeliveryInterface::new();
+
+		mock.expect_get_allowance()
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok("0".to_string()) }));
+		mock.expect_get_receipt().times(1).returning(|_, _| {
+			Box::pin(async move {
+				Ok(TransactionReceipt {
+					hash: TransactionHash(vec![0x11; 32]),
+					block_number: 1,
+					success: true,
+					logs: vec![],
+					block_timestamp: None,
+				})
+			})
+		});
+		mock.expect_eth_call().times(1).returning(|_| {
+			Box::pin(async move {
+				Ok(alloy_primitives::Bytes::from(composer_quote_fee_bytes(
+					U256::from(1u64),
+				)))
+			})
+		});
+		mock.expect_estimate_gas()
+			.returning(|_| Box::pin(async move { Ok(800_000u64) }));
+		{
+			let submitted = submitted.clone();
+			mock.expect_submit().times(2).returning(move |tx, _| {
+				submitted.lock().unwrap().push(tx.clone());
+				let len = submitted.lock().unwrap().len();
+				Box::pin(async move { Ok(TransactionHash(vec![len as u8; 32])) })
+			});
+		}
+
+		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
+		let result = bridge.bridge_via_composer(&request, Some(&route)).await;
+
+		assert!(result.is_ok(), "composer bridge failed: {result:?}");
+		let submitted = submitted.lock().unwrap();
+		assert_eq!(submitted.len(), 2, "approve and deposit should both submit");
+		assert_eq!(tx_to(&submitted[0]), request.source_token);
+		let approve: contracts::approveCall = decode_submit(&submitted[0]);
+		assert_eq!(approve.spender, composer);
 	}
 
 	#[tokio::test]
@@ -972,7 +1738,10 @@ mod tests {
 		});
 
 		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
-		bridge.bridge_asset(&request).await.unwrap();
+		bridge
+			.bridge_asset(&request, &Default::default())
+			.await
+			.unwrap();
 
 		let submitted = submitted.lock().unwrap();
 		assert_eq!(submitted.len(), 2);
@@ -1032,7 +1801,10 @@ mod tests {
 		});
 
 		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
-		bridge.bridge_asset(&request).await.unwrap();
+		bridge
+			.bridge_asset(&request, &Default::default())
+			.await
+			.unwrap();
 
 		let submitted = submitted.lock().unwrap();
 		assert_eq!(submitted.len(), 2);
@@ -1087,7 +1859,10 @@ mod tests {
 		});
 
 		let bridge = bridge_with_two_chain_delivery(mock, None);
-		let result = bridge.bridge_asset(&request).await.unwrap();
+		let result = bridge
+			.bridge_asset(&request, &Default::default())
+			.await
+			.unwrap();
 
 		assert_eq!(result.tx_hash, format!("0x{}", hex::encode(vec![0x22; 32])));
 		let submitted = submitted.lock().unwrap();
@@ -1157,7 +1932,10 @@ mod tests {
 		mock.expect_estimate_gas().times(0);
 
 		let bridge = bridge_with_two_chain_delivery(mock, None);
-		bridge.bridge_asset(&request).await.unwrap();
+		bridge
+			.bridge_asset(&request, &Default::default())
+			.await
+			.unwrap();
 
 		let submitted = submitted.lock().unwrap();
 		assert_eq!(submitted.len(), 2);
@@ -1229,7 +2007,7 @@ mod tests {
 
 		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
 		let result = bridge
-			.bridge_asset(&request)
+			.bridge_asset(&request, &Default::default())
 			.await
 			.expect("bridge_asset must succeed by falling through to approve");
 
@@ -1303,7 +2081,7 @@ mod tests {
 
 		let bridge = bridge_with_two_chain_delivery(mock, None);
 		let result = bridge
-			.bridge_asset(&request)
+			.bridge_asset(&request, &Default::default())
 			.await
 			.expect("bridge_asset must succeed by falling through to approve");
 
@@ -1555,7 +2333,10 @@ mod tests {
 		}
 
 		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
-		let quoted = bridge.estimate_fee(&request).await.unwrap();
+		let quoted = bridge
+			.estimate_fee(&request, &Default::default())
+			.await
+			.unwrap();
 
 		assert_eq!(quoted, fee);
 		let tx = call_target
@@ -1582,7 +2363,10 @@ mod tests {
 		}
 
 		let bridge = bridge_with_two_chain_delivery(mock, None);
-		let quoted = bridge.estimate_fee(&request).await.unwrap();
+		let quoted = bridge
+			.estimate_fee(&request, &Default::default())
+			.await
+			.unwrap();
 
 		assert_eq!(quoted, fee);
 		let tx = call_target
@@ -1591,6 +2375,39 @@ mod tests {
 			.clone()
 			.expect("missing contract call");
 		// OFT flow: quoteSend is called on source_oft
+		assert_eq!(tx_to(&tx), request.source_oft);
+	}
+
+	#[tokio::test]
+	async fn test_estimate_fee_with_non_source_composer_route_uses_oft_quote() {
+		let request = bridge_request();
+		let fee = U256::from(999u64);
+		let legacy_composer = Address::from([0xCC; 20]);
+		let route = lz_route(Address::from([0xDD; 20]), request.dest_chain);
+		let call_target = Arc::new(Mutex::new(None));
+		let mut mock = MockDeliveryInterface::new();
+		{
+			let call_target = call_target.clone();
+			mock.expect_eth_call().returning(move |tx| {
+				*call_target.lock().unwrap() = Some(tx.clone());
+				assert_eq!(tx_to(&tx), bridge_request().source_oft);
+				Box::pin(async move { Ok(alloy_primitives::Bytes::from(oft_quote_fee_bytes(fee))) })
+			});
+		}
+
+		let bridge = bridge_with_two_chain_delivery(mock, Some(legacy_composer));
+		let metadata = TransferMetadata {
+			bridge_route: Some(serde_json::to_value(route).unwrap()),
+			..Default::default()
+		};
+		let quoted = bridge.estimate_fee(&request, &metadata).await.unwrap();
+
+		assert_eq!(quoted, fee);
+		let tx = call_target
+			.lock()
+			.unwrap()
+			.clone()
+			.expect("missing contract call");
 		assert_eq!(tx_to(&tx), request.source_oft);
 	}
 
@@ -1659,7 +2476,7 @@ mod tests {
 		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
 		let request = bridge_request();
 
-		let result = bridge.bridge_via_composer(&request).await;
+		let result = bridge.bridge_via_composer(&request, None).await;
 		assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
 	}
 
@@ -1685,7 +2502,7 @@ mod tests {
 		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
 		let request = bridge_request();
 
-		let result = bridge.bridge_via_composer(&request).await;
+		let result = bridge.bridge_via_composer(&request, None).await;
 		let err = result.expect_err("expected Err");
 		match err {
 			BridgeError::ApproveSubmitFailed { error } => {
@@ -1791,7 +2608,7 @@ mod tests {
 		let bridge = bridge_with_two_chain_delivery(mock, None);
 		let request = bridge_request();
 
-		let result = bridge.bridge_via_oft_send(&request).await;
+		let result = bridge.bridge_via_oft_send(&request, None).await;
 		assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
 	}
 
@@ -1816,7 +2633,7 @@ mod tests {
 		let bridge = bridge_with_two_chain_delivery(mock, None);
 		let request = bridge_request();
 
-		let result = bridge.bridge_via_oft_send(&request).await;
+		let result = bridge.bridge_via_oft_send(&request, None).await;
 		let err = result.expect_err("expected Err");
 		match err {
 			BridgeError::ApproveSubmitFailed { error } => {

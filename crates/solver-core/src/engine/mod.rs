@@ -372,6 +372,118 @@ impl SolverEngine {
 		let general_semaphore = Arc::new(Semaphore::new(100)); // Allow concurrent non-tx operations
 
 		let rebalance_handle = if let Some(bridge_service) = &self.bridge_service {
+			// Rebalance preflight: cross-check operator-declared route data
+			// against on-chain state before starting the monitor. Catches wrong
+			// composer/wrapper/OFT addresses, peer-wiring drift, and
+			// `approval_required` mismatches at startup rather than at first
+			// rebalance attempt. Pairs without `bridge_route` (legacy
+			// chain-keyed path) skip preflight.
+			{
+				let runtime_config = self.dynamic_config.read().await;
+				if let Some(rebalance) = runtime_config.rebalance.as_ref() {
+					if rebalance.enabled && !rebalance.pairs.is_empty() {
+						let impl_name = rebalance.implementation.clone();
+						// Convert runtime RebalancePairConfig (string addresses) into
+						// OperatorRebalancePairConfig (parsed addresses) for preflight.
+						let mut converted: Vec<solver_types::OperatorRebalancePairConfig> =
+							Vec::with_capacity(rebalance.pairs.len());
+						let mut convert_err: Option<String> = None;
+						for p in &rebalance.pairs {
+							let parse = |hex_str: &str,
+							             field: &str|
+							 -> Result<alloy_primitives::Address, String> {
+								let s = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+								let bytes = hex::decode(s).map_err(|e| {
+									format!("pair '{}' {} not hex: {e}", p.pair_id, field)
+								})?;
+								if bytes.len() != 20 {
+									return Err(format!(
+										"pair '{}' {} not 20 bytes",
+										p.pair_id, field
+									));
+								}
+								let mut arr = [0u8; 20];
+								arr.copy_from_slice(&bytes);
+								Ok(alloy_primitives::Address::from(arr))
+							};
+							let chain_a = match (
+								parse(&p.chain_a.token_address, "chain_a.token_address"),
+								parse(&p.chain_a.oft_address, "chain_a.oft_address"),
+							) {
+								(Ok(t), Ok(o)) => solver_types::RebalancePairSide {
+									chain_id: p.chain_a.chain_id,
+									token_address: t,
+									oft_address: o,
+								},
+								(Err(e), _) | (_, Err(e)) => {
+									convert_err = Some(e);
+									break;
+								},
+							};
+							let chain_b = match (
+								parse(&p.chain_b.token_address, "chain_b.token_address"),
+								parse(&p.chain_b.oft_address, "chain_b.oft_address"),
+							) {
+								(Ok(t), Ok(o)) => solver_types::RebalancePairSide {
+									chain_id: p.chain_b.chain_id,
+									token_address: t,
+									oft_address: o,
+								},
+								(Err(e), _) | (_, Err(e)) => {
+									convert_err = Some(e);
+									break;
+								},
+							};
+							converted.push(solver_types::OperatorRebalancePairConfig {
+								pair_id: p.pair_id.clone(),
+								chain_a,
+								chain_b,
+								target_balance_a: p.target_balance_a.clone(),
+								target_balance_b: p.target_balance_b.clone(),
+								deviation_band_bps: p.deviation_band_bps,
+								max_bridge_amount: p.max_bridge_amount.clone(),
+								bridge_route: p.bridge_route.clone(),
+							});
+						}
+						drop(runtime_config);
+						if let Some(e) = convert_err {
+							return Err(EngineError::Service(format!(
+								"rebalance preflight: pair conversion failed: {e}"
+							)));
+						}
+						match bridge_service.get_implementation(&impl_name) {
+							Ok(bridge_impl) => {
+								if let Err(e) = bridge_impl.preflight(&converted).await {
+									tracing::error!(
+										implementation = %impl_name,
+										error = %e,
+										"Rebalance preflight FAILED — bridge config mismatch with on-chain state; the rebalance monitor will not start"
+									);
+									return Err(EngineError::Service(format!(
+										"rebalance preflight failed: {e}"
+									)));
+								}
+								tracing::info!(
+									implementation = %impl_name,
+									pairs = converted.len(),
+									"Rebalance preflight passed"
+								);
+							},
+							Err(e) => {
+								tracing::error!(
+									implementation = %impl_name,
+									error = %e,
+									"Rebalance bridge implementation not registered; refusing to start rebalance monitor"
+								);
+								return Err(EngineError::Service(format!(
+									"rebalance bridge implementation '{impl_name}' is not registered: {e}"
+								)));
+							},
+						}
+					}
+				}
+			}
+
 			let solver_addr_hex = format!("0x{}", hex::encode(&self.solver_address.0));
 			let monitor = solver_bridge::monitor::RebalanceMonitor::new(
 				bridge_service.clone(),
