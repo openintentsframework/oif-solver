@@ -238,9 +238,17 @@ cargo run -- --seed testnet --bootstrap-config config/seed-overrides-testnet.jso
 cargo run --
 ```
 
-### Auth Quickstart (when `auth_enabled = true`)
+### Auth Quickstart
 
-If you enable API auth in your seed overrides (`"auth_enabled": true`), set:
+The solver has **two independent auth flags**:
+
+- **`orders_auth_enabled`** — JWT-gates the public Orders API (`POST /orders`,
+  `GET /orders/{id}`) and the public client-registration endpoints
+  (`/auth/register`, `/auth/refresh`). Default: `false`.
+- **`admin.enabled`** — gates SIWE admin login and the admin endpoints. SIWE
+  works whenever this is true, regardless of `orders_auth_enabled`.
+
+If you enable Orders API auth in your seed overrides (`"orders_auth_enabled": true`), set:
 
 ```bash
 export JWT_SECRET=replace_with_a_strong_random_value
@@ -249,7 +257,7 @@ export JWT_SECRET=replace_with_a_strong_random_value
 export AUTH_PUBLIC_REGISTER_ENABLED=false
 ```
 
-If `auth_enabled = false`, `AUTH_PUBLIC_REGISTER_ENABLED` is ignored.
+If `orders_auth_enabled = false`, `AUTH_PUBLIC_REGISTER_ENABLED` is ignored.
 
 Admin JWTs (`admin-all` scope) are obtained via SIWE wallet login:
 
@@ -981,7 +989,7 @@ The admin API enables authorized wallet addresses to perform administrative oper
 4. Sign with your admin wallet (EIP-712)
 5. Submit the signed action to the appropriate endpoint
 
-**Note:** If API auth is enabled (`auth_enabled = true` in seed overrides, mapped to runtime `auth.enabled`), protected admin endpoints require a JWT with `admin-read` for `GET` routes and `admin-all` for mutating routes. Use SIWE (`POST /api/v1/auth/siwe/nonce` + `POST /api/v1/auth/siwe/verify`) to obtain it.
+**Note:** Protected admin endpoints require a JWT with `admin-read` for `GET` routes and `admin-all` for mutating routes. Obtain it via SIWE (`POST /api/v1/auth/siwe/nonce` + `POST /api/v1/auth/siwe/verify`). SIWE only requires `admin.enabled = true` — it works regardless of `orders_auth_enabled`.
 **Note:** `/api/v1/auth/siwe/nonce` is dedicated to SIWE login. `/api/v1/admin/nonce` is dedicated to EIP-712 admin action signing.
 **Note:** `POST /api/v1/auth/register` never issues `admin-all` and is disabled by default unless `AUTH_PUBLIC_REGISTER_ENABLED=true`.
 **Note:** Admin withdrawals require `admin.withdrawals.enabled = true` in config.

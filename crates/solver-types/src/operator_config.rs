@@ -65,9 +65,13 @@ pub struct OperatorConfig {
 	/// Admin authentication settings.
 	pub admin: OperatorAdminConfig,
 
-	/// Whether JWT auth is required for API routes.
+	/// Whether JWT auth is required for the public Orders API.
+	///
+	/// When true, `POST /orders` and `GET /orders/{id}` require a valid JWT.
+	/// Independent of `admin.enabled` — admin SIWE login is gated solely by
+	/// the admin block, so SIWE works regardless of this flag.
 	#[serde(default)]
-	pub auth_enabled: bool,
+	pub orders_auth_enabled: bool,
 
 	/// Account signing backend configuration.
 	/// If None, defaults to local wallet with SOLVER_PRIVATE_KEY.
@@ -1046,7 +1050,7 @@ mod tests {
 				}],
 				withdrawals: OperatorWithdrawalsConfig::default(),
 			},
-			auth_enabled: false,
+			orders_auth_enabled: false,
 			account: None,
 			rebalance: None,
 			fee_policy: None,

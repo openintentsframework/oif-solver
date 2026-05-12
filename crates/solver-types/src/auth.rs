@@ -140,11 +140,18 @@ pub struct RefreshTokenData {
 	pub issued_at: i64,
 }
 
-/// Authentication configuration for the API service
+/// Authentication configuration for the API service.
+///
+/// `orders_auth_enabled` controls **only** JWT-gating of the public Orders API
+/// (`POST /orders` and `GET /orders/{id}`). It does NOT gate admin SIWE login;
+/// SIWE is gated solely by the admin block (see [`AdminConfig::enabled`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
-	/// Enable authentication
-	pub enabled: bool,
+	/// Whether the public Orders API requires a JWT.
+	///
+	/// When false, `POST /orders` and `GET /orders/{id}` are open. SIWE admin
+	/// login still works whenever the `admin` block has `enabled: true`.
+	pub orders_auth_enabled: bool,
 	/// JWT signing secret
 	pub jwt_secret: SecretString,
 	/// Access token expiry in hours
@@ -480,7 +487,7 @@ mod tests {
 	#[test]
 	fn test_auth_config_with_admin() {
 		let json = r#"{
-			"enabled": true,
+			"orders_auth_enabled": true,
 			"jwt_secret": "test-secret-at-least-32-characters-long",
 			"access_token_expiry_hours": 1,
 			"refresh_token_expiry_hours": 720,
@@ -505,7 +512,7 @@ mod tests {
 	#[test]
 	fn test_auth_config_without_admin() {
 		let json = r#"{
-			"enabled": true,
+			"orders_auth_enabled": true,
 			"jwt_secret": "test-secret-at-least-32-characters-long",
 			"access_token_expiry_hours": 1,
 			"refresh_token_expiry_hours": 720,
@@ -521,7 +528,7 @@ mod tests {
 	#[test]
 	fn test_auth_config_with_public_register_enabled() {
 		let json = r#"{
-			"enabled": true,
+			"orders_auth_enabled": true,
 			"jwt_secret": "test-secret-at-least-32-characters-long",
 			"access_token_expiry_hours": 1,
 			"refresh_token_expiry_hours": 720,
