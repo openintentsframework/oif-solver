@@ -207,18 +207,18 @@ impl Context {
 			"http://localhost:3000".to_string()
 		};
 
-		// Check if auth is enabled
-		let auth_enabled = self
+		// Check if the public Orders API requires a JWT.
+		let orders_auth_enabled = self
 			.config
 			.solver
 			.api
 			.as_ref()
 			.and_then(|api| api.auth.as_ref())
-			.map(|auth| auth.enabled)
+			.map(|auth| auth.orders_auth_enabled)
 			.unwrap_or(false);
 
 		// Create API client with or without JWT authentication
-		if auth_enabled {
+		if orders_auth_enabled {
 			// Get valid JWT token
 			let token = self.jwt.get_valid_token(&self.session).await?;
 			ApiClient::new(&api_url).map(|client| client.with_jwt(token))

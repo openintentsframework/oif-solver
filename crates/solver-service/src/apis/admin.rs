@@ -1722,7 +1722,7 @@ mod tests {
 				}],
 				withdrawals,
 			},
-			auth_enabled: false,
+			orders_auth_enabled: false,
 			account: None,
 			rebalance: None,
 			fee_policy: None,

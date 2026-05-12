@@ -227,7 +227,7 @@ mod tests {
 
 	fn test_config() -> AuthConfig {
 		AuthConfig {
-			enabled: true,
+			orders_auth_enabled: true,
 			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars-long"),
 			access_token_expiry_hours: 1,
 			refresh_token_expiry_hours: 720,

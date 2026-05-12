@@ -167,7 +167,7 @@ pub async fn start_server(
 	let jwt_service = match &api_config.auth {
 		Some(auth_config) => match JwtService::new(auth_config.clone()) {
 			Ok(service) => {
-				if auth_config.enabled {
+				if auth_config.orders_auth_enabled {
 					tracing::info!(
 						"API authentication enabled for orders with issuer: {}",
 						auth_config.issuer
@@ -188,8 +188,13 @@ pub async fn start_server(
 		},
 	};
 
-	// Track whether orders should require auth
-	let orders_require_auth = api_config.auth.as_ref().map(|a| a.enabled).unwrap_or(false);
+	// Track whether the public Orders API should require a JWT.
+	// Independent of admin SIWE — see `AuthConfig::orders_auth_enabled`.
+	let orders_require_auth = api_config
+		.auth
+		.as_ref()
+		.map(|a| a.orders_auth_enabled)
+		.unwrap_or(false);
 
 	// Initialize signature validation service
 	let signature_validation = Arc::new(SignatureValidationService::new());

@@ -1060,7 +1060,7 @@ mod tests {
 				}],
 				withdrawals: OperatorWithdrawalsConfig { enabled: false },
 			},
-			auth_enabled: false,
+			orders_auth_enabled: false,
 			account: None,
 			rebalance: Some(OperatorRebalanceConfig {
 				enabled: true,
