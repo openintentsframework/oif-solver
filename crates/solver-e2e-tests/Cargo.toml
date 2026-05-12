@@ -38,3 +38,9 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 reqwest = { workspace = true }
+
+[dev-dependencies]
+solver-core = { path = "../solver-core" }
+solver-delivery = { path = "../solver-delivery" }
+solver-settlement = { path = "../solver-settlement" }
+solver-storage = { path = "../solver-storage" }

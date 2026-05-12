@@ -26,6 +26,11 @@ enum OrderStatusKind {
 	Failed,
 }
 
+pub(crate) const STATUS_KIND_INDEX_FIELD: &str = "status_kind";
+pub(crate) const IS_TERMINAL_INDEX_FIELD: &str = "is_terminal";
+pub(crate) const FINALIZED_STATUS_KIND_INDEX_VALUE: &str = "finalized";
+pub(crate) const FAILED_STATUS_KIND_INDEX_VALUE: &str = "failed";
+
 /// Errors that can occur during order state management.
 ///
 /// These errors represent failures in storage operations,
@@ -76,8 +81,8 @@ impl OrderStateMachine {
 			.map_err(|e| OrderStateError::TimeError(e.to_string()))?
 			.as_secs();
 
-		// Update with status index
-		let indexes = StorageIndexes::new().with_field("status", order.status.to_string());
+		// Update with canonical status indexes used by recovery queries.
+		let indexes = order_storage_indexes(&order);
 
 		self.storage
 			.update(StorageKey::Orders.as_str(), order_id, &order, Some(indexes))
@@ -186,10 +191,9 @@ impl OrderStateMachine {
 			.map_err(|e| OrderStateError::Storage(e.to_string()))
 	}
 
-	/// Stores a new order with indexed status
+	/// Stores a new order with canonical status indexes.
 	pub async fn store_order(&self, order: &Order) -> Result<(), OrderStateError> {
-		// Store with status index for recovery queries
-		let indexes = StorageIndexes::new().with_field("status", order.status.to_string());
+		let indexes = order_storage_indexes(order);
 
 		self.storage
 			.store(StorageKey::Orders.as_str(), &order.id, order, Some(indexes))
@@ -254,10 +258,37 @@ fn status_kind(status: &OrderStatus) -> OrderStatusKind {
 	}
 }
 
+pub(crate) fn status_kind_index_value(status: &OrderStatus) -> &'static str {
+	match status {
+		OrderStatus::Created => "created",
+		OrderStatus::Pending => "pending",
+		OrderStatus::Executing => "executing",
+		OrderStatus::Executed => "executed",
+		OrderStatus::PostFilled => "post_filled",
+		OrderStatus::PreClaimed => "pre_claimed",
+		OrderStatus::Settled => "settled",
+		OrderStatus::Finalized => FINALIZED_STATUS_KIND_INDEX_VALUE,
+		OrderStatus::Failed(_, _) => FAILED_STATUS_KIND_INDEX_VALUE,
+	}
+}
+
+pub(crate) fn is_terminal_status(status: &OrderStatus) -> bool {
+	matches!(status, OrderStatus::Finalized | OrderStatus::Failed(_, _))
+}
+
+fn order_storage_indexes(order: &Order) -> StorageIndexes {
+	StorageIndexes::new()
+		.with_field(
+			STATUS_KIND_INDEX_FIELD,
+			status_kind_index_value(&order.status),
+		)
+		.with_field(IS_TERMINAL_INDEX_FIELD, is_terminal_status(&order.status))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use solver_storage::StorageService;
+	use solver_storage::{MockStorageInterface, StorageService};
 	use solver_types::{utils::tests::builders::OrderBuilder, OrderStatus, TransactionType};
 	use std::sync::Arc;
 	use tokio;
@@ -269,6 +300,121 @@ mod tests {
 
 	fn create_test_order() -> Order {
 		OrderBuilder::new().with_id("test_order_1").build()
+	}
+
+	#[tokio::test]
+	async fn store_order_writes_canonical_status_indexes() {
+		let mut mock_storage = MockStorageInterface::new();
+		let order = OrderBuilder::new()
+			.with_id("indexed_order")
+			.with_status(OrderStatus::Pending)
+			.build();
+
+		mock_storage
+			.expect_set_bytes()
+			.times(1)
+			.withf(|key, _bytes, indexes, ttl| {
+				if key != "orders:indexed_order" || ttl.is_some() {
+					return false;
+				}
+
+				let Some(indexes) = indexes else {
+					return false;
+				};
+
+				indexes.fields.get("status_kind") == Some(&serde_json::json!("pending"))
+					&& indexes.fields.get("is_terminal") == Some(&serde_json::json!(false))
+					&& !indexes.fields.contains_key("status")
+			})
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = OrderStateMachine::new(storage);
+
+		state_machine.store_order(&order).await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn update_order_with_rewrites_canonical_status_indexes() {
+		let mut mock_storage = MockStorageInterface::new();
+		let order = OrderBuilder::new()
+			.with_id("update_indexed_order")
+			.with_status(OrderStatus::Pending)
+			.build();
+		let order_bytes = serde_json::to_vec(&order).unwrap();
+
+		mock_storage
+			.expect_get_bytes()
+			.with(mockall::predicate::eq("orders:update_indexed_order"))
+			.times(1)
+			.return_once(move |_| Box::pin(async move { Ok(order_bytes) }));
+
+		mock_storage
+			.expect_exists()
+			.with(mockall::predicate::eq("orders:update_indexed_order"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(true) }));
+
+		mock_storage
+			.expect_set_bytes()
+			.times(1)
+			.withf(|key, bytes, indexes, ttl| {
+				if key != "orders:update_indexed_order" || ttl.is_some() {
+					return false;
+				}
+
+				let Ok(order) = serde_json::from_slice::<Order>(bytes) else {
+					return false;
+				};
+				if order.status != OrderStatus::Finalized {
+					return false;
+				}
+
+				let Some(indexes) = indexes else {
+					return false;
+				};
+
+				indexes.fields.get("status_kind") == Some(&serde_json::json!("finalized"))
+					&& indexes.fields.get("is_terminal") == Some(&serde_json::json!(true))
+					&& !indexes.fields.contains_key("status")
+			})
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = OrderStateMachine::new(storage);
+
+		let updated = state_machine
+			.update_order_with("update_indexed_order", |order| {
+				order.status = OrderStatus::Finalized;
+			})
+			.await
+			.unwrap();
+
+		assert_eq!(updated.status, OrderStatus::Finalized);
+	}
+
+	#[test]
+	fn status_kind_index_values_are_stable() {
+		let cases = [
+			(OrderStatus::Created, "created", false),
+			(OrderStatus::Pending, "pending", false),
+			(OrderStatus::Executing, "executing", false),
+			(OrderStatus::Executed, "executed", false),
+			(OrderStatus::PostFilled, "post_filled", false),
+			(OrderStatus::PreClaimed, "pre_claimed", false),
+			(OrderStatus::Settled, "settled", false),
+			(OrderStatus::Finalized, "finalized", true),
+			(
+				OrderStatus::Failed(TransactionType::Fill, "boom".to_string()),
+				"failed",
+				true,
+			),
+		];
+
+		for (status, expected_kind, expected_terminal) in cases {
+			assert_eq!(status_kind_index_value(&status), expected_kind);
+			assert_eq!(is_terminal_status(&status), expected_terminal);
+		}
 	}
 
 	#[tokio::test]
