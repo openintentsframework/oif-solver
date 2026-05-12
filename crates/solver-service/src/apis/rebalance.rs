@@ -490,20 +490,33 @@ pub async fn handle_trigger_rebalance(
 		recipient,
 	};
 
-	// Build metadata for delivery detection and redeem path
-	let is_composer = rebalance_config
-		.bridge_config
-		.as_ref()
-		.and_then(|bc| bc.get("composer_addresses"))
-		.and_then(|ca| ca.get(request.source_chain.to_string()))
-		.is_some();
-	let vault_addr = rebalance_config
-		.bridge_config
-		.as_ref()
-		.and_then(|bc| bc.get("vault_addresses"))
-		.and_then(|va| va.get(dest_side.chain_id.to_string()))
-		.and_then(|v| v.as_str())
-		.map(|s| s.to_string());
+	// Determine composer-flow + vault address. Per-pair `bridge_route` (round-1..8
+	// design) wins when present; legacy chain-keyed `bridge_config` is the
+	// fallback for USDC-style pairs that haven't migrated.
+	let (is_composer, vault_addr) = if let Some(route) = pair.bridge_route.as_ref() {
+		let composer_chain = route.get("composer_chain_id").and_then(|v| v.as_u64());
+		let is_composer = composer_chain == Some(request.source_chain);
+		let vault = route
+			.get("vault")
+			.and_then(|v| v.as_str())
+			.map(|s| s.to_string());
+		(is_composer, vault)
+	} else {
+		let is_composer = rebalance_config
+			.bridge_config
+			.as_ref()
+			.and_then(|bc| bc.get("composer_addresses"))
+			.and_then(|ca| ca.get(request.source_chain.to_string()))
+			.is_some();
+		let vault_addr = rebalance_config
+			.bridge_config
+			.as_ref()
+			.and_then(|bc| bc.get("vault_addresses"))
+			.and_then(|va| va.get(dest_side.chain_id.to_string()))
+			.and_then(|v| v.as_str())
+			.map(|s| s.to_string());
+		(is_composer, vault_addr)
+	};
 
 	if !is_composer && vault_addr.is_none() {
 		return Err(AdminAuthError::InvalidMessage(
@@ -511,11 +524,56 @@ pub async fn handle_trigger_rebalance(
 		));
 	}
 
+	// Effective tokens: for native pair sides (token_address == 0x000…), read
+	// the wrapper address from the route. For inbound non-composer flow, the
+	// delivery-scan target on the destination is `route.vault` (shares), NOT
+	// the wrapper — that's what the existing `check_status` event scan watches
+	// during `Relaying`.
+	let zero_addr = alloy_primitives::Address::ZERO;
+	let route_wrapper_for_chain = |chain_id: u64| -> Result<Option<String>, AdminAuthError> {
+		let Some(route) = pair.bridge_route.as_ref() else {
+			return Ok(None);
+		};
+		for key in ["chain_a", "chain_b"] {
+			let Some(side) = route.get(key) else {
+				continue;
+			};
+			if side.get("chain_id").and_then(|v| v.as_u64()) == Some(chain_id) {
+				return Ok(side
+					.get("wrapper")
+					.and_then(|w| w.get("address"))
+					.and_then(|a| a.as_str())
+					.map(String::from));
+			}
+		}
+		Err(AdminAuthError::InvalidMessage(format!(
+			"bridge_route has no side for chain {chain_id}"
+		)))
+	};
+	let effective_source_token: String = if source_side.token_address == zero_addr {
+		route_wrapper_for_chain(request.source_chain)?
+			.unwrap_or_else(|| source_side.token_address.to_string())
+	} else {
+		source_side.token_address.to_string()
+	};
+	// For composer (outbound) flow on a native dest, the wrapper arrives at the
+	// solver — that's the Transfer-event scan target. For non-composer flow,
+	// the existing scan logic falls back to `vault_address` so the pair token
+	// works here (and matches existing test expectations).
+	let delivery_scan_token: String = if is_composer && dest_side.token_address == zero_addr {
+		route_wrapper_for_chain(request.dest_chain)?
+			.unwrap_or_else(|| dest_side.token_address.to_string())
+	} else {
+		dest_side.token_address.to_string()
+	};
+
 	let metadata = solver_bridge::types::TransferMetadata {
-		dest_token_address: dest_side.token_address.to_string(),
+		source_token_address: effective_source_token,
+		dest_token_address: delivery_scan_token,
 		dest_oft_address: dest_side.oft_address.to_string(),
 		is_composer_flow: is_composer,
 		vault_address: vault_addr,
+		bridge_route: pair.bridge_route.clone(),
 	};
 
 	match bridge_service
@@ -820,6 +878,7 @@ mod tests {
 		async fn bridge_asset(
 			&self,
 			request: &BridgeRequest,
+			_metadata: &solver_bridge::types::TransferMetadata,
 		) -> Result<BridgeDepositResult, BridgeError> {
 			self.recorded_requests.lock().unwrap().push(request.clone());
 			Ok(BridgeDepositResult {
@@ -836,7 +895,11 @@ mod tests {
 			Ok(transfer.status.clone())
 		}
 
-		async fn estimate_fee(&self, _request: &BridgeRequest) -> Result<U256, BridgeError> {
+		async fn estimate_fee(
+			&self,
+			_request: &BridgeRequest,
+			_metadata: &solver_bridge::types::TransferMetadata,
+		) -> Result<U256, BridgeError> {
 			Ok(U256::ZERO)
 		}
 	}
@@ -1023,6 +1086,7 @@ mod tests {
 					target_balance_b: "1000000".to_string(),
 					deviation_band_bps: 2000,
 					max_bridge_amount: "500000".to_string(),
+					bridge_route: None,
 				}],
 				bridge_config: Some(serde_json::json!({
 					"composer_addresses": {},
@@ -1322,6 +1386,63 @@ mod tests {
 			result,
 			Err(AdminAuthError::InvalidMessage(msg))
 				if msg == "missing vault address for non-composer destination"
+		));
+	}
+
+	#[tokio::test]
+	async fn test_handle_trigger_rebalance_rejects_route_without_matching_side() {
+		let mut operator_config = sample_operator_config();
+		let rebalance = operator_config.rebalance.as_mut().unwrap();
+		rebalance.pairs[0].chain_b.token_address = alloy_primitives::Address::ZERO;
+		rebalance.pairs[0].bridge_route = Some(serde_json::json!({
+			"composer": "0xcccccccccccccccccccccccccccccccccccccccc",
+			"composer_chain_id": 1,
+			"vault": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			"chain_a": {
+				"chain_id": 1,
+				"approval_required": true,
+				"wrapper": {
+					"address": "0x1111111111111111111111111111111111111111",
+					"type": "weth9"
+				}
+			},
+			"chain_b": {
+				"chain_id": 999,
+				"approval_required": false,
+				"wrapper": {
+					"address": "0x3333333333333333333333333333333333333333",
+					"type": "weth9"
+				}
+			}
+		}));
+		let bridge_service = make_bridge_service(Arc::new(Mutex::new(Vec::new())));
+		let state = make_admin_state(
+			operator_config,
+			create_delivery_service(|_, _, _| Ok("0".to_string())),
+			Some(bridge_service),
+		)
+		.await;
+
+		let result = handle_trigger_rebalance(
+			axum::extract::State(state),
+			crate::apis::admin::VerifiedAdmin {
+				admin: solver_types::Address::from(alloy_address(SOLVER_ADDRESS)),
+				contents: TriggerRebalanceContents {
+					pair_id: "eth-katana".to_string(),
+					source_chain: 747474,
+					dest_chain: 1,
+					amount: "12345".to_string(),
+					nonce: 1,
+					deadline: 2,
+				},
+			},
+		)
+		.await;
+
+		assert!(matches!(
+			result,
+			Err(AdminAuthError::InvalidMessage(msg))
+				if msg == "bridge_route has no side for chain 747474"
 		));
 	}
 

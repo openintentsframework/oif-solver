@@ -2564,6 +2564,7 @@ fn build_rebalance_config_from_operator(
 			target_balance_b: p.target_balance_b.clone(),
 			deviation_band_bps: p.deviation_band_bps,
 			max_bridge_amount: p.max_bridge_amount.clone(),
+			bridge_route: p.bridge_route.clone(),
 		})
 		.collect();
 
@@ -2633,6 +2634,7 @@ fn extract_rebalance_config(
 			target_balance_b: p.target_balance_b.clone(),
 			deviation_band_bps: p.deviation_band_bps,
 			max_bridge_amount: p.max_bridge_amount.clone(),
+			bridge_route: p.bridge_route.clone(),
 		});
 	}
 
@@ -7084,6 +7086,7 @@ mod tests {
 					target_balance_b: "1000000".to_string(),
 					deviation_band_bps: 2000,
 					max_bridge_amount: "500000".to_string(),
+					bridge_route: None,
 				},
 				solver_types::OperatorRebalancePairConfig {
 					pair_id: "eth-katana".to_string(),
@@ -7101,6 +7104,7 @@ mod tests {
 					target_balance_b: "1000000".to_string(),
 					deviation_band_bps: 2000,
 					max_bridge_amount: "500000".to_string(),
+					bridge_route: None,
 				},
 			],
 			bridge_config: None,
@@ -7139,6 +7143,7 @@ mod tests {
 				target_balance_b: "1000000".to_string(),
 				deviation_band_bps: 2000,
 				max_bridge_amount: "500000".to_string(),
+				bridge_route: None,
 			}],
 			bridge_config: None,
 		};
@@ -7176,6 +7181,7 @@ mod tests {
 				target_balance_b: "1000000".to_string(),
 				deviation_band_bps: 2000,
 				max_bridge_amount: "500000".to_string(),
+				bridge_route: None,
 			}],
 			bridge_config: None,
 		};

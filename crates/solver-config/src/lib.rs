@@ -423,6 +423,11 @@ pub struct RebalancePairConfig {
 	pub deviation_band_bps: u32,
 	/// Maximum amount per bridge operation (decimal string).
 	pub max_bridge_amount: String,
+	/// Bridge-implementation-opaque route blob (per-pair). Forwarded as-is to
+	/// `OperatorRebalancePairConfig.bridge_route`. For LayerZero this carries
+	/// composer/vault/per-side wrapper + approval_required.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub bridge_route: Option<serde_json::Value>,
 }
 
 /// One side of a runtime rebalance pair.
@@ -1356,6 +1361,7 @@ mod tests {
 			target_balance_b: "1000000".to_string(),
 			deviation_band_bps: 2000,
 			max_bridge_amount: "500000".to_string(),
+			bridge_route: None,
 		};
 
 		// pair_id is the value set by the operator, not derived
@@ -1382,6 +1388,7 @@ mod tests {
 			target_balance_b: "1000000".to_string(),
 			deviation_band_bps: 2000,
 			max_bridge_amount: "500000".to_string(),
+			bridge_route: None,
 		};
 
 		let bridged_usdc = RebalancePairConfig {
@@ -1401,6 +1408,7 @@ mod tests {
 			target_balance_b: "1000000".to_string(),
 			deviation_band_bps: 2000,
 			max_bridge_amount: "500000".to_string(),
+			bridge_route: None,
 		};
 
 		// Distinct pair_ids — no collision

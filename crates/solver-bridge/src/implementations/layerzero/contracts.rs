@@ -14,11 +14,46 @@ sol! {
 	function allowance(address owner, address spender) external view returns (uint256);
 }
 
+// --- WETH9 (used for native-asset wrap/unwrap on Ethereum and on Katana via vbETH's
+//     `CustomTokenWethExtension`; same selector layout in both deployments) ---
+
+sol! {
+	function deposit() external payable;
+	function withdraw(uint256 amount) external;
+}
+
 // --- ERC-4626 Vault ---
+//
+// `redeem` returns the assets paid out, but EVM transaction receipts do NOT expose
+// Solidity return values — only logs and gas data. The canonical post-mining source
+// for the asset amount is the standard `Withdraw(...)` event, parsed by the bridge
+// implementation via `BridgeInterface::parse_redeem_assets`.
 
 sol! {
 	function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets);
 	function previewRedeem(uint256 shares) external view returns (uint256 assets);
+	function asset() external view returns (address);
+
+	/// Standard ERC-4626 event emitted by `redeem` / `withdraw`. Parsed by the
+	/// bridge impl to recover the actual asset amount paid out post-redeem.
+	event Withdraw(
+		address indexed sender,
+		address indexed receiver,
+		address indexed owner,
+		uint256 assets,
+		uint256 shares
+	);
+}
+
+// --- OFT additional view methods used by preflight ---
+//
+// Defined in this block (separate from the core `IOFT` interface below) so it can
+// be reused across OFT and OFT-Adapter contracts without touching the `IOFT` shape.
+
+sol! {
+	function approvalRequired() external view returns (bool);
+	function token() external view returns (address);
+	function peers(uint32 eid) external view returns (bytes32);
 }
 
 // --- LayerZero OFT + OVault Composer ---
@@ -79,6 +114,13 @@ sol! {
 			uint256 vaultInAmount,
 			SendParam calldata sendParam
 		) external view returns (MessagingFee msgFee);
+
+		// View methods used by preflight. The composer's immutables (VAULT,
+		// SHARE_OFT, ASSET_ERC20) let us verify the operator-supplied route
+		// addresses against the deployed composer at startup.
+		function VAULT() external view returns (address);
+		function SHARE_OFT() external view returns (address);
+		function ASSET_ERC20() external view returns (address);
 	}
 }
 
