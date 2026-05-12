@@ -24,6 +24,7 @@ redis = { version = "0.32", features = [
 	"cluster",
 	"cluster-async",
 	"tls-rustls",
+	"tls-rustls-webpki-roots",
 	"tokio-rustls-comp",
 ] }
 futures = { workspace = true }
