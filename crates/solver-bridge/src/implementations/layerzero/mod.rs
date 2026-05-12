@@ -206,13 +206,10 @@ impl LayerZeroBridge {
 		};
 		// Effective source token = wrapper for native sides, pair token otherwise.
 		let source_token = Self::effective_source_token(route, request);
-		// Approval is required by default (unchanged for USDC). For pairs whose
-		// route explicitly declares `approval_required: false` (e.g., Katana
-		// mint/burn adapter), we skip the entire allowance + approve step.
-		let approval_required = route
-			.and_then(|r| r.resolve_side(request.source_chain))
-			.map(|s| s.approval_required)
-			.unwrap_or(true);
+		// Composer flows consume the source ERC-20/wrapper via the composer
+		// contract, so approval is always required. The route-side
+		// `approval_required=false` flag only applies to direct OFT sends.
+		let approval_required = true;
 		let dest_eid = self.get_eid(request.dest_chain)?;
 		let to_bytes32 = address_to_bytes32(self.solver_address);
 		let extra_options = self.build_extra_options();
@@ -840,11 +837,11 @@ impl BridgeInterface for LayerZeroBridge {
 		//   - If a per-pair route is present, use it (it knows which chain holds
 		//     the composer + vault).
 		//   - Otherwise fall back to the legacy chain-keyed `is_composer_flow`.
-		let route_composer = route
-			.as_ref()
-			.filter(|r| r.composer_chain_id == request.source_chain)
-			.map(|r| r.composer);
-		let is_composer = route_composer.is_some() || self.is_composer_flow(request.source_chain);
+		let (is_composer, route_composer) = match route.as_ref() {
+			Some(r) if r.composer_chain_id == request.source_chain => (true, Some(r.composer)),
+			Some(_) => (false, None),
+			None => (self.is_composer_flow(request.source_chain), None),
+		};
 
 		if is_composer {
 			// Composer has its own quoteSend with different params
@@ -1528,6 +1525,24 @@ mod tests {
 		})
 	}
 
+	fn lz_route(composer: Address, composer_chain_id: u64) -> types::LayerZeroBridgeRoute {
+		types::LayerZeroBridgeRoute {
+			composer,
+			composer_chain_id,
+			vault: Address::from([0xDD; 20]),
+			chain_a: types::SideRoute {
+				chain_id: 1,
+				approval_required: false,
+				wrapper: None,
+			},
+			chain_b: types::SideRoute {
+				chain_id: 747474,
+				approval_required: false,
+				wrapper: None,
+			},
+		}
+	}
+
 	#[tokio::test]
 	async fn test_bridge_via_composer_approves_source_token_and_calls_deposit_and_send_on_composer()
 	{
@@ -1611,6 +1626,57 @@ mod tests {
 			contracts::address_to_bytes32(solver_address())
 		);
 		assert_eq!(submitted[1].gas_limit, Some(1_125_000));
+	}
+
+	#[tokio::test]
+	async fn test_bridge_via_composer_ignores_route_approval_false() {
+		let request = bridge_request();
+		let composer = Address::from([0xCC; 20]);
+		let route = lz_route(composer, request.source_chain);
+		let submitted = Arc::new(Mutex::new(Vec::<Transaction>::new()));
+		let mut mock = MockDeliveryInterface::new();
+
+		mock.expect_get_allowance()
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok("0".to_string()) }));
+		mock.expect_get_receipt().times(1).returning(|_, _| {
+			Box::pin(async move {
+				Ok(TransactionReceipt {
+					hash: TransactionHash(vec![0x11; 32]),
+					block_number: 1,
+					success: true,
+					logs: vec![],
+					block_timestamp: None,
+				})
+			})
+		});
+		mock.expect_eth_call().times(1).returning(|_| {
+			Box::pin(async move {
+				Ok(alloy_primitives::Bytes::from(composer_quote_fee_bytes(
+					U256::from(1u64),
+				)))
+			})
+		});
+		mock.expect_estimate_gas()
+			.returning(|_| Box::pin(async move { Ok(800_000u64) }));
+		{
+			let submitted = submitted.clone();
+			mock.expect_submit().times(2).returning(move |tx, _| {
+				submitted.lock().unwrap().push(tx.clone());
+				let len = submitted.lock().unwrap().len();
+				Box::pin(async move { Ok(TransactionHash(vec![len as u8; 32])) })
+			});
+		}
+
+		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
+		let result = bridge.bridge_via_composer(&request, Some(&route)).await;
+
+		assert!(result.is_ok(), "composer bridge failed: {result:?}");
+		let submitted = submitted.lock().unwrap();
+		assert_eq!(submitted.len(), 2, "approve and deposit should both submit");
+		assert_eq!(tx_to(&submitted[0]), request.source_token);
+		let approve: contracts::approveCall = decode_submit(&submitted[0]);
+		assert_eq!(approve.spender, composer);
 	}
 
 	#[tokio::test]
@@ -2309,6 +2375,39 @@ mod tests {
 			.clone()
 			.expect("missing contract call");
 		// OFT flow: quoteSend is called on source_oft
+		assert_eq!(tx_to(&tx), request.source_oft);
+	}
+
+	#[tokio::test]
+	async fn test_estimate_fee_with_non_source_composer_route_uses_oft_quote() {
+		let request = bridge_request();
+		let fee = U256::from(999u64);
+		let legacy_composer = Address::from([0xCC; 20]);
+		let route = lz_route(Address::from([0xDD; 20]), request.dest_chain);
+		let call_target = Arc::new(Mutex::new(None));
+		let mut mock = MockDeliveryInterface::new();
+		{
+			let call_target = call_target.clone();
+			mock.expect_eth_call().returning(move |tx| {
+				*call_target.lock().unwrap() = Some(tx.clone());
+				assert_eq!(tx_to(&tx), bridge_request().source_oft);
+				Box::pin(async move { Ok(alloy_primitives::Bytes::from(oft_quote_fee_bytes(fee))) })
+			});
+		}
+
+		let bridge = bridge_with_two_chain_delivery(mock, Some(legacy_composer));
+		let metadata = TransferMetadata {
+			bridge_route: Some(serde_json::to_value(route).unwrap()),
+			..Default::default()
+		};
+		let quoted = bridge.estimate_fee(&request, &metadata).await.unwrap();
+
+		assert_eq!(quoted, fee);
+		let tx = call_target
+			.lock()
+			.unwrap()
+			.clone()
+			.expect("missing contract call");
 		assert_eq!(tx_to(&tx), request.source_oft);
 	}
 

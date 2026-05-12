@@ -470,11 +470,14 @@ impl SolverEngine {
 								);
 							},
 							Err(e) => {
-								tracing::warn!(
+								tracing::error!(
 									implementation = %impl_name,
 									error = %e,
-									"Rebalance bridge implementation not registered; skipping preflight"
+									"Rebalance bridge implementation not registered; refusing to start rebalance monitor"
 								);
+								return Err(EngineError::Service(format!(
+									"rebalance bridge implementation '{impl_name}' is not registered: {e}"
+								)));
 							},
 						}
 					}

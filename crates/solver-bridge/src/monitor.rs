@@ -927,41 +927,68 @@ impl RebalanceMonitor {
 							.and_then(|r| Self::route_wrapper_address(r, transfer.dest_chain))
 							.is_some();
 						if dest_has_wrapper {
-							if let Some(hash_str) = transfer.redeem_tx_hash.as_ref() {
-								let hash_bytes =
-									hex::decode(hash_str.strip_prefix("0x").unwrap_or(hash_str));
-								if let Ok(hash_bytes) = hash_bytes {
-									let tx_hash_obj = solver_types::TransactionHash(hash_bytes);
-									if let Ok(receipt) = self
-										.delivery
-										.get_receipt(&tx_hash_obj, transfer.dest_chain)
-										.await
-									{
-										match bridge_impl.parse_redeem_assets(&receipt) {
-											Ok(assets) => {
-												transfer.unwrap_amount = Some(assets.to_string());
-												new_status = BridgeTransferStatus::UnwrapPending;
-												tracing::info!(
-													transfer_id = %transfer.id,
-													assets = %assets,
-													"Redeem confirmed; diverting to UnwrapPending"
-												);
+							new_status = match transfer.redeem_tx_hash.as_ref() {
+									Some(hash_str) => {
+										let hash_bytes = hex::decode(
+											hash_str.strip_prefix("0x").unwrap_or(hash_str),
+										);
+										match hash_bytes {
+											Ok(hash_bytes) => {
+												let tx_hash_obj =
+													solver_types::TransactionHash(hash_bytes);
+												match self
+													.delivery
+													.get_receipt(&tx_hash_obj, transfer.dest_chain)
+													.await
+												{
+													Ok(receipt) => match bridge_impl
+														.parse_redeem_assets(&receipt)
+													{
+														Ok(assets) => {
+															transfer.unwrap_amount =
+																Some(assets.to_string());
+															tracing::info!(
+																transfer_id = %transfer.id,
+																assets = %assets,
+																"Redeem confirmed; diverting to UnwrapPending"
+															);
+															BridgeTransferStatus::UnwrapPending
+														},
+														Err(e) => {
+															tracing::warn!(
+																transfer_id = %transfer.id,
+																error = %e,
+																"parse_redeem_assets failed; escalating to NeedsIntervention"
+															);
+															BridgeTransferStatus::NeedsIntervention(
+																format!(
+																	"redeem receipt parse failed: {e}"
+																),
+															)
+														},
+													},
+													Err(e) => {
+														tracing::warn!(
+															transfer_id = %transfer.id,
+															error = %e,
+															"redeem receipt unavailable for native unwrap amount; escalating"
+														);
+														BridgeTransferStatus::NeedsIntervention(format!(
+															"redeem receipt unavailable for unwrap amount: {e}"
+														))
+													},
+												}
 											},
-											Err(e) => {
-												tracing::warn!(
-													transfer_id = %transfer.id,
-													error = %e,
-													"parse_redeem_assets failed; escalating to NeedsIntervention"
-												);
-												new_status =
-													BridgeTransferStatus::NeedsIntervention(
-														format!("redeem receipt parse failed: {e}"),
-													);
-											},
+											Err(e) => BridgeTransferStatus::NeedsIntervention(format!(
+												"invalid redeem tx hash for unwrap amount: {e}"
+											)),
 										}
-									}
-								}
-							}
+									},
+									None => BridgeTransferStatus::NeedsIntervention(
+										"redeem completed but no redeem_tx_hash persisted for unwrap amount"
+											.to_string(),
+									),
+								};
 						}
 					}
 
@@ -1554,6 +1581,68 @@ impl RebalanceMonitor {
 					RebalanceDirection::BToA => (&pair.chain_b, &pair.chain_a),
 				};
 
+				let zero_str = "0x0000000000000000000000000000000000000000";
+				let amount_to_bridge = if source_side.token_address.eq_ignore_ascii_case(zero_str) {
+					let native_balance = match self
+						.delivery
+						.get_balance(source_side.chain_id, solver_address, None)
+						.await
+					{
+						Ok(balance) => U256::from_str_radix(&balance, 10).map_err(|e| {
+							crate::BridgeError::Config(format!(
+								"Pair '{}': invalid native balance on chain {}: {e}",
+								pair.pair_id, source_side.chain_id
+							))
+						})?,
+						Err(e) => {
+							tracing::warn!(
+								pair = %pair.pair_id,
+								chain_id = source_side.chain_id,
+								"Failed to query native spendable balance: {e}"
+							);
+							continue;
+						},
+					};
+					let reserve = match config
+						.min_native_gas_reserve
+						.get(&source_side.chain_id)
+						.map(|s| U256::from_str_radix(s, 10))
+					{
+						Some(Ok(v)) => v,
+						Some(Err(e)) => {
+							return Err(crate::BridgeError::Config(format!(
+								"Pair '{}': invalid min_native_gas_reserve for chain {}: {e}",
+								pair.pair_id, source_side.chain_id
+							)));
+						},
+						None => U256::ZERO,
+					};
+					let spendable_native = native_balance.saturating_sub(reserve);
+					let capped = analysis.suggested_amount.min(spendable_native);
+					if capped.is_zero() {
+						tracing::warn!(
+							pair = %pair.pair_id,
+							chain_id = source_side.chain_id,
+							native_balance = %native_balance,
+							min_native_gas_reserve = %reserve,
+							"Skipping native-source auto rebalance: no spendable native balance"
+						);
+						continue;
+					}
+					if capped < analysis.suggested_amount {
+						tracing::warn!(
+							pair = %pair.pair_id,
+							requested = %analysis.suggested_amount,
+							capped = %capped,
+							spendable_native = %spendable_native,
+							"Native-source auto rebalance amount capped by native-only spendable balance"
+						);
+					}
+					capped
+				} else {
+					analysis.suggested_amount
+				};
+
 				let source_token = Self::parse_address(&source_side.token_address)?;
 				let source_oft = Self::parse_address(&source_side.oft_address)?;
 				let dest_token = Self::parse_address(&dest_side.token_address)?;
@@ -1568,7 +1657,7 @@ impl RebalanceMonitor {
 					source_oft,
 					dest_token,
 					dest_oft,
-					amount: analysis.suggested_amount,
+					amount: amount_to_bridge,
 					min_amount: None,
 					recipient,
 				};
@@ -1578,7 +1667,7 @@ impl RebalanceMonitor {
 					direction = ?direction,
 					source = source_side.chain_id,
 					dest = dest_side.chain_id,
-					amount = %analysis.suggested_amount,
+					amount = %amount_to_bridge,
 					"Auto-triggering rebalance"
 				);
 
@@ -1628,7 +1717,6 @@ impl RebalanceMonitor {
 				// Effective tokens for native pairs:
 				//   - source = wrapper address (for approve/balance)
 				//   - dest = wrapper (composer flow) or vault shares (non-composer)
-				let zero_str = "0x0000000000000000000000000000000000000000";
 				let effective_source_token: String =
 					if source_side.token_address.eq_ignore_ascii_case(zero_str) {
 						pair.bridge_route
@@ -1727,14 +1815,23 @@ impl RebalanceMonitor {
 		let native = delivery.get_balance(chain_id, solver_address, None).await?;
 		let wrapper = bridge_route.and_then(|r| Self::route_wrapper_address(r, chain_id));
 		let wrapper_balance = match wrapper {
-			Some(addr) => delivery
-				.get_balance(chain_id, solver_address, Some(&addr))
-				.await
-				.unwrap_or_else(|_| "0".to_string()),
+			Some(addr) => {
+				delivery
+					.get_balance(chain_id, solver_address, Some(&addr))
+					.await?
+			},
 			None => "0".to_string(),
 		};
-		let native_u = U256::from_str_radix(&native, 10).unwrap_or(U256::ZERO);
-		let wrapper_u = U256::from_str_radix(&wrapper_balance, 10).unwrap_or(U256::ZERO);
+		let native_u = U256::from_str_radix(&native, 10).map_err(|e| {
+			solver_delivery::DeliveryError::Network(format!(
+				"invalid native balance '{native}' on chain {chain_id}: {e}"
+			))
+		})?;
+		let wrapper_u = U256::from_str_radix(&wrapper_balance, 10).map_err(|e| {
+			solver_delivery::DeliveryError::Network(format!(
+				"invalid wrapper balance '{wrapper_balance}' on chain {chain_id}: {e}"
+			))
+		})?;
 		Ok((native_u + wrapper_u).to_string())
 	}
 
@@ -2057,6 +2154,13 @@ mod tests {
 		) -> Result<U256, crate::BridgeError> {
 			Ok(U256::ZERO)
 		}
+
+		async fn wrap_native(
+			&self,
+			_transfer: &crate::types::PendingBridgeTransfer,
+		) -> Result<TransactionHash, crate::BridgeError> {
+			Ok(TransactionHash(vec![0x11; 32]))
+		}
 	}
 
 	fn make_storage() -> Arc<StorageService> {
@@ -2167,6 +2271,60 @@ mod tests {
 		transfer.created_at = now;
 		transfer.updated_at = now;
 		transfer
+	}
+
+	fn native_bridge_route() -> serde_json::Value {
+		serde_json::json!({
+			"composer": "0xcccccccccccccccccccccccccccccccccccccccc",
+			"composer_chain_id": 1,
+			"vault": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			"chain_a": {
+				"chain_id": 1,
+				"approval_required": true,
+				"wrapper": {
+					"address": "0x1111111111111111111111111111111111111111",
+					"type": "weth9"
+				}
+			},
+			"chain_b": {
+				"chain_id": 747474,
+				"approval_required": false,
+				"wrapper": {
+					"address": "0x3333333333333333333333333333333333333333",
+					"type": "weth9"
+				}
+			}
+		})
+	}
+
+	#[tokio::test]
+	async fn logical_balance_propagates_wrapper_balance_errors() {
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_balance()
+			.times(2)
+			.returning(|_address, token, chain_id| match (chain_id, token) {
+				(747474, None) => Box::pin(async move { Ok("100".to_string()) }),
+				(747474, Some("0x3333333333333333333333333333333333333333")) => {
+					Box::pin(async move {
+						Err(DeliveryError::Network("wrapper rpc failed".to_string()))
+					})
+				},
+				other => panic!("unexpected balance query: {other:?}"),
+			});
+		let delivery = make_delivery(mock);
+
+		let err = RebalanceMonitor::logical_balance(
+			&delivery,
+			747474,
+			SOLVER_ADDRESS,
+			"0x0000000000000000000000000000000000000000",
+			Some(&native_bridge_route()),
+			"0x0000000000000000000000000000000000000000",
+		)
+		.await
+		.unwrap_err();
+
+		assert!(format!("{err}").contains("wrapper rpc failed"));
 	}
 
 	#[tokio::test]
@@ -2711,6 +2869,56 @@ mod tests {
 			.is_cooldown_active("eth-katana")
 			.await
 			.unwrap());
+	}
+
+	#[tokio::test]
+	async fn test_check_thresholds_caps_native_source_amount_to_spendable_native() {
+		let storage = make_storage();
+		let recorded = Arc::new(Mutex::new(Vec::new()));
+		let bridge = Arc::new(StubBridge {
+			recorded_requests: recorded.clone(),
+			..Default::default()
+		}) as Arc<dyn BridgeInterface>;
+
+		let solver_address = SOLVER_ADDRESS.to_string();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_get_balance()
+			.times(4)
+			.returning(move |address, token, chain_id| {
+				assert_eq!(address, solver_address);
+				match (chain_id, token) {
+					(1, Some("0x1111111111111111111111111111111111111111")) => {
+						Box::pin(async move { Ok("500000".to_string()) })
+					},
+					(747474, None) => Box::pin(async move { Ok("100".to_string()) }),
+					(747474, Some("0x3333333333333333333333333333333333333333")) => {
+						Box::pin(async move { Ok("1499900".to_string()) })
+					},
+					other => panic!("unexpected balance query: {other:?}"),
+				}
+			});
+		let delivery = make_delivery(mock);
+		let mut rebalance = rebalance_config();
+		rebalance.pairs[0].chain_b.token_address =
+			"0x0000000000000000000000000000000000000000".to_string();
+		rebalance.pairs[0].bridge_route = Some(native_bridge_route());
+		rebalance.bridge_config = None;
+		let (bridge_service, monitor) = make_monitor(bridge, delivery, storage, rebalance.clone());
+
+		monitor
+			.check_thresholds_and_trigger(&rebalance)
+			.await
+			.unwrap();
+
+		assert!(recorded.lock().unwrap().is_empty());
+		let active = bridge_service.get_active_transfers().await.unwrap();
+		assert_eq!(active.len(), 1);
+		assert_eq!(active[0].source_chain, 747474);
+		assert_eq!(active[0].amount, "100");
+		assert!(matches!(
+			active[0].status,
+			BridgeTransferStatus::WrapPending
+		));
 	}
 
 	#[tokio::test]

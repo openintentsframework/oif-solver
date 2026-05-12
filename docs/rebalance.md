@@ -96,7 +96,7 @@ For LayerZero, the shape is:
 |-------|------|----------|-------------|
 | `composer` | string | Yes | OVault Composer address on the vault's chain. |
 | `composer_chain_id` | u64 | Yes | Chain ID where the composer + vault live. Must match one of the pair's chain IDs. |
-| `vault` | address | Yes | ERC-4626 vault address. Must equal `composer.VAULT()`. |
+| `vault` | string (hex address) | Yes | ERC-4626 vault address. Must equal `composer.VAULT()`. |
 | `chain_a` | object | Yes | Route data for the side whose `chain_id` matches `pair.chain_a.chain_id`. |
 | `chain_b` | object | Yes | Route data for `pair.chain_b`. |
 
@@ -178,7 +178,7 @@ If any of these fail, the engine refuses to start the rebalance monitor with a s
 
 Each pair has a target balance and a deviation band for each side. The monitor computes:
 
-```
+```text
 lower_bound = target * (10000 - deviation_band_bps) / 10000
 upper_bound = target * (10000 + deviation_band_bps) / 10000
 ```
@@ -194,14 +194,14 @@ When a balance exceeds `upper_bound`, the surplus is bridged to the other side, 
 
 ERC-20 pairs (e.g., USDC):
 
-```
+```text
 Submitted --> Relaying --> Completed                              (Composer / outbound)
 Submitted --> Relaying --> PendingRedemption --> Completed         (OFT send + vault redeem)
 ```
 
 Native-asset pairs (e.g., ETH ↔ ETH via WETH/vbETH) add `WrapPending` before and `UnwrapPending` after:
 
-```
+```text
 WrapPending --> Submitted --> Relaying --> UnwrapPending --> Completed                       (Composer / outbound)
 WrapPending --> Submitted --> Relaying --> PendingRedemption --> UnwrapPending --> Completed (Non-composer / inbound)
 ```

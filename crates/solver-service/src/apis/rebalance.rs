@@ -530,26 +530,28 @@ pub async fn handle_trigger_rebalance(
 	// the wrapper — that's what the existing `check_status` event scan watches
 	// during `Relaying`.
 	let zero_addr = alloy_primitives::Address::ZERO;
-	let effective_source_token: String = if source_side.token_address == zero_addr {
-		pair.bridge_route
-			.as_ref()
-			.and_then(|r| {
-				let key = if r
-					.get("chain_a")
-					.and_then(|s| s.get("chain_id"))
-					.and_then(|v| v.as_u64())
-					== Some(request.source_chain)
-				{
-					"chain_a"
-				} else {
-					"chain_b"
-				};
-				r.get(key)
-					.and_then(|s| s.get("wrapper"))
+	let route_wrapper_for_chain = |chain_id: u64| -> Result<Option<String>, AdminAuthError> {
+		let Some(route) = pair.bridge_route.as_ref() else {
+			return Ok(None);
+		};
+		for key in ["chain_a", "chain_b"] {
+			let Some(side) = route.get(key) else {
+				continue;
+			};
+			if side.get("chain_id").and_then(|v| v.as_u64()) == Some(chain_id) {
+				return Ok(side
+					.get("wrapper")
 					.and_then(|w| w.get("address"))
 					.and_then(|a| a.as_str())
-					.map(String::from)
-			})
+					.map(String::from));
+			}
+		}
+		Err(AdminAuthError::InvalidMessage(format!(
+			"bridge_route has no side for chain {chain_id}"
+		)))
+	};
+	let effective_source_token: String = if source_side.token_address == zero_addr {
+		route_wrapper_for_chain(request.source_chain)?
 			.unwrap_or_else(|| source_side.token_address.to_string())
 	} else {
 		source_side.token_address.to_string()
@@ -559,25 +561,7 @@ pub async fn handle_trigger_rebalance(
 	// the existing scan logic falls back to `vault_address` so the pair token
 	// works here (and matches existing test expectations).
 	let delivery_scan_token: String = if is_composer && dest_side.token_address == zero_addr {
-		pair.bridge_route
-			.as_ref()
-			.and_then(|r| {
-				let key = if r
-					.get("chain_a")
-					.and_then(|s| s.get("chain_id"))
-					.and_then(|v| v.as_u64())
-					== Some(request.dest_chain)
-				{
-					"chain_a"
-				} else {
-					"chain_b"
-				};
-				r.get(key)
-					.and_then(|s| s.get("wrapper"))
-					.and_then(|w| w.get("address"))
-					.and_then(|a| a.as_str())
-					.map(String::from)
-			})
+		route_wrapper_for_chain(request.dest_chain)?
 			.unwrap_or_else(|| dest_side.token_address.to_string())
 	} else {
 		dest_side.token_address.to_string()
@@ -1402,6 +1386,63 @@ mod tests {
 			result,
 			Err(AdminAuthError::InvalidMessage(msg))
 				if msg == "missing vault address for non-composer destination"
+		));
+	}
+
+	#[tokio::test]
+	async fn test_handle_trigger_rebalance_rejects_route_without_matching_side() {
+		let mut operator_config = sample_operator_config();
+		let rebalance = operator_config.rebalance.as_mut().unwrap();
+		rebalance.pairs[0].chain_b.token_address = alloy_primitives::Address::ZERO;
+		rebalance.pairs[0].bridge_route = Some(serde_json::json!({
+			"composer": "0xcccccccccccccccccccccccccccccccccccccccc",
+			"composer_chain_id": 1,
+			"vault": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			"chain_a": {
+				"chain_id": 1,
+				"approval_required": true,
+				"wrapper": {
+					"address": "0x1111111111111111111111111111111111111111",
+					"type": "weth9"
+				}
+			},
+			"chain_b": {
+				"chain_id": 999,
+				"approval_required": false,
+				"wrapper": {
+					"address": "0x3333333333333333333333333333333333333333",
+					"type": "weth9"
+				}
+			}
+		}));
+		let bridge_service = make_bridge_service(Arc::new(Mutex::new(Vec::new())));
+		let state = make_admin_state(
+			operator_config,
+			create_delivery_service(|_, _, _| Ok("0".to_string())),
+			Some(bridge_service),
+		)
+		.await;
+
+		let result = handle_trigger_rebalance(
+			axum::extract::State(state),
+			crate::apis::admin::VerifiedAdmin {
+				admin: solver_types::Address::from(alloy_address(SOLVER_ADDRESS)),
+				contents: TriggerRebalanceContents {
+					pair_id: "eth-katana".to_string(),
+					source_chain: 747474,
+					dest_chain: 1,
+					amount: "12345".to_string(),
+					nonce: 1,
+					deadline: 2,
+				},
+			},
+		)
+		.await;
+
+		assert!(matches!(
+			result,
+			Err(AdminAuthError::InvalidMessage(msg))
+				if msg == "bridge_route has no side for chain 747474"
 		));
 	}
 

@@ -643,6 +643,16 @@ impl BridgeService {
 				// would immediately re-escalate the transfer back to
 				// NeedsIntervention on the next tick.
 				transfer.bridge_submit_attempted = false;
+				transfer.wrap_submit_attempted = false;
+				transfer.wrap_tx_hash = None;
+				transfer.wrap_missing_checks = 0;
+				transfer.redeem_submit_attempted = false;
+				transfer.redeem_tx_hash = None;
+				transfer.redeem_missing_checks = 0;
+				transfer.redeem_missing_since = None;
+				transfer.unwrap_submit_attempted = false;
+				transfer.unwrap_tx_hash = None;
+				transfer.unwrap_missing_checks = 0;
 				if let Some(prev_status) = transfer.status_before_intervention.take() {
 					transfer.status = prev_status;
 				} else {
@@ -831,6 +841,7 @@ mod tests {
 
 	fn bridge_metadata() -> types::TransferMetadata {
 		types::TransferMetadata {
+			source_token_address: "0x1111111111111111111111111111111111111111".to_string(),
 			dest_token_address: "0x3333333333333333333333333333333333333333".to_string(),
 			dest_oft_address: "0x4444444444444444444444444444444444444444".to_string(),
 			is_composer_flow: true,
@@ -1818,6 +1829,70 @@ mod tests {
 		assert!(matches!(saved.status, BridgeTransferStatus::Submitted));
 		assert!(!saved.bridge_submit_attempted);
 		assert!(saved.tx_hash.is_none());
+	}
+
+	#[tokio::test]
+	async fn test_resolve_transfer_retry_clears_native_phase_markers() {
+		let mut transfer = pending_transfer(BridgeTransferStatus::NeedsIntervention(
+			"native crash window".to_string(),
+		));
+		transfer.status_before_intervention = Some(BridgeTransferStatus::WrapPending);
+		transfer.wrap_submit_attempted = true;
+		transfer.wrap_tx_hash = Some("0xwrap".to_string());
+		transfer.wrap_missing_checks = 2;
+		transfer.redeem_submit_attempted = true;
+		transfer.redeem_tx_hash = Some("0xredeem".to_string());
+		transfer.redeem_missing_checks = 2;
+		transfer.redeem_missing_since = Some(1_700_000_010);
+		transfer.unwrap_submit_attempted = true;
+		transfer.unwrap_tx_hash = Some("0xunwrap".to_string());
+		transfer.unwrap_missing_checks = 2;
+		let saved = Arc::new(Mutex::new(None));
+		let mut storage = MockStorageInterface::new();
+		{
+			let expected_transfer = transfer.clone();
+			storage.expect_get_bytes().returning(move |_| {
+				let expected_transfer = expected_transfer.clone();
+				Box::pin(async move { Ok(transfer_json(&expected_transfer)) })
+			});
+		}
+		{
+			let saved = saved.clone();
+			storage
+				.expect_set_bytes()
+				.returning(move |_key, value, _indexes, _ttl| {
+					let transfer: PendingBridgeTransfer = serde_json::from_slice(&value).unwrap();
+					*saved.lock().unwrap() = Some(transfer);
+					Box::pin(async move { Ok(()) })
+				});
+		}
+
+		let service = make_service(Arc::new(TestBridge::new()), storage);
+		let resolved = service
+			.resolve_transfer(&transfer.id, "retry", "operator verified native phases")
+			.await
+			.unwrap();
+
+		assert!(matches!(resolved.status, BridgeTransferStatus::WrapPending));
+		assert!(!resolved.wrap_submit_attempted);
+		assert!(resolved.wrap_tx_hash.is_none());
+		assert_eq!(resolved.wrap_missing_checks, 0);
+		assert!(!resolved.redeem_submit_attempted);
+		assert!(resolved.redeem_tx_hash.is_none());
+		assert_eq!(resolved.redeem_missing_checks, 0);
+		assert!(resolved.redeem_missing_since.is_none());
+		assert!(!resolved.unwrap_submit_attempted);
+		assert!(resolved.unwrap_tx_hash.is_none());
+		assert_eq!(resolved.unwrap_missing_checks, 0);
+
+		let saved = saved.lock().unwrap().clone().unwrap();
+		assert!(matches!(saved.status, BridgeTransferStatus::WrapPending));
+		assert!(!saved.wrap_submit_attempted);
+		assert!(saved.wrap_tx_hash.is_none());
+		assert!(!saved.redeem_submit_attempted);
+		assert!(saved.redeem_tx_hash.is_none());
+		assert!(!saved.unwrap_submit_attempted);
+		assert!(saved.unwrap_tx_hash.is_none());
 	}
 
 	#[tokio::test]

@@ -82,6 +82,7 @@ pub fn rebalance_config() -> RebalanceConfig {
 
 pub fn bridge_metadata() -> TransferMetadata {
 	TransferMetadata {
+		source_token_address: "0x1111111111111111111111111111111111111111".to_string(),
 		dest_token_address: "0x3333333333333333333333333333333333333333".to_string(),
 		dest_oft_address: "0x4444444444444444444444444444444444444444".to_string(),
 		is_composer_flow: true,
