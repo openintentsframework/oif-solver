@@ -30,6 +30,8 @@ info:
 
     - Authentication is optional and configured per solver instance
     - If `auth.enabled = false`, auth endpoints are unavailable
+    - When Orders API auth or admin auth is enabled, the service requires `JWT_SECRET`
+      at startup and rejects secrets shorter than 32 bytes after trimming whitespace
     - `/auth/register` cannot issue `admin-all`
     - Client IDs must be between 3-100 characters
   version: 1.0.0

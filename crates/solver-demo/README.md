@@ -307,6 +307,16 @@ export RECIPIENT_ADDRESS=0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC
 export JWT_SECRET=REPLACE_ME_WITH_AT_LEAST_32_BYTES_OF_ENTROPY
 ```
 
+The demo placeholder satisfies the minimum length check, but production and
+shared testnet deployments should replace it with a random secret:
+
+```bash
+export JWT_SECRET="$(openssl rand -base64 48)"
+```
+
+When Orders API auth or admin auth is enabled, the solver refuses to start if
+`JWT_SECRET` is missing or shorter than 32 bytes after trimming whitespace.
+
 ## Commands Reference
 
 ### Init Commands
