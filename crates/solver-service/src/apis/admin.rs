@@ -1398,6 +1398,7 @@ pub async fn handle_get_types(State(state): State<AdminApiState>) -> Json<Eip712
 mod tests {
 	use super::*;
 	use async_trait::async_trait;
+	use serial_test::serial;
 	use solver_account::{AccountInterface, AccountService, AccountSigner};
 	use solver_config::builders::config::ConfigBuilder;
 	use solver_delivery::{DeliveryInterface, DeliveryService, MockDeliveryInterface};
@@ -1894,8 +1895,36 @@ mod tests {
 		}
 	}
 
+	struct EnvVarGuard {
+		key: &'static str,
+		original: Option<String>,
+	}
+
+	impl EnvVarGuard {
+		fn set(key: &'static str, value: impl AsRef<str>) -> Self {
+			let original = std::env::var(key).ok();
+			std::env::set_var(key, value.as_ref());
+			Self { key, original }
+		}
+	}
+
+	impl Drop for EnvVarGuard {
+		fn drop(&mut self) {
+			match &self.original {
+				Some(value) => std::env::set_var(self.key, value),
+				None => std::env::remove_var(self.key),
+			}
+		}
+	}
+
+	fn strong_jwt_secret_guard() -> EnvVarGuard {
+		EnvVarGuard::set("JWT_SECRET", "x".repeat(32))
+	}
+
 	#[tokio::test]
+	#[serial]
 	async fn test_handle_add_token_triggers_approval_setup() {
+		let _jwt_secret = strong_jwt_secret_guard();
 		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 		let mut operator_config =
 			build_operator_config(admin_alloy, OperatorWithdrawalsConfig { enabled: true });
@@ -1982,7 +2011,9 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial]
 	async fn test_handle_add_tokens_triggers_approval_setup() {
+		let _jwt_secret = strong_jwt_secret_guard();
 		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 		let mut operator_config =
 			build_operator_config(admin_alloy, OperatorWithdrawalsConfig { enabled: true });
@@ -2081,7 +2112,9 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial]
 	async fn test_handle_add_token_approval_failure_is_atomic() {
+		let _jwt_secret = strong_jwt_secret_guard();
 		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 		let mut operator_config =
 			build_operator_config(admin_alloy, OperatorWithdrawalsConfig { enabled: true });
@@ -2182,7 +2215,9 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial]
 	async fn test_handle_add_tokens_approval_failure_is_atomic() {
+		let _jwt_secret = strong_jwt_secret_guard();
 		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 		let mut operator_config =
 			build_operator_config(admin_alloy, OperatorWithdrawalsConfig { enabled: true });
@@ -2641,7 +2676,9 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial]
 	async fn test_handle_set_admin_role_supports_read_only_role() {
+		let _jwt_secret = strong_jwt_secret_guard();
 		let admin = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 		let read_only = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
 		let mut operator_config =

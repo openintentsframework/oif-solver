@@ -1428,7 +1428,11 @@ fn spawn_solver(
 		.stderr(stderr_file);
 
 	if options.enable_admin_api {
-		command.env("JWT_SECRET", "solver-e2e-admin-jwt-secret");
+		// Must be at least JWT_SECRET_MIN_BYTES (32) bytes; see config_merge::load_jwt_secret_from_env.
+		command.env(
+			"JWT_SECRET",
+			"solver-e2e-admin-jwt-secret-padding-0123456789",
+		);
 	}
 	if let Some(redis_url) = &options.admin_redis_url {
 		command.env("REDIS_URL", redis_url);

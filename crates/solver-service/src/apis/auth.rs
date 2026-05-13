@@ -293,27 +293,15 @@ pub async fn refresh_token(
 			.into_response();
 	}
 
-	// First validate the refresh token to extract claims for response
-	let refresh_claims = match jwt_service.validate_token(&request.refresh_token) {
-		Ok(claims) => claims,
-		Err(e) => {
-			tracing::warn!("Invalid refresh token: {}", e);
-			return (
-				StatusCode::UNAUTHORIZED,
-				Json(json!({
-					"error": "Invalid or expired refresh token"
-				})),
-			)
-				.into_response();
-		},
-	};
-
-	// Exchange refresh token for new tokens
-	let (new_access_token, new_refresh_token) = match jwt_service
+	// Exchange refresh token for new tokens. `refresh_access_token` is the
+	// authoritative refresh-flow gate: it rejects anything that isn't a
+	// refresh-typed JWT, and it hands back the access-token claims it just
+	// constructed so the response can be built without a second decode.
+	let (new_access_token, new_refresh_token, access_claims) = match jwt_service
 		.refresh_access_token(&request.refresh_token)
 		.await
 	{
-		Ok((access, refresh)) => (access, refresh),
+		Ok(tokens) => tokens,
 		Err(e) => {
 			tracing::warn!("Failed to refresh token: {}", e);
 			return (
@@ -326,30 +314,18 @@ pub async fn refresh_token(
 		},
 	};
 
-	// Get access token expiry from the token claims
-	let access_token_expires_at = match jwt_service.validate_token(&new_access_token) {
-		Ok(claims) => claims.exp,
-		Err(_) => {
-			// Fallback calculation if we can't decode our own token
-			let expiry_hours = jwt_service.config().access_token_expiry_hours;
-			chrono::Utc::now().timestamp() + (expiry_hours as i64 * 3600)
-		},
-	};
-
-	// Get refresh token expiry from configuration
 	let refresh_token_expires_at = chrono::Utc::now().timestamp()
 		+ (jwt_service.config().refresh_token_expiry_hours as i64 * 3600);
 
 	tracing::info!("Token refreshed successfully");
 
-	// Return success response
 	let response = RegisterResponse {
 		access_token: new_access_token,
 		refresh_token: new_refresh_token,
-		client_id: refresh_claims.sub,
-		access_token_expires_at,
+		client_id: access_claims.sub,
+		access_token_expires_at: access_claims.exp,
 		refresh_token_expires_at,
-		scopes: refresh_claims.scope.iter().map(|s| s.to_string()).collect(),
+		scopes: access_claims.scope.iter().map(|s| s.to_string()).collect(),
 		token_type: "Bearer".to_string(),
 	};
 
@@ -786,7 +762,7 @@ fn parse_public_scopes(scopes: Option<Vec<String>>) -> Result<Vec<AuthScope>, St
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::auth::JwtService;
+	use crate::auth::{AuthError, JwtService};
 	use alloy_primitives::B256;
 	use alloy_signer::SignerSync;
 	use alloy_signer_local::PrivateKeySigner;
@@ -1346,12 +1322,19 @@ mod tests {
 		assert_eq!(access_claims.sub, signer_address.to_string());
 		assert_eq!(access_claims.scope, vec![AuthScope::AdminAll]);
 
-		let refresh_claims = jwt_service
+		// The refresh token must NOT be accepted as an access token. It is only
+		// usable at the refresh endpoint.
+		let err = jwt_service
 			.validate_token(&register_response.refresh_token)
-			.unwrap();
-		assert_eq!(refresh_claims.sub, signer_address.to_string());
-		assert_eq!(refresh_claims.scope, vec![AuthScope::AdminAll]);
-		assert!(refresh_claims.nonce.is_some());
+			.expect_err("refresh token must not validate as an access token");
+		assert!(matches!(err, AuthError::InvalidAccessToken(_)));
+
+		// But it must remain a working refresh token.
+		let (_, rotated_refresh, _) = jwt_service
+			.refresh_access_token(&register_response.refresh_token)
+			.await
+			.expect("refresh token must work at the refresh endpoint");
+		assert!(!rotated_refresh.is_empty());
 
 		let reuse = nonce_store.consume(nonce_id).await;
 		assert!(matches!(
@@ -1452,11 +1435,11 @@ mod tests {
 		assert_eq!(refreshed_access_claims.sub, signer_address.to_string());
 		assert_eq!(refreshed_access_claims.scope, vec![AuthScope::AdminAll]);
 
-		let refreshed_refresh_claims = jwt_service
+		// The newly-issued refresh token must NOT be accepted as an access token.
+		let err = jwt_service
 			.validate_token(&refreshed_tokens.refresh_token)
-			.unwrap();
-		assert_eq!(refreshed_refresh_claims.sub, signer_address.to_string());
-		assert_eq!(refreshed_refresh_claims.scope, vec![AuthScope::AdminAll]);
+			.expect_err("rotated refresh token must not validate as access");
+		assert!(matches!(err, AuthError::InvalidAccessToken(_)));
 	}
 
 	/// Locks in the API-separation hot-fix on the verify path: SIWE verify must

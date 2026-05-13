@@ -14,11 +14,12 @@ info:
 
     ## Token Lifecycle
 
-    - **Access Tokens**: Short-lived, used for API authentication
+    - **Access Tokens**: Short-lived, include `typ: "access"`, and are used for API authentication
     - **SIWE Access Tokens**: Default 900 seconds (with current constants)
     - **SIWE Refresh Tokens**: Issued by /auth/siwe/verify and compatible with /auth/refresh
-    - **Refresh Tokens**: Long-lived (default 30 days), used to obtain new access tokens
+    - **Refresh Tokens**: Long-lived (default 30 days), include `typ: "refresh"`, and are used only to obtain new access tokens
     - **Token Rotation**: Refresh endpoint returns a new refresh token
+    - **Type Separation**: Refresh tokens are rejected as bearer credentials, and access tokens are rejected by /auth/refresh
 
     ## Scopes
 
@@ -30,7 +31,10 @@ info:
 
     - Authentication is optional and configured per solver instance
     - If `auth.enabled = false`, auth endpoints are unavailable
+    - When Orders API auth or admin auth is enabled, the service requires `JWT_SECRET`
+      at startup and rejects secrets shorter than 32 bytes after trimming whitespace
     - `/auth/register` cannot issue `admin-all`
+    - Tokens issued before the `typ` claim existed are rejected after upgrade; clients should re-authenticate once
     - Client IDs must be between 3-100 characters
   version: 1.0.0
 servers:
@@ -194,6 +198,10 @@ paths:
         longer expiry (30 days by default) and should be used to obtain new tokens
         when the access token expires.
 
+        Access and refresh tokens are type-separated JWTs. Only access tokens are
+        accepted as `Authorization: Bearer <access_token>` credentials. Refresh
+        tokens are accepted only by `/auth/refresh`.
+
         If no scopes are provided, the client is granted basic read permissions (read-orders).
         `admin-all` is not allowed on this endpoint.
       operationId: registerClient
@@ -286,6 +294,8 @@ paths:
 
         Use this endpoint when an access token from `/auth/register` or
         `/auth/siwe/verify` expires to continue making authenticated API calls.
+        This endpoint accepts only JWTs with `typ: "refresh"`; an access token
+        cannot be exchanged here.
       operationId: refreshToken
       tags:
         - Authentication
@@ -456,12 +466,14 @@ components:
           description: |
             JWT access token for API authentication.
             Include in Authorization header as: `Bearer <access_token>`
+            Access tokens include `typ: "access"` and are rejected by /auth/refresh.
           example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJteS1hcHAtY2xpZW50Iiwic2NvcGUiOlsicmVhZC1vcmRlcnMiXSwiZXhwIjoxNzAwMDAzNjAwLCJpYXQiOjE3MDAwMDAwMDAsImlzcyI6Im9pZi1zb2x2ZXIifQ..."
         refresh_token:
           type: string
           description: |
             JWT refresh token for obtaining new access tokens.
             Use with /auth/refresh endpoint when access token expires.
+            Refresh tokens include `typ: "refresh"` and are rejected as bearer API credentials.
           example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJteS1hcHAtY2xpZW50Iiwic2NvcGUiOlsicmVhZC1vcmRlcnMiXSwiZXhwIjoxNzAyNTk1NjAwLCJpYXQiOjE3MDAwMDAwMDAsImlzcyI6Im9pZi1zb2x2ZXItcmVmcmVzaCJ9..."
         client_id:
           type: string

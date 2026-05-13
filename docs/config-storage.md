@@ -182,8 +182,20 @@ Example `direct` settlement:
 | `REDIS_URL` | Yes | `redis://localhost:6379` | Redis connection URL |
 | `SOLVER_PRIVATE_KEY` | Yes | - | 64-character hex private key (without 0x prefix) |
 | `SOLVER_ID` | For loading | - | Solver ID to load from Redis (required when not seeding) |
+| `JWT_SECRET` | Conditional | - | Required when Orders API auth or admin auth is enabled. Must be at least 32 bytes after trimming whitespace |
 
 **Note:** After seeding, the solver outputs the `SOLVER_ID` to use for subsequent runs. Set this environment variable before running without `--bootstrap-config`.
+
+Generate production JWT secrets with a high-entropy value, for example:
+
+```bash
+export JWT_SECRET="$(openssl rand -base64 48)"
+```
+
+When authentication is enabled, the solver refuses to boot if `JWT_SECRET` is
+missing or shorter than 32 bytes. This avoids restart-local secrets that
+invalidate every token and public demo placeholders that could let attackers
+forge JWTs.
 
 ## Supported Networks
 
