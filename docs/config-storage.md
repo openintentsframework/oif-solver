@@ -96,7 +96,7 @@ Bootstrap config specifies which networks your solver will support. Networks can
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `solver_id` | No | Unique solver identifier. If provided, enables idempotent seeding. If omitted, a UUID is generated. |
+| `solver_id` | No | Unique solver identifier. If provided, enables idempotent seeding and derives the EIP-712 admin domain salt that binds admin signatures to this solver instance. If omitted, a UUID is generated. |
 | `monitoring_timeout_seconds` | No | Top-level solver monitoring timeout in seconds. Controls how long post-fill settlement monitoring keeps polling for claim readiness. Valid range: `30` to `1209600` seconds. Defaults to seed/common default (`28800`). Long-latency broadcaster routes may need values like `864000` (10 days). |
 | `networks` | Yes | Array of networks to support |
 | `networks[].chain_id` | Yes | Chain ID (seeded or non-seeded) |
@@ -173,7 +173,7 @@ Example `direct` settlement:
 }
 ```
 
-**Note:** Providing a `solver_id` makes seeding idempotent - running bootstrap again with the same config will detect existing configuration and skip seeding (unless `--force-seed` is used).
+**Note:** Providing a `solver_id` makes seeding idempotent - running bootstrap again with the same config will detect existing configuration and skip seeding (unless `--force-seed` is used). Keep the `solver_id` stable after launch; changing it changes the EIP-712 admin domain salt, so existing pending admin signatures will no longer verify.
 
 ## Environment Variables
 

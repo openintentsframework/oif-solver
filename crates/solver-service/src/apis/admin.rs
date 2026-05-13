@@ -2749,7 +2749,16 @@ mod tests {
 		assert_eq!(response.domain.name, "OIF Solver Admin");
 		assert_eq!(response.domain.version, "1");
 		assert_eq!(response.domain.chain_id, 1);
+		assert!(response.domain.salt.starts_with("0x"));
+		assert_eq!(response.domain.salt.len(), 66);
 		assert!(response.types.is_object());
+
+		let domain_fields = response.types["EIP712Domain"]
+			.as_array()
+			.expect("EIP712Domain should be an array");
+		assert!(domain_fields.iter().any(|field| {
+			field["name"].as_str() == Some("salt") && field["type"].as_str() == Some("bytes32")
+		}));
 	}
 
 	#[tokio::test]
