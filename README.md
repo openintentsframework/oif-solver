@@ -290,6 +290,17 @@ SIWE-issued access tokens use the same JWT format as other auth flows and curren
 SIWE also returns a refresh token with the configured `refresh_token_expiry_hours`, and that
 refresh token is compatible with `POST /api/v1/auth/refresh`.
 
+Access and refresh tokens are not interchangeable:
+
+- **Access tokens** include `typ = "access"` and are the only tokens accepted in
+  the `Authorization: Bearer <access_token>` header for protected APIs.
+- **Refresh tokens** include `typ = "refresh"` and are accepted only by
+  `POST /api/v1/auth/refresh` to obtain a new access/refresh token pair.
+
+Tokens issued before this token-type claim was introduced do not contain `typ`
+and are rejected after upgrade. Users and admins should re-authenticate once
+after deploying this change.
+
 ## Docker
 
 The solver can be run in a Docker container for production deployments.
