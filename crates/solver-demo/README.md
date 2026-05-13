@@ -304,7 +304,7 @@ export SOLVER_PRIVATE_KEY=0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae78
 export RECIPIENT_ADDRESS=0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC
 
 # API Configuration
-export JWT_SECRET=MySuperDuperSecureSecret123!
+export JWT_SECRET=REPLACE_ME_WITH_AT_LEAST_32_BYTES_OF_ENTROPY
 ```
 
 ## Commands Reference

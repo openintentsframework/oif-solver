@@ -776,7 +776,7 @@ fn generate_demo_config(
 			},
 			"auth": {
 				"orders_auth_enabled": true,
-				"jwt_secret": "${JWT_SECRET:-MySuperDuperSecureSecret123!}",
+				"jwt_secret": "${JWT_SECRET:-REPLACE_ME_WITH_AT_LEAST_32_BYTES_OF_ENTROPY}",
 				"access_token_expiry_hours": 1,
 				"refresh_token_expiry_hours": 720,
 				"issuer": "oif-solver-demo"
