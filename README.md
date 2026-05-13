@@ -355,6 +355,7 @@ For Redis connectivity from within Docker:
 | `SOLVER_ID` | For loading | Solver ID to load config from Redis (after first seed) |
 | `RUST_LOG` | No | Log level (default: `info`) |
 | `SOLVER_PRIVATE_KEY` | Conditional | Required for local wallet if no inline `private_key` in bootstrap config |
+| `JWT_SECRET` | Conditional | Required when Orders API auth or admin auth is enabled. Must be at least 32 bytes; generate with `openssl rand -base64 48` |
 | `AWS_ACCESS_KEY_ID` | For KMS | AWS access key (if using KMS signer) |
 | `AWS_SECRET_ACCESS_KEY` | For KMS | AWS secret key (if using KMS signer) |
 | `AWS_REGION` | For KMS | AWS region (if using KMS signer, default: from config) |
