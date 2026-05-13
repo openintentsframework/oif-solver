@@ -55,7 +55,8 @@ pub use account::*;
 pub use admin_api::*;
 pub use api::*;
 pub use auth::{
-	AdminConfig, AdminRole, AdminWhitelistEntry, AuthConfig, AuthScope, JwtClaims, RefreshTokenData,
+	AdminConfig, AdminRole, AdminWhitelistEntry, AuthConfig, AuthScope, JwtClaims, JwtTokenKind,
+	RefreshTokenData,
 };
 pub use costs::{CostBreakdown, CostContext};
 pub use delivery::*;

@@ -96,7 +96,7 @@ Bootstrap config specifies which networks your solver will support. Networks can
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `solver_id` | No | Unique solver identifier. If provided, enables idempotent seeding. If omitted, a UUID is generated. |
+| `solver_id` | No | Unique solver identifier. If provided, enables idempotent seeding and derives the EIP-712 admin domain salt that binds admin signatures to this solver instance. If omitted, a UUID is generated. |
 | `monitoring_timeout_seconds` | No | Top-level solver monitoring timeout in seconds. Controls how long post-fill settlement monitoring keeps polling for claim readiness. Valid range: `30` to `1209600` seconds. Defaults to seed/common default (`28800`). Long-latency broadcaster routes may need values like `864000` (10 days). |
 | `networks` | Yes | Array of networks to support |
 | `networks[].chain_id` | Yes | Chain ID (seeded or non-seeded) |
@@ -173,7 +173,7 @@ Example `direct` settlement:
 }
 ```
 
-**Note:** Providing a `solver_id` makes seeding idempotent - running bootstrap again with the same config will detect existing configuration and skip seeding (unless `--force-seed` is used).
+**Note:** Providing a `solver_id` makes seeding idempotent - running bootstrap again with the same config will detect existing configuration and skip seeding (unless `--force-seed` is used). Keep the `solver_id` stable after launch; changing it changes the EIP-712 admin domain salt, so existing pending admin signatures will no longer verify.
 
 ## Environment Variables
 
@@ -182,8 +182,20 @@ Example `direct` settlement:
 | `REDIS_URL` | Yes | `redis://localhost:6379` | Redis connection URL |
 | `SOLVER_PRIVATE_KEY` | Yes | - | 64-character hex private key (without 0x prefix) |
 | `SOLVER_ID` | For loading | - | Solver ID to load from Redis (required when not seeding) |
+| `JWT_SECRET` | Conditional | - | Required when Orders API auth or admin auth is enabled. Must be at least 32 bytes after trimming whitespace |
 
 **Note:** After seeding, the solver outputs the `SOLVER_ID` to use for subsequent runs. Set this environment variable before running without `--bootstrap-config`.
+
+Generate production JWT secrets with a high-entropy value, for example:
+
+```bash
+export JWT_SECRET="$(openssl rand -base64 48)"
+```
+
+When authentication is enabled, the solver refuses to boot if `JWT_SECRET` is
+missing or shorter than 32 bytes. This avoids restart-local secrets that
+invalidate every token and public demo placeholders that could let attackers
+forge JWTs.
 
 ## Supported Networks
 

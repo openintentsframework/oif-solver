@@ -288,6 +288,7 @@ pub async fn start_server(
 							nonce_store.clone(),
 							admin_config.clone(),
 							chain_id,
+							&solver_id,
 						);
 						tracing::info!(
 							"Admin API enabled for {} admin(s) with config persistence",
@@ -300,6 +301,7 @@ pub async fn start_server(
 							dynamic_config: dynamic_config.clone(),
 							// Store nonce_store for rebuilding verifier later
 							nonce_store,
+							solver_id: solver_id.clone(),
 							// Token manager for hot-reloading token configurations
 							token_manager: solver.token_manager().clone(),
 							bridge_service: solver.bridge_service().cloned(),

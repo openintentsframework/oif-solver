@@ -732,6 +732,7 @@ pub fn reconstruct_eip3009_digest(
 ///
 /// These types are used by clients to construct typed data for signing admin actions.
 /// The EIP712Domain does NOT include verifyingContract (off-chain verification).
+/// It includes `salt` so signatures are bound to one solver instance.
 ///
 /// # Returns
 ///
@@ -752,7 +753,8 @@ pub fn admin_eip712_types() -> serde_json::Value {
 		"EIP712Domain": [
 			{"name": "name", "type": "string"},
 			{"name": "version", "type": "string"},
-			{"name": "chainId", "type": "uint256"}
+			{"name": "chainId", "type": "uint256"},
+			{"name": "salt", "type": "bytes32"}
 		],
 		"AddToken": [
 			{"name": "chainId", "type": "uint256"},
@@ -1891,13 +1893,15 @@ mod tests {
 			.as_array()
 			.expect("should be an array");
 
-		// Domain should have name, version, chainId (no verifyingContract for off-chain)
-		assert_eq!(domain.len(), 3);
+		// Domain should have name, version, chainId, and salt
+		// (no verifyingContract for off-chain verification).
+		assert_eq!(domain.len(), 4);
 
 		let names: Vec<&str> = domain.iter().map(|f| f["name"].as_str().unwrap()).collect();
 		assert!(names.contains(&"name"));
 		assert!(names.contains(&"version"));
 		assert!(names.contains(&"chainId"));
+		assert!(names.contains(&"salt"));
 	}
 
 	#[test]

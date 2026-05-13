@@ -605,6 +605,7 @@ mod tests {
 			iss: "test-issuer".to_string(),
 			scope: vec![],
 			nonce: None,
+			typ: solver_types::JwtTokenKind::Access,
 		};
 
 		let result = get_order_by_id(

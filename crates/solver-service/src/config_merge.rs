@@ -2116,6 +2116,45 @@ fn build_gas_config_from_operator(gas: &OperatorGasConfig) -> GasConfig {
 	}
 }
 
+/// Minimum length (bytes) required for the JWT signing secret.
+///
+/// HMAC-SHA256 produces 32-byte output; a secret shorter than that buys no
+/// extra security and a placeholder string is trivially brute-forced. Reject
+/// boot rather than silently accepting a weak secret.
+const JWT_SECRET_MIN_BYTES: usize = 32;
+
+/// Read the JWT signing secret from the environment.
+///
+/// Refuses to fall back to a generated or default value when authentication is
+/// enabled: a missing or weak secret is a configuration mistake, not something
+/// the service can paper over. Tokens minted under an unstable or guessable
+/// secret are either silently invalidated on every restart or — worse —
+/// forgeable by anyone reading the repo's demo defaults.
+fn load_jwt_secret_from_env() -> Result<String, MergeError> {
+	match std::env::var("JWT_SECRET") {
+		Ok(value) => {
+			let trimmed = value.trim();
+			if trimmed.len() < JWT_SECRET_MIN_BYTES {
+				return Err(MergeError::Validation(format!(
+					"JWT_SECRET must be at least {JWT_SECRET_MIN_BYTES} bytes \
+					 (got {} after trimming). Generate one with e.g. \
+					 `openssl rand -base64 48`.",
+					trimmed.len()
+				)));
+			}
+			Ok(trimmed.to_string())
+		},
+		Err(std::env::VarError::NotPresent) => Err(MergeError::Validation(
+			"JWT_SECRET is not set but API authentication (admin or orders) is enabled. \
+			 Set it to a high-entropy value of at least 32 bytes."
+				.to_string(),
+		)),
+		Err(std::env::VarError::NotUnicode(_)) => Err(MergeError::Validation(
+			"JWT_SECRET contains non-UTF-8 bytes".to_string(),
+		)),
+	}
+}
+
 /// Builds ApiConfig from OperatorAdminConfig.
 fn build_api_config_from_operator(
 	admin: &OperatorAdminConfig,
@@ -2123,13 +2162,7 @@ fn build_api_config_from_operator(
 ) -> Result<ApiConfig, MergeError> {
 	let api_port = parse_u16_env_var("SOLVER_API_PORT", 3000)?;
 	let auth = if admin.enabled || orders_auth_enabled {
-		// Read JWT secret from environment variable
-		let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| {
-			tracing::warn!(
-				"JWT_SECRET not set - using random secret. Tokens will be invalid after restart!"
-			);
-			uuid::Uuid::new_v4().to_string()
-		});
+		let jwt_secret = load_jwt_secret_from_env()?;
 		let public_register_enabled = load_public_register_enabled(orders_auth_enabled)?;
 
 		let admin_config = if admin.enabled {
@@ -6598,7 +6631,9 @@ mod tests {
 		use std::env;
 
 		let original_public_register = env::var("AUTH_PUBLIC_REGISTER_ENABLED").ok();
+		let original_jwt = env::var("JWT_SECRET").ok();
 		env::set_var("AUTH_PUBLIC_REGISTER_ENABLED", "true");
+		env::set_var("JWT_SECRET", "x".repeat(32));
 
 		let admin = OperatorAdminConfig {
 			enabled: true,
@@ -6626,6 +6661,10 @@ mod tests {
 		env::remove_var("AUTH_PUBLIC_REGISTER_ENABLED");
 		if let Some(val) = original_public_register {
 			env::set_var("AUTH_PUBLIC_REGISTER_ENABLED", val);
+		}
+		env::remove_var("JWT_SECRET");
+		if let Some(val) = original_jwt {
+			env::set_var("JWT_SECRET", val);
 		}
 	}
 
@@ -6725,6 +6764,50 @@ mod tests {
 	}
 
 	#[test]
+	#[serial]
+	fn test_load_jwt_secret_rejects_missing_var() {
+		std::env::remove_var("JWT_SECRET");
+		let err = load_jwt_secret_from_env().unwrap_err();
+		assert!(matches!(err, MergeError::Validation(_)));
+		assert!(err.to_string().contains("JWT_SECRET is not set"));
+	}
+
+	#[test]
+	#[serial]
+	fn test_load_jwt_secret_rejects_too_short_secret() {
+		std::env::set_var("JWT_SECRET", "too-short");
+		let err = load_jwt_secret_from_env().unwrap_err();
+		std::env::remove_var("JWT_SECRET");
+		assert!(matches!(err, MergeError::Validation(_)));
+		assert!(err.to_string().contains("at least 32 bytes"));
+	}
+
+	#[test]
+	#[serial]
+	fn test_load_jwt_secret_accepts_strong_secret() {
+		let strong = "x".repeat(32);
+		std::env::set_var("JWT_SECRET", &strong);
+		let parsed = load_jwt_secret_from_env().expect("strong secret accepted");
+		std::env::remove_var("JWT_SECRET");
+		assert_eq!(parsed, strong);
+	}
+
+	#[test]
+	#[serial]
+	fn test_load_jwt_secret_trims_whitespace_before_length_check() {
+		// A whitespace-padded but otherwise long secret stays valid; a
+		// whitespace-padded short secret is still rejected.
+		std::env::set_var("JWT_SECRET", format!("   {}   ", "x".repeat(32)));
+		let parsed = load_jwt_secret_from_env().expect("padded long secret accepted");
+		assert_eq!(parsed.len(), 32);
+
+		std::env::set_var("JWT_SECRET", "   short   ");
+		let err = load_jwt_secret_from_env().unwrap_err();
+		std::env::remove_var("JWT_SECRET");
+		assert!(err.to_string().contains("at least 32 bytes"));
+	}
+
+	#[test]
 	fn test_build_operator_network_config_falls_back_to_seed_name_and_rpc() {
 		let network_seed = TESTNET_SEED
 			.get_network(11155420)
@@ -6807,7 +6890,9 @@ mod tests {
 		use std::env;
 
 		let original = env::var("AUTH_PUBLIC_REGISTER_ENABLED").ok();
+		let original_jwt = env::var("JWT_SECRET").ok();
 		env::remove_var("AUTH_PUBLIC_REGISTER_ENABLED");
+		env::set_var("JWT_SECRET", "x".repeat(32));
 
 		let admin = OperatorAdminConfig::default();
 		let api = build_api_config_from_operator(&admin, true).unwrap();
@@ -6816,6 +6901,10 @@ mod tests {
 
 		if let Some(val) = original {
 			env::set_var("AUTH_PUBLIC_REGISTER_ENABLED", val);
+		}
+		env::remove_var("JWT_SECRET");
+		if let Some(val) = original_jwt {
+			env::set_var("JWT_SECRET", val);
 		}
 	}
 

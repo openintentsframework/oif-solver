@@ -308,4 +308,41 @@ mod tests {
 
 		assert_eq!(response.status(), StatusCode::FORBIDDEN);
 	}
+
+	#[tokio::test]
+	async fn test_middleware_rejects_refresh_token_as_bearer() {
+		// A refresh token carries the same claims shape as an access token —
+		// without an explicit `typ` discriminator, a stolen refresh token could
+		// be presented in the Authorization header and pass middleware. This
+		// test locks in the rejection.
+		let config = AuthConfig {
+			orders_auth_enabled: true,
+			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars"),
+			access_token_expiry_hours: 1,
+			refresh_token_expiry_hours: 720,
+			issuer: "test".to_string(),
+			public_register_enabled: false,
+			admin: None,
+		};
+
+		let jwt_service = Arc::new(JwtService::new(config).unwrap());
+		let refresh_token = jwt_service
+			.generate_refresh_token("admin", vec![AuthScope::AdminAll])
+			.await
+			.unwrap();
+
+		let app = create_test_app_with_scope(jwt_service, AuthScope::AdminRead);
+		let response = app
+			.oneshot(
+				Request::builder()
+					.uri("/protected")
+					.header("Authorization", format!("Bearer {refresh_token}"))
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+	}
 }

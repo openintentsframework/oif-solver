@@ -59,6 +59,9 @@ pub struct AdminApiState {
 	pub dynamic_config: Arc<RwLock<Config>>,
 	/// Nonce store (concrete type, kept for rebuilding verifier).
 	pub nonce_store: Arc<NonceStore>,
+	/// Stable solver identifier, folded into the EIP-712 admin domain salt so
+	/// signatures cannot be replayed across solvers on the same chain.
+	pub solver_id: String,
 	/// Token manager for hot-reloading token configurations.
 	pub token_manager: Arc<TokenManager>,
 	/// Bridge service for cross-chain rebalancing.
@@ -122,6 +125,7 @@ impl AdminApiState {
 				whitelist: admin_config.whitelist.clone(),
 			},
 			admin_config.chain_id,
+			&self.solver_id,
 		);
 
 		*self.verifier.write().await = new_verifier;
@@ -1406,6 +1410,7 @@ pub async fn handle_get_types(State(state): State<AdminApiState>) -> Json<Eip712
 			name: ADMIN_DOMAIN_NAME.to_string(),
 			version: ADMIN_DOMAIN_VERSION.to_string(),
 			chain_id: verifier.chain_id(),
+			salt: with_0x_prefix(&hex::encode(verifier.domain_salt().as_slice())),
 		},
 		types: admin_eip712_types(),
 	})
@@ -1415,6 +1420,7 @@ pub async fn handle_get_types(State(state): State<AdminApiState>) -> Json<Eip712
 mod tests {
 	use super::*;
 	use async_trait::async_trait;
+	use serial_test::serial;
 	use solver_account::{AccountInterface, AccountService, AccountSigner};
 	use solver_config::builders::config::ConfigBuilder;
 	use solver_delivery::{DeliveryInterface, DeliveryService, MockDeliveryInterface};
@@ -1516,12 +1522,14 @@ mod tests {
 			name: "OIF Solver Admin".to_string(),
 			version: "1".to_string(),
 			chain_id: 1,
+			salt: "0x1234".to_string(),
 		};
 
 		let json = serde_json::to_string(&domain).unwrap();
 		assert!(json.contains("\"name\":\"OIF Solver Admin\""));
 		assert!(json.contains("\"version\":\"1\""));
 		assert!(json.contains("\"chainId\":1"));
+		assert!(json.contains("\"salt\":\"0x1234\""));
 	}
 
 	#[test]
@@ -1571,6 +1579,7 @@ mod tests {
 				name: "Test".to_string(),
 				version: "1".to_string(),
 				chain_id: 10,
+				salt: "0x00".to_string(),
 			},
 			types,
 		};
@@ -1820,6 +1829,7 @@ mod tests {
 				}],
 			},
 			1,
+			"test-solver",
 		);
 
 		let account = Arc::new(AccountService::new(Box::new(DummyAccount {
@@ -1838,6 +1848,7 @@ mod tests {
 			config_store,
 			dynamic_config,
 			nonce_store,
+			solver_id: "test-solver".to_string(),
 			token_manager,
 			bridge_service: None,
 			solver_address: "0x0000000000000000000000000000000000000000".to_string(),
@@ -1877,6 +1888,7 @@ mod tests {
 				}],
 			},
 			1,
+			"test-solver",
 		);
 
 		let account = Arc::new(AccountService::new(Box::new(DummyAccount {
@@ -1894,6 +1906,7 @@ mod tests {
 			config_store,
 			dynamic_config,
 			nonce_store,
+			solver_id: "test-solver".to_string(),
 			token_manager,
 			bridge_service: None,
 			solver_address: "0x0000000000000000000000000000000000000000".to_string(),
@@ -1904,8 +1917,36 @@ mod tests {
 		}
 	}
 
+	struct EnvVarGuard {
+		key: &'static str,
+		original: Option<String>,
+	}
+
+	impl EnvVarGuard {
+		fn set(key: &'static str, value: impl AsRef<str>) -> Self {
+			let original = std::env::var(key).ok();
+			std::env::set_var(key, value.as_ref());
+			Self { key, original }
+		}
+	}
+
+	impl Drop for EnvVarGuard {
+		fn drop(&mut self) {
+			match &self.original {
+				Some(value) => std::env::set_var(self.key, value),
+				None => std::env::remove_var(self.key),
+			}
+		}
+	}
+
+	fn strong_jwt_secret_guard() -> EnvVarGuard {
+		EnvVarGuard::set("JWT_SECRET", "x".repeat(32))
+	}
+
 	#[tokio::test]
+	#[serial]
 	async fn test_handle_add_token_triggers_approval_setup() {
+		let _jwt_secret = strong_jwt_secret_guard();
 		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 		let mut operator_config = build_operator_config(
 			admin_alloy,
@@ -1997,7 +2038,9 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial]
 	async fn test_handle_add_tokens_triggers_approval_setup() {
+		let _jwt_secret = strong_jwt_secret_guard();
 		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 		let mut operator_config = build_operator_config(
 			admin_alloy,
@@ -2101,7 +2144,9 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial]
 	async fn test_handle_add_token_approval_failure_is_atomic() {
+		let _jwt_secret = strong_jwt_secret_guard();
 		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 		let mut operator_config = build_operator_config(
 			admin_alloy,
@@ -2207,7 +2252,9 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial]
 	async fn test_handle_add_tokens_approval_failure_is_atomic() {
+		let _jwt_secret = strong_jwt_secret_guard();
 		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 		let mut operator_config = build_operator_config(
 			admin_alloy,
@@ -2674,12 +2721,14 @@ mod tests {
 			name: "Solver".to_string(),
 			version: "1".to_string(),
 			chain_id: 1,
+			salt: "0x00".to_string(),
 		};
 
 		let optimism = Eip712Domain {
 			name: "Solver".to_string(),
 			version: "1".to_string(),
 			chain_id: 10,
+			salt: "0x00".to_string(),
 		};
 
 		let mainnet_json = serde_json::to_string(&mainnet).unwrap();
@@ -2767,7 +2816,9 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[serial]
 	async fn test_handle_set_admin_role_supports_read_only_role() {
+		let _jwt_secret = strong_jwt_secret_guard();
 		let admin = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 		let read_only = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
 		let mut operator_config = build_operator_config(
@@ -2890,7 +2941,16 @@ mod tests {
 		assert_eq!(response.domain.name, "OIF Solver Admin");
 		assert_eq!(response.domain.version, "1");
 		assert_eq!(response.domain.chain_id, 1);
+		assert!(response.domain.salt.starts_with("0x"));
+		assert_eq!(response.domain.salt.len(), 66);
 		assert!(response.types.is_object());
+
+		let domain_fields = response.types["EIP712Domain"]
+			.as_array()
+			.expect("EIP712Domain should be an array");
+		assert!(domain_fields.iter().any(|field| {
+			field["name"].as_str() == Some("salt") && field["type"].as_str() == Some("bytes32")
+		}));
 	}
 
 	#[tokio::test]

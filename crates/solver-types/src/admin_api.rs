@@ -186,11 +186,18 @@ pub struct Eip712TypeInfo {
 	pub types: serde_json::Value,
 }
 
-/// EIP-712 domain (without verifyingContract - off-chain verification)
+/// EIP-712 domain published to admin clients.
+///
+/// `verifyingContract` is intentionally absent because admin signatures are
+/// verified off-chain. `salt` is included so clients pin their signature to
+/// this specific solver instance, preventing cross-solver replay when the same
+/// admin key is authorized on multiple deployments.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Eip712Domain {
 	pub name: String,
 	pub version: String,
 	pub chain_id: u64,
+	/// 0x-prefixed hex of the 32-byte domain salt.
+	pub salt: String,
 }

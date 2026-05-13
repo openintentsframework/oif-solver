@@ -1126,6 +1126,7 @@ mod tests {
 				}],
 			},
 			1,
+			"test-solver",
 		);
 
 		let account = Arc::new(AccountService::new(Box::new(DummyAccount {
@@ -1145,6 +1146,7 @@ mod tests {
 			config_store,
 			dynamic_config,
 			nonce_store,
+			solver_id: "test-solver".to_string(),
 			token_manager,
 			bridge_service,
 			solver_address: SOLVER_ADDRESS.to_string(),

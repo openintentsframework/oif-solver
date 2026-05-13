@@ -248,14 +248,21 @@ The solver has **two independent auth flags**:
 - **`admin.enabled`** — gates SIWE admin login and the admin endpoints. SIWE
   works whenever this is true, regardless of `orders_auth_enabled`.
 
-If you enable Orders API auth in your seed overrides (`"orders_auth_enabled": true`), set:
+If you enable Orders API auth in your seed overrides (`"orders_auth_enabled": true`)
+or enable admin auth (`"admin": { "enabled": true, ... }`), set `JWT_SECRET`
+before starting the service:
 
 ```bash
-export JWT_SECRET=replace_with_a_strong_random_value
+export JWT_SECRET="$(openssl rand -base64 48)"
 
 # Optional
 export AUTH_PUBLIC_REGISTER_ENABLED=false
 ```
+
+`JWT_SECRET` must be at least 32 bytes after trimming whitespace. The solver
+refuses to start with auth enabled if the secret is missing or too short. This
+prevents tokens from being signed with an unstable restart-local secret or a
+public demo placeholder.
 
 If `orders_auth_enabled = false`, `AUTH_PUBLIC_REGISTER_ENABLED` is ignored.
 
@@ -289,6 +296,17 @@ SIWE-issued access tokens use the same JWT format as other auth flows and curren
 `TOKEN_DEFAULT_TTL_SECONDS.min(TOKEN_MAX_TTL_SECONDS)` (900s with current constants).
 SIWE also returns a refresh token with the configured `refresh_token_expiry_hours`, and that
 refresh token is compatible with `POST /api/v1/auth/refresh`.
+
+Access and refresh tokens are not interchangeable:
+
+- **Access tokens** include `typ = "access"` and are the only tokens accepted in
+  the `Authorization: Bearer <access_token>` header for protected APIs.
+- **Refresh tokens** include `typ = "refresh"` and are accepted only by
+  `POST /api/v1/auth/refresh` to obtain a new access/refresh token pair.
+
+Tokens issued before this token-type claim was introduced do not contain `typ`
+and are rejected after upgrade. Users and admins should re-authenticate once
+after deploying this change.
 
 ## Docker
 
@@ -348,6 +366,7 @@ For Redis connectivity from within Docker:
 | `SOLVER_ID` | For loading | Solver ID to load config from Redis (after first seed) |
 | `RUST_LOG` | No | Log level (default: `info`) |
 | `SOLVER_PRIVATE_KEY` | Conditional | Required for local wallet if no inline `private_key` in bootstrap config |
+| `JWT_SECRET` | Conditional | Required when Orders API auth or admin auth is enabled. Must be at least 32 bytes; generate with `openssl rand -base64 48` |
 | `AWS_ACCESS_KEY_ID` | For KMS | AWS access key (if using KMS signer) |
 | `AWS_SECRET_ACCESS_KEY` | For KMS | AWS secret key (if using KMS signer) |
 | `AWS_REGION` | For KMS | AWS region (if using KMS signer, default: from config) |
@@ -400,6 +419,7 @@ Legacy alias support:
 | `REDIS_URL` | Yes | Redis connection URL (default: `redis://localhost:6379`). For production, use managed services like AWS ElastiCache |
 | `SOLVER_PRIVATE_KEY` | Conditional | 64-character hex private key (without 0x prefix) |
 | `SOLVER_ID` | For loading | Solver ID to load from Redis (set after first seed) |
+| `JWT_SECRET` | Conditional | Required when Orders API auth or admin auth is enabled. Must be at least 32 bytes; generate with `openssl rand -base64 48` |
 | `SOLVER_INGRESS_MODE` | No | `active` by default; set `intake_disabled` to stop accepting new solver work. Changing this value requires a process restart/redeploy. |
 
 `SOLVER_PRIVATE_KEY` is only required when using the local wallet without an inline `private_key` in bootstrap config. Not needed if using KMS or providing `private_key` directly in the JSON.
@@ -930,6 +950,21 @@ The admin API enables authorized wallet addresses to perform administrative oper
 
 `role: "admin"` receives `admin-all` and can sign EIP-712 transactions. `role: "read-only"` receives `admin-read` through SIWE and can call admin `GET` endpoints only. The legacy `admin_addresses` list is still accepted as input and is normalized to full admin entries.
 
+`admin.domain` is the SIWE/admin login domain. Use `"localhost"` for local development because the wallet signs a login message for the local host. In production, set it to the public host your admin UI uses, such as `"solver.example.com"`.
+
+Admin action signatures use a separate EIP-712 domain returned by `GET /api/v1/admin/types`:
+
+```json
+{
+  "name": "OIF Solver Admin",
+  "version": "1",
+  "chainId": 1,
+  "salt": "0x..."
+}
+```
+
+The `salt` is derived from `solver_id` and binds each admin signature to one solver instance. Clients must use the complete `domain` object and `types.EIP712Domain` returned by `/admin/types`, including `salt`, instead of rebuilding the domain from `admin.domain` or hard-coding `"localhost"`.
+
 **Endpoints:**
 
 - **GET `/api/v1/admin/balances`** - Get solver balances by chain and token (protected, read-only)
@@ -947,7 +982,7 @@ The admin API enables authorized wallet addresses to perform administrative oper
     ```
 
 - **GET `/api/v1/admin/types`** - Get EIP-712 type definitions for client-side signing (protected)
-  - Returns domain and type definitions for all admin actions (AddToken, RemoveToken, etc.)
+  - Returns the EIP-712 domain, including the solver-derived `salt`, and type definitions for all admin actions (AddToken, RemoveToken, etc.)
 
 - **POST `/api/v1/admin/tokens`** - Add a new token to a network (protected)
   - Request body:
@@ -984,13 +1019,14 @@ The admin API enables authorized wallet addresses to perform administrative oper
 **Admin Action Flow:**
 
 1. Call `POST /api/v1/admin/nonce` (or `GET` if your token is read-only) to get a fresh nonce
-2. Call `GET /api/v1/admin/types` to get EIP-712 type definitions
-3. Construct the typed data with the nonce and a deadline
+2. Call `GET /api/v1/admin/types` to get the EIP-712 domain and type definitions
+3. Construct the typed data with the nonce, a deadline, and the exact `domain` and `types` from `/admin/types`
 4. Sign with your admin wallet (EIP-712)
 5. Submit the signed action to the appropriate endpoint
 
 **Note:** Protected admin endpoints require a JWT with `admin-read` for `GET` routes and `admin-all` for mutating routes. Obtain it via SIWE (`POST /api/v1/auth/siwe/nonce` + `POST /api/v1/auth/siwe/verify`). SIWE only requires `admin.enabled = true` — it works regardless of `orders_auth_enabled`.
 **Note:** `/api/v1/auth/siwe/nonce` is dedicated to SIWE login. `/api/v1/admin/nonce` is dedicated to EIP-712 admin action signing.
+**Note:** The `domain` string in `/api/v1/admin/nonce` is the configured admin login domain. For EIP-712 signing, use the structured domain from `/api/v1/admin/types`.
 **Note:** `POST /api/v1/auth/register` never issues `admin-all` and is disabled by default unless `AUTH_PUBLIC_REGISTER_ENABLED=true`.
 **Note:** Admin withdrawals require `admin.withdrawals.enabled = true` in config.
 
