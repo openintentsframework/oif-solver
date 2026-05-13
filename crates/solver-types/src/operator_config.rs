@@ -601,6 +601,34 @@ pub struct OperatorWithdrawalsConfig {
 	/// Whether withdrawals are enabled.
 	#[serde(default)]
 	pub enabled: bool,
+
+	/// Permitted recipient addresses for `POST /admin/withdrawals`.
+	///
+	/// When non-empty, the admin handler rejects any withdrawal whose
+	/// `recipient` is not present in this list. This caps the blast radius of
+	/// a single compromised admin key: the attacker can only redirect funds to
+	/// addresses the operator pre-approved (e.g. a cold-storage multisig),
+	/// not an attacker-controlled address.
+	///
+	/// When empty (default), withdrawals to any recipient are permitted,
+	/// preserving previous behavior for deployments that haven't yet pinned a
+	/// recipient set.
+	#[serde(default)]
+	pub recipient_allowlist: Vec<Address>,
+}
+
+impl OperatorWithdrawalsConfig {
+	/// Whether the supplied recipient is permitted by the configured policy.
+	///
+	/// An empty `recipient_allowlist` is treated as "no constraint" — every
+	/// recipient is accepted. Once the allowlist contains at least one
+	/// address, the recipient must match one of those entries exactly.
+	pub fn recipient_allowed(&self, recipient: &Address) -> bool {
+		if self.recipient_allowlist.is_empty() {
+			return true;
+		}
+		self.recipient_allowlist.contains(recipient)
+	}
 }
 
 /// Cross-chain rebalancing configuration.
@@ -859,6 +887,27 @@ mod tests {
 
 	fn test_token_address() -> Address {
 		Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap()
+	}
+
+	#[test]
+	fn test_withdrawals_recipient_allowed_empty_allowlist_permits_any() {
+		let policy = OperatorWithdrawalsConfig {
+			enabled: true,
+			recipient_allowlist: vec![],
+		};
+		assert!(policy.recipient_allowed(&test_address()));
+		assert!(policy.recipient_allowed(&test_token_address()));
+	}
+
+	#[test]
+	fn test_withdrawals_recipient_allowed_non_empty_allowlist_enforces_match() {
+		let approved = test_address();
+		let policy = OperatorWithdrawalsConfig {
+			enabled: true,
+			recipient_allowlist: vec![approved],
+		};
+		assert!(policy.recipient_allowed(&approved));
+		assert!(!policy.recipient_allowed(&test_token_address()));
 	}
 
 	#[test]

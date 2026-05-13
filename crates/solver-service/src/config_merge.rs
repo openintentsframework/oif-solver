@@ -414,6 +414,7 @@ pub fn merge_to_operator_config(
 			),
 			withdrawals: OperatorWithdrawalsConfig {
 				enabled: admin_override.withdrawals.enabled,
+				recipient_allowlist: admin_override.withdrawals.recipient_allowlist.clone(),
 			},
 		},
 		None => OperatorAdminConfig::default(),
