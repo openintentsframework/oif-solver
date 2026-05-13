@@ -136,8 +136,17 @@ fn recover_signer(
 
 	let secp = Secp256k1::<All>::new();
 
-	// Create recoverable signature
-	let recovery_id = secp256k1::ecdsa::RecoveryId::try_from(recovery_id as i32).unwrap();
+	// Create recoverable signature. The `v` byte after EIP-155/2718 normalization
+	// must map to a valid secp256k1 recovery id (0..=3); anything else came from
+	// a malformed signature and must be rejected as a `BadRequest` rather than
+	// panicking the handler task.
+	let recovery_id = secp256k1::ecdsa::RecoveryId::try_from(recovery_id as i32).map_err(|_| {
+		APIError::BadRequest {
+			error_type: ApiErrorType::OrderValidationFailed,
+			message: "Invalid signature recovery id".to_string(),
+			details: None,
+		}
+	})?;
 	let recoverable_sig = RecoverableSignature::from_compact(signature_bytes, recovery_id)
 		.map_err(|_| APIError::BadRequest {
 			error_type: ApiErrorType::OrderValidationFailed,
@@ -322,5 +331,36 @@ mod tests {
 			err,
 			APIError::BadRequest { message, .. } if message.contains("Invalid signature length")
 		));
+	}
+
+	#[test]
+	fn validate_eip712_signature_rejects_invalid_recovery_id_without_panic() {
+		// secp256k1 recovery ids are 0..=3. Pre-normalization the v byte may be
+		// 0/1 or 27/28; everything else (e.g. 4..=26, 31..=255) is an attacker-
+		// controlled malformed signature and must produce a BadRequest rather
+		// than panicking the handler task.
+		for bad_v in [4u8, 5, 26, 31, 32, 100, 255] {
+			let mut signature_bytes = vec![0u8; 65];
+			signature_bytes[64] = bad_v;
+			let signature = Bytes::from(signature_bytes);
+
+			let err = validate_eip712_signature(
+				FixedBytes::from([0x77u8; 32]),
+				FixedBytes::from([0x88u8; 32]),
+				&signature,
+				AlloyAddress::from_slice(&[0u8; 20]),
+			)
+			.expect_err("invalid recovery id must surface as BadRequest");
+
+			assert!(
+				matches!(
+					&err,
+					APIError::BadRequest { message, .. }
+						if message.contains("recovery id")
+							|| message.contains("signature format")
+				),
+				"unexpected error for v={bad_v}: {err:?}"
+			);
+		}
 	}
 }
