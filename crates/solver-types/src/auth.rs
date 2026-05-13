@@ -110,6 +110,21 @@ pub struct AdminWhitelistEntry {
 	pub role: AdminRole,
 }
 
+/// JWT token kind. Encoded as the `typ` claim so that refresh tokens cannot be
+/// presented as bearer access tokens (or vice-versa) — the two token types
+/// carry the same claim shape, so without this discriminator either could be
+/// used in the other's flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JwtTokenKind {
+	/// Short-lived token used to authorize API requests via the `Authorization`
+	/// header.
+	Access,
+	/// Long-lived token accepted only by the refresh endpoint to mint a new
+	/// access/refresh pair.
+	Refresh,
+}
+
 /// JWT claims structure for token validation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JwtClaims {
@@ -125,6 +140,9 @@ pub struct JwtClaims {
 	pub scope: Vec<AuthScope>,
 	/// Optional nonce for one-time tokens
 	pub nonce: Option<String>,
+	/// Token kind discriminator. Required: tokens minted before this field
+	/// existed are no longer accepted, forcing a re-login after upgrade.
+	pub typ: JwtTokenKind,
 }
 
 /// Refresh token data stored persistently

@@ -14,7 +14,7 @@ pub mod siwe;
 
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use solver_types::{AuthConfig, AuthScope, JwtClaims};
+use solver_types::{AuthConfig, AuthScope, JwtClaims, JwtTokenKind};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -98,38 +98,79 @@ impl JwtService {
 		scopes: Vec<AuthScope>,
 		ttl_seconds: u32,
 	) -> Result<String, AuthError> {
+		let claims = self.build_access_claims(client_id, scopes, ttl_seconds);
+		self.encode_claims(&claims)
+	}
+
+	/// Construct the access-token claims without encoding them. Used so the
+	/// refresh flow can hand the same claims back to the caller for the
+	/// response body — that avoids re-decoding the freshly-minted token and
+	/// removes a defensive error branch that could never trigger in practice.
+	fn build_access_claims(
+		&self,
+		client_id: &str,
+		scopes: Vec<AuthScope>,
+		ttl_seconds: u32,
+	) -> JwtClaims {
 		let ttl_seconds = ttl_seconds.max(1);
-		let claims = JwtClaims {
+		JwtClaims {
 			sub: client_id.to_string(),
 			exp: (Utc::now() + Duration::seconds(ttl_seconds as i64)).timestamp(),
 			iat: Utc::now().timestamp(),
 			iss: self.config.issuer.clone(),
 			scope: scopes,
 			nonce: None,
-		};
+			typ: JwtTokenKind::Access,
+		}
+	}
 
-		encode(&Header::default(), &claims, &self.encoding_key)
+	fn encode_claims(&self, claims: &JwtClaims) -> Result<String, AuthError> {
+		encode(&Header::default(), claims, &self.encoding_key)
 			.map_err(|e| AuthError::TokenGeneration(e.to_string()))
 	}
 
-	/// Validates a JWT token and returns the claims if valid.
+	/// Validates a JWT access token and returns the claims if valid.
+	///
+	/// Rejects tokens whose `typ` claim is not `access`, so refresh tokens
+	/// cannot be presented as bearer credentials in the authorization header.
 	///
 	/// # Arguments
-	/// * `token` - The JWT token string to validate
+	/// * `token` - The JWT access token string to validate
 	///
 	/// # Returns
 	/// The JWT claims if the token is valid, or an error
 	pub fn validate_token(&self, token: &str) -> Result<JwtClaims, AuthError> {
-		// Decode and validate the token
+		let claims =
+			self.decode_claims(token, |msg| AuthError::InvalidAccessToken(msg.to_string()))?;
+
+		if claims.typ != JwtTokenKind::Access {
+			return Err(AuthError::InvalidAccessToken(
+				"Token is not an access token".to_string(),
+			));
+		}
+
+		Ok(claims)
+	}
+
+	/// Decode and verify expiry for a JWT, without checking the `typ` claim.
+	///
+	/// Caller is responsible for asserting the expected token kind.
+	fn decode_claims(
+		&self,
+		token: &str,
+		err: impl Fn(&str) -> AuthError,
+	) -> Result<JwtClaims, AuthError> {
 		let token_data = decode::<JwtClaims>(token, &self.decoding_key, &self.validation)
-			.map_err(|e| AuthError::InvalidAccessToken(e.to_string()))?;
+			.map_err(|e| err(&e.to_string()))?;
 
 		let claims = token_data.claims;
 
-		// Check if token is expired (jsonwebtoken handles this, but we can double-check)
+		// `jsonwebtoken` already enforces expiry via Validation, but the check is
+		// repeated here so a downstream change to the Validation config cannot
+		// silently let an expired token through.
 		let now = Utc::now().timestamp();
 		if claims.exp < now {
-			return Err(AuthError::InvalidAccessToken("Token expired".to_string()));
+			return Err(err("Token expired"));
 		}
 
 		Ok(claims)
@@ -159,6 +200,7 @@ impl JwtService {
 			iss: self.config.issuer.clone(),
 			scope: scopes,
 			nonce: Some(Uuid::new_v4().to_string()), // Unique nonce for each refresh token
+			typ: JwtTokenKind::Refresh,
 		};
 
 		// Generate and return the JWT refresh token
@@ -168,38 +210,47 @@ impl JwtService {
 
 	/// Validates a JWT refresh token and returns new access and refresh tokens.
 	///
+	/// Rejects tokens whose `typ` claim is not `refresh`, so access tokens
+	/// cannot be exchanged at the refresh endpoint for new access tokens.
+	///
 	/// # Arguments
 	/// * `refresh_token` - The JWT refresh token to validate
 	///
 	/// # Returns
-	/// A tuple of (access_token, new_refresh_token) or an error
+	/// A tuple of `(access_token, new_refresh_token, access_claims)`. The
+	/// `access_claims` are the claims embedded in the freshly-issued access
+	/// token; the caller can use them for the response body without decoding
+	/// the token again.
 	pub async fn refresh_access_token(
 		&self,
 		refresh_token: &str,
-	) -> Result<(String, String), AuthError> {
-		// Decode and validate the JWT refresh token
-		let token_data = decode::<JwtClaims>(refresh_token, &self.decoding_key, &self.validation)
-			.map_err(|e| AuthError::InvalidRefreshToken(e.to_string()))?;
+	) -> Result<(String, String, JwtClaims), AuthError> {
+		let claims = self.decode_claims(refresh_token, |msg| {
+			AuthError::InvalidRefreshToken(msg.to_string())
+		})?;
 
-		let claims = token_data.claims;
-
-		// Check if token is expired
-		let now = Utc::now().timestamp();
-		if claims.exp <= now {
+		if claims.typ != JwtTokenKind::Refresh {
 			return Err(AuthError::InvalidRefreshToken(
-				"Refresh token expired".to_string(),
+				"Token is not a refresh token".to_string(),
 			));
 		}
 
-		// Generate new access token using the claims from the refresh token
-		let access_token = self.generate_access_token(&claims.sub, claims.scope.clone())?;
+		// Build access-token claims once and use them for both the encoded
+		// token and the response body — see `build_access_claims` for why.
+		let access_ttl = self
+			.config
+			.access_token_expiry_hours
+			.saturating_mul(3600)
+			.max(1);
+		let access_claims = self.build_access_claims(&claims.sub, claims.scope.clone(), access_ttl);
+		let access_token = self.encode_claims(&access_claims)?;
 
 		// Generate new refresh token (token rotation for security)
 		let new_refresh_token = self
 			.generate_refresh_token(&claims.sub, claims.scope)
 			.await?;
 
-		Ok((access_token, new_refresh_token))
+		Ok((access_token, new_refresh_token, access_claims))
 	}
 
 	/// Returns a reference to the auth configuration.
@@ -254,6 +305,7 @@ mod tests {
 			iss: "test".to_string(),
 			scope: vec![AuthScope::ReadOrders, AuthScope::AdminAll],
 			nonce: None,
+			typ: JwtTokenKind::Access,
 		};
 
 		// AdminAll grants everything
@@ -285,19 +337,39 @@ mod tests {
 			.await
 			.unwrap();
 
-		// Verify the refresh token is a valid JWT
-		let refresh_claims = service.validate_token(&refresh_token).unwrap();
-		assert_eq!(refresh_claims.sub, "test-client");
-		assert_eq!(refresh_claims.scope, vec![AuthScope::ReadOrders]);
+		// A refresh token MUST NOT validate as an access token. This protects
+		// against an attacker stealing a refresh token and presenting it as a
+		// bearer credential against protected endpoints.
+		let err = service
+			.validate_token(&refresh_token)
+			.expect_err("refresh token must not pass access-token validation");
+		assert!(matches!(err, AuthError::InvalidAccessToken(_)));
 
-		// Refresh the access token
-		let (access_token, new_refresh_token) =
+		// Refresh the access token via the refresh flow.
+		let (access_token, new_refresh_token, returned_claims) =
 			service.refresh_access_token(&refresh_token).await.unwrap();
 
-		// Validate the new access token
+		// The returned access claims must match what the refresh flow encoded
+		// into the access token (locking in that the response body in the API
+		// handler is consistent with the issued JWT).
+		assert_eq!(returned_claims.sub, "test-client");
+		assert_eq!(returned_claims.scope, vec![AuthScope::ReadOrders]);
+		assert_eq!(returned_claims.typ, JwtTokenKind::Access);
+
+		// And independently validating the encoded access token confirms the
+		// same claims round-trip cleanly.
 		let access_claims = service.validate_token(&access_token).unwrap();
-		assert_eq!(access_claims.sub, "test-client");
-		assert_eq!(access_claims.scope, vec![AuthScope::ReadOrders]);
+		assert_eq!(access_claims.sub, returned_claims.sub);
+		assert_eq!(access_claims.scope, returned_claims.scope);
+		assert_eq!(access_claims.exp, returned_claims.exp);
+		assert_eq!(access_claims.typ, JwtTokenKind::Access);
+
+		// And the access token must NOT be accepted at the refresh endpoint.
+		let err = service
+			.refresh_access_token(&access_token)
+			.await
+			.expect_err("access token must not be exchangeable at the refresh endpoint");
+		assert!(matches!(err, AuthError::InvalidRefreshToken(_)));
 
 		// Ensure refresh tokens are different (token rotation)
 		assert_ne!(refresh_token, new_refresh_token);
@@ -337,14 +409,14 @@ mod tests {
 			.unwrap();
 
 		// First refresh - get new tokens
-		let (access_token1, refresh_token1) =
+		let (access_token1, refresh_token1, _) =
 			service.refresh_access_token(&initial_token).await.unwrap();
 
 		// Add small delay to ensure different timestamps
 		tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
 		// Second refresh - get different tokens (token rotation)
-		let (access_token2, refresh_token2) =
+		let (access_token2, refresh_token2, _) =
 			service.refresh_access_token(&refresh_token1).await.unwrap();
 
 		// Verify refresh tokens are different (rotation working)
