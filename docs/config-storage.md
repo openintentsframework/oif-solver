@@ -88,7 +88,15 @@ Bootstrap config specifies which networks your solver will support. Networks can
       ],
       "rpc_urls": ["https://my-custom-rpc.com"]
     }
-  ]
+  ],
+  "admin": {
+    "withdrawals": {
+      "enabled": true,
+      "recipient_allowlist": [
+        "0x1111111111111111111111111111111111111111"
+      ]
+    }
+  }
 }
 ```
 
@@ -105,6 +113,8 @@ Bootstrap config specifies which networks your solver will support. Networks can
 | `networks[].tokens[].address` | Yes | Token contract address |
 | `networks[].tokens[].decimals` | Yes | Token decimals |
 | `networks[].rpc_urls` | No | Custom RPC URLs (falls back to seed defaults) |
+| `admin.withdrawals.enabled` | No | Enables `POST /api/v1/admin/withdrawals`. Defaults to `false`. |
+| `admin.withdrawals.recipient_allowlist` | No | Pre-approved admin withdrawal recipients. Empty or omitted preserves previous behavior and permits any recipient; non-empty requires each withdrawal recipient to match one listed address exactly. |
 | `settlement.type` | No | `"hyperlane"` (default), `"direct"`, or `"broadcaster"` |
 | `settlement.hyperlane` | Conditional | Required for non-seeded chains when `settlement.type = "hyperlane"` |
 | `settlement.direct` | Conditional | Required when `settlement.type = "direct"` |

@@ -762,7 +762,9 @@ paths:
       description: |
         Submit a withdrawal transaction from the solver-managed account.
         Supports native token withdrawal when token is 0x0.
-        Requires an EIP-712 signed request body.
+        Requires an EIP-712 signed request body. If
+        `admin.withdrawals.recipient_allowlist` is non-empty, the requested
+        recipient must match one of the configured allowlisted addresses.
       operationId: withdrawAdminTokens
       tags:
         - Admin
@@ -803,7 +805,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/AdminAuthErrorResponse"
         "403":
-          description: Not authorized
+          description: Not authorized, or withdrawal recipient is not in the configured allowlist
           content:
             application/json:
               schema:
@@ -1394,6 +1396,7 @@ components:
         - enabled
         - domain
         - withdrawalsEnabled
+        - withdrawalRecipientAllowlist
       properties:
         enabled:
           type: boolean
@@ -1405,6 +1408,14 @@ components:
         withdrawalsEnabled:
           type: boolean
           example: true
+        withdrawalRecipientAllowlist:
+          type: array
+          description: Pre-approved recipient addresses for admin withdrawals. Empty means no recipient constraint; non-empty means withdrawal recipients must match one of these addresses exactly.
+          items:
+            type: string
+            pattern: "^0x[a-fA-F0-9]{40}$"
+          example:
+            - "0x1111111111111111111111111111111111111111"
 
     GasConfigResponse:
       type: object
@@ -1670,7 +1681,7 @@ components:
           example: "1000000000000000000"
         recipient:
           type: string
-          description: Recipient address
+          description: Recipient address. If the withdrawal recipient allowlist is configured, this address must be allowlisted.
           pattern: "^0x[a-fA-F0-9]{40}$"
           example: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
         nonce:
