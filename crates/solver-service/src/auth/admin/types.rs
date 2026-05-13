@@ -25,28 +25,44 @@ pub enum AdminActionHashError {
 pub const ADMIN_DOMAIN_NAME: &str = "OIF Solver Admin";
 pub const ADMIN_DOMAIN_VERSION: &str = "1";
 
+/// Derive the deterministic EIP-712 domain `salt` for a given solver instance.
+///
+/// `salt` is an EIP-712-spec field (one of the five domain fields). We use it
+/// to bind every admin signature to a specific solver deployment so that an
+/// admin signature minted for solver A on chain C cannot be replayed against
+/// solver B running on the same chain C with the same admin key — the salt
+/// derived from `solver_id` differs between the two and is part of the domain
+/// separator.
+pub fn admin_domain_salt(solver_id: &str) -> FixedBytes<32> {
+	use alloy_primitives::keccak256;
+	keccak256(solver_id.as_bytes())
+}
+
 /// Compute the EIP-712 domain separator for admin actions.
 ///
-/// Domain: { name: "OIF Solver Admin", version: "1", chainId: <chain_id> }
+/// Domain: `{ name: "OIF Solver Admin", version: "1", chainId, salt }`.
 ///
-/// Note: `verifyingContract` is intentionally omitted since these signatures
-/// are verified off-chain by the solver backend, not by a smart contract.
-/// This is fully EIP-712 compliant - all domain fields are optional.
-pub fn admin_domain_separator(chain_id: u64) -> FixedBytes<32> {
+/// `verifyingContract` is intentionally omitted since these signatures are
+/// verified off-chain by the solver backend, not by a smart contract — fully
+/// EIP-712 compliant (all domain fields are optional). The `salt` field
+/// distinguishes deployments so the same admin key signing for two solvers on
+/// the same chain produces different signatures, preventing cross-solver
+/// replay.
+pub fn admin_domain_separator(chain_id: u64, salt: FixedBytes<32>) -> FixedBytes<32> {
 	use alloy_primitives::keccak256;
 
-	// EIP-712 domain type hash (without verifyingContract - it's optional per spec)
-	let domain_type_hash = keccak256(b"EIP712Domain(string name,string version,uint256 chainId)");
+	let domain_type_hash =
+		keccak256(b"EIP712Domain(string name,string version,uint256 chainId,bytes32 salt)");
 
 	let name_hash = keccak256(ADMIN_DOMAIN_NAME.as_bytes());
 	let version_hash = keccak256(ADMIN_DOMAIN_VERSION.as_bytes());
 
-	// Encode and hash: typeHash || nameHash || versionHash || chainId
 	let encoded = [
 		domain_type_hash.as_slice(),
 		name_hash.as_slice(),
 		version_hash.as_slice(),
 		&U256::from(chain_id).to_be_bytes::<32>(),
+		salt.as_slice(),
 	]
 	.concat();
 
@@ -595,11 +611,20 @@ pub trait AdminAction {
 	/// Compute the EIP-712 struct hash for this action
 	fn struct_hash(&self) -> Result<FixedBytes<32>, AdminActionHashError>;
 
-	/// Compute the full EIP-712 message hash
-	fn message_hash(&self, chain_id: u64) -> Result<FixedBytes<32>, AdminActionHashError> {
+	/// Compute the full EIP-712 message hash.
+	///
+	/// `salt` must be the per-solver domain salt (see [`admin_domain_salt`]).
+	/// Passing the wrong salt — for example one derived from a different
+	/// solver_id — yields a different message hash and therefore a different
+	/// recovered signer, which is precisely what prevents cross-solver replay.
+	fn message_hash(
+		&self,
+		chain_id: u64,
+		salt: FixedBytes<32>,
+	) -> Result<FixedBytes<32>, AdminActionHashError> {
 		use alloy_primitives::keccak256;
 
-		let domain_separator = admin_domain_separator(chain_id);
+		let domain_separator = admin_domain_separator(chain_id, salt);
 		let struct_hash = self.struct_hash()?;
 
 		// EIP-712: keccak256("\x19\x01" || domainSeparator || structHash)
@@ -1030,15 +1055,28 @@ mod tests {
 	use super::*;
 	use std::str::FromStr;
 
+	/// Stable salt used throughout the tests in this module. Equivalent to the
+	/// salt a real deployment would derive from its configured `solver_id`.
+	fn test_salt() -> FixedBytes<32> {
+		admin_domain_salt("test-solver")
+	}
+
 	#[test]
 	fn test_domain_separator_computation() {
-		// Just verify it doesn't panic and produces 32 bytes
-		let separator = admin_domain_separator(1);
+		let salt = test_salt();
+
+		let separator = admin_domain_separator(1, salt);
 		assert_eq!(separator.len(), 32);
 
 		// Different chain IDs should produce different separators
-		let separator_10 = admin_domain_separator(10);
+		let separator_10 = admin_domain_separator(10, salt);
 		assert_ne!(separator, separator_10);
+
+		// Different solver salts must produce different separators on the
+		// same chain — this is what protects against cross-solver replay.
+		let other_salt = admin_domain_salt("other-solver");
+		let separator_other = admin_domain_separator(1, other_salt);
+		assert_ne!(separator, separator_other);
 	}
 
 	#[test]
@@ -1100,11 +1138,11 @@ mod tests {
 			deadline: 1706184000,
 		};
 
-		let hash = contents.message_hash(1).unwrap();
+		let hash = contents.message_hash(1, test_salt()).unwrap();
 		assert_eq!(hash.len(), 32);
 
 		// Different chain should produce different hash
-		let hash_other = contents.message_hash(10).unwrap();
+		let hash_other = contents.message_hash(10, test_salt()).unwrap();
 		assert_ne!(hash, hash_other);
 	}
 
@@ -1167,8 +1205,8 @@ mod tests {
 			deadline: 1706184000,
 		};
 
-		let hash_1 = contents_1.message_hash(1).unwrap();
-		let hash_2 = contents_2.message_hash(1).unwrap();
+		let hash_1 = contents_1.message_hash(1, test_salt()).unwrap();
+		let hash_2 = contents_2.message_hash(1, test_salt()).unwrap();
 		assert_ne!(hash_1, hash_2);
 	}
 
@@ -1459,11 +1497,11 @@ mod tests {
 			deadline: 1706184000,
 		};
 
-		let hash = contents.message_hash(1).unwrap();
+		let hash = contents.message_hash(1, test_salt()).unwrap();
 		assert_eq!(hash.len(), 32);
 
 		// Different chain should produce different hash
-		let hash_other = contents.message_hash(10).unwrap();
+		let hash_other = contents.message_hash(10, test_salt()).unwrap();
 		assert_ne!(hash, hash_other);
 	}
 
@@ -1497,7 +1535,7 @@ mod tests {
 			deadline: 1706184000,
 		};
 
-		let hash = contents.message_hash(1).unwrap();
+		let hash = contents.message_hash(1, test_salt()).unwrap();
 		assert_eq!(hash.len(), 32);
 	}
 
@@ -1512,7 +1550,7 @@ mod tests {
 			deadline: 1706184000,
 		};
 
-		let result = contents.message_hash(1);
+		let result = contents.message_hash(1, test_salt());
 		assert!(result.is_err());
 	}
 
@@ -1634,8 +1672,9 @@ mod tests {
 
 	#[test]
 	fn test_domain_separator_same_chain_same_result() {
-		let sep1 = admin_domain_separator(1);
-		let sep2 = admin_domain_separator(1);
+		let salt = test_salt();
+		let sep1 = admin_domain_separator(1, salt);
+		let sep2 = admin_domain_separator(1, salt);
 		assert_eq!(sep1, sep2);
 	}
 
@@ -1747,11 +1786,11 @@ mod tests {
 			deadline: 1706184000,
 		};
 
-		let hash = contents.message_hash(1).unwrap();
+		let hash = contents.message_hash(1, test_salt()).unwrap();
 		assert_eq!(hash.len(), 32);
 
 		// Different chain should produce different hash
-		let hash_other = contents.message_hash(10).unwrap();
+		let hash_other = contents.message_hash(10, test_salt()).unwrap();
 		assert_ne!(hash, hash_other);
 	}
 
@@ -1875,11 +1914,11 @@ mod tests {
 			deadline: 1706184000,
 		};
 
-		let hash = contents.message_hash(1).unwrap();
+		let hash = contents.message_hash(1, test_salt()).unwrap();
 		assert_eq!(hash.len(), 32);
 
 		// Different chain should produce different hash
-		let hash_other = contents.message_hash(10).unwrap();
+		let hash_other = contents.message_hash(10, test_salt()).unwrap();
 		assert_ne!(hash, hash_other);
 	}
 

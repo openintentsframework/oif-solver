@@ -950,6 +950,21 @@ The admin API enables authorized wallet addresses to perform administrative oper
 
 `role: "admin"` receives `admin-all` and can sign EIP-712 transactions. `role: "read-only"` receives `admin-read` through SIWE and can call admin `GET` endpoints only. The legacy `admin_addresses` list is still accepted as input and is normalized to full admin entries.
 
+`admin.domain` is the SIWE/admin login domain. Use `"localhost"` for local development because the wallet signs a login message for the local host. In production, set it to the public host your admin UI uses, such as `"solver.example.com"`.
+
+Admin action signatures use a separate EIP-712 domain returned by `GET /api/v1/admin/types`:
+
+```json
+{
+  "name": "OIF Solver Admin",
+  "version": "1",
+  "chainId": 1,
+  "salt": "0x..."
+}
+```
+
+The `salt` is derived from `solver_id` and binds each admin signature to one solver instance. Clients must use the complete `domain` object and `types.EIP712Domain` returned by `/admin/types`, including `salt`, instead of rebuilding the domain from `admin.domain` or hard-coding `"localhost"`.
+
 **Endpoints:**
 
 - **GET `/api/v1/admin/balances`** - Get solver balances by chain and token (protected, read-only)
@@ -967,7 +982,7 @@ The admin API enables authorized wallet addresses to perform administrative oper
     ```
 
 - **GET `/api/v1/admin/types`** - Get EIP-712 type definitions for client-side signing (protected)
-  - Returns domain and type definitions for all admin actions (AddToken, RemoveToken, etc.)
+  - Returns the EIP-712 domain, including the solver-derived `salt`, and type definitions for all admin actions (AddToken, RemoveToken, etc.)
 
 - **POST `/api/v1/admin/tokens`** - Add a new token to a network (protected)
   - Request body:
@@ -1004,13 +1019,14 @@ The admin API enables authorized wallet addresses to perform administrative oper
 **Admin Action Flow:**
 
 1. Call `POST /api/v1/admin/nonce` (or `GET` if your token is read-only) to get a fresh nonce
-2. Call `GET /api/v1/admin/types` to get EIP-712 type definitions
-3. Construct the typed data with the nonce and a deadline
+2. Call `GET /api/v1/admin/types` to get the EIP-712 domain and type definitions
+3. Construct the typed data with the nonce, a deadline, and the exact `domain` and `types` from `/admin/types`
 4. Sign with your admin wallet (EIP-712)
 5. Submit the signed action to the appropriate endpoint
 
 **Note:** Protected admin endpoints require a JWT with `admin-read` for `GET` routes and `admin-all` for mutating routes. Obtain it via SIWE (`POST /api/v1/auth/siwe/nonce` + `POST /api/v1/auth/siwe/verify`). SIWE only requires `admin.enabled = true` — it works regardless of `orders_auth_enabled`.
 **Note:** `/api/v1/auth/siwe/nonce` is dedicated to SIWE login. `/api/v1/admin/nonce` is dedicated to EIP-712 admin action signing.
+**Note:** The `domain` string in `/api/v1/admin/nonce` is the configured admin login domain. For EIP-712 signing, use the structured domain from `/api/v1/admin/types`.
 **Note:** `POST /api/v1/auth/register` never issues `admin-all` and is disabled by default unless `AUTH_PUBLIC_REGISTER_ENABLED=true`.
 **Note:** Admin withdrawals require `admin.withdrawals.enabled = true` in config.
 

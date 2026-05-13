@@ -6,6 +6,11 @@ info:
 
     All admin write actions require an EIP-712 signed request payload. If JWT auth
     is enabled, these endpoints also require the `admin-all` scope.
+
+    Admin action clients should fetch `GET /admin/types` before signing and use
+    the returned EIP-712 `domain` and `types` exactly as provided. The domain
+    includes a `salt` derived from the configured solver identifier, which binds
+    signatures to one solver instance and prevents cross-solver replay.
   version: 1.0.0
 servers:
   - url: http://localhost:3000/api/v1
@@ -113,7 +118,9 @@ paths:
       summary: Get EIP-712 type definitions
       description: |
         Returns the EIP-712 domain and type definitions required for client-side
-        signing of admin actions.
+        signing of admin actions. The returned domain includes a solver-derived
+        `salt`; clients must include that `salt` and the corresponding
+        `EIP712Domain` field when constructing typed data.
       operationId: getAdminTypes
       tags:
         - Admin
@@ -834,7 +841,7 @@ components:
           example: 300
         domain:
           type: string
-          description: EIP-712 domain name
+          description: Configured admin login domain. Kept for compatibility on nonce responses; use `/admin/types`.domain for EIP-712 signing.
           example: "solver.example.com"
         chainId:
           type: integer
@@ -1393,6 +1400,7 @@ components:
           example: true
         domain:
           type: string
+          description: Configured admin login domain used for SIWE/admin auth, not the full EIP-712 action domain.
           example: "localhost"
         withdrawalsEnabled:
           type: boolean
@@ -1735,7 +1743,7 @@ components:
           $ref: "#/components/schemas/Eip712Domain"
         types:
           type: object
-          description: EIP-712 type definitions
+          description: "EIP-712 type definitions, including EIP712Domain with `salt: bytes32`"
           additionalProperties: true
 
     Eip712Domain:
@@ -1744,6 +1752,7 @@ components:
         - name
         - version
         - chainId
+        - salt
       properties:
         name:
           type: string
@@ -1755,6 +1764,11 @@ components:
           type: integer
           format: int64
           example: 1
+        salt:
+          type: string
+          description: 0x-prefixed 32-byte EIP-712 domain salt derived from the solver identifier. Include this as a `bytes32` domain field when signing admin actions.
+          pattern: "^0x[0-9a-fA-F]{64}$"
+          example: "0x70ef8290a7b7a891d94e1c9f4e6d0e70a5f53307f0c551254e1f2b7f9f2a5a8b"
 
     AdminAuthErrorResponse:
       type: object
