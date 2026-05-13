@@ -207,7 +207,8 @@ mod tests {
 			}],
 		};
 
-		let verifier = AdminActionVerifier::new(nonce_store.clone(), admin_config, 1, "test-solver");
+		let verifier =
+			AdminActionVerifier::new(nonce_store.clone(), admin_config, 1, "test-solver");
 
 		// Generate nonce (now returns u64)
 		let nonce = verifier.generate_nonce().await.unwrap();
@@ -258,7 +259,8 @@ mod tests {
 			}],
 		};
 
-		let verifier = AdminActionVerifier::new(nonce_store.clone(), admin_config, 1, "test-solver");
+		let verifier =
+			AdminActionVerifier::new(nonce_store.clone(), admin_config, 1, "test-solver");
 		let nonce = verifier.generate_nonce().await.unwrap();
 
 		// Create expired action
@@ -369,7 +371,8 @@ mod tests {
 			}], // Different address
 		};
 
-		let verifier = AdminActionVerifier::new(nonce_store.clone(), admin_config, 1, "test-solver");
+		let verifier =
+			AdminActionVerifier::new(nonce_store.clone(), admin_config, 1, "test-solver");
 		let nonce = verifier.generate_nonce().await.unwrap();
 
 		let action = AddTokenContents {
