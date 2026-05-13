@@ -248,14 +248,21 @@ The solver has **two independent auth flags**:
 - **`admin.enabled`** — gates SIWE admin login and the admin endpoints. SIWE
   works whenever this is true, regardless of `orders_auth_enabled`.
 
-If you enable Orders API auth in your seed overrides (`"orders_auth_enabled": true`), set:
+If you enable Orders API auth in your seed overrides (`"orders_auth_enabled": true`)
+or enable admin auth (`"admin": { "enabled": true, ... }`), set `JWT_SECRET`
+before starting the service:
 
 ```bash
-export JWT_SECRET=replace_with_a_strong_random_value
+export JWT_SECRET="$(openssl rand -base64 48)"
 
 # Optional
 export AUTH_PUBLIC_REGISTER_ENABLED=false
 ```
+
+`JWT_SECRET` must be at least 32 bytes after trimming whitespace. The solver
+refuses to start with auth enabled if the secret is missing or too short. This
+prevents tokens from being signed with an unstable restart-local secret or a
+public demo placeholder.
 
 If `orders_auth_enabled = false`, `AUTH_PUBLIC_REGISTER_ENABLED` is ignored.
 
@@ -348,6 +355,7 @@ For Redis connectivity from within Docker:
 | `SOLVER_ID` | For loading | Solver ID to load config from Redis (after first seed) |
 | `RUST_LOG` | No | Log level (default: `info`) |
 | `SOLVER_PRIVATE_KEY` | Conditional | Required for local wallet if no inline `private_key` in bootstrap config |
+| `JWT_SECRET` | Conditional | Required when Orders API auth or admin auth is enabled. Must be at least 32 bytes; generate with `openssl rand -base64 48` |
 | `AWS_ACCESS_KEY_ID` | For KMS | AWS access key (if using KMS signer) |
 | `AWS_SECRET_ACCESS_KEY` | For KMS | AWS secret key (if using KMS signer) |
 | `AWS_REGION` | For KMS | AWS region (if using KMS signer, default: from config) |
@@ -400,6 +408,7 @@ Legacy alias support:
 | `REDIS_URL` | Yes | Redis connection URL (default: `redis://localhost:6379`). For production, use managed services like AWS ElastiCache |
 | `SOLVER_PRIVATE_KEY` | Conditional | 64-character hex private key (without 0x prefix) |
 | `SOLVER_ID` | For loading | Solver ID to load from Redis (set after first seed) |
+| `JWT_SECRET` | Conditional | Required when Orders API auth or admin auth is enabled. Must be at least 32 bytes; generate with `openssl rand -base64 48` |
 | `SOLVER_INGRESS_MODE` | No | `active` by default; set `intake_disabled` to stop accepting new solver work. Changing this value requires a process restart/redeploy. |
 
 `SOLVER_PRIVATE_KEY` is only required when using the local wallet without an inline `private_key` in bootstrap config. Not needed if using KMS or providing `private_key` directly in the JSON.

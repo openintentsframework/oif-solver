@@ -12,7 +12,7 @@
       "access_token_expiry_hours": 1,
       "enabled": true,
       "issuer": "oif-solver-demo",
-      "jwt_secret": "${JWT_SECRET:-MySuperDuperSecureSecret123!}",
+      "jwt_secret": "${JWT_SECRET:-REPLACE_ME_WITH_AT_LEAST_32_BYTES_OF_ENTROPY}",
       "refresh_token_expiry_hours": 720
     },
     "enabled": true,
