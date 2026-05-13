@@ -9,7 +9,7 @@
 //! The order is important: we verify the signature BEFORE consuming the nonce
 //! to prevent DoS attacks where an attacker burns valid nonces.
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, FixedBytes};
 use solver_storage::nonce_store::NonceStore;
 use solver_types::AdminConfig;
 #[cfg(test)]
@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use super::error::AdminAuthError;
 use super::signature::recover_from_hash;
-use super::types::AdminAction;
+use super::types::{admin_domain_salt, AdminAction};
 
 /// Verifier for EIP-712 signed admin actions.
 ///
@@ -28,6 +28,10 @@ pub struct AdminActionVerifier {
 	admin_config: AdminConfig,
 	/// Chain ID for EIP-712 domain
 	chain_id: u64,
+	/// Per-solver EIP-712 domain salt derived from `solver_id`. Prevents an
+	/// admin signature minted for this solver from replaying against another
+	/// solver running on the same chain with the same admin key.
+	domain_salt: FixedBytes<32>,
 }
 
 impl AdminActionVerifier {
@@ -38,11 +42,20 @@ impl AdminActionVerifier {
 	/// * `nonce_store` - Redis-backed nonce storage
 	/// * `admin_config` - Admin configuration with authorized addresses
 	/// * `chain_id` - Chain ID for EIP-712 domain separator
-	pub fn new(nonce_store: Arc<NonceStore>, admin_config: AdminConfig, chain_id: u64) -> Self {
+	/// * `solver_id` - Stable identifier of this solver instance. Folded into
+	///   the EIP-712 domain `salt` so signatures cannot be replayed across
+	///   solvers sharing a chain and admin key.
+	pub fn new(
+		nonce_store: Arc<NonceStore>,
+		admin_config: AdminConfig,
+		chain_id: u64,
+		solver_id: &str,
+	) -> Self {
 		Self {
 			nonce_store,
 			admin_config,
 			chain_id,
+			domain_salt: admin_domain_salt(solver_id),
 		}
 	}
 
@@ -86,8 +99,9 @@ impl AdminActionVerifier {
 			return Err(AdminAuthError::NonceNotFound);
 		}
 
-		// 3. Compute message hash and recover signer
-		let message_hash = action.message_hash(self.chain_id)?;
+		// 3. Compute message hash and recover signer. Salt binds the digest to
+		// this solver instance — see `AdminActionVerifier::domain_salt`.
+		let message_hash = action.message_hash(self.chain_id, self.domain_salt)?;
 		let signer = recover_from_hash(&message_hash.0, signature)?;
 
 		// 4. Check signer is in admin registry
@@ -123,6 +137,13 @@ impl AdminActionVerifier {
 	/// Get the chain ID used for EIP-712 domain.
 	pub fn chain_id(&self) -> u64 {
 		self.chain_id
+	}
+
+	/// Get the per-solver EIP-712 domain salt. Exposed so the admin API can
+	/// echo it back to clients alongside the type definitions so they sign the
+	/// right digest.
+	pub fn domain_salt(&self) -> FixedBytes<32> {
+		self.domain_salt
 	}
 
 	/// Check if an address is an admin.
@@ -186,7 +207,7 @@ mod tests {
 			}],
 		};
 
-		let verifier = AdminActionVerifier::new(nonce_store.clone(), admin_config, 1);
+		let verifier = AdminActionVerifier::new(nonce_store.clone(), admin_config, 1, "test-solver");
 
 		// Generate nonce (now returns u64)
 		let nonce = verifier.generate_nonce().await.unwrap();
@@ -203,7 +224,9 @@ mod tests {
 		};
 
 		// Sign
-		let message_hash = action.message_hash(1).unwrap();
+		let message_hash = action
+			.message_hash(1, admin_domain_salt("test-solver"))
+			.unwrap();
 		let signature = sign_hash(&message_hash.0, &secret);
 
 		// Verify - nonce is now extracted from action contents
@@ -235,7 +258,7 @@ mod tests {
 			}],
 		};
 
-		let verifier = AdminActionVerifier::new(nonce_store.clone(), admin_config, 1);
+		let verifier = AdminActionVerifier::new(nonce_store.clone(), admin_config, 1, "test-solver");
 		let nonce = verifier.generate_nonce().await.unwrap();
 
 		// Create expired action
@@ -249,11 +272,81 @@ mod tests {
 			deadline: 1000, // Far in the past
 		};
 
-		let message_hash = action.message_hash(1).unwrap();
+		let message_hash = action
+			.message_hash(1, admin_domain_salt("test-solver"))
+			.unwrap();
 		let signature = sign_hash(&message_hash.0, &secret);
 
 		let result = verifier.verify(&action, &signature).await;
 		assert!(matches!(result, Err(AdminAuthError::Expired)));
+	}
+
+	#[tokio::test]
+	async fn test_cross_solver_replay_is_rejected() {
+		// Two solver instances share the same chain id and admin whitelist
+		// (the same admin key is authorized on both). An admin signs an action
+		// intended for solver A; the same signature presented to solver B must
+		// be rejected because B's domain salt — derived from its own
+		// `solver_id` — differs.
+		let secret = SecretKey::from_byte_array([0x42u8; 32]).expect("valid secret");
+		let admin_address = address_from_secret(&secret);
+
+		let admin_config = AdminConfig {
+			enabled: true,
+			domain: "test.example.com".to_string(),
+			chain_id: Some(1),
+			nonce_ttl_seconds: 300,
+			whitelist: vec![AdminWhitelistEntry {
+				address: admin_address,
+				role: AdminRole::Admin,
+			}],
+		};
+
+		let nonce_store_a =
+			Arc::new(create_nonce_store(StoreConfig::Memory, "solver-a", 300).unwrap());
+		let nonce_store_b =
+			Arc::new(create_nonce_store(StoreConfig::Memory, "solver-b", 300).unwrap());
+
+		let verifier_a =
+			AdminActionVerifier::new(nonce_store_a.clone(), admin_config.clone(), 1, "solver-a");
+		let verifier_b =
+			AdminActionVerifier::new(nonce_store_b.clone(), admin_config, 1, "solver-b");
+
+		// Admin gets a nonce from each solver (real flow — clients pre-register
+		// the nonce against the solver they intend to act on).
+		let nonce_a = verifier_a.generate_nonce().await.unwrap();
+		let nonce_b = verifier_b.generate_nonce().await.unwrap();
+
+		// Sign for solver A using solver A's salt.
+		let action_a = AddTokenContents {
+			chain_id: 10,
+			symbol: "USDC".to_string(),
+			name: None,
+			token_address: Address::from_str("0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85").unwrap(),
+			decimals: 6,
+			nonce: nonce_a,
+			deadline: (chrono::Utc::now().timestamp() + 300) as u64,
+		};
+		let digest_a = action_a
+			.message_hash(1, verifier_a.domain_salt())
+			.expect("message hash for solver A");
+		let signature_a = sign_hash(&digest_a.0, &secret);
+
+		// Replay attempt: feed solver B the same signed payload, but with a
+		// valid nonce from B's own store (otherwise the nonce check, not the
+		// signature check, would be the gate). The signature was computed
+		// under A's salt, so when B reconstructs the digest with B's salt the
+		// recovered signer differs from `admin_address` and B rejects it.
+		let mut action_replayed = action_a.clone();
+		action_replayed.nonce = nonce_b;
+		let result = verifier_b.verify(&action_replayed, &signature_a).await;
+		assert!(
+			matches!(result, Err(AdminAuthError::NotAuthorized(_))),
+			"solver B must not accept solver A's signature; got {result:?}"
+		);
+
+		// Sanity: A accepts its own signature.
+		assert!(verifier_a.verify(&action_a, &signature_a).await.is_ok());
 	}
 
 	#[tokio::test]
@@ -276,7 +369,7 @@ mod tests {
 			}], // Different address
 		};
 
-		let verifier = AdminActionVerifier::new(nonce_store.clone(), admin_config, 1);
+		let verifier = AdminActionVerifier::new(nonce_store.clone(), admin_config, 1, "test-solver");
 		let nonce = verifier.generate_nonce().await.unwrap();
 
 		let action = AddTokenContents {
@@ -289,7 +382,9 @@ mod tests {
 			deadline: (chrono::Utc::now().timestamp() + 300) as u64,
 		};
 
-		let message_hash = action.message_hash(1).unwrap();
+		let message_hash = action
+			.message_hash(1, admin_domain_salt("test-solver"))
+			.unwrap();
 		let signature = sign_hash(&message_hash.0, &secret);
 
 		let result = verifier.verify(&action, &signature).await;

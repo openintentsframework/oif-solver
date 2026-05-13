@@ -59,6 +59,9 @@ pub struct AdminApiState {
 	pub dynamic_config: Arc<RwLock<Config>>,
 	/// Nonce store (concrete type, kept for rebuilding verifier).
 	pub nonce_store: Arc<NonceStore>,
+	/// Stable solver identifier, folded into the EIP-712 admin domain salt so
+	/// signatures cannot be replayed across solvers on the same chain.
+	pub solver_id: String,
 	/// Token manager for hot-reloading token configurations.
 	pub token_manager: Arc<TokenManager>,
 	/// Bridge service for cross-chain rebalancing.
@@ -122,6 +125,7 @@ impl AdminApiState {
 				whitelist: admin_config.whitelist.clone(),
 			},
 			admin_config.chain_id,
+			&self.solver_id,
 		);
 
 		*self.verifier.write().await = new_verifier;
@@ -1384,6 +1388,7 @@ pub async fn handle_get_types(State(state): State<AdminApiState>) -> Json<Eip712
 			name: ADMIN_DOMAIN_NAME.to_string(),
 			version: ADMIN_DOMAIN_VERSION.to_string(),
 			chain_id: verifier.chain_id(),
+			salt: with_0x_prefix(&hex::encode(verifier.domain_salt().as_slice())),
 		},
 		types: admin_eip712_types(),
 	})
@@ -1494,12 +1499,14 @@ mod tests {
 			name: "OIF Solver Admin".to_string(),
 			version: "1".to_string(),
 			chain_id: 1,
+			salt: "0x1234".to_string(),
 		};
 
 		let json = serde_json::to_string(&domain).unwrap();
 		assert!(json.contains("\"name\":\"OIF Solver Admin\""));
 		assert!(json.contains("\"version\":\"1\""));
 		assert!(json.contains("\"chainId\":1"));
+		assert!(json.contains("\"salt\":\"0x1234\""));
 	}
 
 	#[test]
@@ -1549,6 +1556,7 @@ mod tests {
 				name: "Test".to_string(),
 				version: "1".to_string(),
 				chain_id: 10,
+				salt: "0x00".to_string(),
 			},
 			types,
 		};
@@ -1798,6 +1806,7 @@ mod tests {
 				}],
 			},
 			1,
+			"test-solver",
 		);
 
 		let account = Arc::new(AccountService::new(Box::new(DummyAccount {
@@ -1816,6 +1825,7 @@ mod tests {
 			config_store,
 			dynamic_config,
 			nonce_store,
+			solver_id: "test-solver".to_string(),
 			token_manager,
 			bridge_service: None,
 			solver_address: "0x0000000000000000000000000000000000000000".to_string(),
@@ -1855,6 +1865,7 @@ mod tests {
 				}],
 			},
 			1,
+			"test-solver",
 		);
 
 		let account = Arc::new(AccountService::new(Box::new(DummyAccount {
@@ -1872,6 +1883,7 @@ mod tests {
 			config_store,
 			dynamic_config,
 			nonce_store,
+			solver_id: "test-solver".to_string(),
 			token_manager,
 			bridge_service: None,
 			solver_address: "0x0000000000000000000000000000000000000000".to_string(),
@@ -2545,12 +2557,14 @@ mod tests {
 			name: "Solver".to_string(),
 			version: "1".to_string(),
 			chain_id: 1,
+			salt: "0x00".to_string(),
 		};
 
 		let optimism = Eip712Domain {
 			name: "Solver".to_string(),
 			version: "1".to_string(),
 			chain_id: 10,
+			salt: "0x00".to_string(),
 		};
 
 		let mainnet_json = serde_json::to_string(&mainnet).unwrap();
