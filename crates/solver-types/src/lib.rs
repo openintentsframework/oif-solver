@@ -38,6 +38,8 @@ pub mod seed_overrides;
 pub mod standards;
 /// Storage types for managing persistent data.
 pub mod storage;
+/// Transaction attempt ledger types.
+pub mod transaction_attempt;
 /// Utility functions for common type conversions.
 pub mod utils;
 /// Configuration validation types for ensuring type-safe configurations.
@@ -91,6 +93,7 @@ pub use standards::{
 	eip7930::{InteropAddress, InteropAddressError},
 };
 pub use storage::*;
+pub use transaction_attempt::{TransactionAttempt, TransactionAttemptStatus};
 pub use utils::{
 	bytes32_to_address, current_timestamp, format_token_amount, normalize_bytes32_address,
 	parse_address, truncate_id, wei_string_to_eth_string, with_0x_prefix, without_0x_prefix,

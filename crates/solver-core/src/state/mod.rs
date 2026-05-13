@@ -5,5 +5,6 @@
 //! maintaining data consistency.
 
 pub mod order;
+pub mod transaction_attempt;
 
 pub use order::{OrderStateError, OrderStateMachine};

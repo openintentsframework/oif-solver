@@ -8,8 +8,8 @@ use alloy_primitives::Bytes;
 use async_trait::async_trait;
 use solver_types::events::TransactionType;
 use solver_types::{
-	ChainData, ConfigSchema, ImplementationRegistry, Log, LogFilter, NetworksConfig, Transaction,
-	TransactionHash, TransactionReceipt,
+	Address, ChainData, ConfigSchema, ImplementationRegistry, Log, LogFilter, NetworksConfig,
+	Transaction, TransactionAttempt, TransactionAttemptStatus, TransactionHash, TransactionReceipt,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,6 +21,79 @@ pub mod implementations {
 		pub mod alloy;
 		pub mod fees;
 		pub mod nonce;
+	}
+}
+
+#[cfg(test)]
+mod transaction_attempt_recorder_tests {
+	use super::*;
+	use alloy_primitives::U256;
+	use solver_types::{Address, TransactionAttemptStatus, TransactionType};
+	use std::sync::Arc;
+
+	fn sample_tx() -> Transaction {
+		Transaction {
+			to: Some(Address(vec![2; 20])),
+			data: vec![1, 2, 3],
+			value: U256::ZERO,
+			chain_id: 8453,
+			nonce: Some(11),
+			gas_limit: Some(100000),
+			gas_price: None,
+			max_fee_per_gas: Some(1000),
+			max_priority_fee_per_gas: Some(10),
+		}
+	}
+
+	#[tokio::test]
+	async fn noop_recorder_returns_planned_attempt() {
+		let recorder = NoopTransactionAttemptRecorder;
+		let attempt = recorder
+			.record_planned_attempt(
+				"order-1",
+				Some(Address(vec![9; 20])),
+				TransactionType::Fill,
+				sample_tx(),
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(attempt.order_id, "order-1");
+		assert_eq!(attempt.signer, Some(Address(vec![9; 20])));
+		assert_eq!(attempt.tx_type, TransactionType::Fill);
+		assert_eq!(attempt.status, TransactionAttemptStatus::Planned);
+	}
+
+	#[tokio::test]
+	async fn noop_status_update_is_record_and_forget() {
+		let recorder = NoopTransactionAttemptRecorder;
+
+		recorder
+			.record_attempt_status(
+				"attempt-1",
+				TransactionAttemptStatus::SubmitRejected,
+				Some("nonce too low".to_string()),
+			)
+			.await
+			.unwrap();
+	}
+
+	#[tokio::test]
+	async fn recorder_trait_is_dyn_safe() {
+		let recorder: Arc<dyn TransactionAttemptRecorder> =
+			Arc::new(NoopTransactionAttemptRecorder);
+
+		let attempt = recorder
+			.record_planned_attempt(
+				"order-1",
+				Some(Address(vec![9; 20])),
+				TransactionType::Fill,
+				sample_tx(),
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(attempt.order_id, "order-1");
 	}
 }
 
@@ -67,6 +140,65 @@ pub struct InsufficientNativeGasInfo {
 	pub max_fee_per_gas: Option<u128>,
 	pub gas_price: Option<u128>,
 	pub value_wei: String,
+}
+
+/// Errors that can occur while recording transaction attempt ledger rows.
+#[derive(Debug, Error)]
+pub enum TransactionAttemptRecorderError {
+	/// Storage or persistence failure from the recorder implementation.
+	#[error("transaction attempt recorder storage error: {0}")]
+	Storage(String),
+}
+
+/// Records transaction delivery attempts independently from order lifecycle state.
+#[async_trait]
+pub trait TransactionAttemptRecorder: Send + Sync {
+	async fn record_planned_attempt(
+		&self,
+		order_id: &str,
+		signer: Option<Address>,
+		tx_type: TransactionType,
+		tx: Transaction,
+	) -> Result<TransactionAttempt, TransactionAttemptRecorderError>;
+
+	async fn record_attempt_status(
+		&self,
+		attempt_id: &str,
+		status: TransactionAttemptStatus,
+		error: Option<String>,
+	) -> Result<(), TransactionAttemptRecorderError>;
+}
+
+#[derive(Debug, Default)]
+pub struct NoopTransactionAttemptRecorder;
+
+#[async_trait]
+impl TransactionAttemptRecorder for NoopTransactionAttemptRecorder {
+	async fn record_planned_attempt(
+		&self,
+		order_id: &str,
+		signer: Option<Address>,
+		tx_type: TransactionType,
+		tx: Transaction,
+	) -> Result<TransactionAttempt, TransactionAttemptRecorderError> {
+		Ok(TransactionAttempt::planned(
+			"noop-attempt".to_string(),
+			order_id.to_string(),
+			signer,
+			tx_type,
+			tx,
+		))
+	}
+
+	async fn record_attempt_status(
+		&self,
+		attempt_id: &str,
+		status: TransactionAttemptStatus,
+		error: Option<String>,
+	) -> Result<(), TransactionAttemptRecorderError> {
+		let _ = (attempt_id, status, error);
+		Ok(())
+	}
 }
 
 /// Fee model used by a chain at transaction submission time.
