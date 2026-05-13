@@ -138,6 +138,11 @@ pub struct AdminConfigSummary {
 	pub enabled: bool,
 	pub domain: String,
 	pub withdrawals_enabled: bool,
+	/// Pre-approved recipient addresses for `POST /admin/withdrawals`. Empty
+	/// means no constraint (any recipient is accepted); non-empty means the
+	/// recipient must match one of these entries.
+	#[serde(default)]
+	pub withdrawal_recipient_allowlist: Vec<String>,
 }
 
 /// Response for fee configuration read.

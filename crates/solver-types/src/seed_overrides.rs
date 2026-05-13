@@ -450,6 +450,12 @@ pub struct WithdrawalsOverride {
 	/// Whether withdrawals are enabled.
 	#[serde(default)]
 	pub enabled: bool,
+
+	/// Optional list of pre-approved recipient addresses. When non-empty, only
+	/// these addresses can receive admin-initiated withdrawals. Defaults to
+	/// empty for backward compatibility (no constraint).
+	#[serde(default)]
+	pub recipient_allowlist: Vec<alloy_primitives::Address>,
 }
 
 /// Helper module for Option<Decimal> serialization.
