@@ -44,7 +44,8 @@
     "chain_id": 84532,
     "admin_addresses": ["0xYourAdminAddress"],
     "withdrawals": {
-      "enabled": true
+      "enabled": true,
+      "recipient_allowlist": []
     }
   }
 }

@@ -1058,7 +1058,10 @@ mod tests {
 					address: admin_address,
 					role: solver_types::AdminRole::Admin,
 				}],
-				withdrawals: OperatorWithdrawalsConfig { enabled: false },
+				withdrawals: OperatorWithdrawalsConfig {
+					enabled: false,
+					recipient_allowlist: vec![],
+				},
 			},
 			orders_auth_enabled: false,
 			account: None,

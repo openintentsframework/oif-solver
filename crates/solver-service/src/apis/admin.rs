@@ -311,6 +311,13 @@ pub async fn handle_get_config(
 			enabled: operator_config.admin.enabled,
 			domain: operator_config.admin.domain.clone(),
 			withdrawals_enabled: operator_config.admin.withdrawals.enabled,
+			withdrawal_recipient_allowlist: operator_config
+				.admin
+				.withdrawals
+				.recipient_allowlist
+				.iter()
+				.map(|addr| with_0x_prefix(&hex::encode(addr.as_slice())))
+				.collect(),
 		},
 		version: versioned.version,
 	}))
@@ -1156,6 +1163,21 @@ pub async fn handle_withdrawal(
 		));
 	}
 
+	// Recipient allowlist: when configured, the recipient must be pre-approved.
+	// Reduces the blast radius of a single compromised admin key — a leak that
+	// would otherwise drain to any attacker-chosen address can only redirect
+	// funds to operator-vetted recipients (e.g. a cold-storage multisig).
+	if !policy.recipient_allowed(&contents.recipient) {
+		tracing::warn!(
+			admin = %hex::encode(&admin.0),
+			recipient = %contents.recipient,
+			"Rejected withdrawal: recipient not in allowlist"
+		);
+		return Err(AdminAuthError::NotAuthorized(
+			"Withdrawal recipient is not in the configured allowlist".to_string(),
+		));
+	}
+
 	// Balance check
 	let balance_str = state
 		.token_manager
@@ -1926,8 +1948,13 @@ mod tests {
 	async fn test_handle_add_token_triggers_approval_setup() {
 		let _jwt_secret = strong_jwt_secret_guard();
 		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-		let mut operator_config =
-			build_operator_config(admin_alloy, OperatorWithdrawalsConfig { enabled: true });
+		let mut operator_config = build_operator_config(
+			admin_alloy,
+			OperatorWithdrawalsConfig {
+				enabled: true,
+				recipient_allowlist: vec![],
+			},
+		);
 
 		operator_config.networks.insert(
 			1,
@@ -2015,8 +2042,13 @@ mod tests {
 	async fn test_handle_add_tokens_triggers_approval_setup() {
 		let _jwt_secret = strong_jwt_secret_guard();
 		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-		let mut operator_config =
-			build_operator_config(admin_alloy, OperatorWithdrawalsConfig { enabled: true });
+		let mut operator_config = build_operator_config(
+			admin_alloy,
+			OperatorWithdrawalsConfig {
+				enabled: true,
+				recipient_allowlist: vec![],
+			},
+		);
 
 		operator_config.networks.insert(
 			1,
@@ -2116,8 +2148,13 @@ mod tests {
 	async fn test_handle_add_token_approval_failure_is_atomic() {
 		let _jwt_secret = strong_jwt_secret_guard();
 		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-		let mut operator_config =
-			build_operator_config(admin_alloy, OperatorWithdrawalsConfig { enabled: true });
+		let mut operator_config = build_operator_config(
+			admin_alloy,
+			OperatorWithdrawalsConfig {
+				enabled: true,
+				recipient_allowlist: vec![],
+			},
+		);
 
 		operator_config.networks.insert(
 			1,
@@ -2219,8 +2256,13 @@ mod tests {
 	async fn test_handle_add_tokens_approval_failure_is_atomic() {
 		let _jwt_secret = strong_jwt_secret_guard();
 		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-		let mut operator_config =
-			build_operator_config(admin_alloy, OperatorWithdrawalsConfig { enabled: true });
+		let mut operator_config = build_operator_config(
+			admin_alloy,
+			OperatorWithdrawalsConfig {
+				enabled: true,
+				recipient_allowlist: vec![],
+			},
+		);
 
 		operator_config.networks.insert(
 			1,
@@ -2322,8 +2364,13 @@ mod tests {
 	#[tokio::test]
 	async fn test_handle_add_tokens_rejects_small_batch() {
 		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-		let mut operator_config =
-			build_operator_config(admin_alloy, OperatorWithdrawalsConfig { enabled: true });
+		let mut operator_config = build_operator_config(
+			admin_alloy,
+			OperatorWithdrawalsConfig {
+				enabled: true,
+				recipient_allowlist: vec![],
+			},
+		);
 		operator_config.networks.insert(
 			1,
 			OperatorNetworkConfig {
@@ -2374,8 +2421,13 @@ mod tests {
 	#[tokio::test]
 	async fn test_handle_add_tokens_rejects_duplicate_payload_entries() {
 		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-		let mut operator_config =
-			build_operator_config(admin_alloy, OperatorWithdrawalsConfig { enabled: true });
+		let mut operator_config = build_operator_config(
+			admin_alloy,
+			OperatorWithdrawalsConfig {
+				enabled: true,
+				recipient_allowlist: vec![],
+			},
+		);
 		operator_config.networks.insert(
 			1,
 			OperatorNetworkConfig {
@@ -2440,8 +2492,13 @@ mod tests {
 	#[tokio::test]
 	async fn test_handle_add_tokens_atomic_validation() {
 		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-		let mut operator_config =
-			build_operator_config(admin_alloy, OperatorWithdrawalsConfig { enabled: true });
+		let mut operator_config = build_operator_config(
+			admin_alloy,
+			OperatorWithdrawalsConfig {
+				enabled: true,
+				recipient_allowlist: vec![],
+			},
+		);
 		operator_config.networks.insert(
 			1,
 			OperatorNetworkConfig {
@@ -2505,7 +2562,10 @@ mod tests {
 	#[tokio::test]
 	async fn test_withdraw_success() {
 		let recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
-		let withdrawals = OperatorWithdrawalsConfig { enabled: true };
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: true,
+			recipient_allowlist: vec![],
+		};
 
 		let state = create_admin_state(Some("1000000000000000000"), withdrawals, true).await;
 		let contents = WithdrawContents {
@@ -2529,9 +2589,75 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn test_withdraw_recipient_not_in_allowlist_is_rejected() {
+		// Operator pinned a single recipient. A different recipient — even one
+		// signed by a legitimate admin — must be rejected before any balance
+		// query or token transfer is attempted.
+		let approved = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
+		let attacker = alloy_address("0xdEAdBeEFdEadBEefDEAdbEEFdeadBEEFDEadBeeF");
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: true,
+			recipient_allowlist: vec![approved],
+		};
+
+		let state = create_admin_state(Some("1000000000000000000"), withdrawals, false).await;
+		let contents = WithdrawContents {
+			chain_id: 1,
+			token: zero_alloy_address(),
+			amount: "1".to_string(),
+			recipient: attacker,
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let err = handle_withdrawal(State(state), verified).await.unwrap_err();
+		assert!(
+			matches!(&err, AdminAuthError::NotAuthorized(msg) if msg.contains("allowlist")),
+			"expected NotAuthorized(allowlist), got {err:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_withdraw_recipient_in_allowlist_succeeds() {
+		// Same allowlist setup as above, but the request targets an approved
+		// recipient — must succeed end-to-end.
+		let approved = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: true,
+			recipient_allowlist: vec![approved],
+		};
+
+		let state = create_admin_state(Some("1000000000000000000"), withdrawals, true).await;
+		let contents = WithdrawContents {
+			chain_id: 1,
+			token: zero_alloy_address(),
+			amount: "100000000000000000".to_string(),
+			recipient: approved,
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let response = handle_withdrawal(State(state), verified).await.unwrap();
+		assert!(response.success);
+	}
+
+	#[tokio::test]
 	async fn test_withdraw_insufficient_funds() {
 		let recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
-		let withdrawals = OperatorWithdrawalsConfig { enabled: true };
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: true,
+			recipient_allowlist: vec![],
+		};
 
 		let state = create_admin_state(Some("10"), withdrawals, false).await;
 		let contents = WithdrawContents {
@@ -2555,7 +2681,10 @@ mod tests {
 	#[tokio::test]
 	async fn test_verified_admin_bad_signature() {
 		let recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
-		let withdrawals = OperatorWithdrawalsConfig { enabled: true };
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: true,
+			recipient_allowlist: vec![],
+		};
 
 		let state = create_admin_state(None, withdrawals, false).await;
 		let verifier = state.verifier.read().await;
@@ -2612,7 +2741,10 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_handle_get_fees() {
-		let withdrawals = OperatorWithdrawalsConfig { enabled: false };
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: false,
+			recipient_allowlist: vec![],
+		};
 		let state = create_admin_state(None, withdrawals, false).await;
 		let response = handle_get_fees(State(state)).await;
 
@@ -2625,7 +2757,10 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_handle_get_nonce() {
-		let withdrawals = OperatorWithdrawalsConfig { enabled: false };
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: false,
+			recipient_allowlist: vec![],
+		};
 		let state = create_admin_state(None, withdrawals, false).await;
 		let result = handle_get_nonce(State(state)).await;
 
@@ -2641,8 +2776,13 @@ mod tests {
 	async fn test_handle_get_whitelist_returns_configured_admins() {
 		let admin_one = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 		let admin_two = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
-		let mut operator_config =
-			build_operator_config(admin_one, OperatorWithdrawalsConfig { enabled: false });
+		let mut operator_config = build_operator_config(
+			admin_one,
+			OperatorWithdrawalsConfig {
+				enabled: false,
+				recipient_allowlist: vec![],
+			},
+		);
 		operator_config
 			.admin
 			.set_role(admin_two, AdminRole::ReadOnly);
@@ -2681,8 +2821,13 @@ mod tests {
 		let _jwt_secret = strong_jwt_secret_guard();
 		let admin = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
 		let read_only = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
-		let mut operator_config =
-			build_operator_config(admin, OperatorWithdrawalsConfig { enabled: false });
+		let mut operator_config = build_operator_config(
+			admin,
+			OperatorWithdrawalsConfig {
+				enabled: false,
+				recipient_allowlist: vec![],
+			},
+		);
 		operator_config.networks.insert(
 			1,
 			OperatorNetworkConfig {
@@ -2751,8 +2896,15 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_legacy_add_admin_payload_is_rejected() {
-		let state =
-			create_admin_state(None, OperatorWithdrawalsConfig { enabled: false }, false).await;
+		let state = create_admin_state(
+			None,
+			OperatorWithdrawalsConfig {
+				enabled: false,
+				recipient_allowlist: vec![],
+			},
+			false,
+		)
+		.await;
 		let payload = serde_json::json!({
 			"signature": "0x12",
 			"contents": {
@@ -2779,7 +2931,10 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_handle_get_types() {
-		let withdrawals = OperatorWithdrawalsConfig { enabled: false };
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: false,
+			recipient_allowlist: vec![],
+		};
 		let state = create_admin_state(None, withdrawals, false).await;
 		let response = handle_get_types(State(state)).await;
 
@@ -2801,7 +2956,10 @@ mod tests {
 	#[tokio::test]
 	async fn test_withdraw_disabled() {
 		let recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
-		let withdrawals = OperatorWithdrawalsConfig { enabled: false };
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: false,
+			recipient_allowlist: vec![],
+		};
 
 		let state = create_admin_state(None, withdrawals, false).await;
 		let contents = WithdrawContents {
@@ -2825,7 +2983,10 @@ mod tests {
 	#[tokio::test]
 	async fn test_withdraw_zero_amount() {
 		let recipient = alloy_address("0x70997970C51812dc3A010C7d01b50e0d17dc79C8");
-		let withdrawals = OperatorWithdrawalsConfig { enabled: true };
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: true,
+			recipient_allowlist: vec![],
+		};
 
 		let state = create_admin_state(None, withdrawals, false).await;
 		let contents = WithdrawContents {
@@ -2848,7 +3009,10 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_withdraw_zero_recipient() {
-		let withdrawals = OperatorWithdrawalsConfig { enabled: true };
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: true,
+			recipient_allowlist: vec![],
+		};
 
 		let state = create_admin_state(None, withdrawals, false).await;
 		let contents = WithdrawContents {
@@ -3104,12 +3268,16 @@ mod tests {
 			enabled: true,
 			domain: "localhost".to_string(),
 			withdrawals_enabled: true,
+			withdrawal_recipient_allowlist: vec![
+				"0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266".to_string()
+			],
 		};
 
 		let json = serde_json::to_string(&summary).unwrap();
 		assert!(json.contains("\"enabled\":true"));
 		assert!(json.contains("\"domain\":\"localhost\""));
 		assert!(json.contains("\"withdrawalsEnabled\":true"));
+		assert!(json.contains("\"withdrawalRecipientAllowlist\""));
 	}
 
 	#[test]

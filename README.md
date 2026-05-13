@@ -934,6 +934,12 @@ The admin API enables authorized wallet addresses to perform administrative oper
   "admin": {
     "enabled": true,
     "domain": "localhost",
+    "withdrawals": {
+      "enabled": true,
+      "recipient_allowlist": [
+        "0x1111111111111111111111111111111111111111"
+      ]
+    },
     "whitelist": [
       {
         "address": "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
@@ -949,6 +955,8 @@ The admin API enables authorized wallet addresses to perform administrative oper
 ```
 
 `role: "admin"` receives `admin-all` and can sign EIP-712 transactions. `role: "read-only"` receives `admin-read` through SIWE and can call admin `GET` endpoints only. The legacy `admin_addresses` list is still accepted as input and is normalized to full admin entries.
+
+`admin.withdrawals.enabled` gates `POST /api/v1/admin/withdrawals`. `admin.withdrawals.recipient_allowlist` is optional and defaults to empty. Empty means withdrawals can target any recipient, preserving previous behavior. Once the list contains at least one address, every admin withdrawal recipient must match one of those addresses exactly. Use this to pin withdrawals to operator-controlled destinations such as a cold-storage multisig.
 
 `admin.domain` is the SIWE/admin login domain. Use `"localhost"` for local development because the wallet signs a login message for the local host. In production, set it to the public host your admin UI uses, such as `"solver.example.com"`.
 
@@ -1008,6 +1016,7 @@ The `salt` is derived from `solver_id` and binds each admin signature to one sol
 - **DELETE `/api/v1/admin/tokens`** - Remove a token from a network (protected)
 - **POST `/api/v1/admin/tokens/approve`** - Approve token allowance for settlements (protected)
 - **POST `/api/v1/admin/withdrawals`** - Perform an admin withdrawal (protected)
+  - If `admin.withdrawals.recipient_allowlist` is non-empty, `contents.recipient` must be in that allowlist
 - **GET `/api/v1/admin/whitelist`** - List typed admin whitelist entries (protected, read-only)
 - **POST `/api/v1/admin/whitelist`** - Set a wallet role to `admin` or `read-only` (protected, EIP-712 signed)
 - **DELETE `/api/v1/admin/whitelist`** - Remove an admin (protected)
@@ -1028,7 +1037,7 @@ The `salt` is derived from `solver_id` and binds each admin signature to one sol
 **Note:** `/api/v1/auth/siwe/nonce` is dedicated to SIWE login. `/api/v1/admin/nonce` is dedicated to EIP-712 admin action signing.
 **Note:** The `domain` string in `/api/v1/admin/nonce` is the configured admin login domain. For EIP-712 signing, use the structured domain from `/api/v1/admin/types`.
 **Note:** `POST /api/v1/auth/register` never issues `admin-all` and is disabled by default unless `AUTH_PUBLIC_REGISTER_ENABLED=true`.
-**Note:** Admin withdrawals require `admin.withdrawals.enabled = true` in config.
+**Note:** Admin withdrawals require `admin.withdrawals.enabled = true` in config. Configure `admin.withdrawals.recipient_allowlist` to restrict withdrawals to vetted recipient addresses; leaving it empty keeps withdrawals unrestricted by recipient.
 
 #### Fees and Profitability
 
