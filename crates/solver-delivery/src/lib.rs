@@ -24,6 +24,9 @@ pub mod implementations {
 	}
 }
 
+pub mod revert_classifier;
+pub use revert_classifier::{classify_revert, RevertClassification, StageCompleteReason};
+
 #[cfg(test)]
 mod transaction_attempt_recorder_tests {
 	use super::*;
@@ -351,6 +354,12 @@ pub enum TransactionMonitoringEvent {
 		tx_hash: TransactionHash,
 		tx_type: TransactionType,
 		error: String,
+		/// Classification of the revert payload. `StageComplete` indicates
+		/// the stage may already be done on-chain (caller should defer to
+		/// recovery for chain confirmation); `Terminal` and `Unknown` both
+		/// indicate stage failure and should terminalize the order through
+		/// the existing flow.
+		classification: RevertClassification,
 	},
 	/// Live confirmation watcher gave up before reaching `min_confirmations`.
 	/// The transaction's on-chain status is unknown to the monitor — it may
@@ -536,6 +545,33 @@ pub trait DeliveryInterface: Send + Sync {
 	/// or simulate transaction execution without submitting to the blockchain.
 	async fn eth_call(&self, tx: Transaction) -> Result<Bytes, DeliveryError>;
 
+	/// Replays the given transaction via `eth_call` at the specified block and
+	/// returns the revert payload (4-byte selector + ABI-encoded args) if the
+	/// replay reverts. Returns `Ok(None)` if the replay succeeds (unexpected
+	/// when the caller already saw `success=false` — can happen after a reorg),
+	/// if the backend cannot extract structured revert data, or if this
+	/// backend does not support replay.
+	///
+	/// `from` carries the original signer. It is REQUIRED for OIF settler
+	/// reverts because finalise/claim paths perform permission checks against
+	/// `msg.sender`; replaying without the matching caller can produce a
+	/// different selector. Pass `attempt.signer` from the transaction-attempt
+	/// ledger.
+	///
+	/// Default implementation returns `Ok(None)` so backends that can't replay
+	/// (test mocks, recorders, non-EVM backends) compile out-of-the-box.
+	/// Callers MUST treat `Ok(None)` as `Unknown` classification (i.e.,
+	/// preserve today's `Failed(stage)` behavior).
+	async fn get_revert_data(
+		&self,
+		_chain_id: u64,
+		_tx: Transaction,
+		_from: Option<Address>,
+		_block: u64,
+	) -> Result<Option<Vec<u8>>, DeliveryError> {
+		Ok(None)
+	}
+
 	/// Checks whether a transaction exists in the mempool or on-chain.
 	///
 	/// Returns `Ok(true)` if the tx is visible (pending or mined), `Ok(false)` if
@@ -665,6 +701,27 @@ impl DeliveryService {
 	) -> Result<bool, DeliveryError> {
 		let receipt = self.get_receipt(hash, chain_id).await?;
 		Ok(receipt.success)
+	}
+
+	/// Replays a transaction via `eth_call` at the given block and returns the
+	/// revert payload bytes on revert. See `DeliveryInterface::get_revert_data`
+	/// for the contract: backends without replay support return `Ok(None)`,
+	/// which callers must treat as Unknown classification.
+	pub async fn get_revert_data(
+		&self,
+		chain_id: u64,
+		tx: Transaction,
+		from: Option<Address>,
+		block: u64,
+	) -> Result<Option<Vec<u8>>, DeliveryError> {
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
+
+		implementation
+			.get_revert_data(chain_id, tx, from, block)
+			.await
 	}
 
 	/// Gets chain-specific data for the given chain ID.
