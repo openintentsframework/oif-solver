@@ -18,8 +18,9 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use solver_storage::StorageService;
 use solver_types::{
-	with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, InteropAddress, NetworksConfig,
-	Order, OrderOutput, Schema, Transaction, TransactionHash, TransactionReceipt, TransactionType,
+	order_id_to_bytes32, with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, InteropAddress,
+	NetworksConfig, Order, OrderOutput, Schema, Transaction, TransactionHash, TransactionReceipt,
+	TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -52,26 +53,6 @@ fn keccak256(data: &str) -> FixedBytes<32> {
 	hasher.update(data.as_bytes());
 	let result = hasher.finalize();
 	FixedBytes::<32>::from_slice(&result)
-}
-
-/// Convert order ID string to bytes32
-fn order_id_to_bytes32(order_id: &str) -> [u8; 32] {
-	// If order_id starts with 0x, treat as hex
-	if let Some(hex_str) = order_id.strip_prefix("0x") {
-		let mut bytes = [0u8; 32];
-		if let Ok(decoded) = hex::decode(hex_str) {
-			let len = decoded.len().min(32);
-			bytes[32 - len..].copy_from_slice(&decoded[..len]);
-		}
-		bytes
-	} else {
-		// Otherwise, encode as UTF-8 bytes, right-align and left-pad with zeros
-		let raw = order_id.as_bytes();
-		let mut bytes = [0u8; 32];
-		let len = raw.len().min(32);
-		bytes[32 - len..].copy_from_slice(&raw[..len]);
-		bytes
-	}
 }
 
 /// Hyperlane-compatible output representation
@@ -1216,6 +1197,10 @@ impl SettlementInterface for HyperlaneSettlement {
 						.map(|t| solver_types::H256(t.0))
 						.collect(),
 					data: log.data().data.to_vec(),
+					transaction_hash: log
+						.transaction_hash
+						.map(|h| solver_types::TransactionHash(h.0.to_vec())),
+					block_number: log.block_number,
 				})
 				.collect();
 

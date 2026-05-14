@@ -363,6 +363,40 @@ pub mod interfaces {
 		interface ITheCompact {
 			function DOMAIN_SEPARATOR() external view returns (bytes32);
 		}
+
+		/// Emitted by `InputSettlerEscrow.open()` on the origin chain.
+		#[derive(Debug)]
+		event Open(bytes32 indexed orderId, StandardOrder order);
+
+		/// Emitted by `OutputSettlerBase` on the destination chain when a fill
+		/// is successfully recorded.
+		#[derive(Debug)]
+		event OutputFilled(
+			bytes32 indexed orderId,
+			bytes32 solver,
+			uint32 timestamp,
+			SolMandateOutput output,
+			uint256 finalAmount
+		);
+
+		/// Emitted by `InputSettlerBase` on the origin chain when the order is
+		/// finalized for the solver (claim leg).
+		#[derive(Debug)]
+		event Finalised(bytes32 indexed orderId, bytes32 solver, bytes32 destination);
+
+		/// Emitted by `InputSettlerEscrow` on the origin chain when the order
+		/// is refunded to the user (deadline expired before fill).
+		#[derive(Debug)]
+		event Refunded(bytes32 indexed orderId);
+
+		/// Emitted by `InputSettlerPurchase` on the origin chain when the
+		/// claim rights are transferred to another solver.
+		#[derive(Debug)]
+		event OrderPurchased(
+			bytes32 indexed orderId,
+			bytes32 solver,
+			bytes32 purchaser
+		);
 	}
 }
 

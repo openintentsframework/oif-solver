@@ -1722,6 +1722,10 @@ impl DeliveryInterface for AlloyDelivery {
 				address: solver_types::Address(l.address().as_slice().to_vec()),
 				topics: l.topics().iter().map(|t| solver_types::H256(t.0)).collect(),
 				data: l.data().data.to_vec(),
+				transaction_hash: l
+					.transaction_hash
+					.map(|h| solver_types::TransactionHash(h.0.to_vec())),
+				block_number: l.block_number,
 			})
 			.collect())
 	}

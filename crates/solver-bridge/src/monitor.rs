@@ -2255,6 +2255,7 @@ mod tests {
 				topic_for_address(to),
 			],
 			data: amount_data(amount),
+			..Default::default()
 		}
 	}
 

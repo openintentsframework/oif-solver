@@ -34,65 +34,25 @@ fn harness_lock() -> &'static Mutex<()> {
 }
 
 // =============================================================================
-// Public sol! types — mirror on-chain types; solver-discovery's sol!s are
-// crate-private, so we redeclare here.
+// Public sol! types
+//
+// Order, output, and event types come from solver-types' canonical
+// `eip7683::interfaces` module. Re-exported here under the names existing
+// e2e callers use (`MandateOutput`, `IInputSettlerEscrow`). Test-only
+// contract bindings (`IERC20`, `IMailboxMock`) stay local.
 // =============================================================================
 
+pub use solver_types::standards::eip7683::interfaces::{
+	Finalised, IInputSettlerEscrow, Open, OutputFilled, SolMandateOutput as MandateOutput,
+	StandardOrder,
+};
+
 sol! {
-	#[derive(Debug)]
-	struct MandateOutput {
-		bytes32 oracle;
-		bytes32 settler;
-		uint256 chainId;
-		bytes32 token;
-		uint256 amount;
-		bytes32 recipient;
-		bytes callbackData;
-		bytes context;
-	}
-
-	#[derive(Debug)]
-	struct StandardOrder {
-		address user;
-		uint256 nonce;
-		uint256 originChainId;
-		uint32 expires;
-		uint32 fillDeadline;
-		address inputOracle;
-		uint256[2][] inputs;
-		MandateOutput[] outputs;
-	}
-
-	/// Emitted by InputSettlerEscrow.open(); the signal that on-chain
-	/// discovery picks up.
-	#[derive(Debug)]
-	event Open(bytes32 indexed orderId, StandardOrder order);
-
-	/// Emitted by OutputSettlerBase when the solver fills on the destination.
-	#[derive(Debug)]
-	event OutputFilled(
-		bytes32 indexed orderId,
-		bytes32 solver,
-		uint32 timestamp,
-		MandateOutput output,
-		uint256 finalAmount
-	);
-
-	/// Emitted by InputSettlerBase when the order is settled (claim leg).
-	#[derive(Debug)]
-	event Finalised(bytes32 indexed orderId, bytes32 solver, bytes32 destination);
-
 	#[sol(rpc)]
 	contract IERC20 {
 		function mint(address to, uint256 value) external;
 		function approve(address spender, uint256 value) external returns (bool);
 		function balanceOf(address account) external view returns (uint256);
-	}
-
-	#[sol(rpc)]
-	contract IInputSettlerEscrow {
-		function open(StandardOrder calldata order) external;
-		function orderIdentifier(StandardOrder calldata order) external view returns (bytes32);
 	}
 
 	/// Read-only view onto `MockMailboxV2.dispatchCounter`. Bumps once per

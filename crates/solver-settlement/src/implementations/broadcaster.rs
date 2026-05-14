@@ -20,9 +20,10 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use solver_storage::StorageService;
 use solver_types::{
-	bytes32_to_address, parse_address, with_0x_prefix, ConfigSchema, Eip7683OrderData, Field,
-	FieldType, FillProof, InteropAddress, NetworksConfig, Order, OrderOutput, PusherL2Params,
-	Schema, Transaction, TransactionHash, TransactionReceipt, TransactionType,
+	bytes32_to_address, order_id_to_bytes32, parse_address, with_0x_prefix, ConfigSchema,
+	Eip7683OrderData, Field, FieldType, FillProof, InteropAddress, NetworksConfig, Order,
+	OrderOutput, PusherL2Params, Schema, Transaction, TransactionHash, TransactionReceipt,
+	TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,24 +67,6 @@ fn keccak256(data: &[u8]) -> [u8; 32] {
 	let mut out = [0u8; 32];
 	out.copy_from_slice(&result);
 	out
-}
-
-/// Convert order ID string to bytes32.
-fn order_id_to_bytes32(order_id: &str) -> [u8; 32] {
-	if let Some(hex_str) = order_id.strip_prefix("0x") {
-		let mut bytes = [0u8; 32];
-		if let Ok(decoded) = hex::decode(hex_str) {
-			let len = decoded.len().min(32);
-			bytes[32 - len..].copy_from_slice(&decoded[..len]);
-		}
-		bytes
-	} else {
-		let raw = order_id.as_bytes();
-		let mut bytes = [0u8; 32];
-		let len = raw.len().min(32);
-		bytes[32 - len..].copy_from_slice(&raw[..len]);
-		bytes
-	}
 }
 
 /// Broadcaster-compatible output representation.
@@ -790,6 +773,10 @@ impl BroadcasterSettlement {
 					.map(|topic| solver_types::H256(topic.0))
 					.collect(),
 				data: log.data().data.to_vec(),
+				transaction_hash: log
+					.transaction_hash
+					.map(|h| solver_types::TransactionHash(h.0.to_vec())),
+				block_number: log.block_number,
 			})
 			.collect();
 
@@ -2164,6 +2151,7 @@ mod tests {
 				solver_types::H256(order_id),
 			],
 			data,
+			..Default::default()
 		};
 
 		let (solver, timestamp) = extract_fill_details_from_logs(&[log], &order_id).unwrap();
@@ -2220,6 +2208,7 @@ mod tests {
 				solver_types::H256(address_to_bytes32(&expected_publisher)),
 			],
 			data: vec![],
+			..Default::default()
 		};
 
 		assert_eq!(
@@ -2240,6 +2229,7 @@ mod tests {
 				solver_types::H256(address_to_bytes32(&solver_types::Address(vec![0x88; 20]))),
 			],
 			data: vec![],
+			..Default::default()
 		};
 
 		assert_eq!(
@@ -2485,6 +2475,7 @@ mod tests {
 					solver_types::H256(order_id_to_bytes32(&order.id)),
 				],
 				data: event_data,
+				..Default::default()
 			}],
 			block_timestamp: None,
 		};

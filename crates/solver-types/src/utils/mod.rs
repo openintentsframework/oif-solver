@@ -26,4 +26,4 @@ pub use eip712::{
 	TOKEN_PERMISSIONS_TYPE,
 };
 pub use formatting::{format_token_amount, truncate_id, with_0x_prefix, without_0x_prefix};
-pub use helpers::current_timestamp;
+pub use helpers::{current_timestamp, order_id_to_bytes32};
