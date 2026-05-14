@@ -69,9 +69,11 @@ mod transaction_attempt_recorder_tests {
 		let recorder = NoopTransactionAttemptRecorder;
 
 		recorder
-			.record_attempt_status(
+			.record_attempt_update(
 				"attempt-1",
 				TransactionAttemptStatus::SubmitRejected,
+				None,
+				None,
 				Some("nonce too low".to_string()),
 			)
 			.await
@@ -161,10 +163,12 @@ pub trait TransactionAttemptRecorder: Send + Sync {
 		tx: Transaction,
 	) -> Result<TransactionAttempt, TransactionAttemptRecorderError>;
 
-	async fn record_attempt_status(
+	async fn record_attempt_update(
 		&self,
 		attempt_id: &str,
 		status: TransactionAttemptStatus,
+		tx_hash: Option<TransactionHash>,
+		receipt: Option<TransactionReceipt>,
 		error: Option<String>,
 	) -> Result<(), TransactionAttemptRecorderError>;
 }
@@ -190,13 +194,15 @@ impl TransactionAttemptRecorder for NoopTransactionAttemptRecorder {
 		))
 	}
 
-	async fn record_attempt_status(
+	async fn record_attempt_update(
 		&self,
 		attempt_id: &str,
 		status: TransactionAttemptStatus,
+		tx_hash: Option<TransactionHash>,
+		receipt: Option<TransactionReceipt>,
 		error: Option<String>,
 	) -> Result<(), TransactionAttemptRecorderError> {
-		let _ = (attempt_id, status, error);
+		let _ = (attempt_id, status, tx_hash, receipt, error);
 		Ok(())
 	}
 }
@@ -365,6 +371,8 @@ pub struct TransactionTracking {
 	pub id: String,
 	/// Type of transaction being submitted
 	pub tx_type: TransactionType,
+	/// Records durable delivery attempts for this tracked transaction.
+	pub attempt_recorder: Arc<dyn TransactionAttemptRecorder>,
 	/// Callback to invoke when transaction state changes
 	pub callback: TransactionCallback,
 }
@@ -390,6 +398,43 @@ pub struct TransactionTrackingWithConfig {
 	/// Timeout in seconds for live tx-confirmation polling (short window).
 	/// Distinct from `monitoring_timeout_seconds`; see `DeliveryConfig`.
 	pub tx_confirmation_timeout_seconds: u64,
+}
+
+#[cfg(test)]
+mod tracking_config_tests {
+	use super::{
+		NoopTransactionAttemptRecorder, TransactionMonitoringEvent, TransactionTracking,
+		TransactionTrackingWithConfig,
+	};
+	use solver_types::TransactionType;
+	use std::sync::Arc;
+
+	#[test]
+	fn tracking_debug_omits_attempt_recorder() {
+		let tracking = TransactionTracking {
+			id: "test-order-123".to_string(),
+			tx_type: TransactionType::Fill,
+			attempt_recorder: Arc::new(NoopTransactionAttemptRecorder),
+			callback: Box::new(|_: TransactionMonitoringEvent| {}),
+		};
+
+		let config = TransactionTrackingWithConfig {
+			tracking,
+			min_confirmations: 3,
+			monitoring_timeout_seconds: 300,
+			tx_confirmation_timeout_seconds: 600,
+		};
+
+		assert_eq!(config.min_confirmations, 3);
+		assert_eq!(config.monitoring_timeout_seconds, 300);
+		assert_eq!(config.tx_confirmation_timeout_seconds, 600);
+		assert_eq!(config.tracking.id, "test-order-123");
+
+		let debug = format!("{:?}", config.tracking);
+		assert!(debug.contains("test-order-123"));
+		assert!(debug.contains("Fill"));
+		assert!(!debug.contains("attempt_recorder"));
+	}
 }
 
 /// Trait defining the interface for transaction delivery implementations.

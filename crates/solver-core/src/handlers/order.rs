@@ -4,9 +4,12 @@
 //! and fill transactions, updating order state and publishing appropriate events.
 
 use crate::engine::event_bus::EventBus;
+use crate::state::transaction_attempt::TransactionAttemptStore;
 use crate::state::OrderStateMachine;
 use alloy_primitives::hex;
-use solver_delivery::{DeliveryService, TransactionMonitoringEvent, TransactionTracking};
+use solver_delivery::{
+	DeliveryService, TransactionAttemptRecorder, TransactionMonitoringEvent, TransactionTracking,
+};
 use solver_order::OrderService;
 use solver_storage::StorageService;
 use solver_types::{
@@ -59,6 +62,10 @@ impl OrderHandler {
 			state_machine,
 			event_bus,
 		}
+	}
+
+	fn transaction_attempt_recorder(&self) -> Arc<dyn TransactionAttemptRecorder> {
+		Arc::new(TransactionAttemptStore::new(self.storage.clone()))
 	}
 
 	/// Handles order preparation for off-chain orders.
@@ -133,6 +140,7 @@ impl OrderHandler {
 			let tracking = TransactionTracking {
 				id: order.id.clone(),
 				tx_type: TransactionType::Prepare,
+				attempt_recorder: self.transaction_attempt_recorder(),
 				callback,
 			};
 
@@ -258,6 +266,7 @@ impl OrderHandler {
 		let tracking = TransactionTracking {
 			id: order.id.clone(),
 			tx_type: TransactionType::Fill,
+			attempt_recorder: self.transaction_attempt_recorder(),
 			callback,
 		};
 

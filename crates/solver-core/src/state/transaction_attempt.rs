@@ -10,7 +10,7 @@ use solver_delivery::{TransactionAttemptRecorder, TransactionAttemptRecorderErro
 use solver_storage::{QueryFilter, StorageError, StorageIndexes, StorageService};
 use solver_types::{
 	current_timestamp, Address, StorageKey, Transaction, TransactionAttempt,
-	TransactionAttemptStatus, TransactionHash, TransactionType,
+	TransactionAttemptStatus, TransactionHash, TransactionReceipt, TransactionType,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -189,15 +189,24 @@ impl TransactionAttemptRecorder for TransactionAttemptStore {
 			.map_err(|e| TransactionAttemptRecorderError::Storage(e.to_string()))
 	}
 
-	async fn record_attempt_status(
+	async fn record_attempt_update(
 		&self,
 		attempt_id: &str,
 		status: TransactionAttemptStatus,
+		tx_hash: Option<TransactionHash>,
+		receipt: Option<TransactionReceipt>,
 		error: Option<String>,
 	) -> Result<(), TransactionAttemptRecorderError> {
-		self.update_attempt_status(attempt_id, status, error, |_| {})
-			.await
-			.map_err(|e| TransactionAttemptRecorderError::Storage(e.to_string()))?;
+		self.update_attempt_status(attempt_id, status, error, |attempt| {
+			if let Some(tx_hash) = tx_hash {
+				attempt.tx_hash = Some(tx_hash);
+			}
+			if let Some(receipt) = receipt {
+				attempt.receipt = Some(receipt);
+			}
+		})
+		.await
+		.map_err(|e| TransactionAttemptRecorderError::Storage(e.to_string()))?;
 		Ok(())
 	}
 }

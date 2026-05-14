@@ -2,12 +2,14 @@ use std::sync::Arc;
 
 use alloy_primitives::U256;
 use solver_core::state::transaction_attempt::TransactionAttemptStore;
+use solver_delivery::TransactionAttemptRecorder;
 use solver_storage::{
 	implementations::file::{FileStorage, TtlConfig},
 	StorageService,
 };
 use solver_types::{
-	Address, Transaction, TransactionAttemptStatus, TransactionHash, TransactionType,
+	Address, Transaction, TransactionAttemptStatus, TransactionHash, TransactionReceipt,
+	TransactionType,
 };
 use tempfile::TempDir;
 
@@ -37,6 +39,16 @@ fn sample_tx(chain_id: u64, nonce: Option<u64>) -> Transaction {
 
 fn sample_hash(byte: u8) -> TransactionHash {
 	TransactionHash(vec![byte; 32])
+}
+
+fn sample_receipt(hash: TransactionHash, success: bool) -> TransactionReceipt {
+	TransactionReceipt {
+		hash,
+		block_number: 123,
+		success,
+		logs: vec![],
+		block_timestamp: Some(456),
+	}
 }
 
 #[tokio::test]
@@ -142,6 +154,78 @@ async fn update_attempt_status_sets_hash_and_hash_lookup_finds_it() {
 
 	let by_hash = store.attempt_by_hash(&tx_hash).await.unwrap().unwrap();
 	assert_eq!(by_hash.id, attempt.id);
+}
+
+#[tokio::test]
+async fn recorder_update_persists_broadcast_hash_index() {
+	let (store, _temp_dir) = make_store();
+	let tx_hash = sample_hash(7);
+	let attempt = store
+		.create_planned_attempt(
+			"order-1",
+			Some(Address(vec![9; 20])),
+			TransactionType::Fill,
+			sample_tx(10, Some(7)),
+		)
+		.await
+		.unwrap();
+
+	store
+		.record_attempt_update(
+			&attempt.id,
+			TransactionAttemptStatus::Broadcast,
+			Some(tx_hash.clone()),
+			None,
+			None,
+		)
+		.await
+		.unwrap();
+
+	let stored = store.get_attempt(&attempt.id).await.unwrap();
+	assert_eq!(stored.status, TransactionAttemptStatus::Broadcast);
+	assert_eq!(stored.tx_hash, Some(tx_hash.clone()));
+	assert_eq!(stored.receipt, None);
+	assert_eq!(stored.error, None);
+
+	let by_hash = store.attempt_by_hash(&tx_hash).await.unwrap().unwrap();
+	assert_eq!(by_hash.id, attempt.id);
+}
+
+#[tokio::test]
+async fn recorder_update_persists_confirmed_receipt() {
+	let (store, _temp_dir) = make_store();
+	let tx_hash = sample_hash(8);
+	let receipt = sample_receipt(tx_hash.clone(), true);
+	let attempt = store
+		.create_planned_attempt(
+			"order-1",
+			Some(Address(vec![9; 20])),
+			TransactionType::Claim,
+			sample_tx(10, Some(7)),
+		)
+		.await
+		.unwrap();
+
+	store
+		.record_attempt_update(
+			&attempt.id,
+			TransactionAttemptStatus::Confirmed,
+			Some(tx_hash.clone()),
+			Some(receipt.clone()),
+			None,
+		)
+		.await
+		.unwrap();
+
+	let stored = store.get_attempt(&attempt.id).await.unwrap();
+	assert_eq!(stored.status, TransactionAttemptStatus::Confirmed);
+	assert_eq!(stored.tx_hash, Some(tx_hash));
+	assert_eq!(
+		stored.receipt.as_ref().unwrap().block_number,
+		receipt.block_number
+	);
+	assert_eq!(stored.receipt.as_ref().unwrap().success, true);
+	assert!(stored.is_terminal());
 }
 
 #[tokio::test]

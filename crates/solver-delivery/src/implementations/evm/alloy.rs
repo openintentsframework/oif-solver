@@ -16,7 +16,7 @@ use crate::implementations::evm::nonce::{
 };
 use crate::{
 	DeliveryError, DeliveryInterface, FeeParams, InsufficientNativeGasInfo,
-	TransactionMonitoringEvent, TransactionTrackingWithConfig,
+	TransactionAttemptRecorder, TransactionMonitoringEvent, TransactionTrackingWithConfig,
 };
 use alloy_consensus::BlockHeader;
 use alloy_network::{BlockResponse, EthereumWallet};
@@ -32,7 +32,8 @@ use alloy_transport::TransportError;
 use async_trait::async_trait;
 use solver_account::AccountSigner;
 use solver_types::{
-	ConfigSchema, Field, FieldType, NetworksConfig, Schema, Transaction as SolverTransaction,
+	Address as SolverAddress, ConfigSchema, Field, FieldType, NetworksConfig, Schema,
+	Transaction as SolverTransaction, TransactionAttempt, TransactionAttemptStatus,
 	TransactionHash, TransactionReceipt,
 };
 use std::collections::HashMap;
@@ -219,6 +220,65 @@ fn nonce_action_for_outcome(outcome: SubmissionOutcome) -> NonceCacheAction {
 		SubmissionOutcome::DefinitelyRejected => NonceCacheAction::AttemptRollback,
 		SubmissionOutcome::NonceTooLow => NonceCacheAction::NonceTooLowRetry,
 		SubmissionOutcome::Replacement | SubmissionOutcome::Ambiguous => NonceCacheAction::Keep,
+	}
+}
+
+fn attempt_status_for_submission_outcome(outcome: SubmissionOutcome) -> TransactionAttemptStatus {
+	match outcome {
+		SubmissionOutcome::NonceTooLow | SubmissionOutcome::DefinitelyRejected => {
+			TransactionAttemptStatus::SubmitRejected
+		},
+		SubmissionOutcome::Replacement | SubmissionOutcome::Ambiguous => {
+			TransactionAttemptStatus::Indeterminate
+		},
+	}
+}
+
+fn solver_address_from_alloy(address: Address) -> SolverAddress {
+	SolverAddress(address.as_slice().to_vec())
+}
+
+async fn record_planned_attempt(
+	tracking: &TransactionTrackingWithConfig,
+	signer: SolverAddress,
+	tx: SolverTransaction,
+) -> Result<TransactionAttempt, DeliveryError> {
+	tracking
+		.tracking
+		.attempt_recorder
+		.record_planned_attempt(
+			&tracking.tracking.id,
+			Some(signer),
+			tracking.tracking.tx_type,
+			tx,
+		)
+		.await
+		.map_err(|e| {
+			DeliveryError::Network(format!(
+				"Failed to persist planned transaction attempt before broadcast: {e}"
+			))
+		})
+}
+
+async fn record_attempt_update_best_effort(
+	recorder: Arc<dyn TransactionAttemptRecorder>,
+	attempt_id: String,
+	status: TransactionAttemptStatus,
+	tx_hash: Option<TransactionHash>,
+	receipt: Option<TransactionReceipt>,
+	error: Option<String>,
+	context: &'static str,
+) {
+	if let Err(err) = recorder
+		.record_attempt_update(&attempt_id, status, tx_hash, receipt, error)
+		.await
+	{
+		tracing::error!(
+			attempt_id,
+			%err,
+			context,
+			"Failed to update transaction attempt ledger"
+		);
 	}
 }
 
@@ -853,6 +913,20 @@ impl DeliveryInterface for AlloyDelivery {
 		// (NonceTooLow / DefinitelyRejected / Replacement / Ambiguous) and act
 		// on the local nonce cache accordingly. See `nonce_action_for_outcome`
 		// and `apply_nonce_cache_action`.
+		let mut broadcast_attempt_id: Option<String> = None;
+		let first_attempt = if let Some(tracking) = tracking.as_ref() {
+			Some(
+				record_planned_attempt(
+					tracking,
+					solver_address_from_alloy(from),
+					tx_attempt.clone(),
+				)
+				.await?,
+			)
+		} else {
+			None
+		};
+
 		let pending_tx = match provider.send_transaction(request).await {
 			Ok(p) => {
 				tracing::debug!(
@@ -862,11 +936,38 @@ impl DeliveryInterface for AlloyDelivery {
 					tx_hash = %p.tx_hash(),
 					"tx submitted; nonce committed"
 				);
+				if let (Some(tracking), Some(attempt)) = (tracking.as_ref(), first_attempt.as_ref())
+				{
+					record_attempt_update_best_effort(
+						tracking.tracking.attempt_recorder.clone(),
+						attempt.id.clone(),
+						TransactionAttemptStatus::Broadcast,
+						Some(TransactionHash(p.tx_hash().0.to_vec())),
+						None,
+						None,
+						"first_broadcast",
+					)
+					.await;
+					broadcast_attempt_id = Some(attempt.id.clone());
+				}
 				p
 			},
 			Err(first_err) => {
 				let first_err_str = first_err.to_string();
 				let outcome = classify_submission_outcome(&first_err_str);
+				if let (Some(tracking), Some(attempt)) = (tracking.as_ref(), first_attempt.as_ref())
+				{
+					record_attempt_update_best_effort(
+						tracking.tracking.attempt_recorder.clone(),
+						attempt.id.clone(),
+						attempt_status_for_submission_outcome(outcome),
+						None,
+						None,
+						Some(first_err_str.clone()),
+						"first_submit_error",
+					)
+					.await;
+				}
 				match nonce_action_for_outcome(outcome) {
 					NonceCacheAction::NonceTooLowRetry => {
 						// EXISTING path — resync local cache from chain
@@ -882,6 +983,18 @@ impl DeliveryInterface for AlloyDelivery {
 						let retry_nonce = self.resync_nonce_for(chain_id, from).await?;
 						let mut retry_tx = tx_attempt.clone();
 						retry_tx.nonce = Some(retry_nonce);
+						let retry_attempt = if let Some(tracking) = tracking.as_ref() {
+							Some(
+								record_planned_attempt(
+									tracking,
+									solver_address_from_alloy(from),
+									retry_tx.clone(),
+								)
+								.await?,
+							)
+						} else {
+							None
+						};
 						let retry_request: TransactionRequest = retry_tx.into();
 
 						match provider.send_transaction(retry_request).await {
@@ -891,11 +1004,40 @@ impl DeliveryInterface for AlloyDelivery {
 									retry_nonce,
 									"Resynced nonce retry succeeded"
 								);
+								if let (Some(tracking), Some(attempt)) =
+									(tracking.as_ref(), retry_attempt.as_ref())
+								{
+									record_attempt_update_best_effort(
+										tracking.tracking.attempt_recorder.clone(),
+										attempt.id.clone(),
+										TransactionAttemptStatus::Broadcast,
+										Some(TransactionHash(p.tx_hash().0.to_vec())),
+										None,
+										None,
+										"retry_broadcast",
+									)
+									.await;
+									broadcast_attempt_id = Some(attempt.id.clone());
+								}
 								p
 							},
 							Err(retry_err) => {
 								let retry_err_str = retry_err.to_string();
 								let retry_outcome = classify_submission_outcome(&retry_err_str);
+								if let (Some(tracking), Some(attempt)) =
+									(tracking.as_ref(), retry_attempt.as_ref())
+								{
+									record_attempt_update_best_effort(
+										tracking.tracking.attempt_recorder.clone(),
+										attempt.id.clone(),
+										attempt_status_for_submission_outcome(retry_outcome),
+										None,
+										None,
+										Some(retry_err_str.clone()),
+										"retry_submit_error",
+									)
+									.await;
+								}
 								match nonce_action_for_outcome(retry_outcome) {
 									NonceCacheAction::NonceTooLowRetry => {
 										tracing::error!(
@@ -1089,6 +1231,8 @@ impl DeliveryInterface for AlloyDelivery {
 		// If tracking is provided, set up monitoring
 		if let Some(tracking) = tracking {
 			let tx_hash_clone = tx_hash_obj.clone();
+			let monitor_attempt_id = broadcast_attempt_id.clone();
+			let monitor_attempt_recorder = tracking.tracking.attempt_recorder.clone();
 			// Erase the root provider to a `DynProvider` so it matches
 			// `monitor_transaction`'s signature (and `ProviderProbe` inside it).
 			let provider_clone = pending_tx.provider().clone().erased();
@@ -1103,6 +1247,18 @@ impl DeliveryInterface for AlloyDelivery {
 
 				match result {
 					PollOutcome::Confirmed(receipt) => {
+						if let Some(attempt_id) = monitor_attempt_id.clone() {
+							record_attempt_update_best_effort(
+								monitor_attempt_recorder.clone(),
+								attempt_id,
+								TransactionAttemptStatus::Confirmed,
+								Some(tx_hash_clone.clone()),
+								Some(receipt.clone()),
+								None,
+								"monitor_confirmed",
+							)
+							.await;
+						}
 						(tracking.tracking.callback)(TransactionMonitoringEvent::Confirmed {
 							id: tracking.tracking.id,
 							tx_hash: tx_hash_clone,
@@ -1111,6 +1267,18 @@ impl DeliveryInterface for AlloyDelivery {
 						});
 					},
 					PollOutcome::Reverted(error) => {
+						if let Some(attempt_id) = monitor_attempt_id.clone() {
+							record_attempt_update_best_effort(
+								monitor_attempt_recorder.clone(),
+								attempt_id,
+								TransactionAttemptStatus::Reverted,
+								Some(tx_hash_clone.clone()),
+								None,
+								Some(error.clone()),
+								"monitor_reverted",
+							)
+							.await;
+						}
 						(tracking.tracking.callback)(TransactionMonitoringEvent::Failed {
 							id: tracking.tracking.id,
 							tx_hash: tx_hash_clone,
@@ -1119,6 +1287,18 @@ impl DeliveryInterface for AlloyDelivery {
 						});
 					},
 					PollOutcome::Indeterminate(reason) => {
+						if let Some(attempt_id) = monitor_attempt_id.clone() {
+							record_attempt_update_best_effort(
+								monitor_attempt_recorder.clone(),
+								attempt_id,
+								TransactionAttemptStatus::Indeterminate,
+								Some(tx_hash_clone.clone()),
+								None,
+								Some(reason.clone()),
+								"monitor_indeterminate",
+							)
+							.await;
+						}
 						(tracking.tracking.callback)(TransactionMonitoringEvent::Indeterminate {
 							id: tracking.tracking.id,
 							tx_hash: tx_hash_clone,
@@ -2127,6 +2307,28 @@ mod tests {
 	}
 
 	#[test]
+	fn submission_outcome_maps_to_attempt_status() {
+		use SubmissionOutcome::*;
+
+		assert_eq!(
+			attempt_status_for_submission_outcome(NonceTooLow),
+			TransactionAttemptStatus::SubmitRejected
+		);
+		assert_eq!(
+			attempt_status_for_submission_outcome(DefinitelyRejected),
+			TransactionAttemptStatus::SubmitRejected
+		);
+		assert_eq!(
+			attempt_status_for_submission_outcome(Replacement),
+			TransactionAttemptStatus::Indeterminate
+		);
+		assert_eq!(
+			attempt_status_for_submission_outcome(Ambiguous),
+			TransactionAttemptStatus::Indeterminate
+		);
+	}
+
+	#[test]
 	fn apply_nonce_cache_action_rollback_with_pending_resets_cache() {
 		use NonceCacheAction::*;
 		let mgr = ResettableNonceManager::new();
@@ -2979,8 +3181,11 @@ mod tests {
 	// ========================================================================
 
 	mod tracking_config_tests {
-		use crate::{TransactionTracking, TransactionTrackingWithConfig};
+		use crate::{
+			NoopTransactionAttemptRecorder, TransactionTracking, TransactionTrackingWithConfig,
+		};
 		use solver_types::TransactionType;
+		use std::sync::Arc;
 
 		#[test]
 		fn test_tracking_with_config_creation() {
@@ -2989,6 +3194,7 @@ mod tests {
 			let tracking = TransactionTracking {
 				id: "test-order-123".to_string(),
 				tx_type: TransactionType::Fill,
+				attempt_recorder: Arc::new(NoopTransactionAttemptRecorder),
 				callback,
 			};
 
@@ -3020,6 +3226,7 @@ mod tests {
 				let tracking = TransactionTracking {
 					id: format!("order-{tx_type:?}"),
 					tx_type,
+					attempt_recorder: Arc::new(NoopTransactionAttemptRecorder),
 					callback,
 				};
 
