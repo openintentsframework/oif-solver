@@ -204,6 +204,17 @@ impl StorageInterface for MemoryStorage {
 		}
 	}
 
+	async fn compare_and_swap_with_indexes(
+		&self,
+		key: &str,
+		expected: &[u8],
+		new_value: Vec<u8>,
+		_indexes: Option<StorageIndexes>,
+		ttl: Option<Duration>,
+	) -> Result<bool, StorageError> {
+		self.compare_and_swap(key, expected, new_value, ttl).await
+	}
+
 	async fn delete_if_exists(&self, key: &str) -> Result<bool, StorageError> {
 		let mut store = self.store.write().await;
 

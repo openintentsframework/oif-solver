@@ -501,6 +501,66 @@ impl FileStorage {
 		}
 		Ok(removed)
 	}
+
+	async fn compare_and_swap_internal(
+		&self,
+		key: &str,
+		expected: &[u8],
+		new_value: Vec<u8>,
+		indexes: Option<StorageIndexes>,
+		ttl: Option<Duration>,
+	) -> Result<bool, StorageError> {
+		let path = self.get_file_path(key);
+
+		let current_data = match fs::read(&path).await {
+			Ok(data) => data,
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+				return Err(StorageError::NotFound(key.to_string()));
+			},
+			Err(e) => return Err(StorageError::Backend(e.to_string())),
+		};
+
+		let current_value = if let Ok(header) = FileHeader::deserialize(&current_data) {
+			if header.is_expired() {
+				return Err(StorageError::NotFound(key.to_string()));
+			}
+			if current_data.len() > FileHeader::SIZE {
+				&current_data[FileHeader::SIZE..]
+			} else {
+				&[]
+			}
+		} else {
+			&current_data[..]
+		};
+
+		if current_value != expected {
+			return Ok(false);
+		}
+
+		let ttl = ttl.unwrap_or_else(|| self.get_ttl_for_key(key));
+		let header = FileHeader::new(ttl);
+		let header_bytes = header.serialize();
+
+		let mut file_data = Vec::with_capacity(FileHeader::SIZE + new_value.len());
+		file_data.extend_from_slice(&header_bytes);
+		file_data.extend_from_slice(&new_value);
+
+		let temp_path = path.with_extension("tmp");
+		fs::write(&temp_path, file_data)
+			.await
+			.map_err(|e| StorageError::Backend(e.to_string()))?;
+
+		fs::rename(&temp_path, &path)
+			.await
+			.map_err(|e| StorageError::Backend(e.to_string()))?;
+
+		if let Some(indexes) = indexes {
+			let namespace = key.split(':').next().unwrap_or("");
+			self.update_indexes(namespace, key, &indexes).await?;
+		}
+
+		Ok(true)
+	}
 }
 
 #[async_trait]
@@ -789,56 +849,20 @@ impl StorageInterface for FileStorage {
 		new_value: Vec<u8>,
 		ttl: Option<Duration>,
 	) -> Result<bool, StorageError> {
-		let path = self.get_file_path(key);
-
-		// Read current value
-		let current_data = match fs::read(&path).await {
-			Ok(data) => data,
-			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-				return Err(StorageError::NotFound(key.to_string()));
-			},
-			Err(e) => return Err(StorageError::Backend(e.to_string())),
-		};
-
-		// Parse header and get current value
-		let current_value = if let Ok(header) = FileHeader::deserialize(&current_data) {
-			if header.is_expired() {
-				return Err(StorageError::NotFound(key.to_string()));
-			}
-			if current_data.len() > FileHeader::SIZE {
-				&current_data[FileHeader::SIZE..]
-			} else {
-				&[]
-			}
-		} else {
-			// Legacy file without header
-			&current_data[..]
-		};
-
-		// Compare
-		if current_value != expected {
-			return Ok(false);
-		}
-
-		// Match - write new value
-		let ttl = ttl.unwrap_or_else(|| self.get_ttl_for_key(key));
-		let header = FileHeader::new(ttl);
-		let header_bytes = header.serialize();
-
-		let mut file_data = Vec::with_capacity(FileHeader::SIZE + new_value.len());
-		file_data.extend_from_slice(&header_bytes);
-		file_data.extend_from_slice(&new_value);
-
-		let temp_path = path.with_extension("tmp");
-		fs::write(&temp_path, file_data)
+		self.compare_and_swap_internal(key, expected, new_value, None, ttl)
 			.await
-			.map_err(|e| StorageError::Backend(e.to_string()))?;
+	}
 
-		fs::rename(&temp_path, &path)
+	async fn compare_and_swap_with_indexes(
+		&self,
+		key: &str,
+		expected: &[u8],
+		new_value: Vec<u8>,
+		indexes: Option<StorageIndexes>,
+		ttl: Option<Duration>,
+	) -> Result<bool, StorageError> {
+		self.compare_and_swap_internal(key, expected, new_value, indexes, ttl)
 			.await
-			.map_err(|e| StorageError::Backend(e.to_string()))?;
-
-		Ok(true)
 	}
 
 	async fn delete_if_exists(&self, key: &str) -> Result<bool, StorageError> {

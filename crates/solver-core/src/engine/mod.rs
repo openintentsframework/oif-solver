@@ -19,6 +19,7 @@ use self::{
 };
 use crate::handlers::{IntentHandler, OrderHandler, SettlementHandler, TransactionHandler};
 use crate::recovery::RecoveryService;
+use crate::state::transaction_attempt::TransactionAttemptStore;
 use crate::state::OrderStateMachine;
 use alloy_primitives::hex;
 use solver_account::AccountService;
@@ -265,6 +266,9 @@ impl SolverEngine {
 	pub async fn initialize_with_recovery(&self) -> Result<Vec<Intent>, EngineError> {
 		tracing::info!("Initializing solver engine with state recovery");
 
+		let transaction_attempt_store =
+			Arc::new(TransactionAttemptStore::new(self.storage.clone()));
+
 		// Create recovery service with required dependencies
 		let recovery_service = RecoveryService::new(
 			self.storage.clone(),
@@ -272,6 +276,7 @@ impl SolverEngine {
 			self.delivery.clone(),
 			self.settlement.clone(),
 			self.event_bus.clone(),
+			transaction_attempt_store,
 		);
 
 		// Perform recovery

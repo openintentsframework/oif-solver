@@ -1,15 +1,20 @@
-use std::sync::Arc;
+use std::sync::{
+	atomic::{AtomicUsize, Ordering},
+	Arc,
+};
 
 use alloy_primitives::U256;
-use solver_core::state::transaction_attempt::TransactionAttemptStore;
+use solver_core::state::transaction_attempt::{
+	TransactionAttemptStore, TransactionAttemptStoreError,
+};
 use solver_delivery::TransactionAttemptRecorder;
 use solver_storage::{
 	implementations::file::{FileStorage, TtlConfig},
-	StorageService,
+	MockStorageInterface, StorageService,
 };
 use solver_types::{
-	Address, Transaction, TransactionAttemptStatus, TransactionHash, TransactionReceipt,
-	TransactionType,
+	Address, StorageKey, Transaction, TransactionAttempt, TransactionAttemptStatus,
+	TransactionHash, TransactionReceipt, TransactionType,
 };
 use tempfile::TempDir;
 
@@ -49,6 +54,21 @@ fn sample_receipt(hash: TransactionHash, success: bool) -> TransactionReceipt {
 		logs: vec![],
 		block_timestamp: Some(456),
 	}
+}
+
+fn sample_attempt_with_id_and_status(
+	id: &str,
+	status: TransactionAttemptStatus,
+) -> TransactionAttempt {
+	let mut attempt = TransactionAttempt::planned(
+		id.to_string(),
+		"order-1".to_string(),
+		Some(Address(vec![9; 20])),
+		TransactionType::Fill,
+		sample_tx(10, Some(7)),
+	);
+	attempt.status = status;
+	attempt
 }
 
 #[tokio::test]
@@ -267,4 +287,115 @@ async fn terminal_attempt_cannot_be_mutated() {
 	let loaded = store.get_attempt(&attempt.id).await.unwrap();
 	assert_eq!(loaded.status, TransactionAttemptStatus::Confirmed);
 	assert_eq!(loaded.error, None);
+}
+
+#[tokio::test]
+async fn update_attempt_status_rejects_when_cas_loser_sees_terminal_attempt() {
+	let attempt_id = "attempt-race-terminal";
+	let key = format!("{}:{attempt_id}", StorageKey::TransactionAttempts.as_str());
+
+	let non_terminal =
+		sample_attempt_with_id_and_status(attempt_id, TransactionAttemptStatus::Broadcast);
+	let terminal =
+		sample_attempt_with_id_and_status(attempt_id, TransactionAttemptStatus::Confirmed);
+	let non_terminal_bytes = serde_json::to_vec(&non_terminal).unwrap();
+	let terminal_bytes = serde_json::to_vec(&terminal).unwrap();
+	let read_count = Arc::new(AtomicUsize::new(0));
+
+	let mut backend = MockStorageInterface::new();
+	{
+		let key = key.clone();
+		let read_count = read_count.clone();
+		let non_terminal_bytes = non_terminal_bytes.clone();
+		let terminal_bytes = terminal_bytes.clone();
+		backend
+			.expect_get_bytes()
+			.withf(move |actual| actual == key.as_str())
+			.times(2)
+			.returning(move |_| {
+				let call = read_count.fetch_add(1, Ordering::SeqCst);
+				let bytes = if call == 0 {
+					non_terminal_bytes.clone()
+				} else {
+					terminal_bytes.clone()
+				};
+				Box::pin(async move { Ok(bytes) })
+			});
+	}
+
+	backend
+		.expect_compare_and_swap_with_indexes()
+		.times(1)
+		.returning(|_, _, _, _, _| Box::pin(async move { Ok(false) }));
+
+	let store = TransactionAttemptStore::new(Arc::new(StorageService::new(Box::new(backend))));
+
+	let result = store
+		.update_attempt_status(
+			attempt_id,
+			TransactionAttemptStatus::Indeterminate,
+			Some("monitor timeout".to_string()),
+			|_| {},
+		)
+		.await;
+
+	assert!(matches!(
+		result,
+		Err(TransactionAttemptStoreError::TerminalAttempt(id)) if id == attempt_id
+	));
+}
+
+#[tokio::test]
+async fn update_attempt_status_returns_conflict_when_cas_loser_sees_non_terminal_attempt() {
+	let attempt_id = "attempt-race-active";
+	let key = format!("{}:{attempt_id}", StorageKey::TransactionAttempts.as_str());
+
+	let first = sample_attempt_with_id_and_status(attempt_id, TransactionAttemptStatus::Broadcast);
+	let second =
+		sample_attempt_with_id_and_status(attempt_id, TransactionAttemptStatus::Indeterminate);
+	let first_bytes = serde_json::to_vec(&first).unwrap();
+	let second_bytes = serde_json::to_vec(&second).unwrap();
+	let read_count = Arc::new(AtomicUsize::new(0));
+
+	let mut backend = MockStorageInterface::new();
+	{
+		let key = key.clone();
+		let read_count = read_count.clone();
+		let first_bytes = first_bytes.clone();
+		let second_bytes = second_bytes.clone();
+		backend
+			.expect_get_bytes()
+			.withf(move |actual| actual == key.as_str())
+			.times(2)
+			.returning(move |_| {
+				let call = read_count.fetch_add(1, Ordering::SeqCst);
+				let bytes = if call == 0 {
+					first_bytes.clone()
+				} else {
+					second_bytes.clone()
+				};
+				Box::pin(async move { Ok(bytes) })
+			});
+	}
+
+	backend
+		.expect_compare_and_swap_with_indexes()
+		.times(1)
+		.returning(|_, _, _, _, _| Box::pin(async move { Ok(false) }));
+
+	let store = TransactionAttemptStore::new(Arc::new(StorageService::new(Box::new(backend))));
+
+	let result = store
+		.update_attempt_status(
+			attempt_id,
+			TransactionAttemptStatus::Confirmed,
+			None,
+			|_| {},
+		)
+		.await;
+
+	assert!(matches!(
+		result,
+		Err(TransactionAttemptStoreError::ConcurrentModification(id)) if id == attempt_id
+	));
 }
