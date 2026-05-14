@@ -43,5 +43,5 @@ reqwest = { workspace = true }
 async-trait = { workspace = true }
 solver-core = { path = "../solver-core" }
 solver-delivery = { path = "../solver-delivery" }
-solver-settlement = { path = "../solver-settlement" }
+solver-settlement = { path = "../solver-settlement", features = ["testing"] }
 solver-storage = { path = "../solver-storage" }
