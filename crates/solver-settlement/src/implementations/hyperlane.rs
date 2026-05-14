@@ -494,7 +494,8 @@ impl HyperlaneSettlement {
 	) -> Result<[u8; 32], SettlementError> {
 		// Extract output details from order
 		let output = extract_output_details(order)?;
-		let order_id_bytes = order_id_to_bytes32(&order.id);
+		let order_id_bytes =
+			order_id_to_bytes32(&order.id).map_err(SettlementError::ValidationFailed)?;
 
 		// Encode the FillDescription payload
 		let payload = encode_fill_description(
@@ -1059,7 +1060,8 @@ impl SettlementInterface for HyperlaneSettlement {
 		let output = extract_output_details(order)?;
 
 		// Convert order ID to bytes32
-		let order_id_bytes = order_id_to_bytes32(&order.id);
+		let order_id_bytes =
+			order_id_to_bytes32(&order.id).map_err(SettlementError::ValidationFailed)?;
 
 		// Extract solver and timestamp from OutputFilled event
 		let (solver_bytes, fill_timestamp) =
@@ -1204,7 +1206,8 @@ impl SettlementInterface for HyperlaneSettlement {
 				})
 				.collect();
 
-			let order_id_bytes = order_id_to_bytes32(&order.id);
+			let order_id_bytes =
+				order_id_to_bytes32(&order.id).map_err(SettlementError::ValidationFailed)?;
 			let (solver_bytes, timestamp) = extract_fill_details_from_logs(&logs, &order_id_bytes)?;
 
 			let mut solver_id = [0u8; 32];

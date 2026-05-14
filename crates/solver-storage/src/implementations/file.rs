@@ -296,6 +296,45 @@ impl FileStorage {
 		operation().await
 	}
 
+	/// Executes an operation with an exclusive lock on a data file.
+	///
+	/// This is separate from index locking: CAS correctness depends on holding
+	/// one lock across read, compare, and write of the value file itself.
+	async fn with_data_lock<F, Fut, R>(path: &Path, operation: F) -> Result<R, StorageError>
+	where
+		F: FnOnce() -> Fut + Send,
+		Fut: std::future::Future<Output = Result<R, StorageError>> + Send,
+		R: Send,
+	{
+		let lock_path = path.with_extension("data.lock");
+
+		if let Some(parent) = lock_path.parent() {
+			fs::create_dir_all(parent).await.map_err(|e| {
+				StorageError::Backend(format!("Failed to create lock directory: {e}"))
+			})?;
+		}
+
+		let result = tokio::task::spawn_blocking(move || {
+			let lock_file = std::fs::OpenOptions::new()
+				.create(true)
+				.truncate(false)
+				.read(true)
+				.write(true)
+				.open(&lock_path)
+				.map_err(|e| StorageError::Backend(format!("Failed to open lock file: {e}")))?;
+
+			FileExt::lock_exclusive(&lock_file)
+				.map_err(|e| StorageError::Backend(format!("Failed to acquire lock: {e}")))?;
+
+			Ok((lock_file,))
+		})
+		.await
+		.map_err(|e| StorageError::Backend(format!("Failed to spawn blocking task: {e}")))?;
+
+		let (_lock_file,) = result?;
+		operation().await
+	}
+
 	/// Updates index files when storing data.
 	async fn update_indexes(
 		&self,
@@ -511,55 +550,64 @@ impl FileStorage {
 		ttl: Option<Duration>,
 	) -> Result<bool, StorageError> {
 		let path = self.get_file_path(key);
+		let file_path = path.clone();
 
-		let current_data = match fs::read(&path).await {
-			Ok(data) => data,
-			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-				return Err(StorageError::NotFound(key.to_string()));
-			},
-			Err(e) => return Err(StorageError::Backend(e.to_string())),
-		};
+		Self::with_data_lock(&path, || async move {
+			let current_data = match fs::read(&file_path).await {
+				Ok(data) => data,
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+					return Err(StorageError::NotFound(key.to_string()));
+				},
+				Err(e) => return Err(StorageError::Backend(e.to_string())),
+			};
 
-		let current_value = if let Ok(header) = FileHeader::deserialize(&current_data) {
-			if header.is_expired() {
-				return Err(StorageError::NotFound(key.to_string()));
-			}
-			if current_data.len() > FileHeader::SIZE {
-				&current_data[FileHeader::SIZE..]
+			let current_value = if let Ok(header) = FileHeader::deserialize(&current_data) {
+				if header.is_expired() {
+					return Err(StorageError::NotFound(key.to_string()));
+				}
+				if current_data.len() > FileHeader::SIZE {
+					&current_data[FileHeader::SIZE..]
+				} else {
+					&[]
+				}
 			} else {
-				&[]
+				&current_data[..]
+			};
+
+			if current_value != expected {
+				return Ok(false);
 			}
-		} else {
-			&current_data[..]
-		};
 
-		if current_value != expected {
-			return Ok(false);
-		}
+			let ttl = ttl.unwrap_or_else(|| self.get_ttl_for_key(key));
+			let header = FileHeader::new(ttl);
+			let header_bytes = header.serialize();
 
-		let ttl = ttl.unwrap_or_else(|| self.get_ttl_for_key(key));
-		let header = FileHeader::new(ttl);
-		let header_bytes = header.serialize();
+			let mut file_data = Vec::with_capacity(FileHeader::SIZE + new_value.len());
+			file_data.extend_from_slice(&header_bytes);
+			file_data.extend_from_slice(&new_value);
 
-		let mut file_data = Vec::with_capacity(FileHeader::SIZE + new_value.len());
-		file_data.extend_from_slice(&header_bytes);
-		file_data.extend_from_slice(&new_value);
+			let nonce = SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.map(|d| d.as_nanos())
+				.unwrap_or(0);
+			let temp_path =
+				file_path.with_extension(format!("{}.{}.tmp", std::process::id(), nonce));
+			fs::write(&temp_path, file_data)
+				.await
+				.map_err(|e| StorageError::Backend(e.to_string()))?;
 
-		let temp_path = path.with_extension("tmp");
-		fs::write(&temp_path, file_data)
-			.await
-			.map_err(|e| StorageError::Backend(e.to_string()))?;
+			fs::rename(&temp_path, &file_path)
+				.await
+				.map_err(|e| StorageError::Backend(e.to_string()))?;
 
-		fs::rename(&temp_path, &path)
-			.await
-			.map_err(|e| StorageError::Backend(e.to_string()))?;
+			if let Some(indexes) = indexes {
+				let namespace = key.split(':').next().unwrap_or("");
+				self.update_indexes(namespace, key, &indexes).await?;
+			}
 
-		if let Some(indexes) = indexes {
-			let namespace = key.split(':').next().unwrap_or("");
-			self.update_indexes(namespace, key, &indexes).await?;
-		}
-
-		Ok(true)
+			Ok(true)
+		})
+		.await
 	}
 }
 

@@ -388,7 +388,17 @@ impl RecoveryService {
 				return StageResolution::NotFound;
 			},
 		};
-		let order_id_bytes = solver_types::order_id_to_bytes32(&order.id);
+		let order_id_bytes = match solver_types::order_id_to_bytes32(&order.id) {
+			Ok(bytes) => bytes,
+			Err(error) => {
+				tracing::warn!(
+					order_id = %order.id,
+					%error,
+					"invalid order id for fill chain probe"
+				);
+				return StageResolution::Unknown;
+			},
+		};
 
 		let evidence = chain_evidence::chain_evidence_for_fill(
 			&self.delivery,
@@ -403,7 +413,11 @@ impl RecoveryService {
 			.await
 	}
 
-	async fn claim_chain_evidence(&self, order: &mut Order) -> StageResolution {
+	async fn claim_chain_evidence(
+		&self,
+		order: &mut Order,
+		attempts: &[TransactionAttempt],
+	) -> StageResolution {
 		let chain_id = match order.input_chains.first().map(|c| c.chain_id) {
 			Some(id) => id,
 			None => {
@@ -426,7 +440,21 @@ impl RecoveryService {
 				return StageResolution::NotFound;
 			},
 		};
-		let order_id_bytes = solver_types::order_id_to_bytes32(&order.id);
+		let order_id_bytes = match solver_types::order_id_to_bytes32(&order.id) {
+			Ok(bytes) => bytes,
+			Err(error) => {
+				tracing::warn!(
+					order_id = %order.id,
+					%error,
+					"invalid order id for claim chain probe"
+				);
+				return StageResolution::Unknown;
+			},
+		};
+		let anchor_tx = order
+			.prepare_tx_hash
+			.clone()
+			.or_else(|| choose_recovery_attempt_hash(attempts, TransactionType::Prepare));
 
 		let candidates: Vec<&solver_types::Address> =
 			std::iter::once(&network.input_settler_address)
@@ -439,7 +467,7 @@ impl RecoveryService {
 				chain_id,
 				settler,
 				&order_id_bytes,
-				order.prepare_tx_hash.as_ref(),
+				anchor_tx.as_ref(),
 				chain_evidence::DEFAULT_RECOVERY_SCAN_WINDOW_BLOCKS,
 			)
 			.await;
@@ -524,7 +552,7 @@ impl RecoveryService {
 		// Layer 3: chain log probe
 		match tx_type {
 			TransactionType::Fill => self.fill_chain_evidence(order).await,
-			TransactionType::Claim => self.claim_chain_evidence(order).await,
+			TransactionType::Claim => self.claim_chain_evidence(order, attempts).await,
 			_ => StageResolution::NotFound,
 		}
 	}
@@ -652,6 +680,14 @@ impl RecoveryService {
 
 				match self.delivery.get_status(&post_fill_tx, chain_id).await {
 					Ok(true) => {
+						if order.fill_proof.is_some() {
+							return Ok((
+								order.clone(),
+								ReconcileResult::NeedsPreClaim {
+									fill_proof: order.fill_proof.clone(),
+								},
+							));
+						}
 						return Ok((order, ReconcileResult::NeedsMonitoring));
 					},
 					Ok(false) => {
@@ -2149,6 +2185,65 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn post_fill_confirmed_with_fill_proof_needs_pre_claim() {
+		let mut mock_delivery = MockDeliveryInterface::new();
+		let mut order = create_test_order_with_status(OrderStatus::Settled);
+		order.post_fill_tx_hash = Some(TransactionHash(vec![0xdd; 32]));
+		order.fill_proof = Some(create_test_fill_proof());
+
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(TransactionHash(vec![0xdd; 32])), eq(137u64))
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async {
+					Ok(solver_types::TransactionReceipt {
+						hash: TransactionHash(vec![0xdd; 32]),
+						block_number: 12345,
+						success: true,
+						block_timestamp: None,
+						logs: vec![],
+					})
+				})
+			});
+
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				137u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			20,
+			60,
+		));
+
+		let storage = Arc::new(StorageService::new(Box::new(MockStorageInterface::new())));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let recovery_service = RecoveryService::new(
+			storage,
+			state_machine,
+			delivery,
+			settlement,
+			EventBus::new(100),
+			empty_attempt_store(),
+			empty_networks_config(),
+		);
+
+		let (_, result) = recovery_service
+			.reconcile_with_blockchain(&order)
+			.await
+			.unwrap();
+
+		assert!(matches!(
+			result,
+			ReconcileResult::NeedsPreClaim {
+				fill_proof: Some(_)
+			}
+		));
+	}
+
+	#[tokio::test]
 	async fn test_reconcile_with_blockchain_post_fill_recovery_miss_needs_post_fill() {
 		let mut mock_delivery = MockDeliveryInterface::new();
 		let mut mock_settlement = MockSettlementInterface::new();
@@ -3009,6 +3104,137 @@ mod tests {
 			.unwrap();
 		assert!(matches!(result, ReconcileResult::Finalized));
 		assert_eq!(repaired.claim_tx_hash, Some(claim_hash.clone()));
+	}
+
+	#[tokio::test]
+	async fn claim_chain_probe_uses_prepare_hash_from_attempt_ledger_as_anchor() {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let attempt_store = Arc::new(TransactionAttemptStore::new(storage.clone()));
+
+		let mut order = create_test_order_with_status(OrderStatus::Settled);
+		order.prepare_tx_hash = None;
+		order.claim_tx_hash = None;
+		state_machine.store_order(&order).await.unwrap();
+
+		let prepare_hash = TransactionHash(vec![0xaa; 32]);
+		let claim_hash = TransactionHash(vec![0xc1; 32]);
+		let prepare_attempt = attempt_store
+			.create_planned_attempt(
+				&order.id,
+				Some(Address(vec![9; 20])),
+				TransactionType::Prepare,
+				sample_tx(1),
+			)
+			.await
+			.unwrap();
+		attempt_store
+			.update_attempt_status(
+				&prepare_attempt.id,
+				TransactionAttemptStatus::Broadcast,
+				None,
+				|attempt| {
+					attempt.tx_hash = Some(prepare_hash.clone());
+				},
+			)
+			.await
+			.unwrap();
+
+		let input_settler = Address(vec![0xcc; 20]);
+		let networks = networks_with(
+			1,
+			test_network_config(input_settler.clone(), Address(vec![0xaa; 20])),
+		);
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_block_number()
+			.with(eq(1u64))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(20_000_000u64) }));
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(prepare_hash.clone()), eq(1u64))
+			.times(1)
+			.returning(|hash, _| {
+				let hash = hash.clone();
+				Box::pin(async move {
+					Ok(solver_types::TransactionReceipt {
+						hash,
+						block_number: 19_990_000,
+						success: true,
+						block_timestamp: None,
+						logs: vec![],
+					})
+				})
+			});
+
+		let claim_hash_for_logs = claim_hash.clone();
+		mock_delivery
+			.expect_get_logs()
+			.withf(|chain_id, filter| *chain_id == 1 && matches_event::<Finalised>(filter))
+			.times(1)
+			.returning(move |_, _| {
+				let h = claim_hash_for_logs.clone();
+				Box::pin(async move {
+					Ok(vec![solver_types::Log {
+						address: Address(vec![0xcc; 20]),
+						topics: vec![],
+						data: vec![],
+						transaction_hash: Some(h),
+						block_number: Some(19_995_000),
+					}])
+				})
+			});
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(claim_hash.clone()), eq(1u64))
+			.times(1)
+			.returning(|hash, _| {
+				let hash = hash.clone();
+				Box::pin(async move {
+					Ok(solver_types::TransactionReceipt {
+						hash,
+						block_number: 19_995_000,
+						success: true,
+						block_timestamp: None,
+						logs: vec![],
+					})
+				})
+			});
+
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				1u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			20,
+			60,
+		));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+
+		let recovery_service = RecoveryService::new(
+			storage,
+			state_machine,
+			delivery,
+			settlement,
+			EventBus::new(100),
+			attempt_store,
+			networks,
+		);
+
+		let (repaired, result) = recovery_service
+			.reconcile_with_blockchain(&order)
+			.await
+			.unwrap();
+
+		assert!(matches!(result, ReconcileResult::Finalized));
+		assert_eq!(repaired.claim_tx_hash, Some(claim_hash));
 	}
 
 	#[tokio::test]
