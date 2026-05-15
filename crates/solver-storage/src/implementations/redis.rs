@@ -917,6 +917,30 @@ impl StorageInterface for RedisStorage {
 		}
 	}
 
+	async fn compare_and_swap_with_indexes(
+		&self,
+		key: &str,
+		expected: &[u8],
+		new_value: Vec<u8>,
+		indexes: Option<StorageIndexes>,
+		ttl: Option<Duration>,
+	) -> Result<bool, StorageError> {
+		let effective_ttl = ttl.or_else(|| self.get_ttl_for_key(key));
+		let swapped = self
+			.compare_and_swap(key, expected, new_value, effective_ttl)
+			.await?;
+
+		if swapped {
+			if let Some(indexes) = indexes {
+				let namespace = key.split(':').next().unwrap_or("");
+				self.update_indexes(key, namespace, &indexes, effective_ttl)
+					.await?;
+			}
+		}
+
+		Ok(swapped)
+	}
+
 	async fn delete_if_exists(&self, key: &str) -> Result<bool, StorageError> {
 		let client = self.get_connection().await?;
 		let mut conn = client.as_ref().clone();

@@ -5,7 +5,11 @@
 //! catch mismatches between indexes written by `OrderStateMachine` and indexes
 //! queried by `RecoveryService`.
 
-use solver_core::{recovery::RecoveryService, state::OrderStateMachine, EventBus};
+use solver_core::{
+	recovery::RecoveryService,
+	state::{transaction_attempt::TransactionAttemptStore, OrderStateMachine},
+	EventBus,
+};
 use solver_delivery::DeliveryService;
 use solver_settlement::SettlementService;
 use solver_storage::{
@@ -28,8 +32,16 @@ fn recovery_service(storage: Arc<StorageService>) -> RecoveryService {
 	let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 	let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
 	let event_bus = EventBus::new(100);
+	let attempt_store = Arc::new(TransactionAttemptStore::new(storage.clone()));
 
-	RecoveryService::new(storage, state_machine, delivery, settlement, event_bus)
+	RecoveryService::new(
+		storage,
+		state_machine,
+		delivery,
+		settlement,
+		event_bus,
+		attempt_store,
+	)
 }
 
 #[tokio::test]

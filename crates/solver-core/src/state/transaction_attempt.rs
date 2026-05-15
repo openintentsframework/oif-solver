@@ -27,6 +27,8 @@ pub enum TransactionAttemptStoreError {
 	NotFound(String),
 	#[error("transaction attempt is terminal and cannot be updated: {0}")]
 	TerminalAttempt(String),
+	#[error("transaction attempt changed concurrently: {0}")]
+	ConcurrentModification(String),
 }
 
 impl From<StorageError> for TransactionAttemptStoreError {
@@ -150,7 +152,11 @@ impl TransactionAttemptStore {
 	where
 		F: FnOnce(&mut TransactionAttempt),
 	{
-		let mut attempt = self.get_attempt(attempt_id).await?;
+		let namespace = StorageKey::TransactionAttempts.as_str();
+		let current_bytes = self.storage.retrieve_bytes(namespace, attempt_id).await?;
+		let mut attempt: TransactionAttempt = serde_json::from_slice(&current_bytes)
+			.map_err(|e| TransactionAttemptStoreError::Storage(e.to_string()))?;
+
 		if attempt.is_terminal() {
 			return Err(TransactionAttemptStoreError::TerminalAttempt(
 				attempt_id.to_string(),
@@ -162,16 +168,38 @@ impl TransactionAttemptStore {
 		attempt.error = error;
 		attempt.updated_at = current_timestamp();
 
-		self.storage
-			.update(
-				StorageKey::TransactionAttempts.as_str(),
+		let updated_bytes = serde_json::to_vec(&attempt)
+			.map_err(|e| TransactionAttemptStoreError::Storage(e.to_string()))?;
+
+		let swapped = self
+			.storage
+			.compare_and_swap_bytes(
+				namespace,
 				&attempt.id,
-				&attempt,
+				&current_bytes,
+				updated_bytes,
 				Some(transaction_attempt_indexes(&attempt)),
+				None,
 			)
 			.await?;
 
-		Ok(attempt)
+		if swapped {
+			return Ok(attempt);
+		}
+
+		let latest_bytes = self.storage.retrieve_bytes(namespace, attempt_id).await?;
+		let latest: TransactionAttempt = serde_json::from_slice(&latest_bytes)
+			.map_err(|e| TransactionAttemptStoreError::Storage(e.to_string()))?;
+
+		if latest.is_terminal() {
+			return Err(TransactionAttemptStoreError::TerminalAttempt(
+				attempt_id.to_string(),
+			));
+		}
+
+		Err(TransactionAttemptStoreError::ConcurrentModification(
+			attempt_id.to_string(),
+		))
 	}
 }
 

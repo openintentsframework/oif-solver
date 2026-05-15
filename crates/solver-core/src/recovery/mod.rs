@@ -8,6 +8,7 @@ use crate::engine::event_bus::EventBus;
 use crate::state::order::{
 	FAILED_STATUS_KIND_INDEX_VALUE, FINALIZED_STATUS_KIND_INDEX_VALUE, STATUS_KIND_INDEX_FIELD,
 };
+use crate::state::transaction_attempt::TransactionAttemptStore;
 use crate::state::OrderStateMachine;
 use alloy_primitives::hex;
 use solver_delivery::DeliveryService;
@@ -15,7 +16,7 @@ use solver_settlement::{SettlementReadiness, SettlementService};
 use solver_storage::{QueryFilter, StorageService};
 use solver_types::{
 	with_0x_prefix, Intent, Order, OrderEvent, OrderStatus, SettlementEvent, SolverEvent,
-	StorageKey, TransactionType,
+	StorageKey, TransactionAttempt, TransactionAttemptStatus, TransactionHash, TransactionType,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -74,6 +75,53 @@ enum ReconcileResult {
 	Finalized,
 }
 
+fn recovery_status_rank(status: TransactionAttemptStatus) -> Option<u8> {
+	match status {
+		TransactionAttemptStatus::Confirmed => Some(3),
+		TransactionAttemptStatus::Broadcast => Some(2),
+		TransactionAttemptStatus::Indeterminate => Some(1),
+		TransactionAttemptStatus::Planned
+		| TransactionAttemptStatus::SubmitRejected
+		| TransactionAttemptStatus::Reverted => None,
+	}
+}
+
+fn choose_recovery_attempt_hash(
+	attempts: &[TransactionAttempt],
+	tx_type: TransactionType,
+) -> Option<TransactionHash> {
+	attempts
+		.iter()
+		.filter(|attempt| attempt.tx_type == tx_type)
+		.filter_map(|attempt| {
+			let rank = recovery_status_rank(attempt.status)?;
+			let tx_hash = attempt.tx_hash.clone()?;
+			Some((rank, attempt.updated_at, tx_hash))
+		})
+		.max_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)))
+		.map(|(_, _, tx_hash)| tx_hash)
+}
+
+fn order_stage_hash(order: &Order, tx_type: TransactionType) -> Option<TransactionHash> {
+	match tx_type {
+		TransactionType::Prepare => order.prepare_tx_hash.clone(),
+		TransactionType::Fill => order.fill_tx_hash.clone(),
+		TransactionType::PostFill => order.post_fill_tx_hash.clone(),
+		TransactionType::PreClaim => order.pre_claim_tx_hash.clone(),
+		TransactionType::Claim => order.claim_tx_hash.clone(),
+	}
+}
+
+fn set_order_stage_hash(order: &mut Order, tx_type: TransactionType, tx_hash: TransactionHash) {
+	match tx_type {
+		TransactionType::Prepare => order.prepare_tx_hash = Some(tx_hash),
+		TransactionType::Fill => order.fill_tx_hash = Some(tx_hash),
+		TransactionType::PostFill => order.post_fill_tx_hash = Some(tx_hash),
+		TransactionType::PreClaim => order.pre_claim_tx_hash = Some(tx_hash),
+		TransactionType::Claim => order.claim_tx_hash = Some(tx_hash),
+	}
+}
+
 /// Report of the recovery operation.
 #[derive(Debug, Default)]
 pub struct RecoveryReport {
@@ -97,6 +145,7 @@ pub struct RecoveryService {
 	delivery: Arc<DeliveryService>,
 	settlement: Arc<SettlementService>,
 	event_bus: EventBus,
+	attempt_store: Arc<TransactionAttemptStore>,
 }
 
 impl RecoveryService {
@@ -115,6 +164,7 @@ impl RecoveryService {
 		delivery: Arc<DeliveryService>,
 		settlement: Arc<SettlementService>,
 		event_bus: EventBus,
+		attempt_store: Arc<TransactionAttemptStore>,
 	) -> Self {
 		Self {
 			storage,
@@ -122,6 +172,7 @@ impl RecoveryService {
 			delivery,
 			settlement,
 			event_bus,
+			attempt_store,
 		}
 	}
 
@@ -157,8 +208,8 @@ impl RecoveryService {
 			}
 
 			match self.reconcile_with_blockchain(&order).await {
-				Ok(result) => {
-					self.publish_recovery_event(order, result).await;
+				Ok((reconciled_order, result)) => {
+					self.publish_recovery_event(reconciled_order, result).await;
 					report.reconciled_orders += 1;
 				},
 				Err(e) => {
@@ -257,6 +308,49 @@ impl RecoveryService {
 		Ok(orphaned)
 	}
 
+	async fn attempts_for_recovery(&self, order_id: &str) -> Vec<TransactionAttempt> {
+		match self.attempt_store.attempts_for_order(order_id).await {
+			Ok(attempts) => attempts,
+			Err(error) => {
+				tracing::warn!(
+					order_id = %order_id,
+					error = %error,
+					"Failed to load transaction attempts during recovery; falling back to order hashes only"
+				);
+				Vec::new()
+			},
+		}
+	}
+
+	async fn resolve_and_repair_stage_hash(
+		&self,
+		order: &mut Order,
+		attempts: &[TransactionAttempt],
+		tx_type: TransactionType,
+	) -> Option<TransactionHash> {
+		if let Some(tx_hash) = order_stage_hash(order, tx_type) {
+			return Some(tx_hash);
+		}
+
+		let tx_hash = choose_recovery_attempt_hash(attempts, tx_type)?;
+		set_order_stage_hash(order, tx_type, tx_hash.clone());
+
+		if let Err(error) = self
+			.state_machine
+			.set_transaction_hash(&order.id, tx_hash.clone(), tx_type)
+			.await
+		{
+			tracing::error!(
+				order_id = %order.id,
+				tx_type = ?tx_type,
+				error = %error,
+				"Recovered transaction hash from attempt ledger but failed to write it back to order"
+			);
+		}
+
+		Some(tx_hash)
+	}
+
 	/// Reconciles an order with blockchain state.
 	///
 	/// This method checks the actual status of transactions on the blockchain
@@ -274,26 +368,32 @@ impl RecoveryService {
 	async fn reconcile_with_blockchain(
 		&self,
 		order: &Order,
-	) -> Result<ReconcileResult, RecoveryError> {
-		// Check transactions in reverse order (claim -> fill -> prepare)
+	) -> Result<(Order, ReconcileResult), RecoveryError> {
+		let attempts = self.attempts_for_recovery(&order.id).await;
+		let mut order = order.clone();
+
+		// Check transactions in reverse order (claim -> pre-claim -> post-fill -> fill -> prepare)
 
 		// Check claim transaction
-		if let Some(ref claim_tx) = order.claim_tx_hash {
+		if let Some(claim_tx) = self
+			.resolve_and_repair_stage_hash(&mut order, &attempts, TransactionType::Claim)
+			.await
+		{
 			let chain_id = order
 				.input_chains
 				.first()
 				.map(|c| c.chain_id)
 				.ok_or_else(|| RecoveryError::Storage("No input chains in order".into()))?;
 
-			match self.delivery.get_status(claim_tx, chain_id).await {
+			match self.delivery.get_status(&claim_tx, chain_id).await {
 				Ok(true) => {
 					// Transaction succeeded
-					return Ok(ReconcileResult::Finalized);
+					return Ok((order, ReconcileResult::Finalized));
 				},
 				Ok(false) => {
 					// Transaction failed/reverted
 					tracing::warn!("Claim transaction {:?} failed/reverted", claim_tx);
-					return Ok(ReconcileResult::Failed(TransactionType::Claim));
+					return Ok((order, ReconcileResult::Failed(TransactionType::Claim)));
 				},
 				Err(e) => {
 					// Could not determine on-chain state. Surface as Unknown so the
@@ -303,13 +403,16 @@ impl RecoveryService {
 						"Could not get claim transaction status; treating as Unknown: {}",
 						e
 					);
-					return Ok(ReconcileResult::Unknown);
+					return Ok((order, ReconcileResult::Unknown));
 				},
 			}
 		}
 
 		// Check pre-claim transaction
-		if let Some(ref pre_claim_tx) = order.pre_claim_tx_hash {
+		if let Some(pre_claim_tx) = self
+			.resolve_and_repair_stage_hash(&mut order, &attempts, TransactionType::PreClaim)
+			.await
+		{
 			// PreClaim happens on origin chain (same as claim)
 			let chain_id = order
 				.input_chains
@@ -317,26 +420,34 @@ impl RecoveryService {
 				.map(|c| c.chain_id)
 				.ok_or_else(|| RecoveryError::Storage("No input chains in order".into()))?;
 
-			match self.delivery.get_status(pre_claim_tx, chain_id).await {
+			match self.delivery.get_status(&pre_claim_tx, chain_id).await {
 				Ok(true) => {
 					// Pre-claim confirmed, ready for claim
-					return Ok(ReconcileResult::NeedsClaim {
-						fill_proof: order.fill_proof.clone(),
-					});
+					return Ok((
+						order.clone(),
+						ReconcileResult::NeedsClaim {
+							fill_proof: order.fill_proof.clone(),
+						},
+					));
 				},
-				Ok(false) => return Ok(ReconcileResult::Failed(TransactionType::PreClaim)),
+				Ok(false) => {
+					return Ok((order, ReconcileResult::Failed(TransactionType::PreClaim)));
+				},
 				Err(e) => {
 					tracing::warn!(
 						"Could not get pre-claim transaction status; treating as Unknown: {}",
 						e
 					);
-					return Ok(ReconcileResult::Unknown);
+					return Ok((order, ReconcileResult::Unknown));
 				},
 			}
 		}
 
 		// Check post-fill transaction
-		if let Some(ref post_fill_tx) = order.post_fill_tx_hash {
+		if let Some(post_fill_tx) = self
+			.resolve_and_repair_stage_hash(&mut order, &attempts, TransactionType::PostFill)
+			.await
+		{
 			// PostFill happens on destination chain (same as fill)
 			let chain_id = order
 				.output_chains
@@ -344,46 +455,54 @@ impl RecoveryService {
 				.map(|c| c.chain_id)
 				.ok_or_else(|| RecoveryError::Storage("No output chains in order".into()))?;
 
-			match self.delivery.get_status(post_fill_tx, chain_id).await {
+			match self.delivery.get_status(&post_fill_tx, chain_id).await {
 				Ok(true) => {
 					// Post-fill confirmed, needs monitoring for settlement
-					return Ok(ReconcileResult::NeedsMonitoring);
+					return Ok((order, ReconcileResult::NeedsMonitoring));
 				},
-				Ok(false) => return Ok(ReconcileResult::Failed(TransactionType::PostFill)),
+				Ok(false) => {
+					return Ok((order, ReconcileResult::Failed(TransactionType::PostFill)));
+				},
 				Err(e) => {
 					tracing::warn!(
 						"Could not get post-fill transaction status; treating as Unknown: {}",
 						e
 					);
-					return Ok(ReconcileResult::Unknown);
+					return Ok((order, ReconcileResult::Unknown));
 				},
 			}
 		}
 
 		// Check fill transaction
-		if let Some(ref fill_tx) = order.fill_tx_hash {
+		if let Some(fill_tx) = self
+			.resolve_and_repair_stage_hash(&mut order, &attempts, TransactionType::Fill)
+			.await
+		{
 			let chain_id = order
 				.output_chains
 				.first()
 				.map(|c| c.chain_id)
 				.ok_or_else(|| RecoveryError::Storage("No output chains in order".into()))?;
 
-			match self.delivery.get_status(fill_tx, chain_id).await {
+			match self.delivery.get_status(&fill_tx, chain_id).await {
 				Ok(true) => {
 					// Fill confirmed, check what's needed next
 					if order.fill_proof.is_some() {
 						// Already have attestation, settled and may need pre-claim
-						return Ok(ReconcileResult::NeedsPreClaim {
-							fill_proof: order.fill_proof.clone(),
-						});
+						return Ok((
+							order.clone(),
+							ReconcileResult::NeedsPreClaim {
+								fill_proof: order.fill_proof.clone(),
+							},
+						));
 					} else {
 						// Fill is confirmed but local post-fill state may be missing due to a
 						// crash after submission. Recover it before deciding to resubmit.
-						match self.settlement.recover_post_fill_state(order).await {
-							Ok(true) => return Ok(ReconcileResult::NeedsMonitoring),
+						match self.settlement.recover_post_fill_state(&order).await {
+							Ok(true) => return Ok((order, ReconcileResult::NeedsMonitoring)),
 							Ok(false) => {
 								// Need to process post-fill and get attestation
-								return Ok(ReconcileResult::NeedsPostFill);
+								return Ok((order, ReconcileResult::NeedsPostFill));
 							},
 							Err(e) => {
 								tracing::error!(
@@ -402,7 +521,7 @@ impl RecoveryService {
 						"Fill transaction {} failed/reverted",
 						with_0x_prefix(&hex::encode(&fill_tx.0))
 					);
-					return Ok(ReconcileResult::Failed(TransactionType::Fill));
+					return Ok((order, ReconcileResult::Failed(TransactionType::Fill)));
 				},
 				Err(e) => {
 					// Could not determine on-chain state. Surface as Unknown so the
@@ -411,28 +530,31 @@ impl RecoveryService {
 						"Could not get fill transaction status; treating as Unknown: {}",
 						e
 					);
-					return Ok(ReconcileResult::Unknown);
+					return Ok((order, ReconcileResult::Unknown));
 				},
 			}
 		}
 
 		// Check prepare transaction
-		if let Some(ref prepare_tx) = order.prepare_tx_hash {
+		if let Some(prepare_tx) = self
+			.resolve_and_repair_stage_hash(&mut order, &attempts, TransactionType::Prepare)
+			.await
+		{
 			let chain_id = order
 				.input_chains
 				.first()
 				.map(|c| c.chain_id)
 				.ok_or_else(|| RecoveryError::Storage("No input chains in order".into()))?;
 
-			match self.delivery.get_status(prepare_tx, chain_id).await {
+			match self.delivery.get_status(&prepare_tx, chain_id).await {
 				Ok(true) => {
 					// Transaction succeeded, prepare confirmed
-					return Ok(ReconcileResult::NeedsFill);
+					return Ok((order, ReconcileResult::NeedsFill));
 				},
 				Ok(false) => {
 					// Transaction failed/reverted
 					tracing::warn!("Prepare transaction {:?} failed/reverted", prepare_tx);
-					return Ok(ReconcileResult::Failed(TransactionType::Prepare));
+					return Ok((order, ReconcileResult::Failed(TransactionType::Prepare)));
 				},
 				Err(e) => {
 					// Could not determine on-chain state. Surface as Unknown so the
@@ -441,13 +563,13 @@ impl RecoveryService {
 						"Could not get prepare transaction status; treating as Unknown: {}",
 						e
 					);
-					return Ok(ReconcileResult::Unknown);
+					return Ok((order, ReconcileResult::Unknown));
 				},
 			}
 		}
 
 		// No transactions yet, needs execution
-		Ok(ReconcileResult::NeedsExecution)
+		Ok((order, ReconcileResult::NeedsExecution))
 	}
 
 	/// Ensures the order is in the correct state based on reconciliation result.
@@ -883,12 +1005,17 @@ mod tests {
 	use mockall::predicate::*;
 	use solver_delivery::MockDeliveryInterface;
 	use solver_settlement::MockSettlementInterface;
-	use solver_storage::MockStorageInterface;
+	use solver_storage::{
+		implementations::file::{FileStorage, TtlConfig},
+		MockStorageInterface,
+	};
 	use solver_types::{
 		utils::tests::builders::{IntentBuilder, OrderBuilder},
-		ExecutionParams, FillProof, TransactionHash,
+		Address, ExecutionParams, FillProof, Transaction, TransactionAttempt,
+		TransactionAttemptStatus, TransactionHash,
 	};
 	use std::collections::HashMap;
+	use tempfile::TempDir;
 
 	// Helper functions to create test data
 	fn create_test_order_with_status(status: OrderStatus) -> Order {
@@ -913,6 +1040,396 @@ mod tests {
 			filled_timestamp: 1234567890,
 			oracle_address: "0x1234567890123456789012345678901234567890".to_string(),
 		}
+	}
+
+	/// Returns the attempt store paired with its backing `TempDir`. The caller
+	/// must bind both halves; if the `TempDir` is dropped, the on-disk directory
+	/// is removed and the store points at a path that gets silently re-created
+	/// by `FileStorage::set_bytes` on the next write — leaking an orphan dir
+	/// the test can no longer clean up.
+	fn empty_attempt_store() -> (Arc<TransactionAttemptStore>, TempDir) {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		(Arc::new(TransactionAttemptStore::new(storage)), temp_dir)
+	}
+
+	fn sample_attempt(
+		id: &str,
+		tx_type: TransactionType,
+		status: TransactionAttemptStatus,
+		hash_byte: Option<u8>,
+		updated_at: u64,
+	) -> TransactionAttempt {
+		let mut attempt = TransactionAttempt::planned(
+			id.to_string(),
+			"test_order_123".to_string(),
+			Some(Address(vec![9; 20])),
+			tx_type,
+			Transaction {
+				to: Some(Address(vec![3; 20])),
+				data: vec![0xde, 0xad, 0xbe, 0xef],
+				value: alloy_primitives::U256::ZERO,
+				chain_id: 137,
+				nonce: Some(7),
+				gas_limit: Some(120000),
+				gas_price: None,
+				max_fee_per_gas: Some(2000),
+				max_priority_fee_per_gas: Some(20),
+			},
+		);
+		attempt.status = status;
+		attempt.tx_hash = hash_byte.map(|byte| TransactionHash(vec![byte; 32]));
+		attempt.updated_at = updated_at;
+		attempt
+	}
+
+	#[test]
+	fn choose_recovery_attempt_hash_prefers_confirmed_over_newer_broadcast() {
+		let attempts = vec![
+			sample_attempt(
+				"broadcast",
+				TransactionType::Fill,
+				TransactionAttemptStatus::Broadcast,
+				Some(0xbb),
+				200,
+			),
+			sample_attempt(
+				"confirmed",
+				TransactionType::Fill,
+				TransactionAttemptStatus::Confirmed,
+				Some(0xcc),
+				100,
+			),
+		];
+
+		let hash = choose_recovery_attempt_hash(&attempts, TransactionType::Fill).unwrap();
+
+		assert_eq!(hash, TransactionHash(vec![0xcc; 32]));
+	}
+
+	#[test]
+	fn choose_recovery_attempt_hash_uses_newest_indeterminate_when_no_better_attempt_exists() {
+		let attempts = vec![
+			sample_attempt(
+				"old",
+				TransactionType::Claim,
+				TransactionAttemptStatus::Indeterminate,
+				Some(0x11),
+				100,
+			),
+			sample_attempt(
+				"new",
+				TransactionType::Claim,
+				TransactionAttemptStatus::Indeterminate,
+				Some(0x22),
+				200,
+			),
+		];
+
+		let hash = choose_recovery_attempt_hash(&attempts, TransactionType::Claim).unwrap();
+
+		assert_eq!(hash, TransactionHash(vec![0x22; 32]));
+	}
+
+	#[test]
+	fn choose_recovery_attempt_hash_ignores_planned_reverted_and_submit_rejected() {
+		let attempts = vec![
+			sample_attempt(
+				"planned",
+				TransactionType::Fill,
+				TransactionAttemptStatus::Planned,
+				Some(0x01),
+				300,
+			),
+			sample_attempt(
+				"reverted",
+				TransactionType::Fill,
+				TransactionAttemptStatus::Reverted,
+				Some(0x02),
+				200,
+			),
+			sample_attempt(
+				"rejected",
+				TransactionType::Fill,
+				TransactionAttemptStatus::SubmitRejected,
+				Some(0x03),
+				100,
+			),
+		];
+
+		assert!(choose_recovery_attempt_hash(&attempts, TransactionType::Fill).is_none());
+	}
+
+	#[test]
+	fn choose_recovery_attempt_hash_ignores_wrong_transaction_type() {
+		let attempts = vec![sample_attempt(
+			"claim",
+			TransactionType::Claim,
+			TransactionAttemptStatus::Confirmed,
+			Some(0xcc),
+			100,
+		)];
+
+		assert!(choose_recovery_attempt_hash(&attempts, TransactionType::Fill).is_none());
+	}
+
+	fn sample_tx(chain_id: u64) -> Transaction {
+		Transaction {
+			to: Some(Address(vec![3; 20])),
+			data: vec![0xde, 0xad, 0xbe, 0xef],
+			value: alloy_primitives::U256::ZERO,
+			chain_id,
+			nonce: Some(7),
+			gas_limit: Some(120000),
+			gas_price: None,
+			max_fee_per_gas: Some(2000),
+			max_priority_fee_per_gas: Some(20),
+		}
+	}
+
+	#[tokio::test]
+	async fn recovery_repairs_missing_fill_hash_from_broadcast_attempt() {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let attempt_store = Arc::new(TransactionAttemptStore::new(storage.clone()));
+
+		let mut order = create_test_order_with_status(OrderStatus::Executed);
+		order.fill_tx_hash = None;
+		order.post_fill_tx_hash = None;
+		order.settlement_name = Some("eip7683".to_string());
+		state_machine.store_order(&order).await.unwrap();
+
+		let tx_hash = TransactionHash(vec![0xbb; 32]);
+		let attempt = attempt_store
+			.create_planned_attempt(
+				&order.id,
+				Some(Address(vec![9; 20])),
+				TransactionType::Fill,
+				sample_tx(137),
+			)
+			.await
+			.unwrap();
+		attempt_store
+			.update_attempt_status(
+				&attempt.id,
+				TransactionAttemptStatus::Broadcast,
+				None,
+				|attempt| {
+					attempt.tx_hash = Some(tx_hash.clone());
+				},
+			)
+			.await
+			.unwrap();
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(tx_hash.clone()), eq(137u64))
+			.times(1)
+			.returning(move |hash, _| {
+				let hash = hash.clone();
+				Box::pin(async move {
+					Ok(solver_types::TransactionReceipt {
+						hash,
+						block_number: 12345,
+						success: true,
+						block_timestamp: None,
+						logs: vec![],
+					})
+				})
+			});
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				137u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			20,
+			60,
+		));
+
+		let mut mock_settlement = MockSettlementInterface::new();
+		mock_settlement
+			.expect_recover_post_fill_state()
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+		let settlement = Arc::new(SettlementService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]),
+			String::new(),
+			20,
+		));
+		let event_bus = EventBus::new(100);
+
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine.clone(),
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
+
+		let (repaired_order, result) = recovery_service
+			.reconcile_with_blockchain(&order)
+			.await
+			.unwrap();
+
+		assert!(matches!(result, ReconcileResult::NeedsPostFill));
+		assert_eq!(repaired_order.fill_tx_hash, Some(tx_hash.clone()));
+		let stored = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(stored.fill_tx_hash, Some(tx_hash));
+	}
+
+	#[tokio::test]
+	async fn recovery_uses_claim_attempt_before_fill_attempt() {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let attempt_store = Arc::new(TransactionAttemptStore::new(storage.clone()));
+
+		let mut order = create_test_order_with_status(OrderStatus::Settled);
+		order.fill_tx_hash = None;
+		order.claim_tx_hash = None;
+		state_machine.store_order(&order).await.unwrap();
+
+		let fill_hash = TransactionHash(vec![0xf1; 32]);
+		let claim_hash = TransactionHash(vec![0xc1; 32]);
+
+		for (tx_type, tx_hash, chain_id) in [
+			(TransactionType::Fill, fill_hash.clone(), 137),
+			(TransactionType::Claim, claim_hash.clone(), 1),
+		] {
+			let attempt = attempt_store
+				.create_planned_attempt(
+					&order.id,
+					Some(Address(vec![9; 20])),
+					tx_type,
+					sample_tx(chain_id),
+				)
+				.await
+				.unwrap();
+			attempt_store
+				.update_attempt_status(
+					&attempt.id,
+					TransactionAttemptStatus::Confirmed,
+					None,
+					|attempt| {
+						attempt.tx_hash = Some(tx_hash);
+					},
+				)
+				.await
+				.unwrap();
+		}
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(claim_hash.clone()), eq(1u64))
+			.times(1)
+			.returning(move |hash, _| {
+				let hash = hash.clone();
+				Box::pin(async move {
+					Ok(solver_types::TransactionReceipt {
+						hash,
+						block_number: 999,
+						success: true,
+						block_timestamp: None,
+						logs: vec![],
+					})
+				})
+			});
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				1u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			20,
+			60,
+		));
+
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let event_bus = EventBus::new(100);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine.clone(),
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
+
+		let (repaired_order, result) = recovery_service
+			.reconcile_with_blockchain(&order)
+			.await
+			.unwrap();
+
+		assert!(matches!(result, ReconcileResult::Finalized));
+		assert_eq!(repaired_order.claim_tx_hash, Some(claim_hash.clone()));
+		let stored = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(stored.claim_tx_hash, Some(claim_hash));
+	}
+
+	#[tokio::test]
+	async fn recovery_continues_with_recovered_hash_when_order_writeback_fails() {
+		let mut mock_storage = MockStorageInterface::new();
+		mock_storage
+			.expect_get_bytes()
+			.with(eq("orders:test_order_123"))
+			.times(1)
+			.returning(|_| {
+				Box::pin(async move {
+					Err(solver_storage::StorageError::Backend(
+						"writeback unavailable".to_string(),
+					))
+				})
+			});
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
+		let recovery_service = RecoveryService::new(
+			storage,
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
+
+		let mut order = create_test_order_with_status(OrderStatus::Executed);
+		order.fill_tx_hash = None;
+		let recovered_hash = TransactionHash(vec![0xbb; 32]);
+		let attempts = vec![sample_attempt(
+			"fill",
+			TransactionType::Fill,
+			TransactionAttemptStatus::Broadcast,
+			Some(0xbb),
+			100,
+		)];
+
+		let hash = recovery_service
+			.resolve_and_repair_stage_hash(&mut order, &attempts, TransactionType::Fill)
+			.await;
+
+		assert_eq!(hash, Some(recovered_hash.clone()));
+		assert_eq!(order.fill_tx_hash, Some(recovered_hash));
 	}
 
 	#[tokio::test]
@@ -941,9 +1458,16 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
-		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
 
 		// Test recovery with no orders
 		let result = recovery_service.recover_state().await;
@@ -989,9 +1513,16 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
-		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
 
 		let result = recovery_service.load_active_orders().await;
 		assert!(result.is_ok());
@@ -1042,9 +1573,16 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
-		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
 
 		let orders = recovery_service.load_active_orders().await.unwrap();
 		assert!(orders.is_empty());
@@ -1099,9 +1637,16 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
-		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
 
 		let result = recovery_service.recover_orphaned_intents().await;
 		assert!(result.is_ok());
@@ -1125,14 +1670,21 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
-		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
 		assert!(result.is_ok());
 
-		match result.unwrap() {
+		match result.unwrap().1 {
 			ReconcileResult::NeedsExecution => {},
 			_ => panic!("Expected NeedsExecution"),
 		}
@@ -1176,14 +1728,21 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
-		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
 		assert!(result.is_ok());
 
-		match result.unwrap() {
+		match result.unwrap().1 {
 			ReconcileResult::NeedsFill => {},
 			_ => panic!("Expected NeedsFill"),
 		}
@@ -1229,14 +1788,21 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
-		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
 		assert!(result.is_ok());
 
-		match result.unwrap() {
+		match result.unwrap().1 {
 			ReconcileResult::NeedsClaim { fill_proof } => {
 				assert!(fill_proof.is_some());
 			},
@@ -1290,14 +1856,21 @@ mod tests {
 			)]);
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
-		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
 		assert!(result.is_ok());
 
-		match result.unwrap() {
+		match result.unwrap().1 {
 			ReconcileResult::NeedsMonitoring => {},
 			other => panic!("Expected NeedsMonitoring, got {other:?}"),
 		}
@@ -1349,13 +1922,20 @@ mod tests {
 			)]);
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
-		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
 		assert!(result.is_ok());
-		assert!(matches!(result.unwrap(), ReconcileResult::NeedsPostFill));
+		assert!(matches!(result.unwrap().1, ReconcileResult::NeedsPostFill));
 	}
 
 	#[tokio::test]
@@ -1410,9 +1990,16 @@ mod tests {
 			)]);
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
-		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
 		assert!(result.is_err());
@@ -1456,14 +2043,21 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
-		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
 		assert!(result.is_ok());
 
-		match result.unwrap() {
+		match result.unwrap().1 {
 			ReconcileResult::Finalized => {},
 			_ => panic!("Expected Finalized"),
 		}
@@ -1506,14 +2100,21 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
-		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
 		assert!(result.is_ok());
 
-		match result.unwrap() {
+		match result.unwrap().1 {
 			ReconcileResult::Failed(TransactionType::Prepare) => {},
 			_ => panic!("Expected Failed(Prepare)"),
 		}
@@ -1557,14 +2158,21 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
-		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
 		assert!(result.is_ok());
 
-		match result.unwrap() {
+		match result.unwrap().1 {
 			ReconcileResult::Unknown => {},
 			other => panic!("Expected Unknown for RPC error, got {other:?}"),
 		}
@@ -1611,9 +2219,16 @@ mod tests {
 
 		// Subscribe to events
 		let mut receiver = event_bus.subscribe();
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
-		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
 
 		recovery_service
 			.publish_recovery_event(
@@ -1670,9 +2285,16 @@ mod tests {
 
 		// Subscribe to events
 		let mut receiver = event_bus.subscribe();
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
-		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
 
 		let order = create_test_order_with_status(OrderStatus::Created);
 		recovery_service
@@ -1727,9 +2349,16 @@ mod tests {
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
 		let mut receiver = event_bus.subscribe();
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
-		let recovery_service =
-			RecoveryService::new(storage, state_machine, delivery, settlement, event_bus);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+		);
 
 		recovery_service
 			.publish_recovery_event(
@@ -1786,6 +2415,7 @@ mod tests {
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
 		let mut receiver = event_bus.subscribe();
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
 		let recovery_service = RecoveryService::new(
 			storage.clone(),
@@ -1793,6 +2423,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
+			attempt_store,
 		);
 
 		recovery_service

@@ -234,6 +234,22 @@ pub trait StorageInterface: Send + Sync {
 		ttl: Option<Duration>,
 	) -> Result<bool, StorageError>;
 
+	/// Atomic compare-and-swap on raw bytes, with index refresh after success.
+	///
+	/// The value replacement is conditional on `current == expected`. If the
+	/// swap succeeds and `indexes` is provided, implementations must refresh
+	/// the key's secondary indexes to match the new value. The value CAS is the
+	/// hard atomic boundary; index refresh follows each backend's existing
+	/// indexing guarantees.
+	async fn compare_and_swap_with_indexes(
+		&self,
+		key: &str,
+		expected: &[u8],
+		new_value: Vec<u8>,
+		indexes: Option<StorageIndexes>,
+		ttl: Option<Duration>,
+	) -> Result<bool, StorageError>;
+
 	/// Delete a key and return whether it existed.
 	///
 	/// Useful for single-use tokens like nonces where you need to
@@ -515,6 +531,14 @@ impl StorageService {
 		serde_json::from_slice(&bytes).map_err(|e| StorageError::Serialization(e.to_string()))
 	}
 
+	/// Retrieves raw bytes from storage.
+	///
+	/// The namespace and id are combined to form the lookup key.
+	pub async fn retrieve_bytes(&self, namespace: &str, id: &str) -> Result<Vec<u8>, StorageError> {
+		let key = format!("{namespace}:{id}");
+		self.backend.get_bytes(&key).await
+	}
+
 	/// Removes a value from storage.
 	///
 	/// The namespace and id are combined to form the key to delete.
@@ -545,6 +569,22 @@ impl StorageService {
 		let bytes =
 			serde_json::to_vec(data).map_err(|e| StorageError::Serialization(e.to_string()))?;
 		self.backend.set_bytes(&key, bytes, indexes, None).await
+	}
+
+	/// Atomically replaces raw bytes if the current bytes still match `expected`.
+	pub async fn compare_and_swap_bytes(
+		&self,
+		namespace: &str,
+		id: &str,
+		expected: &[u8],
+		new_value: Vec<u8>,
+		indexes: Option<StorageIndexes>,
+		ttl: Option<Duration>,
+	) -> Result<bool, StorageError> {
+		let key = format!("{namespace}:{id}");
+		self.backend
+			.compare_and_swap_with_indexes(&key, expected, new_value, indexes, ttl)
+			.await
 	}
 
 	/// Checks if a value exists in storage.
@@ -924,5 +964,64 @@ mod tests {
 		assert_eq!(indexes.fields.len(), 2);
 		assert!(indexes.fields.contains_key("status"));
 		assert!(indexes.fields.contains_key("amount"));
+	}
+
+	#[tokio::test]
+	async fn compare_and_swap_bytes_updates_value_and_indexes() {
+		use crate::implementations::file::{FileStorage, TtlConfig};
+
+		let temp_dir = tempfile::TempDir::new().unwrap();
+		let storage = StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		)));
+
+		let namespace = "cas_test";
+		let id = "attempt-1";
+
+		storage
+			.store(
+				namespace,
+				id,
+				&serde_json::json!({ "status": "broadcast" }),
+				Some(StorageIndexes::new().with_field("status", "broadcast")),
+			)
+			.await
+			.unwrap();
+
+		let expected = storage.retrieve_bytes(namespace, id).await.unwrap();
+		let new_value = serde_json::to_vec(&serde_json::json!({ "status": "confirmed" })).unwrap();
+
+		let swapped = storage
+			.compare_and_swap_bytes(
+				namespace,
+				id,
+				&expected,
+				new_value,
+				Some(StorageIndexes::new().with_field("status", "confirmed")),
+				None,
+			)
+			.await
+			.unwrap();
+
+		assert!(swapped);
+
+		let terminal_rows = storage
+			.query::<serde_json::Value>(
+				namespace,
+				QueryFilter::Equals("status".to_string(), serde_json::json!("confirmed")),
+			)
+			.await
+			.unwrap();
+		assert_eq!(terminal_rows.len(), 1);
+
+		let active_rows = storage
+			.query::<serde_json::Value>(
+				namespace,
+				QueryFilter::Equals("status".to_string(), serde_json::json!("broadcast")),
+			)
+			.await
+			.unwrap();
+		assert!(active_rows.is_empty());
 	}
 }
