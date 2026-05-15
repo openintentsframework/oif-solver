@@ -363,6 +363,40 @@ pub mod interfaces {
 		interface ITheCompact {
 			function DOMAIN_SEPARATOR() external view returns (bytes32);
 		}
+
+		/// Emitted by `InputSettlerEscrow.open()` on the origin chain.
+		#[derive(Debug)]
+		event Open(bytes32 indexed orderId, StandardOrder order);
+
+		/// Emitted by `OutputSettlerBase` on the destination chain when a fill
+		/// is successfully recorded.
+		#[derive(Debug)]
+		event OutputFilled(
+			bytes32 indexed orderId,
+			bytes32 solver,
+			uint32 timestamp,
+			SolMandateOutput output,
+			uint256 finalAmount
+		);
+
+		/// Emitted by `InputSettlerBase` on the origin chain when the order is
+		/// finalized for the solver (claim leg).
+		#[derive(Debug)]
+		event Finalised(bytes32 indexed orderId, bytes32 solver, bytes32 destination);
+
+		/// Emitted by `InputSettlerEscrow` on the origin chain when the order
+		/// is refunded to the user (deadline expired before fill).
+		#[derive(Debug)]
+		event Refunded(bytes32 indexed orderId);
+
+		/// Emitted by `InputSettlerPurchase` on the origin chain when the
+		/// claim rights are transferred to another solver.
+		#[derive(Debug)]
+		event OrderPurchased(
+			bytes32 indexed orderId,
+			bytes32 solver,
+			bytes32 purchaser
+		);
 	}
 }
 
@@ -1742,5 +1776,38 @@ mod tests {
 		// This should fail deserialization since hex_string deserializer expects valid hex
 		let result: Result<MandateOutput, _> = serde_json::from_str(json);
 		assert!(result.is_err());
+	}
+
+	/// Topic0 sanity: verify our `sol!`-derived SIGNATURE_HASH for each PR 04
+	/// event matches the manual keccak256 of the canonical Solidity signature.
+	/// Guards against future `sol!` declaration drift (e.g., parameter type
+	/// change that would silently shift topic0).
+	#[cfg(feature = "oif-interfaces")]
+	#[test]
+	fn pr04_event_topic0_hashes_match_canonical_signatures() {
+		use crate::standards::eip7683::interfaces::{
+			Finalised, OrderPurchased, OutputFilled, Refunded,
+		};
+		use alloy_primitives::keccak256;
+		use alloy_sol_types::SolEvent;
+
+		let expected_output_filled = keccak256(
+			b"OutputFilled(bytes32,bytes32,uint32,(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes),uint256)",
+		);
+		assert_eq!(
+			OutputFilled::SIGNATURE_HASH.0,
+			expected_output_filled.0,
+			"OutputFilled topic0 must match canonical signature; \
+			 check MandateOutput field types if this fails"
+		);
+
+		let expected_finalised = keccak256(b"Finalised(bytes32,bytes32,bytes32)");
+		assert_eq!(Finalised::SIGNATURE_HASH.0, expected_finalised.0);
+
+		let expected_refunded = keccak256(b"Refunded(bytes32)");
+		assert_eq!(Refunded::SIGNATURE_HASH.0, expected_refunded.0);
+
+		let expected_order_purchased = keccak256(b"OrderPurchased(bytes32,bytes32,bytes32)");
+		assert_eq!(OrderPurchased::SIGNATURE_HASH.0, expected_order_purchased.0,);
 	}
 }

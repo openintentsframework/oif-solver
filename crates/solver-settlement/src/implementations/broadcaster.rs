@@ -20,9 +20,10 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use solver_storage::StorageService;
 use solver_types::{
-	bytes32_to_address, parse_address, with_0x_prefix, ConfigSchema, Eip7683OrderData, Field,
-	FieldType, FillProof, InteropAddress, NetworksConfig, Order, OrderOutput, PusherL2Params,
-	Schema, Transaction, TransactionHash, TransactionReceipt, TransactionType,
+	bytes32_to_address, order_id_to_bytes32, parse_address, with_0x_prefix, ConfigSchema,
+	Eip7683OrderData, Field, FieldType, FillProof, InteropAddress, NetworksConfig, Order,
+	OrderOutput, PusherL2Params, Schema, Transaction, TransactionHash, TransactionReceipt,
+	TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,24 +67,6 @@ fn keccak256(data: &[u8]) -> [u8; 32] {
 	let mut out = [0u8; 32];
 	out.copy_from_slice(&result);
 	out
-}
-
-/// Convert order ID string to bytes32.
-fn order_id_to_bytes32(order_id: &str) -> [u8; 32] {
-	if let Some(hex_str) = order_id.strip_prefix("0x") {
-		let mut bytes = [0u8; 32];
-		if let Ok(decoded) = hex::decode(hex_str) {
-			let len = decoded.len().min(32);
-			bytes[32 - len..].copy_from_slice(&decoded[..len]);
-		}
-		bytes
-	} else {
-		let raw = order_id.as_bytes();
-		let mut bytes = [0u8; 32];
-		let len = raw.len().min(32);
-		bytes[32 - len..].copy_from_slice(&raw[..len]);
-		bytes
-	}
 }
 
 /// Broadcaster-compatible output representation.
@@ -737,7 +720,8 @@ impl BroadcasterSettlement {
 		logs: &[solver_types::Log],
 	) -> Result<Vec<u8>, SettlementError> {
 		let output = extract_output_details(order)?;
-		let order_id_bytes = order_id_to_bytes32(&order.id);
+		let order_id_bytes =
+			order_id_to_bytes32(&order.id).map_err(SettlementError::ValidationFailed)?;
 		let (solver_identifier, fill_timestamp) =
 			extract_fill_details_from_logs(logs, &order_id_bytes)?;
 
@@ -790,6 +774,10 @@ impl BroadcasterSettlement {
 					.map(|topic| solver_types::H256(topic.0))
 					.collect(),
 				data: log.data().data.to_vec(),
+				transaction_hash: log
+					.transaction_hash
+					.map(|h| solver_types::TransactionHash(h.0.to_vec())),
+				block_number: log.block_number,
 			})
 			.collect();
 
@@ -2140,11 +2128,12 @@ mod tests {
 	fn test_order_id_to_bytes32_handles_hex_and_ascii_inputs() {
 		let hex_id = order_id_to_bytes32(
 			"0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
-		);
+		)
+		.unwrap();
 		assert_eq!(hex_id[0], 0x01);
 		assert_eq!(hex_id[31], 0x20);
 
-		let ascii_id = order_id_to_bytes32("abc");
+		let ascii_id = order_id_to_bytes32("abc").unwrap();
 		assert_eq!(&ascii_id[29..32], b"abc");
 	}
 
@@ -2164,6 +2153,7 @@ mod tests {
 				solver_types::H256(order_id),
 			],
 			data,
+			..Default::default()
 		};
 
 		let (solver, timestamp) = extract_fill_details_from_logs(&[log], &order_id).unwrap();
@@ -2220,6 +2210,7 @@ mod tests {
 				solver_types::H256(address_to_bytes32(&expected_publisher)),
 			],
 			data: vec![],
+			..Default::default()
 		};
 
 		assert_eq!(
@@ -2240,6 +2231,7 @@ mod tests {
 				solver_types::H256(address_to_bytes32(&solver_types::Address(vec![0x88; 20]))),
 			],
 			data: vec![],
+			..Default::default()
 		};
 
 		assert_eq!(
@@ -2482,9 +2474,10 @@ mod tests {
 					solver_types::H256(keccak256(
 						b"OutputFilled(bytes32,bytes32,uint32,(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes),uint256)",
 					)),
-					solver_types::H256(order_id_to_bytes32(&order.id)),
+						solver_types::H256(order_id_to_bytes32(&order.id).unwrap()),
 				],
 				data: event_data,
+				..Default::default()
 			}],
 			block_timestamp: None,
 		};

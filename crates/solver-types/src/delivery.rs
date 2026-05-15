@@ -18,7 +18,9 @@ pub struct H256(pub [u8; 32]);
 
 /// Event log emitted by smart contracts.
 ///
-/// Contains event data and indexed parameters (topics).
+/// Contains event data and indexed parameters (topics), plus optional
+/// transaction metadata (`transaction_hash`, `block_number`) that is
+/// populated when the log originates from a `getLogs` or receipt response.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Log {
 	/// Contract address that emitted the log.
@@ -28,6 +30,53 @@ pub struct Log {
 	pub topics: Vec<H256>,
 	/// Non-indexed event data.
 	pub data: Vec<u8>,
+	/// Hash of the transaction that emitted this log. `None` when the log
+	/// came from a source that doesn't carry tx metadata (e.g., test fixtures).
+	#[serde(default)]
+	pub transaction_hash: Option<TransactionHash>,
+	/// Block that included the emitting transaction. `None` for unknown.
+	#[serde(default)]
+	pub block_number: Option<u64>,
+}
+
+impl Default for Log {
+	fn default() -> Self {
+		Self {
+			address: Address(Vec::new()),
+			topics: Vec::new(),
+			data: Vec::new(),
+			transaction_hash: None,
+			block_number: None,
+		}
+	}
+}
+
+#[cfg(test)]
+mod log_tests {
+	use super::*;
+
+	#[test]
+	fn log_default_has_no_tx_metadata() {
+		let log = Log::default();
+		assert!(log.transaction_hash.is_none());
+		assert!(log.block_number.is_none());
+		assert!(log.address.0.is_empty());
+		assert!(log.topics.is_empty());
+		assert!(log.data.is_empty());
+	}
+
+	#[test]
+	fn log_carries_optional_tx_metadata() {
+		let log = Log {
+			address: Address(vec![0xab; 20]),
+			topics: vec![H256([0x01; 32])],
+			data: vec![0xde, 0xad],
+			transaction_hash: Some(TransactionHash(vec![0xcc; 32])),
+			block_number: Some(123_456),
+		};
+		assert_eq!(log.block_number, Some(123_456));
+		assert_eq!(log.transaction_hash.unwrap().0.len(), 32);
+	}
 }
 
 /// Transaction receipt containing execution details.
@@ -62,6 +111,8 @@ impl From<&AlloyReceipt> for TransactionReceipt {
 				address: log.address().into(),
 				topics: log.topics().iter().map(|topic| H256(topic.0)).collect(),
 				data: log.data().data.to_vec(),
+				transaction_hash: log.transaction_hash.map(|h| TransactionHash(h.0.to_vec())),
+				block_number: log.block_number,
 			})
 			.collect();
 

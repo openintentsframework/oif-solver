@@ -16,7 +16,7 @@ use crate::{QueryFilter, StorageError, StorageIndexes, StorageInterface};
 use async_trait::async_trait;
 use serde::Deserialize;
 use solver_types::{ConfigSchema, ValidationError};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -50,13 +50,18 @@ impl StorageEntry {
 pub struct MemoryStorage {
 	/// The in-memory store protected by a read-write lock.
 	store: Arc<RwLock<HashMap<String, StorageEntry>>>,
+	/// Secondary indexes protected separately from values.
+	indexes: Arc<RwLock<MemoryIndexes>>,
 }
+
+type MemoryIndexes = HashMap<String, HashMap<String, HashMap<serde_json::Value, HashSet<String>>>>;
 
 impl MemoryStorage {
 	/// Creates a new MemoryStorage instance.
 	pub fn new() -> Self {
 		Self {
 			store: Arc::new(RwLock::new(HashMap::new())),
+			indexes: Arc::new(RwLock::new(HashMap::new())),
 		}
 	}
 }
@@ -64,6 +69,110 @@ impl MemoryStorage {
 impl Default for MemoryStorage {
 	fn default() -> Self {
 		Self::new()
+	}
+}
+
+fn namespace_from_key(key: &str) -> &str {
+	key.split(':').next().unwrap_or("")
+}
+
+fn remove_key_from_indexes(indexes: &mut MemoryIndexes, key: &str) {
+	for namespace_index in indexes.values_mut() {
+		for field_index in namespace_index.values_mut() {
+			for keys in field_index.values_mut() {
+				keys.remove(key);
+			}
+			field_index.retain(|_, keys| !keys.is_empty());
+		}
+		namespace_index.retain(|_, field_index| !field_index.is_empty());
+	}
+	indexes.retain(|_, namespace_index| !namespace_index.is_empty());
+}
+
+fn apply_indexes_for_key(indexes: &mut MemoryIndexes, key: &str, storage_indexes: &StorageIndexes) {
+	let namespace = namespace_from_key(key).to_string();
+	let namespace_index = indexes.entry(namespace).or_default();
+
+	for (field, value) in &storage_indexes.fields {
+		namespace_index
+			.entry(field.clone())
+			.or_default()
+			.entry(value.clone())
+			.or_default()
+			.insert(key.to_string());
+	}
+}
+
+fn keys_for_namespace(store: &HashMap<String, StorageEntry>, namespace: &str) -> HashSet<String> {
+	let prefix = format!("{namespace}:");
+	store
+		.iter()
+		.filter_map(|(key, entry)| {
+			if !entry.is_expired() && key.starts_with(&prefix) {
+				Some(key.clone())
+			} else {
+				None
+			}
+		})
+		.collect()
+}
+
+fn indexed_keys(
+	indexes: &MemoryIndexes,
+	namespace: &str,
+	field: &str,
+	value: &serde_json::Value,
+) -> HashSet<String> {
+	indexes
+		.get(namespace)
+		.and_then(|namespace_index| namespace_index.get(field))
+		.and_then(|field_index| field_index.get(value))
+		.cloned()
+		.unwrap_or_default()
+}
+
+fn indexed_query_keys(
+	store: &HashMap<String, StorageEntry>,
+	indexes: &MemoryIndexes,
+	namespace: &str,
+	filter: &QueryFilter,
+) -> Vec<String> {
+	let all = keys_for_namespace(store, namespace);
+	let mut keys = match filter {
+		QueryFilter::All => all.clone(),
+		QueryFilter::Equals(field, expected) => indexed_keys(indexes, namespace, field, expected),
+		QueryFilter::NotEquals(field, expected) => {
+			let excluded = indexed_keys(indexes, namespace, field, expected);
+			all.difference(&excluded).cloned().collect()
+		},
+		QueryFilter::In(field, values) => values
+			.iter()
+			.flat_map(|value| indexed_keys(indexes, namespace, field, value))
+			.collect(),
+		QueryFilter::NotIn(field, values) => {
+			let excluded: HashSet<String> = values
+				.iter()
+				.flat_map(|value| indexed_keys(indexes, namespace, field, value))
+				.collect();
+			all.difference(&excluded).cloned().collect()
+		},
+	};
+
+	keys.retain(|key| all.contains(key));
+	let mut keys: Vec<String> = keys.into_iter().collect();
+	keys.sort();
+	keys
+}
+
+async fn refresh_memory_indexes(
+	indexes: &Arc<RwLock<MemoryIndexes>>,
+	key: &str,
+	storage_indexes: Option<StorageIndexes>,
+) {
+	let mut indexes = indexes.write().await;
+	remove_key_from_indexes(&mut indexes, key);
+	if let Some(storage_indexes) = storage_indexes {
+		apply_indexes_for_key(&mut indexes, key, &storage_indexes);
 	}
 }
 
@@ -82,7 +191,7 @@ impl StorageInterface for MemoryStorage {
 		&self,
 		key: &str,
 		value: Vec<u8>,
-		_indexes: Option<StorageIndexes>,
+		indexes: Option<StorageIndexes>,
 		ttl: Option<Duration>,
 	) -> Result<(), StorageError> {
 		let mut store = self.store.write().await;
@@ -91,12 +200,16 @@ impl StorageInterface for MemoryStorage {
 			expires_at: ttl.map(|d| Instant::now() + d),
 		};
 		store.insert(key.to_string(), entry);
+		drop(store);
+		refresh_memory_indexes(&self.indexes, key, indexes).await;
 		Ok(())
 	}
 
 	async fn delete(&self, key: &str) -> Result<(), StorageError> {
 		let mut store = self.store.write().await;
 		store.remove(key);
+		drop(store);
+		refresh_memory_indexes(&self.indexes, key, None).await;
 		Ok(())
 	}
 
@@ -114,12 +227,12 @@ impl StorageInterface for MemoryStorage {
 
 	async fn query(
 		&self,
-		_namespace: &str,
-		_filter: QueryFilter,
+		namespace: &str,
+		filter: QueryFilter,
 	) -> Result<Vec<String>, StorageError> {
-		// Memory storage doesn't support recovery, so querying is not meaningful.
-		// Return empty for compatibility.
-		Ok(Vec::new())
+		let store = self.store.read().await;
+		let indexes = self.indexes.read().await;
+		Ok(indexed_query_keys(&store, &indexes, namespace, &filter))
 	}
 
 	async fn get_batch(&self, keys: &[String]) -> Result<Vec<(String, Vec<u8>)>, StorageError> {
@@ -140,8 +253,22 @@ impl StorageInterface for MemoryStorage {
 	async fn cleanup_expired(&self) -> Result<usize, StorageError> {
 		let mut store = self.store.write().await;
 		let before = store.len();
+		let expired_keys: Vec<String> = store
+			.iter()
+			.filter_map(|(key, entry)| {
+				if entry.is_expired() {
+					Some(key.clone())
+				} else {
+					None
+				}
+			})
+			.collect();
 		store.retain(|_, entry| !entry.is_expired());
 		let removed = before - store.len();
+		drop(store);
+		for key in expired_keys {
+			refresh_memory_indexes(&self.indexes, &key, None).await;
+		}
 		Ok(removed)
 	}
 
@@ -169,6 +296,8 @@ impl StorageInterface for MemoryStorage {
 			expires_at: ttl.map(|d| Instant::now() + d),
 		};
 		store.insert(key.to_string(), entry);
+		drop(store);
+		refresh_memory_indexes(&self.indexes, key, None).await;
 		Ok(true)
 	}
 
@@ -194,6 +323,8 @@ impl StorageInterface for MemoryStorage {
 						expires_at: ttl.map(|d| Instant::now() + d),
 					};
 					store.insert(key.to_string(), new_entry);
+					drop(store);
+					refresh_memory_indexes(&self.indexes, key, None).await;
 					Ok(true)
 				} else {
 					// Mismatch
@@ -209,19 +340,27 @@ impl StorageInterface for MemoryStorage {
 		key: &str,
 		expected: &[u8],
 		new_value: Vec<u8>,
-		_indexes: Option<StorageIndexes>,
+		indexes: Option<StorageIndexes>,
 		ttl: Option<Duration>,
 	) -> Result<bool, StorageError> {
-		self.compare_and_swap(key, expected, new_value, ttl).await
+		let swapped = self.compare_and_swap(key, expected, new_value, ttl).await?;
+		if swapped {
+			refresh_memory_indexes(&self.indexes, key, indexes).await;
+		}
+		Ok(swapped)
 	}
 
 	async fn delete_if_exists(&self, key: &str) -> Result<bool, StorageError> {
 		let mut store = self.store.write().await;
 
 		match store.remove(key) {
-			Some(entry) if !entry.is_expired() => Ok(true), // Existed and was deleted
-			Some(_) => Ok(false),                           // Was expired (treat as not existed)
-			None => Ok(false),                              // Didn't exist
+			Some(entry) if !entry.is_expired() => {
+				drop(store);
+				refresh_memory_indexes(&self.indexes, key, None).await;
+				Ok(true)
+			}, // Existed and was deleted
+			Some(_) => Ok(false), // Was expired (treat as not existed)
+			None => Ok(false),    // Didn't exist
 		}
 	}
 }

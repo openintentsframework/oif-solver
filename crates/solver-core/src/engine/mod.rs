@@ -277,6 +277,7 @@ impl SolverEngine {
 			self.settlement.clone(),
 			self.event_bus.clone(),
 			transaction_attempt_store,
+			Arc::new(self.static_config.networks.clone()),
 		);
 
 		// Perform recovery

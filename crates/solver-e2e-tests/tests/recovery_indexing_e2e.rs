@@ -33,6 +33,7 @@ fn recovery_service(storage: Arc<StorageService>) -> RecoveryService {
 	let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
 	let event_bus = EventBus::new(100);
 	let attempt_store = Arc::new(TransactionAttemptStore::new(storage.clone()));
+	let networks_config = Arc::new(solver_types::NetworksConfig::new());
 
 	RecoveryService::new(
 		storage,
@@ -41,6 +42,7 @@ fn recovery_service(storage: Arc<StorageService>) -> RecoveryService {
 		settlement,
 		event_bus,
 		attempt_store,
+		networks_config,
 	)
 }
 

@@ -150,6 +150,7 @@ mod tests {
 				address: Address(vec![8; 20]),
 				topics: vec![],
 				data: vec![0xaa],
+				..Default::default()
 			}],
 			block_timestamp: Some(456),
 		});

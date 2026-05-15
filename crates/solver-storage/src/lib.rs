@@ -983,14 +983,16 @@ mod tests {
 			.store(
 				namespace,
 				id,
-				&serde_json::json!({ "status": "broadcast" }),
+				&serde_json::json!({ "stored_status": "not-indexed" }),
 				Some(StorageIndexes::new().with_field("status", "broadcast")),
 			)
 			.await
 			.unwrap();
 
 		let expected = storage.retrieve_bytes(namespace, id).await.unwrap();
-		let new_value = serde_json::to_vec(&serde_json::json!({ "status": "confirmed" })).unwrap();
+		let new_value =
+			serde_json::to_vec(&serde_json::json!({ "stored_status": "still-not-indexed" }))
+				.unwrap();
 
 		let swapped = storage
 			.compare_and_swap_bytes(
@@ -1023,5 +1025,59 @@ mod tests {
 			.await
 			.unwrap();
 		assert!(active_rows.is_empty());
+	}
+
+	#[tokio::test]
+	async fn memory_compare_and_swap_bytes_keeps_query_results_current() {
+		use crate::implementations::memory::MemoryStorage;
+
+		let storage = StorageService::new(Box::new(MemoryStorage::new()));
+		let namespace = "memory_cas_test";
+		let id = "attempt-1";
+
+		storage
+			.store(
+				namespace,
+				id,
+				&serde_json::json!({ "status": "broadcast" }),
+				Some(StorageIndexes::new().with_field("status", "broadcast")),
+			)
+			.await
+			.unwrap();
+
+		let expected = storage.retrieve_bytes(namespace, id).await.unwrap();
+		let new_value = serde_json::to_vec(&serde_json::json!({ "status": "confirmed" })).unwrap();
+
+		let swapped = storage
+			.compare_and_swap_bytes(
+				namespace,
+				id,
+				&expected,
+				new_value,
+				Some(StorageIndexes::new().with_field("status", "confirmed")),
+				None,
+			)
+			.await
+			.unwrap();
+
+		assert!(swapped);
+
+		let confirmed_rows = storage
+			.query::<serde_json::Value>(
+				namespace,
+				QueryFilter::Equals("status".to_string(), serde_json::json!("confirmed")),
+			)
+			.await
+			.unwrap();
+		assert_eq!(confirmed_rows.len(), 1);
+
+		let broadcast_rows = storage
+			.query::<serde_json::Value>(
+				namespace,
+				QueryFilter::Equals("status".to_string(), serde_json::json!("broadcast")),
+			)
+			.await
+			.unwrap();
+		assert!(broadcast_rows.is_empty());
 	}
 }
