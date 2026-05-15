@@ -35,6 +35,8 @@ pub enum StorageKey {
 	Quotes,
 	/// Key for storing settlement message data (per implementation)
 	SettlementMessages,
+	/// Key for storing transaction delivery attempt data
+	TransactionAttempts,
 }
 
 impl StorageKey {
@@ -46,6 +48,7 @@ impl StorageKey {
 			StorageKey::OrderByTxHash => "order_by_tx_hash",
 			StorageKey::Quotes => "quotes",
 			StorageKey::SettlementMessages => "settlement_messages",
+			StorageKey::TransactionAttempts => "transaction_attempts",
 		}
 	}
 
@@ -57,6 +60,7 @@ impl StorageKey {
 			Self::OrderByTxHash,
 			Self::Quotes,
 			Self::SettlementMessages,
+			Self::TransactionAttempts,
 		]
 		.into_iter()
 	}
@@ -72,6 +76,7 @@ impl FromStr for StorageKey {
 			"order_by_tx_hash" => Ok(Self::OrderByTxHash),
 			"quotes" => Ok(Self::Quotes),
 			"settlement_messages" => Ok(Self::SettlementMessages),
+			"transaction_attempts" => Ok(Self::TransactionAttempts),
 			_ => Err(()),
 		}
 	}
@@ -97,6 +102,10 @@ mod tests {
 			StorageKey::SettlementMessages.as_str(),
 			"settlement_messages"
 		);
+		assert_eq!(
+			StorageKey::TransactionAttempts.as_str(),
+			"transaction_attempts"
+		);
 	}
 
 	#[test]
@@ -116,6 +125,10 @@ mod tests {
 			"settlement_messages".parse::<StorageKey>().unwrap(),
 			StorageKey::SettlementMessages
 		);
+		assert_eq!(
+			"transaction_attempts".parse::<StorageKey>().unwrap(),
+			StorageKey::TransactionAttempts
+		);
 
 		// Invalid cases
 		assert!("invalid".parse::<StorageKey>().is_err());
@@ -133,6 +146,7 @@ mod tests {
 			StorageKey::OrderByTxHash,
 			StorageKey::Quotes,
 			StorageKey::SettlementMessages,
+			StorageKey::TransactionAttempts,
 		];
 
 		assert_eq!(all_keys, expected);
@@ -155,6 +169,9 @@ mod tests {
 
 		let settlement_str: &'static str = StorageKey::SettlementMessages.into();
 		assert_eq!(settlement_str, "settlement_messages");
+
+		let transaction_attempts_str: &'static str = StorageKey::TransactionAttempts.into();
+		assert_eq!(transaction_attempts_str, "transaction_attempts");
 	}
 
 	#[test]
@@ -171,7 +188,7 @@ mod tests {
 		use std::collections::HashSet;
 
 		let strings: HashSet<&str> = StorageKey::all().map(|k| k.as_str()).collect();
-		assert_eq!(strings.len(), 5, "String representations should be unique");
+		assert_eq!(strings.len(), 6, "String representations should be unique");
 	}
 
 	#[test]
@@ -182,7 +199,7 @@ mod tests {
 		for key in StorageKey::all() {
 			assert!(set.insert(key)); // Should be unique
 		}
-		assert_eq!(set.len(), 5);
+		assert_eq!(set.len(), 6);
 
 		// Test equality
 		assert_eq!(StorageKey::Orders, StorageKey::Orders);
