@@ -506,7 +506,7 @@ impl RecoveryService {
 	) -> ReconcileResult {
 		let attempt = match self.attempt_store.attempt_by_hash(tx_hash).await {
 			Ok(Some(a)) => a,
-			_ => {
+			Ok(None) => {
 				tracing::warn!(
 					order_id = %order.id,
 					?tx_type,
@@ -514,6 +514,20 @@ impl RecoveryService {
 					"Confirmed revert but no attempt ledger row; cannot replay for classification, treating as Failed"
 				);
 				return ReconcileResult::Failed(tx_type);
+			},
+			Err(error) => {
+				// Transient storage error — DO NOT terminalize. Return Unknown
+				// so the next recovery pass retries cleanly. Without this, a
+				// single backend hiccup converts a healthy in-flight order
+				// into a permanent Failed and may strand funds.
+				tracing::warn!(
+					order_id = %order.id,
+					?tx_type,
+					tx_hash = ?tx_hash,
+					%error,
+					"Confirmed revert but attempt-ledger lookup errored; treating as Unknown for retry"
+				);
+				return ReconcileResult::Unknown;
 			},
 		};
 
@@ -528,14 +542,25 @@ impl RecoveryService {
 			.await
 		{
 			Ok(Some(bytes)) => bytes,
-			_ => {
+			Ok(None) => {
 				tracing::warn!(
 					order_id = %order.id,
 					?tx_type,
 					tx_hash = ?tx_hash,
-					"Confirmed revert but revert-data replay failed; treating as Failed"
+					"Confirmed revert but replay returned no revert data; treating as Failed"
 				);
 				return ReconcileResult::Failed(tx_type);
+			},
+			Err(error) => {
+				// Transient RPC error — DO NOT terminalize. See note above.
+				tracing::warn!(
+					order_id = %order.id,
+					?tx_type,
+					tx_hash = ?tx_hash,
+					%error,
+					"Confirmed revert but revert-data replay errored (transport); treating as Unknown for retry"
+				);
+				return ReconcileResult::Unknown;
 			},
 		};
 
@@ -4737,5 +4762,246 @@ mod tests {
 			matches!(result, ReconcileResult::Failed(TransactionType::PreClaim)),
 			"expected Failed(PreClaim), got {result:?}"
 		);
+	}
+
+	/// Regression: a transient RPC error during `get_revert_data` must NOT
+	/// terminalize the order. Without the Err→Unknown split, a single Alchemy
+	/// blip during startup recovery converts an in-flight order into permanent
+	/// Failed — exactly the stranded-funds case PR 05 is designed to prevent.
+	#[tokio::test]
+	async fn recovery_returns_unknown_when_get_revert_data_errors_transiently() {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let attempt_store = Arc::new(TransactionAttemptStore::new(storage.clone()));
+
+		let mut order = create_test_order_with_status(OrderStatus::Settled);
+		let claim_hash = TransactionHash(vec![0xc1; 32]);
+		order.claim_tx_hash = Some(claim_hash.clone());
+		state_machine.store_order(&order).await.unwrap();
+
+		// Attempt ledger row present so we get past the first guard and reach
+		// the get_revert_data call.
+		let claim_attempt = attempt_store
+			.create_planned_attempt(
+				&order.id,
+				Some(Address(vec![0xab; 20])),
+				TransactionType::Claim,
+				sample_tx(1),
+			)
+			.await
+			.unwrap();
+		attempt_store
+			.update_attempt_status(
+				&claim_attempt.id,
+				TransactionAttemptStatus::Broadcast,
+				None,
+				|attempt| {
+					attempt.tx_hash = Some(claim_hash.clone());
+				},
+			)
+			.await
+			.unwrap();
+
+		let networks = networks_with(
+			1,
+			test_network_config(Address(vec![0xcc; 20]), Address(vec![0xaa; 20])),
+		);
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		// Confirmed-revert receipt for the claim tx.
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(claim_hash.clone()), eq(1u64))
+			.times(1)
+			.returning(|hash, _| {
+				let hash = hash.clone();
+				Box::pin(async move {
+					Ok(solver_types::TransactionReceipt {
+						hash,
+						block_number: 19_995_000,
+						success: false,
+						block_timestamp: None,
+						logs: vec![],
+					})
+				})
+			});
+		// Replay fails with a transport error.
+		mock_delivery
+			.expect_get_revert_data()
+			.times(1)
+			.returning(|_, _, _, _| {
+				Box::pin(async {
+					Err(solver_delivery::DeliveryError::Network(
+						"connection reset by peer".to_string(),
+					))
+				})
+			});
+		// Chain probe must NOT be called: we never reached classification.
+		mock_delivery.expect_get_block_number().times(0);
+		mock_delivery.expect_get_logs().times(0);
+
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				1u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			20,
+			60,
+		));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			EventBus::new(100),
+			attempt_store,
+			networks,
+		);
+
+		let (_, result) = recovery_service
+			.reconcile_with_blockchain(&order)
+			.await
+			.unwrap();
+		assert!(
+			matches!(result, ReconcileResult::Unknown),
+			"transient RPC error must yield Unknown for retry, got {result:?}"
+		);
+	}
+
+	/// Regression: the chain-evidence scan must search BEFORE the anchor block,
+	/// not start at it. A competitor solver's `Finalised` at block N-200 is
+	/// frequently the cause of our claim tx reverting at block N — if we scan
+	/// only [N, latest], we miss the proof and incorrectly return NotFound.
+	///
+	/// With the fix (`from_block = receipt.block_number - window_blocks`), the
+	/// scan covers [N-window, latest] and the earlier event is found.
+	#[tokio::test]
+	async fn chain_probe_scans_before_anchor_block_to_catch_earlier_events() {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let attempt_store = Arc::new(TransactionAttemptStore::new(storage.clone()));
+
+		// Order without claim_tx_hash; resolve_stage(Claim) will fall through
+		// to chain probe. anchor_tx comes from prepare_tx_hash.
+		let mut order = create_test_order_with_status(OrderStatus::Settled);
+		let prepare_hash = TransactionHash(vec![0xaa; 32]);
+		let onchain_claim_hash = TransactionHash(vec![0xee; 32]);
+		order.fill_tx_hash = None;
+		order.claim_tx_hash = None;
+		order.prepare_tx_hash = Some(prepare_hash.clone());
+		state_machine.store_order(&order).await.unwrap();
+
+		let networks = networks_with(
+			1,
+			test_network_config(Address(vec![0xcc; 20]), Address(vec![0xaa; 20])),
+		);
+
+		let prepare_block: u64 = 19_995_000;
+		let earlier_proof_block: u64 = prepare_block - 200;
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_block_number()
+			.with(eq(1u64))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(20_000_000u64) }));
+		// Anchor receipt: prepare_tx mined at prepare_block.
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(prepare_hash.clone()), eq(1u64))
+			.times(1)
+			.returning(move |hash, _| {
+				let hash = hash.clone();
+				Box::pin(async move {
+					Ok(solver_types::TransactionReceipt {
+						hash,
+						block_number: prepare_block,
+						success: true,
+						block_timestamp: None,
+						logs: vec![],
+					})
+				})
+			});
+		// Finalised event lives BEFORE the anchor. The pre-fix `from_block`
+		// was `prepare_block`, which would skip this. The fixed `from_block`
+		// is `prepare_block - DEFAULT_RECOVERY_SCAN_WINDOW_BLOCKS (10_000)`,
+		// which covers `earlier_proof_block` (200 blocks earlier).
+		let proof_hash_for_logs = onchain_claim_hash.clone();
+		mock_delivery
+			.expect_get_logs()
+			.withf(|chain_id, filter| *chain_id == 1 && matches_event::<Finalised>(filter))
+			.times(1)
+			.returning(move |_, _| {
+				let h = proof_hash_for_logs.clone();
+				Box::pin(async move {
+					Ok(vec![solver_types::Log {
+						address: Address(vec![0xcc; 20]),
+						topics: vec![],
+						data: vec![],
+						transaction_hash: Some(h),
+						block_number: Some(earlier_proof_block),
+					}])
+				})
+			});
+		// After write-back, recovery fetches the on-chain claim's receipt to
+		// finish the Finalized branch.
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(onchain_claim_hash.clone()), eq(1u64))
+			.times(1)
+			.returning(move |hash, _| {
+				let hash = hash.clone();
+				Box::pin(async move {
+					Ok(solver_types::TransactionReceipt {
+						hash,
+						block_number: earlier_proof_block,
+						success: true,
+						block_timestamp: None,
+						logs: vec![],
+					})
+				})
+			});
+
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				1u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			20,
+			60,
+		));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			EventBus::new(100),
+			attempt_store,
+			networks,
+		);
+
+		let (repaired, result) = recovery_service
+			.reconcile_with_blockchain(&order)
+			.await
+			.unwrap();
+		assert!(
+			matches!(result, ReconcileResult::Finalized),
+			"chain probe must find earlier proof event, got {result:?}"
+		);
+		assert_eq!(repaired.claim_tx_hash, Some(onchain_claim_hash));
 	}
 }

@@ -78,7 +78,16 @@ pub(crate) async fn anchor_block_for_same_chain(
 
 	if let Some(hash) = anchor_tx {
 		match delivery.get_receipt(hash, chain_id).await {
-			Ok(receipt) => return Ok((receipt.block_number, Some(latest))),
+			Ok(receipt) => {
+				// Subtract the window before the anchor: the proof event we're
+				// scanning for may have fired BEFORE this anchor tx (e.g., a
+				// competitor solver's Finalised landed at an earlier block,
+				// causing our claim attempt at `receipt.block_number` to
+				// revert). Starting the scan at the anchor block would miss
+				// those earlier events and incorrectly return NotFound.
+				let from_block = receipt.block_number.saturating_sub(window_blocks);
+				return Ok((from_block, Some(latest)));
+			},
 			Err(error) => {
 				tracing::debug!(
 					chain_id,

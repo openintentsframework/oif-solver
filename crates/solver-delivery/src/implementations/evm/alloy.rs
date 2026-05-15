@@ -1964,8 +1964,10 @@ async fn monitor_transaction(
 	.await;
 
 	match inner {
-		PollOutcome::Reverted { receipt_block, .. } => {
-			let block = receipt_block.unwrap_or(0);
+		PollOutcome::Reverted {
+			receipt_block: Some(block),
+			..
+		} => {
 			let revert_bytes = get_revert_data_with_provider(
 				provider,
 				chain_id,
@@ -1989,6 +1991,21 @@ async fn monitor_transaction(
 				receipt_block: Some(block),
 				classification,
 			}
+		},
+		// Receipt came back without a block number — extremely rare on
+		// post-merge chains, but defensively avoid replaying at block 0
+		// (genesis state, no OIF contracts deployed) which would either
+		// return empty bytes or coincidentally match an unrelated selector
+		// and misclassify. Fall through as Unknown so recovery on the next
+		// pass picks up a complete receipt.
+		PollOutcome::Reverted {
+			error,
+			receipt_block: None,
+			..
+		} => PollOutcome::Reverted {
+			error,
+			receipt_block: None,
+			classification: crate::RevertClassification::Unknown,
 		},
 		other => other,
 	}
