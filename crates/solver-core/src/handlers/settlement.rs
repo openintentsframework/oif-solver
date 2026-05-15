@@ -6,9 +6,12 @@
 
 use crate::engine::event_bus::EventBus;
 use crate::monitoring::SettlementMonitor;
+use crate::state::transaction_attempt::TransactionAttemptStore;
 use crate::state::OrderStateMachine;
 use alloy_primitives::hex;
-use solver_delivery::{DeliveryService, TransactionMonitoringEvent, TransactionTracking};
+use solver_delivery::{
+	DeliveryService, TransactionAttemptRecorder, TransactionMonitoringEvent, TransactionTracking,
+};
 use solver_order::OrderService;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
@@ -82,6 +85,10 @@ impl SettlementHandler {
 			monitoring_timeout_minutes,
 			networks,
 		}
+	}
+
+	fn transaction_attempt_recorder(&self) -> Arc<dyn TransactionAttemptRecorder> {
+		Arc::new(TransactionAttemptStore::new(self.storage.clone()))
 	}
 
 	/// Helper method to spawn settlement monitoring task.
@@ -211,6 +218,7 @@ impl SettlementHandler {
 				let tracking = TransactionTracking {
 					id: order_id.clone(),
 					tx_type: TransactionType::PostFill,
+					attempt_recorder: self.transaction_attempt_recorder(),
 					callback,
 				};
 
@@ -363,6 +371,7 @@ impl SettlementHandler {
 				let tracking = TransactionTracking {
 					id: order_id.clone(),
 					tx_type: TransactionType::PreClaim,
+					attempt_recorder: self.transaction_attempt_recorder(),
 					callback,
 				};
 
@@ -495,6 +504,7 @@ impl SettlementHandler {
 			let tracking = TransactionTracking {
 				id: order.id.clone(),
 				tx_type: TransactionType::Claim,
+				attempt_recorder: self.transaction_attempt_recorder(),
 				callback,
 			};
 

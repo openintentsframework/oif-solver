@@ -5196,6 +5196,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "anyhow",
+ "async-trait",
  "hex",
  "reqwest",
  "serde",
