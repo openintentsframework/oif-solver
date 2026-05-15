@@ -1015,6 +1015,7 @@ mod tests {
 		TransactionAttemptStatus, TransactionHash,
 	};
 	use std::collections::HashMap;
+	use tempfile::TempDir;
 
 	// Helper functions to create test data
 	fn create_test_order_with_status(status: OrderStatus) -> Order {
@@ -1041,13 +1042,18 @@ mod tests {
 		}
 	}
 
-	fn empty_attempt_store() -> Arc<TransactionAttemptStore> {
+	/// Returns the attempt store paired with its backing `TempDir`. The caller
+	/// must bind both halves; if the `TempDir` is dropped, the on-disk directory
+	/// is removed and the store points at a path that gets silently re-created
+	/// by `FileStorage::set_bytes` on the next write — leaking an orphan dir
+	/// the test can no longer clean up.
+	fn empty_attempt_store() -> (Arc<TransactionAttemptStore>, TempDir) {
 		let temp_dir = tempfile::tempdir().unwrap();
 		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
 			temp_dir.path().to_path_buf(),
 			TtlConfig::default(),
 		))));
-		Arc::new(TransactionAttemptStore::new(storage))
+		(Arc::new(TransactionAttemptStore::new(storage)), temp_dir)
 	}
 
 	fn sample_attempt(
@@ -1397,13 +1403,14 @@ mod tests {
 		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 		let recovery_service = RecoveryService::new(
 			storage,
 			state_machine,
 			delivery,
 			settlement,
 			event_bus,
-			empty_attempt_store(),
+			attempt_store,
 		);
 
 		let mut order = create_test_order_with_status(OrderStatus::Executed);
@@ -1451,6 +1458,7 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
 		let recovery_service = RecoveryService::new(
 			storage.clone(),
@@ -1458,7 +1466,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
-			empty_attempt_store(),
+			attempt_store,
 		);
 
 		// Test recovery with no orders
@@ -1505,6 +1513,7 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
 		let recovery_service = RecoveryService::new(
 			storage.clone(),
@@ -1512,7 +1521,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
-			empty_attempt_store(),
+			attempt_store,
 		);
 
 		let result = recovery_service.load_active_orders().await;
@@ -1564,6 +1573,7 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
 		let recovery_service = RecoveryService::new(
 			storage.clone(),
@@ -1571,7 +1581,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
-			empty_attempt_store(),
+			attempt_store,
 		);
 
 		let orders = recovery_service.load_active_orders().await.unwrap();
@@ -1627,6 +1637,7 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
 		let recovery_service = RecoveryService::new(
 			storage.clone(),
@@ -1634,7 +1645,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
-			empty_attempt_store(),
+			attempt_store,
 		);
 
 		let result = recovery_service.recover_orphaned_intents().await;
@@ -1659,6 +1670,7 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
 		let recovery_service = RecoveryService::new(
 			storage.clone(),
@@ -1666,7 +1678,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
-			empty_attempt_store(),
+			attempt_store,
 		);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
@@ -1716,6 +1728,7 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
 		let recovery_service = RecoveryService::new(
 			storage.clone(),
@@ -1723,7 +1736,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
-			empty_attempt_store(),
+			attempt_store,
 		);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
@@ -1775,6 +1788,7 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
 		let recovery_service = RecoveryService::new(
 			storage.clone(),
@@ -1782,7 +1796,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
-			empty_attempt_store(),
+			attempt_store,
 		);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
@@ -1842,6 +1856,7 @@ mod tests {
 			)]);
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
 		let recovery_service = RecoveryService::new(
 			storage.clone(),
@@ -1849,7 +1864,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
-			empty_attempt_store(),
+			attempt_store,
 		);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
@@ -1907,6 +1922,7 @@ mod tests {
 			)]);
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
 		let recovery_service = RecoveryService::new(
 			storage.clone(),
@@ -1914,7 +1930,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
-			empty_attempt_store(),
+			attempt_store,
 		);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
@@ -1974,6 +1990,7 @@ mod tests {
 			)]);
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
 		let recovery_service = RecoveryService::new(
 			storage.clone(),
@@ -1981,7 +1998,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
-			empty_attempt_store(),
+			attempt_store,
 		);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
@@ -2026,6 +2043,7 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
 		let recovery_service = RecoveryService::new(
 			storage.clone(),
@@ -2033,7 +2051,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
-			empty_attempt_store(),
+			attempt_store,
 		);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
@@ -2082,6 +2100,7 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
 		let recovery_service = RecoveryService::new(
 			storage.clone(),
@@ -2089,7 +2108,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
-			empty_attempt_store(),
+			attempt_store,
 		);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
@@ -2139,6 +2158,7 @@ mod tests {
 			HashMap::new();
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
 		let recovery_service = RecoveryService::new(
 			storage.clone(),
@@ -2146,7 +2166,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
-			empty_attempt_store(),
+			attempt_store,
 		);
 
 		let result = recovery_service.reconcile_with_blockchain(&order).await;
@@ -2199,6 +2219,7 @@ mod tests {
 
 		// Subscribe to events
 		let mut receiver = event_bus.subscribe();
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
 		let recovery_service = RecoveryService::new(
 			storage.clone(),
@@ -2206,7 +2227,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
-			empty_attempt_store(),
+			attempt_store,
 		);
 
 		recovery_service
@@ -2264,6 +2285,7 @@ mod tests {
 
 		// Subscribe to events
 		let mut receiver = event_bus.subscribe();
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
 		let recovery_service = RecoveryService::new(
 			storage.clone(),
@@ -2271,7 +2293,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
-			empty_attempt_store(),
+			attempt_store,
 		);
 
 		let order = create_test_order_with_status(OrderStatus::Created);
@@ -2327,6 +2349,7 @@ mod tests {
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
 		let mut receiver = event_bus.subscribe();
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
 		let recovery_service = RecoveryService::new(
 			storage.clone(),
@@ -2334,7 +2357,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
-			empty_attempt_store(),
+			attempt_store,
 		);
 
 		recovery_service
@@ -2392,6 +2415,7 @@ mod tests {
 		let settlement = Arc::new(SettlementService::new(settlement_impls, String::new(), 20));
 		let event_bus = EventBus::new(100);
 		let mut receiver = event_bus.subscribe();
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
 
 		let recovery_service = RecoveryService::new(
 			storage.clone(),
@@ -2399,7 +2423,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
-			empty_attempt_store(),
+			attempt_store,
 		);
 
 		recovery_service
