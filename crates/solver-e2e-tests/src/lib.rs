@@ -43,8 +43,8 @@ fn harness_lock() -> &'static Mutex<()> {
 // =============================================================================
 
 pub use solver_types::standards::eip7683::interfaces::{
-	Finalised, IInputSettlerEscrow, Open, OutputFilled, SolMandateOutput as MandateOutput,
-	StandardOrder,
+	Finalised, IInputSettlerEscrow, Open, OutputFilled, Refunded,
+	SolMandateOutput as MandateOutput, SolveParams, StandardOrder,
 };
 
 sol! {
@@ -60,6 +60,61 @@ sol! {
 	#[sol(rpc)]
 	contract IMailboxMock {
 		function dispatchCounter() external view returns (uint256);
+	}
+}
+
+/// Test-only ABI wrappers. `IOutputSettlerSimple` in solver-types lacks
+/// `#[sol(rpc)]` so the typed contract wrapper isn't generated; we declare an
+/// rpc-tagged copy here. `InputSettlerEscrow.refund(...)` is missing from the
+/// production binding entirely; we add a minimal rpc-tagged interface for it.
+///
+/// `sol!` only resolves struct names within its own block, so we redeclare
+/// `SolMandateOutput` and `StandardOrder` here with the SAME layout as
+/// solver-types (verify against `solver-types/src/standards/eip7683.rs:305`).
+/// Tests convert between layouts via ABI roundtrip
+/// (`solver_types_value.abi_encode()` -> `ext_bindings::Type::abi_decode(&bytes, true)`).
+pub mod ext_bindings {
+	use alloy_sol_types::sol;
+
+	sol! {
+		#[derive(Debug)]
+		struct SolMandateOutput {
+			bytes32 oracle;
+			bytes32 settler;
+			uint256 chainId;
+			bytes32 token;
+			uint256 amount;
+			bytes32 recipient;
+			bytes callbackData;
+			bytes context;
+		}
+
+		#[derive(Debug)]
+		struct StandardOrder {
+			address user;
+			uint256 nonce;
+			uint256 originChainId;
+			uint32 expires;
+			uint32 fillDeadline;
+			address inputOracle;
+			uint256[2][] inputs;
+			SolMandateOutput[] outputs;
+		}
+
+		#[sol(rpc)]
+		interface IOutputSettlerSimpleRpc {
+			function fill(
+				bytes32 orderId,
+				SolMandateOutput calldata output,
+				uint48 fillDeadline,
+				bytes calldata fillerData
+			) external returns (bytes32);
+		}
+
+		#[sol(rpc)]
+		interface IInputSettlerEscrowRefund {
+			function refund(StandardOrder calldata order) external;
+		}
 	}
 }
 
@@ -193,6 +248,14 @@ pub struct HarnessOptions {
 	/// The list is matched against `order.user` and every output recipient,
 	/// case-insensitively. See PR #308 / `IntentHandler::load_deny_list`.
 	pub deny_list_addresses: Option<Vec<String>>,
+	/// When false, `boot_with` skips the entire solver-service path:
+	/// `ensure_solver_binary_built()`, `spawn_solver(...)`, and the following
+	/// `wait_for_tcp_ready(SOLVER_API_PORT, ...)` health check. Direct-call
+	/// tests (chain-aware recovery, custom event drivers) set this to false so
+	/// the solver loop doesn't race with manually emitted events — and so the
+	/// test doesn't trigger a `cargo build -p solver-service --bin solver` it
+	/// doesn't need. Defaults to true.
+	pub run_solver: bool,
 }
 
 impl Default for HarnessOptions {
@@ -207,6 +270,7 @@ impl Default for HarnessOptions {
 			use_hyperlane_settlement: false,
 			enable_permit2: false,
 			deny_list_addresses: None,
+			run_solver: true,
 		}
 	}
 }
@@ -226,7 +290,9 @@ impl Harness {
 		kill_listeners_on_ports(&[ORIGIN_RPC_PORT, DEST_RPC_PORT, SOLVER_API_PORT]);
 
 		let tempdir = TempDir::new().context("create tempdir")?;
-		ensure_solver_binary_built()?;
+		if options.run_solver {
+			ensure_solver_binary_built()?;
+		}
 
 		let anvils = vec![
 			spawn_anvil(ORIGIN_CHAIN_ID, ORIGIN_RPC_PORT)?,
@@ -369,13 +435,18 @@ impl Harness {
 		// Capture solver stderr to a file so we can dump it on failure
 		// regardless of how cargo test buffers its own stderr.
 		let solver_stderr_path = tempdir.path().join("solver.stderr.log");
-		let solver = spawn_solver(
-			&bootstrap_path,
-			tempdir.path(),
-			&solver_stderr_path,
-			&options,
-		)?;
-		wait_for_tcp_ready(SOLVER_API_PORT, SOLVER_HEALTH_TIMEOUT).await?;
+		let solver = if options.run_solver {
+			let child = spawn_solver(
+				&bootstrap_path,
+				tempdir.path(),
+				&solver_stderr_path,
+				&options,
+			)?;
+			wait_for_tcp_ready(SOLVER_API_PORT, SOLVER_HEALTH_TIMEOUT).await?;
+			Some(child)
+		} else {
+			None
+		};
 
 		Ok(Self {
 			origin,
@@ -384,7 +455,7 @@ impl Harness {
 			destination_provider,
 			user_signer,
 			anvils,
-			solver: Some(solver),
+			solver,
 			solver_stderr_path,
 			bootstrap_path,
 			_tempdir: tempdir,
@@ -693,6 +764,128 @@ impl Harness {
 			DEST_CHAIN_ID => Ok(&self.destination_provider),
 			other => Err(anyhow!("no provider for chain {other}")),
 		}
+	}
+
+	/// Read the destination block's timestamp by number. Used by tests that
+	/// need a real fill timestamp to pass into `direct_finalise(...)`.
+	pub async fn destination_block_timestamp(&self, block_number: u64) -> Result<u64> {
+		let block = self
+			.destination_provider
+			.get_block_by_number(BlockNumberOrTag::Number(block_number))
+			.await
+			.context("destination get_block_by_number")?
+			.ok_or_else(|| anyhow!("destination block {block_number} not found"))?;
+		Ok(block.header.timestamp)
+	}
+
+	/// Approve the output token from the solver, then call
+	/// `OutputSettlerSimple.fill(orderId, output, fillDeadline, fillerData)`
+	/// on the destination chain as the solver. Emits `OutputFilled`.
+	///
+	/// `fillerData` is encoded as `bytes32(solver_address)` per
+	/// `FillerDataLib.sol:23`; empty bytes would revert.
+	pub async fn direct_fill_on_destination(
+		&self,
+		order_id: B256,
+		output: MandateOutput,
+		fill_deadline: u32,
+	) -> Result<TransactionReceipt> {
+		let output_settler = self.destination.output_settler;
+
+		// 1. Solver approves output_settler to pull `output.amount` of token_b.
+		let token_addr = Address::from_slice(&output.token.0[12..]);
+		let approve_pending = IERC20::new(token_addr, &self.destination_provider)
+			.approve(output_settler, output.amount)
+			.send()
+			.await
+			.context("solver approve(output_settler, amount)")?;
+		let _ = approve_pending
+			.get_receipt()
+			.await
+			.context("solver approve receipt")?;
+
+		// 2. ABI roundtrip the typed value into ext_bindings' identical layout.
+		let encoded = output.abi_encode();
+		let local_output = <ext_bindings::SolMandateOutput as SolValue>::abi_decode(&encoded)
+			.context("re-decode MandateOutput into ext_bindings layout")?;
+
+		// 3. fillerData = bytes32(solver_address) (left-padded 32 bytes).
+		let filler_data = Bytes::from(self.solver_address().into_word().0.to_vec());
+
+		// 4. uint48 conversion for fillDeadline.
+		let fill_deadline_u48 = alloy_primitives::aliases::U48::from(fill_deadline);
+
+		// 5. Call fill(...) via the rpc-tagged local binding.
+		let pending =
+			ext_bindings::IOutputSettlerSimpleRpc::new(output_settler, &self.destination_provider)
+				.fill(order_id, local_output, fill_deadline_u48, filler_data)
+				.send()
+				.await
+				.context("send OutputSettlerSimple.fill")?;
+		pending.get_receipt().await.context("fill receipt")
+	}
+
+	/// Call `InputSettlerEscrow.finalise(order, solveParams, destination, [])`
+	/// on the origin chain as the solver. Emits `Finalised`.
+	///
+	/// Default `Harness::boot()` deploys `AlwaysYesOracle`, so this does NOT
+	/// require any oracle attestation setup — `efficientRequireProven` is a
+	/// no-op there.
+	pub async fn direct_finalise(
+		&self,
+		order: StandardOrder,
+		fill_timestamp: u32,
+	) -> Result<TransactionReceipt> {
+		let solver_word = self.solver_address().into_word();
+		let solve_params = SolveParams {
+			timestamp: fill_timestamp,
+			solver: solver_word,
+		};
+		let pending = IInputSettlerEscrow::new(self.origin.input_settler, &self.origin_provider)
+			.finalise(order, vec![solve_params], solver_word, Bytes::new())
+			.send()
+			.await
+			.context("send InputSettlerEscrow.finalise")?;
+		pending.get_receipt().await.context("finalise receipt")
+	}
+
+	/// Advance the origin chain past `order.expires`, then call
+	/// `InputSettlerEscrow.refund(order)`. Emits `Refunded`.
+	pub async fn direct_refund(&self, order: StandardOrder) -> Result<TransactionReceipt> {
+		// 1. Jump time past expires + buffer. Anvil's `evm_setNextBlockTimestamp`
+		//    returns the new timestamp as a hex string and `evm_mine` returns
+		//    the mined block number as a hex string — model the response as
+		//    `serde_json::Value` to ignore the body without a type mismatch.
+		let new_ts: u64 = u64::from(order.expires) + 60;
+		self.origin_provider
+			.client()
+			.request::<_, serde_json::Value>("evm_setNextBlockTimestamp", (new_ts,))
+			.await
+			.context("evm_setNextBlockTimestamp")?;
+		self.origin_provider
+			.client()
+			.request::<_, serde_json::Value>("evm_mine", ())
+			.await
+			.context("evm_mine")?;
+
+		// 2. Roundtrip order into ext_bindings layout for the local rpc-tagged
+		//    interface.
+		let encoded = order.abi_encode();
+		let local_order = <ext_bindings::StandardOrder as SolValue>::abi_decode(&encoded)
+			.context("re-decode StandardOrder into ext_bindings layout")?;
+
+		// 3. Call refund(...) as the user (refund is unrestricted in the
+		//    contract; using the solver-signed provider is fine but mirrors the
+		//    common pattern of "anyone can trigger after expiry").
+		let pending = ext_bindings::IInputSettlerEscrowRefund::new(
+			self.origin.input_settler,
+			&self.origin_provider,
+		)
+		.refund(local_order)
+		.send()
+		.await
+		.context("send InputSettlerEscrow.refund")?;
+		pending.get_receipt().await.context("refund receipt")
 	}
 }
 
