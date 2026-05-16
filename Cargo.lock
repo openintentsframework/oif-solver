@@ -5081,6 +5081,7 @@ name = "solver-delivery"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-json-rpc",
  "alloy-network",
  "alloy-primitives",
  "alloy-provider",

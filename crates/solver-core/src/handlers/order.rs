@@ -8,7 +8,8 @@ use crate::state::transaction_attempt::TransactionAttemptStore;
 use crate::state::OrderStateMachine;
 use alloy_primitives::hex;
 use solver_delivery::{
-	DeliveryService, TransactionAttemptRecorder, TransactionMonitoringEvent, TransactionTracking,
+	DeliveryService, RevertClassification, TransactionAttemptRecorder, TransactionMonitoringEvent,
+	TransactionTracking,
 };
 use solver_order::OrderService;
 use solver_storage::StorageService;
@@ -106,15 +107,27 @@ impl OrderHandler {
 					tx_hash,
 					tx_type,
 					error,
-				} => {
-					event_bus
-						.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
-							order_id: id,
-							tx_hash,
-							tx_type,
-							error,
-						}))
-						.ok();
+					classification,
+				} => match classification {
+					RevertClassification::StageComplete { reason } => {
+						tracing::info!(
+							order_id = %id,
+							?tx_type,
+							?reason,
+							?tx_hash,
+							"Revert classified as stage-complete; deferring to recovery for chain confirmation"
+						);
+					},
+					RevertClassification::Terminal { .. } | RevertClassification::Unknown => {
+						event_bus
+							.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+								order_id: id,
+								tx_hash,
+								tx_type,
+								error,
+							}))
+							.ok();
+					},
 				},
 				TransactionMonitoringEvent::Indeterminate {
 					id: order_id,
@@ -237,15 +250,27 @@ impl OrderHandler {
 				tx_hash,
 				tx_type,
 				error,
-			} => {
-				event_bus
-					.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
-						order_id: id,
-						tx_hash,
-						tx_type,
-						error,
-					}))
-					.ok();
+				classification,
+			} => match classification {
+				RevertClassification::StageComplete { reason } => {
+					tracing::info!(
+						order_id = %id,
+						?tx_type,
+						?reason,
+						?tx_hash,
+						"Revert classified as stage-complete; deferring to recovery for chain confirmation"
+					);
+				},
+				RevertClassification::Terminal { .. } | RevertClassification::Unknown => {
+					event_bus
+						.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+							order_id: id,
+							tx_hash,
+							tx_type,
+							error,
+						}))
+						.ok();
+				},
 			},
 			TransactionMonitoringEvent::Indeterminate {
 				id: order_id,
