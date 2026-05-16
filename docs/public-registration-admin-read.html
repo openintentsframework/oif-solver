@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Public Registration Admin-Read Escalation</title>
+  <style>
+    :root {
+      --bg: #f7f8fb;
+      --panel: #ffffff;
+      --ink: #172033;
+      --muted: #5f6b7a;
+      --line: #d8dee8;
+      --danger: #b42318;
+      --danger-bg: #fff0ed;
+      --safe: #1f7a4d;
+      --safe-bg: #e8f5ee;
+      --warn: #a15c00;
+      --warn-bg: #fff7e8;
+      --code-bg: #eef2f7;
+      --shadow: 0 8px 24px rgba(16, 24, 40, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+      line-height: 1.5;
+    }
+
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 40px 24px 56px;
+    }
+
+    h1,
+    h2,
+    h3,
+    p {
+      margin-top: 0;
+    }
+
+    h1 {
+      font-size: 34px;
+      line-height: 1.1;
+      margin-bottom: 12px;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      font-size: 22px;
+      margin-bottom: 14px;
+      letter-spacing: 0;
+    }
+
+    h3 {
+      font-size: 16px;
+      margin-bottom: 8px;
+      letter-spacing: 0;
+    }
+
+    p {
+      color: var(--muted);
+      margin-bottom: 12px;
+    }
+
+    code {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      background: var(--code-bg);
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      color: var(--ink);
+      padding: 1px 5px;
+      white-space: nowrap;
+    }
+
+    pre {
+      margin: 0;
+      padding: 16px;
+      color: #f8fafc;
+      background: #111827;
+      border-radius: 8px;
+      overflow-x: auto;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 24px;
+      margin-bottom: 24px;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.25fr) minmax(280px, 0.75fr);
+      gap: 24px;
+      align-items: stretch;
+    }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 18px;
+    }
+
+    .status-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      background: #fbfcfe;
+    }
+
+    .status-card strong {
+      display: block;
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .status-card span {
+      display: block;
+      font-size: 17px;
+      font-weight: 800;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .step {
+      position: relative;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfe;
+      padding: 16px;
+      min-height: 180px;
+    }
+
+    .step::after {
+      content: "";
+      position: absolute;
+      top: 50%;
+      right: -15px;
+      width: 15px;
+      height: 2px;
+      background: var(--line);
+    }
+
+    .step:last-child::after {
+      display: none;
+    }
+
+    .step .num {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 999px;
+      color: #fff;
+      background: var(--danger);
+      font-size: 13px;
+      font-weight: 800;
+      margin-bottom: 12px;
+    }
+
+    .step p {
+      margin-bottom: 0;
+    }
+
+    .danger {
+      border-color: rgba(180, 35, 24, 0.35);
+      background: var(--danger-bg);
+    }
+
+    .warn {
+      border-color: rgba(161, 92, 0, 0.35);
+      background: var(--warn-bg);
+    }
+
+    .safe {
+      border-color: rgba(31, 122, 77, 0.35);
+      background: var(--safe-bg);
+    }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 24px;
+    }
+
+    .list {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--muted);
+    }
+
+    .list li {
+      margin-bottom: 8px;
+    }
+
+    .scope-table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+    }
+
+    .scope-table th,
+    .scope-table td {
+      border-bottom: 1px solid var(--line);
+      padding: 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    .scope-table th {
+      background: #f0f3f8;
+      font-size: 13px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .scope-table tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 4px 9px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      margin-right: 6px;
+      margin-bottom: 6px;
+    }
+
+    .badge.danger-badge {
+      color: var(--danger);
+      border-color: rgba(180, 35, 24, 0.35);
+      background: var(--danger-bg);
+    }
+
+    .badge.safe-badge {
+      color: var(--safe);
+      border-color: rgba(31, 122, 77, 0.35);
+      background: var(--safe-bg);
+    }
+
+    .fix-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .fix-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      background: #fbfcfe;
+    }
+
+    .file-ref {
+      display: grid;
+      gap: 8px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    @media (max-width: 900px) {
+      main {
+        padding: 28px 16px 40px;
+      }
+
+      .hero,
+      .flow,
+      .two-col,
+      .status-grid,
+      .fix-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .step::after {
+        top: auto;
+        left: 28px;
+        right: auto;
+        bottom: -15px;
+        width: 2px;
+        height: 15px;
+      }
+
+      h1 {
+        font-size: 28px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <div class="panel">
+        <h1>Public Registration Can Mint Admin-Read JWTs</h1>
+        <p>
+          The registration endpoint is meant to let public clients self-register for normal API scopes. The bug is that the public scope parser rejects <code>admin-all</code> but still accepts <code>admin-read</code>. That creates a read-only admin privilege escalation when public registration and admin routes are enabled.
+        </p>
+        <div>
+          <span class="badge danger-badge">Root cause: denylist misses admin-read</span>
+          <span class="badge">Scope parsing bug</span>
+          <span class="badge">Config-dependent</span>
+        </div>
+      </div>
+
+      <aside class="panel">
+        <h2>When Is It Exploitable?</h2>
+        <div class="status-grid">
+          <div class="status-card">
+            <strong>Orders auth</strong>
+            <span>enabled</span>
+          </div>
+          <div class="status-card">
+            <strong>Public register</strong>
+            <span>enabled</span>
+          </div>
+          <div class="status-card">
+            <strong>Admin API</strong>
+            <span>enabled</span>
+          </div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="panel">
+      <h2>Attack Flow</h2>
+      <div class="flow">
+        <div class="step danger">
+          <div class="num">1</div>
+          <h3>Unauthenticated caller registers</h3>
+          <p>The attacker calls <code>POST /api/v1/auth/register</code>. This route is public by design when self-registration is enabled.</p>
+        </div>
+        <div class="step danger">
+          <div class="num">2</div>
+          <h3>Caller asks for admin-read</h3>
+          <p>The request includes <code>scopes: ["admin-read"]</code>. The shared scope parser recognizes it as a valid scope.</p>
+        </div>
+        <div class="step warn">
+          <div class="num">3</div>
+          <h3>Parser only blocks admin-all</h3>
+          <p><code>parse_public_scopes</code> rejects <code>admin-all</code>, but does not reject <code>admin-read</code>.</p>
+        </div>
+        <div class="step danger">
+          <div class="num">4</div>
+          <h3>JWT unlocks admin read routes</h3>
+          <p>The token is accepted by routes requiring <code>AuthScope::AdminRead</code>, such as config, balances, whitelist, gas, fees, and rebalance reads.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="two-col">
+      <div class="panel">
+        <h2>Request Shape</h2>
+        <p>This is the shape of the bad request. It only works when public registration is enabled.</p>
+        <pre><code>POST /api/v1/auth/register
+Content-Type: application/json
+
+{
+  "client_id": "public-client-123",
+  "client_name": "Public Client",
+  "scopes": ["admin-read"]
+}</code></pre>
+      </div>
+
+      <div class="panel">
+        <h2>Why It Works</h2>
+        <ul class="list">
+          <li><code>AuthScope</code> includes both <code>admin-read</code> and <code>admin-all</code>.</li>
+          <li><code>parse_scopes</code> accepts any valid <code>AuthScope</code> string.</li>
+          <li><code>parse_public_scopes</code> only rejects <code>AdminAll</code>.</li>
+          <li>Admin read routes require <code>AdminRead</code>, so the issued token is enough.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Scope Policy: Current vs Safe</h2>
+      <table class="scope-table">
+        <thead>
+          <tr>
+            <th>Scope</th>
+            <th>Current public registration</th>
+            <th>Safe public registration</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>read-orders</code></td>
+            <td>Allowed</td>
+            <td>Allowed if public clients need order lookup</td>
+          </tr>
+          <tr>
+            <td><code>create-orders</code></td>
+            <td>Allowed</td>
+            <td>Allowed if public clients need order submission</td>
+          </tr>
+          <tr>
+            <td><code>create-quotes</code></td>
+            <td>Allowed</td>
+            <td>Allowed if public clients need quote creation</td>
+          </tr>
+          <tr>
+            <td><code>read-quotes</code></td>
+            <td>Allowed</td>
+            <td>Allowed if public clients need quote lookup</td>
+          </tr>
+          <tr>
+            <td><code>admin-read</code></td>
+            <td class="danger">Allowed by mistake</td>
+            <td class="safe">Always rejected</td>
+          </tr>
+          <tr>
+            <td><code>admin-all</code></td>
+            <td>Rejected</td>
+            <td class="safe">Always rejected</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2>How to Avoid This Vulnerability</h2>
+      <div class="fix-grid">
+        <div class="fix-card safe">
+          <h3>Use a positive allowlist</h3>
+          <p>Public registration should explicitly allow only non-admin scopes. Do not parse all scopes and then block a few dangerous ones.</p>
+        </div>
+        <div class="fix-card safe">
+          <h3>Separate admin issuance</h3>
+          <p>Admin scopes should only be minted after SIWE/admin whitelist verification, never from public self-registration.</p>
+        </div>
+        <div class="fix-card safe">
+          <h3>Test forbidden scopes</h3>
+          <p>Add tests that <code>admin-read</code> and <code>admin-all</code> both fail through <code>/auth/register</code>.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Recommended Code Policy</h2>
+      <p>Conceptually, the public parser should be shaped like this:</p>
+      <pre><code>fn parse_public_scopes(scopes: Option&lt;Vec&lt;String&gt;&gt;) -&gt; Result&lt;Vec&lt;AuthScope&gt;, String&gt; {
+    let scopes = parse_scopes(scopes)?;
+    let allowed = [
+        AuthScope::ReadOrders,
+        AuthScope::CreateOrders,
+        AuthScope::ReadQuotes,
+        AuthScope::CreateQuotes,
+    ];
+
+    if scopes.iter().any(|scope| !allowed.contains(scope)) {
+        return Err("scope is not allowed on public registration".to_string());
+    }
+
+    Ok(scopes)
+}</code></pre>
+      <p style="margin-top: 14px;">
+        This avoids future mistakes if new admin scopes are added later. New privileged scopes will be rejected by default until someone intentionally adds them to the public allowlist.
+      </p>
+    </section>
+
+    <section class="panel">
+      <h2>Operational Safeguards</h2>
+      <ul class="list">
+        <li>Keep <code>AUTH_PUBLIC_REGISTER_ENABLED=false</code> unless public self-registration is explicitly needed.</li>
+        <li>If admin routes are enabled, review every path that can mint JWT scopes.</li>
+        <li>Monitor registration logs for unexpected privileged scope requests.</li>
+        <li>Consider separate JWT issuers or token audiences for public clients and admin sessions.</li>
+      </ul>
+    </section>
+
+    <section class="panel">
+      <h2>Relevant Code References</h2>
+      <div class="file-ref">
+        <div><code>crates/solver-service/src/apis/auth.rs</code>: <code>register_client</code> calls <code>parse_public_scopes</code>.</div>
+        <div><code>crates/solver-service/src/apis/auth.rs</code>: <code>parse_public_scopes</code> only rejects <code>AdminAll</code>.</div>
+        <div><code>crates/solver-types/src/auth.rs</code>: <code>admin-read</code> is a valid <code>AuthScope</code>.</div>
+        <div><code>crates/solver-service/src/server.rs</code>: admin read routes require <code>AuthScope::AdminRead</code>.</div>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
