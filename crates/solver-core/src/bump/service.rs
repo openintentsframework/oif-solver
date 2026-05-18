@@ -157,22 +157,23 @@ impl TransactionBumpService {
 				.await
 				.map_err(|e| BumpError::Storage(e.to_string()))?;
 
-			// Bucket by tx_type (same Vec-pair pattern as phase 1 since
-			// TransactionType doesn't impl Hash).
-			let mut by_tx_type: Vec<(TransactionType, Vec<TransactionAttempt>)> = Vec::new();
+			// Bucket by (chain_id, tx_type) so multi-chain orders apply the
+			// correct per-chain policy. Vec-pair pattern because neither
+			// TransactionType nor the tuple implements Hash.
+			let mut by_chain_and_type: Vec<((u64, TransactionType), Vec<TransactionAttempt>)> =
+				Vec::new();
 			for a in attempts {
-				if let Some(slot) = by_tx_type.iter_mut().find(|(t, _)| *t == a.tx_type) {
+				if let Some(slot) = by_chain_and_type
+					.iter_mut()
+					.find(|((cid, t), _)| *cid == a.chain_id && *t == a.tx_type)
+				{
 					slot.1.push(a);
 				} else {
-					by_tx_type.push((a.tx_type, vec![a]));
+					by_chain_and_type.push(((a.chain_id, a.tx_type), vec![a]));
 				}
 			}
 
-			for (tx_type, group) in by_tx_type {
-				let chain_id = match group.first().map(|a| a.chain_id) {
-					Some(c) => c,
-					None => continue,
-				};
+			for ((chain_id, tx_type), group) in by_chain_and_type {
 				let policy = match self.config.for_chain(chain_id) {
 					Some(p) => p,
 					None => continue,
