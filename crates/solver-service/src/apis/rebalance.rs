@@ -660,9 +660,13 @@ pub async fn handle_update_rebalance_config(
 
 	match operator_config.rebalance.as_mut() {
 		Some(rebalance) => {
+			let max_pending_transfers =
+				u32::try_from(request.max_pending_transfers).map_err(|_| {
+					AdminAuthError::InvalidMessage("max_pending_transfers out of range".to_string())
+				})?;
 			rebalance.enabled = request.enabled;
 			rebalance.cooldown_seconds = request.cooldown_seconds;
-			rebalance.max_pending_transfers = request.max_pending_transfers as u32;
+			rebalance.max_pending_transfers = max_pending_transfers;
 		},
 		None => {
 			return Err(AdminAuthError::InvalidMessage(
@@ -733,9 +737,18 @@ pub async fn handle_update_rebalance_threshold(
 			AdminAuthError::InvalidMessage(format!("Pair '{}' not found", request.pair_id))
 		})?;
 
+	let deviation_band_bps = u32::try_from(request.deviation_band_bps).map_err(|_| {
+		AdminAuthError::InvalidMessage("deviation_band_bps out of range".to_string())
+	})?;
+	if deviation_band_bps > 10_000 {
+		return Err(AdminAuthError::InvalidMessage(
+			"deviation_band_bps must be <= 10000".to_string(),
+		));
+	}
+
 	pair.target_balance_a = request.target_balance_a.clone();
 	pair.target_balance_b = request.target_balance_b.clone();
-	pair.deviation_band_bps = request.deviation_band_bps as u32;
+	pair.deviation_band_bps = deviation_band_bps;
 	pair.max_bridge_amount = request.max_bridge_amount.clone();
 
 	// Validate BEFORE persisting — reject invalid config without touching storage
@@ -1169,6 +1182,103 @@ mod tests {
 			make_bridge_storage(),
 			"test-solver".to_string(),
 		))
+	}
+
+	#[tokio::test]
+	async fn test_handle_update_rebalance_config_rejects_out_of_range_max_pending() {
+		let state = make_admin_state(
+			sample_operator_config(),
+			create_delivery_service(|_, _, _| Ok("0".to_string())),
+			None,
+		)
+		.await;
+
+		let result = handle_update_rebalance_config(
+			axum::extract::State(state),
+			crate::apis::admin::VerifiedAdmin {
+				admin: solver_types::Address::from(alloy_address(SOLVER_ADDRESS)),
+				contents: UpdateRebalanceConfigContents {
+					enabled: true,
+					cooldown_seconds: 60,
+					max_pending_transfers: u64::from(u32::MAX) + 1,
+					nonce: 1,
+					deadline: 2,
+				},
+			},
+		)
+		.await;
+
+		assert!(matches!(
+			result,
+			Err(AdminAuthError::InvalidMessage(msg))
+				if msg == "max_pending_transfers out of range"
+		));
+	}
+
+	#[tokio::test]
+	async fn test_handle_update_rebalance_threshold_rejects_out_of_range_deviation_band() {
+		let state = make_admin_state(
+			sample_operator_config(),
+			create_delivery_service(|_, _, _| Ok("0".to_string())),
+			None,
+		)
+		.await;
+
+		let result = handle_update_rebalance_threshold(
+			axum::extract::State(state),
+			crate::apis::admin::VerifiedAdmin {
+				admin: solver_types::Address::from(alloy_address(SOLVER_ADDRESS)),
+				contents: UpdateRebalanceThresholdContents {
+					pair_id: "eth-katana".to_string(),
+					target_balance_a: "1000000".to_string(),
+					target_balance_b: "1000000".to_string(),
+					deviation_band_bps: u64::from(u32::MAX) + 1,
+					max_bridge_amount: "500000".to_string(),
+					nonce: 1,
+					deadline: 2,
+				},
+			},
+		)
+		.await;
+
+		assert!(matches!(
+			result,
+			Err(AdminAuthError::InvalidMessage(msg))
+				if msg == "deviation_band_bps out of range"
+		));
+	}
+
+	#[tokio::test]
+	async fn test_handle_update_rebalance_threshold_rejects_deviation_band_above_100_percent() {
+		let state = make_admin_state(
+			sample_operator_config(),
+			create_delivery_service(|_, _, _| Ok("0".to_string())),
+			None,
+		)
+		.await;
+
+		let result = handle_update_rebalance_threshold(
+			axum::extract::State(state),
+			crate::apis::admin::VerifiedAdmin {
+				admin: solver_types::Address::from(alloy_address(SOLVER_ADDRESS)),
+				contents: UpdateRebalanceThresholdContents {
+					pair_id: "eth-katana".to_string(),
+					target_balance_a: "1000000".to_string(),
+					target_balance_b: "1000000".to_string(),
+					deviation_band_bps: 10_001,
+					max_bridge_amount: "500000".to_string(),
+					nonce: 1,
+					deadline: 2,
+				},
+			},
+		)
+		.await;
+
+		assert!(matches!(
+			result,
+			Err(AdminAuthError::InvalidMessage(msg))
+				if msg == "deviation_band_bps must be <= 10000"
+		));
 	}
 
 	#[tokio::test]
