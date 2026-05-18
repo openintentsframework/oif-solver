@@ -566,23 +566,25 @@ impl TxBumpConfig {
 		if self.default_max_replacements_per_stage == 0 {
 			return Err("tx_bump.default_max_replacements_per_stage must be >= 1".into());
 		}
-		if let Some(s) = &self.default_max_fee_per_gas_cap_wei {
-			s.parse::<u128>()
-				.map_err(|e| format!("tx_bump.default_max_fee_per_gas_cap_wei parse error: {e}"))?;
-		}
-		if let Some(s) = &self.default_max_priority_fee_per_gas_cap_wei {
-			s.parse::<u128>().map_err(|e| {
-				format!("tx_bump.default_max_priority_fee_per_gas_cap_wei parse error: {e}")
-			})?;
-		}
-		if let (Some(p), Some(f)) = (
-			self.default_max_priority_fee_per_gas_cap_wei
-				.as_ref()
-				.and_then(|s| s.parse::<u128>().ok()),
-			self.default_max_fee_per_gas_cap_wei
-				.as_ref()
-				.and_then(|s| s.parse::<u128>().ok()),
-		) {
+		let default_fee_cap = self
+			.default_max_fee_per_gas_cap_wei
+			.as_ref()
+			.map(|s| {
+				s.parse::<u128>().map_err(|e| {
+					format!("tx_bump.default_max_fee_per_gas_cap_wei parse error: {e}")
+				})
+			})
+			.transpose()?;
+		let default_priority_cap = self
+			.default_max_priority_fee_per_gas_cap_wei
+			.as_ref()
+			.map(|s| {
+				s.parse::<u128>().map_err(|e| {
+					format!("tx_bump.default_max_priority_fee_per_gas_cap_wei parse error: {e}")
+				})
+			})
+			.transpose()?;
+		if let (Some(p), Some(f)) = (default_priority_cap, default_fee_cap) {
 			if p > f {
 				return Err("tx_bump default: priority cap must be <= fee cap".into());
 			}
@@ -609,7 +611,9 @@ impl TxBumpConfig {
 			} else {
 				None
 			};
-			if let (Some(p), Some(f)) = (chain_priority_cap, chain_fee_cap) {
+			let effective_fee_cap = chain_fee_cap.or(default_fee_cap);
+			let effective_priority_cap = chain_priority_cap.or(default_priority_cap);
+			if let (Some(p), Some(f)) = (effective_priority_cap, effective_fee_cap) {
 				if p > f {
 					return Err(format!(
 						"tx_bump.chains.{chain_id}: priority cap must be <= fee cap"
@@ -1835,6 +1839,24 @@ mod tests {
 			1u64,
 			TxBumpChainConfig {
 				max_fee_per_gas_cap_wei: Some("100".into()),
+				max_priority_fee_per_gas_cap_wei: Some("200".into()),
+				..Default::default()
+			},
+		);
+		let err = cfg.validate().unwrap_err();
+		assert!(err.contains("chains.1"));
+		assert!(err.contains("priority"));
+	}
+
+	#[test]
+	fn tx_bump_validation_rejects_effective_chain_priority_above_default_fee_cap() {
+		let mut cfg = TxBumpConfig {
+			default_max_fee_per_gas_cap_wei: Some("100".into()),
+			..TxBumpConfig::default()
+		};
+		cfg.chains.insert(
+			1u64,
+			TxBumpChainConfig {
 				max_priority_fee_per_gas_cap_wei: Some("200".into()),
 				..Default::default()
 			},

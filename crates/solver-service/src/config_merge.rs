@@ -2623,12 +2623,21 @@ fn build_rebalance_config_from_operator(
 /// runtime config's serde defaults so an empty operator block produces a
 /// disabled tx-bump policy with the same sweep/threshold/percent constants.
 fn translate_tx_bump(op: &solver_types::OperatorTxBumpConfig) -> solver_config::TxBumpConfig {
+	let defaults = solver_config::TxBumpConfig::default();
 	solver_config::TxBumpConfig {
 		enabled: op.enabled,
-		sweep_interval_secs: op.sweep_interval_secs.unwrap_or(15),
-		default_pending_threshold_secs: op.default_pending_threshold_secs.unwrap_or(60),
-		default_bump_percent: op.default_bump_percent.unwrap_or(15),
-		default_max_replacements_per_stage: op.default_max_replacements_per_stage.unwrap_or(3),
+		sweep_interval_secs: op
+			.sweep_interval_secs
+			.unwrap_or(defaults.sweep_interval_secs),
+		default_pending_threshold_secs: op
+			.default_pending_threshold_secs
+			.unwrap_or(defaults.default_pending_threshold_secs),
+		default_bump_percent: op
+			.default_bump_percent
+			.unwrap_or(defaults.default_bump_percent),
+		default_max_replacements_per_stage: op
+			.default_max_replacements_per_stage
+			.unwrap_or(defaults.default_max_replacements_per_stage),
 		default_max_fee_per_gas_cap_wei: op.default_max_fee_per_gas_cap_wei.clone(),
 		default_max_priority_fee_per_gas_cap_wei: op
 			.default_max_priority_fee_per_gas_cap_wei

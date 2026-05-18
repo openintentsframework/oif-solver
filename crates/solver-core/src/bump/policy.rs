@@ -14,9 +14,11 @@ pub struct BumpFees {
 /// Transaction has set. Saturating arithmetic — never overflows.
 pub fn apply_bump_percent(tx: &Transaction, bump_percent: u32) -> BumpFees {
 	let bump = |v: u128| -> u128 {
-		// v * (100 + bump_percent) / 100, with saturating math.
-		let multiplier = 100u128.saturating_add(bump_percent as u128);
-		v.saturating_mul(multiplier) / 100
+		let mut increase = v.saturating_mul(bump_percent as u128) / 100;
+		if bump_percent > 0 && v > 0 {
+			increase = increase.max(1);
+		}
+		v.saturating_add(increase)
 	};
 	BumpFees {
 		max_fee_per_gas: tx.max_fee_per_gas.map(bump),
@@ -108,8 +110,15 @@ mod tests {
 		let mut tx = eip1559_tx();
 		tx.max_fee_per_gas = Some(u128::MAX);
 		let bumped = apply_bump_percent(&tx, 15);
-		// saturating: u128::MAX * 115 saturates to u128::MAX before /100
-		assert_eq!(bumped.max_fee_per_gas, Some(u128::MAX / 100));
+		assert_eq!(bumped.max_fee_per_gas, Some(u128::MAX));
+	}
+
+	#[test]
+	fn apply_bump_percent_always_increases_non_zero_fee() {
+		let mut tx = legacy_tx();
+		tx.gas_price = Some(1);
+		let bumped = apply_bump_percent(&tx, 10);
+		assert_eq!(bumped.gas_price, Some(2));
 	}
 
 	#[test]

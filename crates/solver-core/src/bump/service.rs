@@ -12,8 +12,8 @@ use crate::engine::event_bus::EventBus;
 use crate::state::transaction_attempt::TransactionAttemptStore;
 use solver_config::{EffectiveTxBumpPolicy, TxBumpConfig};
 use solver_delivery::{
-	DeliveryError, DeliveryService, TransactionAttemptRecorder, TransactionMonitoringEvent,
-	TransactionTracking,
+	DeliveryError, DeliveryService, RevertClassification, TransactionAttemptRecorder,
+	TransactionMonitoringEvent, TransactionTracking,
 };
 use solver_storage::StorageService;
 use solver_types::{
@@ -409,16 +409,30 @@ impl TransactionBumpService {
 				tx_hash,
 				tx_type,
 				error,
-				classification: _,
-			} => {
-				event_bus
-					.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
-						order_id: id,
-						tx_hash,
-						tx_type,
-						error,
-					}))
-					.ok();
+				classification,
+			} => match classification {
+				RevertClassification::StageComplete { .. } => {
+					event_bus
+						.publish(SolverEvent::Delivery(
+							DeliveryEvent::TransactionIndeterminate {
+								order_id: id,
+								tx_hash,
+								tx_type,
+								reason: format!("stage-complete revert: {error}"),
+							},
+						))
+						.ok();
+				},
+				RevertClassification::Terminal { .. } | RevertClassification::Unknown => {
+					event_bus
+						.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+							order_id: id,
+							tx_hash,
+							tx_type,
+							error,
+						}))
+						.ok();
+				},
 			},
 			TransactionMonitoringEvent::Indeterminate {
 				id,
@@ -582,7 +596,8 @@ mod tests {
 	use super::*;
 	use mockall::predicate::*;
 	use solver_delivery::{
-		DeliveryInterface, MockDeliveryInterface, TransactionTrackingWithConfig,
+		DeliveryInterface, MockDeliveryInterface, RevertClassification, StageCompleteReason,
+		TransactionTrackingWithConfig,
 	};
 	use solver_storage::implementations::file::{FileStorage, TtlConfig};
 	use solver_types::{
@@ -1392,6 +1407,62 @@ mod tests {
 				SolverEvent::Delivery(DeliveryEvent::BumpMissingSigner { .. })
 			)),
 			"expected BumpMissingSigner, got events: {events:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn stage_complete_revert_from_bump_callback_is_indeterminate_not_failed() {
+		let cfg = default_enabled_config();
+		let mut mock = MockDeliveryInterface::new();
+		let signer = Address(vec![9; 20]);
+		let signer_clone = signer.clone();
+		mock.expect_submission_signer()
+			.returning(move |_| Some(signer_clone.clone()));
+		mock_large_balance(&mut mock);
+		mock.expect_submit().times(1).returning(|_tx, tracking| {
+			Box::pin(async move {
+				let tracking = tracking.expect("sweeper must supply tracking");
+				(tracking.tracking.callback)(TransactionMonitoringEvent::Failed {
+					id: "order-1".into(),
+					tx_hash: TransactionHash(vec![0xab; 32]),
+					tx_type: TransactionType::Fill,
+					error: "Already claimed".into(),
+					classification: RevertClassification::StageComplete {
+						reason: StageCompleteReason::AlreadyClaimed,
+					},
+				});
+				Ok(TransactionHash(vec![0xcd; 32]))
+			})
+		});
+
+		let (svc, store, storage, bus, _tmp) = test_service(cfg, mock);
+		seed_active_order(&storage, "order-1").await;
+		seed_attempt(
+			&store,
+			"parent-1",
+			TransactionAttemptStatus::Broadcast,
+			None,
+			Some(signer),
+			10_000_000_000,
+		)
+		.await;
+		let mut sub = bus.subscribe();
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		svc.tick().await.unwrap();
+		let events = drain_bus_events(&mut sub);
+		assert!(
+			events.iter().any(|e| matches!(
+				e,
+				SolverEvent::Delivery(DeliveryEvent::TransactionIndeterminate { .. })
+			)),
+			"expected TransactionIndeterminate, got events: {events:?}"
+		);
+		assert!(
+			!events.iter().any(|e| matches!(
+				e,
+				SolverEvent::Delivery(DeliveryEvent::TransactionFailed { .. })
+			)),
+			"StageComplete revert must not publish TransactionFailed: {events:?}"
 		);
 	}
 }
