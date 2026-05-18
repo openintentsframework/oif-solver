@@ -12,12 +12,14 @@ on:
     paths-ignore:
       - docs/**
       - "**.md"
+      - .claude/**
   push:
     branches:
       - main
     paths-ignore:
       - docs/**
       - "**.md"
+      - .claude/**
   workflow_dispatch:
 
 concurrency:

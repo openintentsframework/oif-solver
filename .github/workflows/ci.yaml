@@ -12,12 +12,14 @@ on:
     paths-ignore:
       - docs/**
       - .gitignore
+      - .claude/**
   push:
     branches:
       - main
     paths-ignore:
       - docs/**
       - "**.md"
+      - .claude/**
 # run concurrency group for the workflow
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
