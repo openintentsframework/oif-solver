@@ -592,10 +592,8 @@ impl OrderInterface for Eip7683OrderImpl {
 		}
 
 		// Per-output shape and settler validation.
-		let origin_chain_id =
-			u64::try_from(standard_order.originChainId).map_err(|_| {
-				OrderError::ValidationFailed("originChainId out of range".to_string())
-			})?;
+		let origin_chain_id = u64::try_from(standard_order.originChainId)
+			.map_err(|_| OrderError::ValidationFailed("originChainId out of range".to_string()))?;
 		let mut seen_chains = std::collections::HashSet::new();
 		for (i, output) in standard_order.outputs.iter().enumerate() {
 			let output_chain_id = u64::try_from(output.chainId).map_err(|_| {
@@ -1460,7 +1458,10 @@ mod tests {
 		let order_bytes = encode_standard_order(&standard_order);
 
 		let result = order_impl.validate_order(&order_bytes).await;
-		assert!(result.is_err(), "expected duplicate output chain to be rejected");
+		assert!(
+			result.is_err(),
+			"expected duplicate output chain to be rejected"
+		);
 		let err = result.unwrap_err().to_string();
 		assert!(
 			err.contains("duplicates an earlier output"),
@@ -1481,7 +1482,10 @@ mod tests {
 		let order_bytes = encode_standard_order(&standard_order);
 
 		let result = order_impl.validate_order(&order_bytes).await;
-		assert!(result.is_err(), "expected mismatched output settler to be rejected");
+		assert!(
+			result.is_err(),
+			"expected mismatched output settler to be rejected"
+		);
 		let err = result.unwrap_err().to_string();
 		assert!(
 			err.contains("does not match configured settler"),
@@ -1993,9 +1997,8 @@ mod tests {
 		// intent_data carries sponsor + signature that the canonical decode cannot supply.
 		let mut data = create_test_order_data();
 		data.sponsor = Some("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string());
-		data.signature = Some(
-			"0xc0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00".to_string(),
-		);
+		data.signature =
+			Some("0xc0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00".to_string());
 
 		let intent_data = Some(serde_json::to_value(&data).unwrap());
 		let solver_address = Address(vec![0x99; 20]);
