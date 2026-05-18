@@ -233,14 +233,14 @@ fn nonce_action_for_outcome(outcome: SubmissionOutcome) -> NonceCacheAction {
 	}
 }
 
-/// PR06 same-nonce invariant: a replacement submission must NOT retry with a
+/// Same-nonce invariant for replacement submissions: must NOT retry with a
 /// fresh nonce on `NonceTooLow`. The replacement was crafted with the parent's
 /// exact nonce; `NonceTooLow` means the parent (or a sibling) already consumed
 /// that nonce on-chain. Retrying with a resynced nonce would submit a second
 /// tx with a different nonce, breaking the same-nonce invariant and blurring
 /// the attempt ledger. Treat it as `Keep`: log, keep cache advanced, return
-/// the classified error so the sweeper can move on (Phase 1 will mark the
-/// rejected child `Replaced` once chain-truth catches up).
+/// the classified error so the sweeper can move on — the bump reconciliation
+/// pass will mark the rejected child `Replaced` once chain-truth catches up.
 fn resolve_nonce_action(outcome: SubmissionOutcome, is_replacement: bool) -> NonceCacheAction {
 	let base = nonce_action_for_outcome(outcome);
 	if is_replacement && matches!(base, NonceCacheAction::NonceTooLowRetry) {
@@ -1849,7 +1849,7 @@ pub(crate) async fn get_revert_data_with_provider(
 ///
 /// Called from `submit()` when `provider.send_transaction(...)` fails.
 /// `is_replacement` is `tracking.tracking.replacement_of.is_some()` — set
-/// only by the bump sweeper. Task 5 wires the actual callsite.
+/// only by the bump sweeper.
 pub(crate) fn classify_submit_error(err: &TransportError, is_replacement: bool) -> DeliveryError {
 	let msg = err.to_string();
 	if is_replacement && is_replacement_class_error(&msg) {
@@ -2607,8 +2607,7 @@ mod tests {
 		use NonceCacheAction::*;
 		use SubmissionOutcome::*;
 		// Replacement + NonceTooLow → Keep (no resync-and-retry; parent
-		// already consumed the nonce). This is the PR06 same-nonce
-		// invariant guard.
+		// already consumed the nonce). Guards the same-nonce invariant.
 		assert_eq!(resolve_nonce_action(NonceTooLow, true), Keep);
 	}
 

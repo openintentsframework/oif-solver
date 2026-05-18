@@ -187,8 +187,7 @@ impl TransactionHandler {
 	/// Updates status to Executed and emits PostFillReady event to trigger
 	/// post-fill transaction generation if needed. The downstream event is
 	/// gated on `outcome.applied()` so a duplicate `Confirmed` callback from
-	/// a same-nonce lineage (PR 06's gas-bumping scenario) does not
-	/// double-publish PostFillReady.
+	/// a same-nonce lineage does not double-publish PostFillReady.
 	async fn handle_fill_confirmed(
 		&self,
 		_tx_hash: TransactionHash,
@@ -925,8 +924,8 @@ mod tests {
 			let finalized_order_bytes: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
 			let finalized_order_bytes_clone = finalized_order_bytes.clone();
 
-			// Mock the retrieve call for getting the order by order ID. After
-			// the Task 9 migration, handle_claim_confirmed performs:
+			// Mock the retrieve call for getting the order by order ID.
+			// handle_claim_confirmed performs:
 			//   handle_confirmed retrieve (1x)
 			//   try_transition_order_status → retrieve + update_order_with retrieve (2x)
 			//   update_order_with for claim_tx_hash → retrieve (1x)
@@ -1129,9 +1128,9 @@ mod tests {
 		count
 	}
 
-	/// Regression test for PR 06: a duplicate `Confirmed` callback arriving
-	/// from a same-nonce lineage (e.g., gas-bumped replacement) must NOT
-	/// re-publish the downstream Settlement event. Without the
+	/// Regression test: a duplicate `Confirmed` callback arriving from a
+	/// same-nonce lineage (e.g., gas-bumped replacement) must NOT re-publish
+	/// the downstream Settlement event. Without the
 	/// `try_transition_order_status` + `outcome.applied()` gate this test
 	/// fails because the second handler call re-publishes PostFillReady.
 	#[tokio::test]

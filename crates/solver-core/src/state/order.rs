@@ -218,8 +218,8 @@ impl OrderStateMachine {
 	/// - `Err(InvalidTransition)` only for genuinely backward moves
 	///
 	/// Used by handlers that may receive duplicate `Confirmed` callbacks
-	/// from same-nonce lineages (PR 06) to gate downstream event
-	/// publication on the actual transition.
+	/// from same-nonce lineages to gate downstream event publication on
+	/// the actual transition.
 	pub async fn try_transition_order_status(
 		&self,
 		order_id: &str,

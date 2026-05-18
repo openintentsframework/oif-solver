@@ -167,10 +167,10 @@ pub enum TransactionAttemptRecorderError {
 	Storage(String),
 }
 
-/// Carrier for `record_planned_attempt`. Bundles the fields a new
-/// attempt row needs at creation time. Replaces the previous positional
-/// signature so PR 06's sweeper can pass `attempt_id_override` and
-/// `replacement_of` without breaking the trait signature again.
+/// Carrier for `record_planned_attempt`. Bundles the fields a new attempt
+/// row needs at creation time, including `attempt_id_override` (for the
+/// bump sweeper to assign a child id up front) and `replacement_of` (for
+/// same-nonce lineage tracking).
 #[derive(Debug, Clone)]
 pub struct PlannedAttemptInit {
 	pub order_id: String,
@@ -308,7 +308,7 @@ impl FeeParams {
 
 	/// Build EIP-1559 fee params from estimator output (max_fee + priority)
 	/// plus the observed base fee, applying the chosen quote-cost strategy.
-	/// This is the single solver-specific constructor used by Task 2's
+	/// This is the single solver-specific constructor used by
 	/// `SolverEip1559Estimator` and by callers that already have estimator output.
 	pub fn eip1559_with_strategy(
 		chain_id: u64,

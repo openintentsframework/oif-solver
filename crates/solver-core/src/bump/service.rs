@@ -520,8 +520,7 @@ impl TransactionBumpService {
 				);
 			},
 			Err(DeliveryError::InsufficientNativeGas(_)) => {
-				// `submit()` already recorded `SubmitRejected` on the child
-				// row through the PR 04 path; nothing extra to do here.
+				// `submit()` already recorded `SubmitRejected` on the child row.
 			},
 			Err(other) => {
 				tracing::warn!(

@@ -1,7 +1,4 @@
 //! Same-nonce gas bumping for stuck pending transactions.
-//!
-//! PR 06 of the transaction-hardening series. See
-//! `docs/superpowers/specs/2026-05-16-tx-bump-design.md`.
 
 pub mod lineage;
 pub mod policy;
