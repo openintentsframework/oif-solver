@@ -52,12 +52,14 @@ mod transaction_attempt_recorder_tests {
 	async fn noop_recorder_returns_planned_attempt() {
 		let recorder = NoopTransactionAttemptRecorder;
 		let attempt = recorder
-			.record_planned_attempt(
-				"order-1",
-				Some(Address(vec![9; 20])),
-				TransactionType::Fill,
-				sample_tx(),
-			)
+			.record_planned_attempt(PlannedAttemptInit {
+				order_id: "order-1".into(),
+				signer: Some(Address(vec![9; 20])),
+				tx_type: TransactionType::Fill,
+				tx: sample_tx(),
+				attempt_id_override: None,
+				replacement_of: None,
+			})
 			.await
 			.unwrap();
 
@@ -89,12 +91,14 @@ mod transaction_attempt_recorder_tests {
 			Arc::new(NoopTransactionAttemptRecorder);
 
 		let attempt = recorder
-			.record_planned_attempt(
-				"order-1",
-				Some(Address(vec![9; 20])),
-				TransactionType::Fill,
-				sample_tx(),
-			)
+			.record_planned_attempt(PlannedAttemptInit {
+				order_id: "order-1".into(),
+				signer: Some(Address(vec![9; 20])),
+				tx_type: TransactionType::Fill,
+				tx: sample_tx(),
+				attempt_id_override: None,
+				replacement_of: None,
+			})
 			.await
 			.unwrap();
 
@@ -127,6 +131,14 @@ pub enum DeliveryError {
 	/// Error that occurs when no suitable implementation is available for the operation.
 	#[error("No implementation available")]
 	NoImplementationAvailable,
+	/// The submission was rejected by the node because it does not
+	/// sufficiently outbid the existing same-nonce tx in the mempool.
+	/// Only emitted when the submission was intentionally a same-nonce
+	/// replacement (i.e., `TransactionTracking::replacement_of.is_some()`).
+	/// Sweeper escalates the bump on next tick by using the rejected
+	/// child's fees as the new highest-fee floor.
+	#[error("Replacement underpriced: {hint}")]
+	ReplacementUnderpriced { hint: String },
 }
 
 /// Detailed payload for `DeliveryError::InsufficientNativeGas`. Stored boxed
@@ -155,15 +167,30 @@ pub enum TransactionAttemptRecorderError {
 	Storage(String),
 }
 
+/// Carrier for `record_planned_attempt`. Bundles the fields a new
+/// attempt row needs at creation time. Replaces the previous positional
+/// signature so PR 06's sweeper can pass `attempt_id_override` and
+/// `replacement_of` without breaking the trait signature again.
+#[derive(Debug, Clone)]
+pub struct PlannedAttemptInit {
+	pub order_id: String,
+	pub signer: Option<Address>,
+	pub tx_type: TransactionType,
+	pub tx: Transaction,
+	/// When `Some`, the recorder uses this id verbatim; when `None`,
+	/// the recorder generates a fresh id (default behavior).
+	pub attempt_id_override: Option<String>,
+	/// When `Some`, the new row records this as the parent of the
+	/// same-nonce lineage; sweeper-only callers set this.
+	pub replacement_of: Option<String>,
+}
+
 /// Records transaction delivery attempts independently from order lifecycle state.
 #[async_trait]
 pub trait TransactionAttemptRecorder: Send + Sync {
 	async fn record_planned_attempt(
 		&self,
-		order_id: &str,
-		signer: Option<Address>,
-		tx_type: TransactionType,
-		tx: Transaction,
+		init: PlannedAttemptInit,
 	) -> Result<TransactionAttempt, TransactionAttemptRecorderError>;
 
 	async fn record_attempt_update(
@@ -183,18 +210,18 @@ pub struct NoopTransactionAttemptRecorder;
 impl TransactionAttemptRecorder for NoopTransactionAttemptRecorder {
 	async fn record_planned_attempt(
 		&self,
-		order_id: &str,
-		signer: Option<Address>,
-		tx_type: TransactionType,
-		tx: Transaction,
+		init: PlannedAttemptInit,
 	) -> Result<TransactionAttempt, TransactionAttemptRecorderError> {
-		Ok(TransactionAttempt::planned(
-			"noop-attempt".to_string(),
-			order_id.to_string(),
-			signer,
-			tx_type,
-			tx,
-		))
+		let mut attempt = TransactionAttempt::planned(
+			init.attempt_id_override
+				.unwrap_or_else(|| "noop-attempt".to_string()),
+			init.order_id,
+			init.signer,
+			init.tx_type,
+			init.tx,
+		);
+		attempt.replacement_of = init.replacement_of;
+		Ok(attempt)
 	}
 
 	async fn record_attempt_update(
@@ -384,6 +411,17 @@ pub struct TransactionTracking {
 	pub attempt_recorder: Arc<dyn TransactionAttemptRecorder>,
 	/// Callback to invoke when transaction state changes
 	pub callback: TransactionCallback,
+	/// Pre-allocated attempt id. If `Some`, the recorder uses this id
+	/// verbatim via `PlannedAttemptInit::attempt_id_override`. The bump
+	/// sweeper sets this so it knows the child id before `deliver()`
+	/// returns. Not serialized (struct holds Arc<dyn ...> + closure);
+	/// default `None` at normal construction.
+	pub attempt_id: Option<String>,
+	/// Parent attempt id when this submission is a same-nonce replacement.
+	/// Threaded into the new attempt row's `replacement_of` field, AND
+	/// gates classification of `DeliveryError::ReplacementUnderpriced`
+	/// (only emitted when this is `Some`).
+	pub replacement_of: Option<String>,
 }
 
 impl std::fmt::Debug for TransactionTracking {
@@ -425,6 +463,8 @@ mod tracking_config_tests {
 			tx_type: TransactionType::Fill,
 			attempt_recorder: Arc::new(NoopTransactionAttemptRecorder),
 			callback: Box::new(|_: TransactionMonitoringEvent| {}),
+			attempt_id: None,
+			replacement_of: None,
 		};
 
 		let config = TransactionTrackingWithConfig {
@@ -489,6 +529,20 @@ pub trait DeliveryInterface: Send + Sync {
 	/// This should return the same fee model and per-gas cost the implementation
 	/// will use when filling missing fee fields before signing a transaction.
 	async fn get_fee_params(&self, chain_id: u64) -> Result<FeeParams, DeliveryError>;
+
+	/// Returns the address this backend would use to sign a transaction
+	/// submitted on `chain_id` right now. `None` when the backend has
+	/// no configured signer for this chain. Synchronous; no RPC.
+	///
+	/// Used by the bump sweeper to enforce the same-signer invariant
+	/// before dispatching a replacement: replacements from a different
+	/// signer don't share a nonce sequence on chain.
+	///
+	/// Default returns `None` so non-EVM and mock backends don't have
+	/// to implement it.
+	fn submission_signer(&self, _chain_id: u64) -> Option<Address> {
+		None
+	}
 
 	/// Gets the balance for an address.
 	///
@@ -754,6 +808,15 @@ impl DeliveryService {
 				.unwrap_or_default()
 				.as_secs(),
 		})
+	}
+
+	/// Returns the chain's configured submission signer, or `None` if no
+	/// backend is registered for `chain_id` OR the backend doesn't expose
+	/// a signer.
+	pub fn submission_signer(&self, chain_id: u64) -> Option<Address> {
+		self.implementations
+			.get(&chain_id)
+			.and_then(|impl_| impl_.submission_signer(chain_id))
 	}
 
 	/// Gets the balance for an address on a specific chain.

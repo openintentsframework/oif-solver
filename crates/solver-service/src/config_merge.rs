@@ -513,6 +513,7 @@ pub fn merge_to_operator_config(
 		// merges it on top of the auto-generated defaults at runtime-config
 		// materialization time.
 		fee_policy: initializer.fee_policy.clone(),
+		tx_bump: solver_types::OperatorTxBumpConfig::default(),
 	})
 }
 
@@ -1148,6 +1149,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 		)?),
 		gas: Some(build_gas_config_from_operator(&operator_config.gas)),
 		rebalance: build_rebalance_config_from_operator(operator_config.rebalance.as_ref())?,
+		tx_bump: translate_tx_bump(&operator_config.tx_bump),
 	};
 
 	Ok(config)
@@ -2530,6 +2532,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		// the runtime config it built was the source of truth. Round-tripping
 		// here keeps OperatorConfig on the auto-generated defaults.
 		fee_policy: None,
+		tx_bump: solver_types::OperatorTxBumpConfig::default(),
 	})
 }
 
@@ -2613,6 +2616,42 @@ fn build_rebalance_config_from_operator(
 		pairs,
 		bridge_config: rebalance.bridge_config.clone(),
 	}))
+}
+
+/// Translates the operator-facing `OperatorTxBumpConfig` bootstrap mirror into
+/// the runtime `solver_config::TxBumpConfig`. Defaults match those used by the
+/// runtime config's serde defaults so an empty operator block produces a
+/// disabled tx-bump policy with the same sweep/threshold/percent constants.
+fn translate_tx_bump(op: &solver_types::OperatorTxBumpConfig) -> solver_config::TxBumpConfig {
+	solver_config::TxBumpConfig {
+		enabled: op.enabled,
+		sweep_interval_secs: op.sweep_interval_secs.unwrap_or(15),
+		default_pending_threshold_secs: op.default_pending_threshold_secs.unwrap_or(60),
+		default_bump_percent: op.default_bump_percent.unwrap_or(15),
+		default_max_replacements_per_stage: op.default_max_replacements_per_stage.unwrap_or(3),
+		default_max_fee_per_gas_cap_wei: op.default_max_fee_per_gas_cap_wei.clone(),
+		default_max_priority_fee_per_gas_cap_wei: op
+			.default_max_priority_fee_per_gas_cap_wei
+			.clone(),
+		chains: op
+			.chains
+			.iter()
+			.map(|(chain_id, c)| {
+				(
+					*chain_id,
+					solver_config::TxBumpChainConfig {
+						pending_threshold_secs: c.pending_threshold_secs,
+						bump_percent: c.bump_percent,
+						max_replacements_per_stage: c.max_replacements_per_stage,
+						max_fee_per_gas_cap_wei: c.max_fee_per_gas_cap_wei.clone(),
+						max_priority_fee_per_gas_cap_wei: c
+							.max_priority_fee_per_gas_cap_wei
+							.clone(),
+					},
+				)
+			})
+			.collect(),
+	}
 }
 
 /// Extracts OperatorRebalanceConfig from runtime RebalanceConfig.
@@ -6071,6 +6110,7 @@ mod tests {
 			account: None,
 			rebalance: None,
 			fee_policy: None,
+			tx_bump: solver_types::OperatorTxBumpConfig::default(),
 		};
 
 		// Add only one network

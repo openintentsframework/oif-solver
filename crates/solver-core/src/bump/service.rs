@@ -1,0 +1,1398 @@
+//! Background sweeper that drives same-nonce gas bumping.
+//!
+//! Owns no in-memory state — every tick re-reads the attempt ledger.
+//! Spawned from `Engine::run()` when `tx_bump.enabled`.
+
+use crate::bump::lineage::{
+	has_confirmed_member, highest_fees_in_lineage, lineage_components, lineage_tip,
+	replacement_count_in_lineage,
+};
+use crate::bump::policy::{apply_bump_percent, bumped_fees_exceed_cap, BumpFees};
+use crate::engine::event_bus::EventBus;
+use crate::state::transaction_attempt::TransactionAttemptStore;
+use solver_config::{EffectiveTxBumpPolicy, TxBumpConfig};
+use solver_delivery::{
+	DeliveryError, DeliveryService, TransactionAttemptRecorder, TransactionMonitoringEvent,
+	TransactionTracking,
+};
+use solver_storage::StorageService;
+use solver_types::{
+	current_timestamp, DeliveryEvent, SolverEvent, TransactionAttempt, TransactionAttemptStatus,
+	TransactionType,
+};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::watch;
+use uuid::Uuid;
+
+pub struct TransactionBumpService {
+	config: TxBumpConfig,
+	storage: Arc<StorageService>,
+	attempt_store: Arc<TransactionAttemptStore>,
+	delivery: Arc<DeliveryService>,
+	event_bus: EventBus,
+	attempt_recorder: Arc<dyn TransactionAttemptRecorder>,
+}
+
+impl TransactionBumpService {
+	pub fn new(
+		config: TxBumpConfig,
+		storage: Arc<StorageService>,
+		attempt_store: Arc<TransactionAttemptStore>,
+		delivery: Arc<DeliveryService>,
+		event_bus: EventBus,
+		attempt_recorder: Arc<dyn TransactionAttemptRecorder>,
+	) -> Self {
+		Self {
+			config,
+			storage,
+			attempt_store,
+			delivery,
+			event_bus,
+			attempt_recorder,
+		}
+	}
+
+	/// Drive the sweeper until `shutdown_rx` fires `true`. Mirrors the
+	/// `rebalance.run(shutdown_rx)` lifecycle in `engine/mod.rs:503-506`.
+	/// Uses `tokio::sync::watch` (NOT `tokio_util::CancellationToken`) to
+	/// match the existing shutdown convention in this codebase.
+	pub async fn run(&self, mut shutdown_rx: watch::Receiver<bool>) {
+		if !self.config.enabled {
+			tracing::info!("tx_bump disabled; sweeper exiting");
+			return;
+		}
+		let interval = Duration::from_secs(self.config.sweep_interval_secs);
+		tracing::info!(
+			sweep_interval_secs = self.config.sweep_interval_secs,
+			chains = ?self.config.chains.keys().collect::<Vec<_>>(),
+			"tx_bump sweeper started"
+		);
+		loop {
+			tokio::select! {
+				changed = shutdown_rx.changed() => {
+					if changed.is_err() || *shutdown_rx.borrow() {
+						tracing::info!("tx_bump sweeper shutdown");
+						return;
+					}
+				}
+				_ = tokio::time::sleep(interval) => {
+					if let Err(e) = self.tick().await {
+						tracing::warn!(error = %e, "tx_bump sweeper tick failed");
+					}
+				}
+			}
+		}
+	}
+
+	/// Single tick: Phase 1 (reconcile) then Phase 2 (dispatch).
+	pub async fn tick(&self) -> Result<(), BumpError> {
+		self.phase_1_reconcile().await?;
+		self.phase_2_dispatch().await?;
+		Ok(())
+	}
+
+	async fn phase_1_reconcile(&self) -> Result<(), BumpError> {
+		let active_orders = load_active_order_ids(&self.storage).await?;
+		for order_id in active_orders {
+			let attempts = self
+				.attempt_store
+				.attempts_for_order(&order_id)
+				.await
+				.map_err(|e| BumpError::Storage(e.to_string()))?;
+
+			// Bucket by tx_type. `TransactionType` is `Copy + PartialEq` but
+			// not `Hash + Eq`, so we use a `Vec` of buckets instead of a
+			// `HashMap` keyed by `TransactionType`.
+			let mut buckets: Vec<(TransactionType, Vec<TransactionAttempt>)> = Vec::new();
+			for a in attempts {
+				if let Some(bucket) = buckets.iter_mut().find(|(t, _)| *t == a.tx_type) {
+					bucket.1.push(a);
+				} else {
+					buckets.push((a.tx_type, vec![a]));
+				}
+			}
+
+			for (_tx_type, group) in buckets {
+				for component in lineage_components(&group) {
+					if !has_confirmed_member(&component) {
+						continue;
+					}
+					let winner_id = component
+						.iter()
+						.find(|a| a.status == TransactionAttemptStatus::Confirmed)
+						.map(|a| a.id.clone())
+						.unwrap();
+					for member in component {
+						if member.is_terminal() {
+							continue;
+						}
+						let _ = self
+							.attempt_store
+							.update_attempt_status(
+								&member.id,
+								TransactionAttemptStatus::Replaced,
+								Some(format!("superseded by {winner_id}")),
+								|_| {},
+							)
+							.await;
+						// CAS conflict (member transitioned mid-call) is
+						// a no-op — next tick re-evaluates.
+					}
+				}
+			}
+		}
+		Ok(())
+	}
+
+	async fn phase_2_dispatch(&self) -> Result<(), BumpError> {
+		let active_orders = load_active_order_ids(&self.storage).await?;
+		for order_id in active_orders {
+			let attempts = self
+				.attempt_store
+				.attempts_for_order(&order_id)
+				.await
+				.map_err(|e| BumpError::Storage(e.to_string()))?;
+
+			// Bucket by tx_type (same Vec-pair pattern as phase 1 since
+			// TransactionType doesn't impl Hash).
+			let mut by_tx_type: Vec<(TransactionType, Vec<TransactionAttempt>)> = Vec::new();
+			for a in attempts {
+				if let Some(slot) = by_tx_type.iter_mut().find(|(t, _)| *t == a.tx_type) {
+					slot.1.push(a);
+				} else {
+					by_tx_type.push((a.tx_type, vec![a]));
+				}
+			}
+
+			for (tx_type, group) in by_tx_type {
+				let chain_id = match group.first().map(|a| a.chain_id) {
+					Some(c) => c,
+					None => continue,
+				};
+				let policy = match self.config.for_chain(chain_id) {
+					Some(p) => p,
+					None => continue,
+				};
+				for component in lineage_components(&group) {
+					self.maybe_bump_component(&component, &policy, chain_id, &order_id, tx_type)
+						.await;
+				}
+			}
+		}
+		Ok(())
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn maybe_bump_component(
+		&self,
+		component: &[&TransactionAttempt],
+		policy: &EffectiveTxBumpPolicy,
+		chain_id: u64,
+		order_id: &str,
+		tx_type: TransactionType,
+	) {
+		// 2. Lineage tip
+		let tip = match lineage_tip(component) {
+			Some(t) => t,
+			None => return,
+		};
+
+		// 3. Status: only Broadcast or Indeterminate are eligible.
+		if !matches!(
+			tip.status,
+			TransactionAttemptStatus::Broadcast | TransactionAttemptStatus::Indeterminate
+		) {
+			return;
+		}
+
+		// 4. Age threshold.
+		let now = current_timestamp();
+		let age = now.saturating_sub(tip.updated_at);
+		if age < policy.pending_threshold_secs {
+			return;
+		}
+
+		// 5. Signer present on the tip row.
+		let expected_signer = match tip.signer.as_ref() {
+			Some(s) => s.clone(),
+			None => {
+				self.event_bus
+					.publish(SolverEvent::Delivery(DeliveryEvent::BumpMissingSigner {
+						order_id: order_id.to_string(),
+						attempt_id: tip.id.clone(),
+						chain_id,
+						tx_type,
+					}))
+					.ok();
+				return;
+			},
+		};
+
+		// 6. Submission signer present (silent skip — chain doesn't expose one).
+		let submission_signer = match self.delivery.submission_signer(chain_id) {
+			Some(s) => s,
+			None => return,
+		};
+
+		// 7. Same-signer invariant.
+		if expected_signer != submission_signer {
+			self.event_bus
+				.publish(SolverEvent::Delivery(DeliveryEvent::BumpSignerMismatch {
+					order_id: order_id.to_string(),
+					attempt_id: tip.id.clone(),
+					chain_id,
+					tx_type,
+					expected_signer: expected_signer.clone(),
+					submission_signer: submission_signer.clone(),
+				}))
+				.ok();
+			return;
+		}
+
+		// 8. Max replacements per stage.
+		let replacement_count = replacement_count_in_lineage(component);
+		if replacement_count >= policy.max_replacements_per_stage {
+			self.event_bus
+				.publish(SolverEvent::Delivery(
+					DeliveryEvent::BumpMaxReplacementsReached {
+						order_id: order_id.to_string(),
+						attempt_id: tip.id.clone(),
+						chain_id,
+						tx_type,
+						lineage_depth: replacement_count,
+					},
+				))
+				.ok();
+			return;
+		}
+
+		// 9. Bump math: build a virtual "floor tx" from the highest fees
+		//    seen across the lineage (including SubmitRejected/Replaced),
+		//    then apply `bump_percent`.
+		let (max_fee, max_priority, gas_price) = highest_fees_in_lineage(component);
+		let floor_tx = solver_types::Transaction {
+			to: tip.tx.to.clone(),
+			data: tip.tx.data.clone(),
+			value: tip.tx.value,
+			chain_id: tip.tx.chain_id,
+			nonce: tip.tx.nonce,
+			gas_limit: tip.tx.gas_limit,
+			gas_price,
+			max_fee_per_gas: max_fee,
+			max_priority_fee_per_gas: max_priority,
+		};
+		let bumped = apply_bump_percent(&floor_tx, policy.bump_percent);
+
+		// 10. Cap check.
+		if let Some(cap_field) = bumped_fees_exceed_cap(
+			&bumped,
+			policy.max_fee_per_gas_cap_wei,
+			policy.max_priority_fee_per_gas_cap_wei,
+		) {
+			let (computed_fee_wei, cap_wei) = match cap_field {
+				solver_types::BumpCapField::MaxFeePerGas => {
+					let computed = bumped.max_fee_per_gas.or(bumped.gas_price).unwrap_or(0);
+					let cap = policy.max_fee_per_gas_cap_wei.unwrap_or(0);
+					(computed.to_string(), cap.to_string())
+				},
+				solver_types::BumpCapField::MaxPriorityFeePerGas => {
+					let computed = bumped.max_priority_fee_per_gas.unwrap_or(0);
+					let cap = policy.max_priority_fee_per_gas_cap_wei.unwrap_or(0);
+					(computed.to_string(), cap.to_string())
+				},
+			};
+			self.event_bus
+				.publish(SolverEvent::Delivery(DeliveryEvent::BumpCapReached {
+					order_id: order_id.to_string(),
+					attempt_id: tip.id.clone(),
+					chain_id,
+					tx_type,
+					cap_field,
+					computed_fee_wei,
+					cap_wei,
+				}))
+				.ok();
+			return;
+		}
+
+		// 11. Balance check (best-effort).
+		let signer_hex = expected_signer.to_string();
+		match self.delivery.get_balance(chain_id, &signer_hex, None).await {
+			Ok(balance_str) => match balance_str.parse::<u128>() {
+				Ok(balance) => {
+					let required = required_balance_wei(&bumped, &tip.tx);
+					if balance < required {
+						tracing::warn!(
+							%order_id,
+							attempt_id = %tip.id,
+							chain_id,
+							signer = %signer_hex,
+							balance = %balance,
+							required = %required,
+							"tx_bump: signer balance insufficient for bumped replacement; skipping tick"
+						);
+						return;
+					}
+				},
+				Err(e) => {
+					tracing::debug!(
+						%order_id,
+						attempt_id = %tip.id,
+						chain_id,
+						balance_str = %balance_str,
+						error = %e,
+						"tx_bump: balance parse error; skipping tick"
+					);
+					return;
+				},
+			},
+			Err(e) => {
+				tracing::debug!(
+					%order_id,
+					attempt_id = %tip.id,
+					chain_id,
+					error = %e,
+					"tx_bump: balance RPC error; skipping tick"
+				);
+				return;
+			},
+		}
+
+		// 12. Build replacement_tx: clone tip.tx and override fee fields.
+		let mut replacement_tx = tip.tx.clone();
+		replacement_tx.max_fee_per_gas = bumped.max_fee_per_gas;
+		replacement_tx.max_priority_fee_per_gas = bumped.max_priority_fee_per_gas;
+		replacement_tx.gas_price = bumped.gas_price;
+
+		// 13. Invariants: same nonce/chain/to/data/value as parent.
+		debug_assert_eq!(
+			replacement_tx.nonce, tip.tx.nonce,
+			"bump must preserve nonce"
+		);
+		debug_assert_eq!(
+			replacement_tx.chain_id, tip.tx.chain_id,
+			"bump must preserve chain_id"
+		);
+		debug_assert_eq!(replacement_tx.to, tip.tx.to, "bump must preserve to");
+		debug_assert_eq!(replacement_tx.data, tip.tx.data, "bump must preserve data");
+		debug_assert_eq!(
+			replacement_tx.value, tip.tx.value,
+			"bump must preserve value"
+		);
+
+		// 14. Allocate child attempt id (the sweeper needs it before deliver
+		//     returns so it can repair the post-deliver Planned/Broadcast row).
+		let child_attempt_id = Uuid::new_v4().to_string();
+
+		// 15. Build TransactionTracking with a callback that fans monitor
+		//     events out to the event bus as DeliveryEvent::Transaction*.
+		let event_bus = self.event_bus.clone();
+		let callback = Box::new(move |event: TransactionMonitoringEvent| match event {
+			TransactionMonitoringEvent::Confirmed {
+				id,
+				tx_hash,
+				tx_type,
+				receipt,
+			} => {
+				event_bus
+					.publish(SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
+						order_id: id,
+						tx_hash,
+						tx_type,
+						receipt,
+					}))
+					.ok();
+			},
+			TransactionMonitoringEvent::Failed {
+				id,
+				tx_hash,
+				tx_type,
+				error,
+				classification: _,
+			} => {
+				event_bus
+					.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
+						order_id: id,
+						tx_hash,
+						tx_type,
+						error,
+					}))
+					.ok();
+			},
+			TransactionMonitoringEvent::Indeterminate {
+				id,
+				tx_hash,
+				tx_type,
+				reason,
+			} => {
+				event_bus
+					.publish(SolverEvent::Delivery(
+						DeliveryEvent::TransactionIndeterminate {
+							order_id: id,
+							tx_hash,
+							tx_type,
+							reason,
+						},
+					))
+					.ok();
+			},
+		});
+
+		let tracking = TransactionTracking {
+			id: order_id.to_string(),
+			tx_type,
+			attempt_recorder: self.attempt_recorder.clone(),
+			callback,
+			attempt_id: Some(child_attempt_id.clone()),
+			replacement_of: Some(tip.id.clone()),
+		};
+
+		// 16. Submit and handle outcomes.
+		match self.delivery.deliver(replacement_tx, Some(tracking)).await {
+			Ok(child_tx_hash) => {
+				// Post-deliver repair: if the recorder created the child row
+				// in `Planned` (no tx_hash) before submit completed, fix it
+				// up to `Broadcast` with the hash. Best-effort; CAS conflicts
+				// and terminal rows are both safe to ignore (the monitor's
+				// own callback may have already advanced the row).
+				match self.attempt_store.get_attempt(&child_attempt_id).await {
+					Ok(child) => {
+						if child.status == TransactionAttemptStatus::Planned
+							&& child.tx_hash.is_none()
+						{
+							let hash_to_set = child_tx_hash.clone();
+							let _ = self
+								.attempt_store
+								.update_attempt_status(
+									&child_attempt_id,
+									TransactionAttemptStatus::Broadcast,
+									None,
+									|a| {
+										a.tx_hash = Some(hash_to_set);
+									},
+								)
+								.await;
+						}
+					},
+					Err(e) => {
+						tracing::debug!(
+							child_attempt_id = %child_attempt_id,
+							error = %e,
+							"tx_bump: could not read child attempt for post-deliver repair"
+						);
+					},
+				}
+
+				// Best-effort backfill of parent.replaced_by hint.
+				if let Err(e) = self
+					.attempt_store
+					.set_replaced_by(&tip.id, &child_attempt_id)
+					.await
+				{
+					tracing::debug!(
+						parent_id = %tip.id,
+						child_id = %child_attempt_id,
+						error = %e,
+						"tx_bump: set_replaced_by failed (best-effort hint)"
+					);
+				}
+
+				tracing::info!(
+					event = "BumpDispatched",
+					%order_id,
+					parent_attempt_id = %tip.id,
+					child_attempt_id = %child_attempt_id,
+					chain_id,
+					?tx_type,
+					bump_percent = policy.bump_percent,
+					"tx_bump: dispatched replacement transaction"
+				);
+			},
+			Err(DeliveryError::ReplacementUnderpriced { hint }) => {
+				tracing::info!(
+					%order_id,
+					parent_attempt_id = %tip.id,
+					chain_id,
+					?tx_type,
+					%hint,
+					"tx_bump: replacement underpriced; lineage stays eligible for next tick"
+				);
+			},
+			Err(DeliveryError::InsufficientNativeGas(_)) => {
+				// `submit()` already recorded `SubmitRejected` on the child
+				// row through the PR 04 path; nothing extra to do here.
+			},
+			Err(other) => {
+				tracing::warn!(
+					event = "BumpSubmitFailed",
+					%order_id,
+					parent_attempt_id = %tip.id,
+					chain_id,
+					?tx_type,
+					error = %other,
+					"tx_bump: replacement submit failed"
+				);
+			},
+		}
+	}
+}
+
+/// Compute the up-front native-gas budget required to submit `bumped` over
+/// the original tip transaction: `gas_limit * fee + value`. Saturating math
+/// guards against pathological inputs.
+fn required_balance_wei(bumped: &BumpFees, original_tx: &solver_types::Transaction) -> u128 {
+	let gas_limit = original_tx.gas_limit.unwrap_or(0) as u128;
+	let fee = bumped.max_fee_per_gas.or(bumped.gas_price).unwrap_or(0);
+	let value: u128 = u128::try_from(original_tx.value).unwrap_or(u128::MAX);
+	gas_limit.saturating_mul(fee).saturating_add(value)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BumpError {
+	#[error("Storage error: {0}")]
+	Storage(String),
+}
+
+/// Loads non-terminal order IDs. Mirrors `RecoveryService::load_active_orders`
+/// (which queries the order store by `status_kind` index).
+async fn load_active_order_ids(storage: &Arc<StorageService>) -> Result<Vec<String>, BumpError> {
+	use crate::state::order::{
+		FAILED_STATUS_KIND_INDEX_VALUE, FINALIZED_STATUS_KIND_INDEX_VALUE, STATUS_KIND_INDEX_FIELD,
+	};
+	use solver_storage::QueryFilter;
+	use solver_types::{Order, StorageKey};
+
+	let terminal_status_kinds = vec![
+		serde_json::json!(FINALIZED_STATUS_KIND_INDEX_VALUE),
+		serde_json::json!(FAILED_STATUS_KIND_INDEX_VALUE),
+	];
+
+	let rows = storage
+		.query::<Order>(
+			StorageKey::Orders.as_str(),
+			QueryFilter::NotIn(STATUS_KIND_INDEX_FIELD.to_string(), terminal_status_kinds),
+		)
+		.await
+		.map_err(|e| BumpError::Storage(e.to_string()))?;
+	Ok(rows.into_iter().map(|(id, _)| id).collect())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use mockall::predicate::*;
+	use solver_delivery::{
+		DeliveryInterface, MockDeliveryInterface, TransactionTrackingWithConfig,
+	};
+	use solver_storage::implementations::file::{FileStorage, TtlConfig};
+	use solver_types::{
+		utils::tests::builders::OrderBuilder, Address, BumpCapField, OrderStatus,
+		TransactionAttempt, TransactionAttemptStatus, TransactionHash, TransactionType,
+	};
+	use std::collections::HashMap;
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::sync::Arc;
+
+	/// Drain matching events from a broadcast subscriber for assertions.
+	fn drain_bus_events(
+		sub: &mut tokio::sync::broadcast::Receiver<SolverEvent>,
+	) -> Vec<SolverEvent> {
+		let mut out = Vec::new();
+		while let Ok(ev) = sub.try_recv() {
+			out.push(ev);
+		}
+		out
+	}
+
+	/// Mock-test helper: simulate the recorder lifecycle that the real
+	/// submit path performs. Without this, `MockDeliveryInterface::submit`
+	/// would not create the child attempt row — tests that assert on the
+	/// row need this to faithfully simulate production.
+	///
+	/// `signer` mirrors the production Alloy path, which records the
+	/// actual submission signer on the child row. Tests should pass the
+	/// same signer they used to seed the parent attempt so follow-up ticks
+	/// see a same-signer lineage instead of `BumpMissingSigner`.
+	async fn simulate_submit_recording(
+		recorder: &Arc<dyn TransactionAttemptRecorder>,
+		tracking: &TransactionTrackingWithConfig,
+		tx: &solver_types::Transaction,
+		outcome: &Result<TransactionHash, DeliveryError>,
+		signer: Option<Address>,
+	) {
+		let init = solver_delivery::PlannedAttemptInit {
+			order_id: tracking.tracking.id.clone(),
+			signer,
+			tx_type: tracking.tracking.tx_type,
+			tx: tx.clone(),
+			attempt_id_override: tracking.tracking.attempt_id.clone(),
+			replacement_of: tracking.tracking.replacement_of.clone(),
+		};
+		let attempt = recorder.record_planned_attempt(init).await.unwrap();
+		match outcome {
+			Ok(hash) => {
+				let _ = recorder
+					.record_attempt_update(
+						&attempt.id,
+						TransactionAttemptStatus::Broadcast,
+						Some(hash.clone()),
+						None,
+						None,
+					)
+					.await;
+			},
+			Err(e) => {
+				let _ = recorder
+					.record_attempt_update(
+						&attempt.id,
+						TransactionAttemptStatus::SubmitRejected,
+						None,
+						None,
+						Some(e.to_string()),
+					)
+					.await;
+			},
+		}
+	}
+
+	fn test_service(
+		cfg: TxBumpConfig,
+		delivery: MockDeliveryInterface,
+	) -> (
+		TransactionBumpService,
+		Arc<TransactionAttemptStore>,
+		Arc<StorageService>,
+		EventBus,
+		tempfile::TempDir,
+	) {
+		let tmp = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			tmp.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let attempt_store = Arc::new(TransactionAttemptStore::new(storage.clone()));
+		let delivery_impls: HashMap<u64, Arc<dyn DeliveryInterface>> =
+			HashMap::from([(1u64, Arc::new(delivery) as Arc<dyn DeliveryInterface>)]);
+		let delivery_svc = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
+		let event_bus = EventBus::new(100);
+		let recorder: Arc<dyn TransactionAttemptRecorder> = attempt_store.clone();
+		let service = TransactionBumpService::new(
+			cfg,
+			storage.clone(),
+			attempt_store.clone(),
+			delivery_svc,
+			event_bus.clone(),
+			recorder,
+		);
+		(service, attempt_store, storage, event_bus, tmp)
+	}
+
+	fn default_enabled_config() -> TxBumpConfig {
+		let mut cfg = TxBumpConfig {
+			enabled: true,
+			default_pending_threshold_secs: 1, // age out quickly in tests
+			..TxBumpConfig::default()
+		};
+		cfg.chains
+			.insert(1u64, solver_config::TxBumpChainConfig::default());
+		cfg
+	}
+
+	fn tx_with_fees(max_fee: u128) -> solver_types::Transaction {
+		use alloy_primitives::U256;
+		solver_types::Transaction {
+			to: Some(Address(vec![1; 20])),
+			data: vec![],
+			value: U256::ZERO,
+			chain_id: 1,
+			nonce: Some(0),
+			gas_limit: Some(100_000),
+			gas_price: None,
+			max_fee_per_gas: Some(max_fee),
+			max_priority_fee_per_gas: Some(max_fee / 10),
+		}
+	}
+
+	/// Seed an attempt with a fixed id and status. If `status != Planned`,
+	/// also flips the row to that status via the public update path so the
+	/// tx_hash field is populated and `updated_at` is current.
+	async fn seed_attempt(
+		store: &TransactionAttemptStore,
+		id: &str,
+		status: TransactionAttemptStatus,
+		replacement_of: Option<&str>,
+		signer: Option<Address>,
+		max_fee: u128,
+	) -> TransactionAttempt {
+		let init = solver_delivery::PlannedAttemptInit {
+			order_id: "order-1".into(),
+			signer,
+			tx_type: TransactionType::Fill,
+			tx: tx_with_fees(max_fee),
+			attempt_id_override: Some(id.into()),
+			replacement_of: replacement_of.map(String::from),
+		};
+		let attempt = store.record_planned_attempt(init).await.unwrap();
+		if status != TransactionAttemptStatus::Planned {
+			let _ = store
+				.update_attempt_status(&attempt.id, status, None, |a| {
+					a.tx_hash = Some(TransactionHash(vec![0; 32]));
+				})
+				.await;
+		}
+		attempt
+	}
+
+	/// Seed an active (non-terminal) order so `load_active_order_ids` returns it.
+	async fn seed_active_order(storage: &Arc<StorageService>, order_id: &str) {
+		use crate::state::order::OrderStateMachine;
+		let sm = OrderStateMachine::new(storage.clone());
+		let order = OrderBuilder::new()
+			.with_id(order_id.to_string())
+			.with_status(OrderStatus::Executing)
+			.build();
+		sm.store_order(&order).await.unwrap();
+	}
+
+	/// Always-large `get_balance` mock (so the balance check never blocks dispatch).
+	fn mock_large_balance(mock: &mut MockDeliveryInterface) {
+		mock.expect_get_balance()
+			.returning(|_, _, _| Box::pin(async move { Ok("1000000000000000000000".to_string()) }));
+	}
+
+	// =====================================================================
+	// 1. Happy bump: dispatches replacement with bumped fees.
+	// =====================================================================
+	#[tokio::test]
+	async fn happy_bump_dispatches_replacement_with_bumped_fees() {
+		let cfg = default_enabled_config();
+		let mut mock = MockDeliveryInterface::new();
+		let signer = Address(vec![9; 20]);
+		let signer_clone = signer.clone();
+		mock.expect_submission_signer()
+			.returning(move |_| Some(signer_clone.clone()));
+		mock_large_balance(&mut mock);
+
+		// We need a handle to the recorder before service construction —
+		// we build the service first, capture the attempt_store, and use
+		// it inside the expect_submit closure.
+		let (service, attempt_store, storage, _bus, _tmp) =
+			test_service(cfg, MockDeliveryInterface::new());
+		seed_active_order(&storage, "order-1").await;
+		let _parent = seed_attempt(
+			&attempt_store,
+			"parent-1",
+			TransactionAttemptStatus::Broadcast,
+			None,
+			Some(signer.clone()),
+			10_000_000_000, // 10 gwei
+		)
+		.await;
+
+		// Re-build the mock with submit() expectation now that we have a store.
+		let mut mock = MockDeliveryInterface::new();
+		let signer_clone = signer.clone();
+		mock.expect_submission_signer()
+			.returning(move |_| Some(signer_clone.clone()));
+		mock_large_balance(&mut mock);
+		let recorder: Arc<dyn TransactionAttemptRecorder> = attempt_store.clone();
+		let recorder_for_mock = recorder.clone();
+		mock.expect_submit()
+			.times(1)
+			.returning(move |tx, tracking| {
+				let recorder = recorder_for_mock.clone();
+				Box::pin(async move {
+					let tracking = tracking.expect("sweeper must supply tracking");
+					let outcome: Result<TransactionHash, DeliveryError> =
+						Ok(TransactionHash(vec![0xab; 32]));
+					simulate_submit_recording(
+						&recorder,
+						&tracking,
+						&tx,
+						&outcome,
+						Some(Address(vec![9; 20])),
+					)
+					.await;
+					outcome
+				})
+			});
+
+		// Replace the delivery in a fresh service that reuses the same store.
+		let delivery_impls: HashMap<u64, Arc<dyn DeliveryInterface>> =
+			HashMap::from([(1u64, Arc::new(mock) as Arc<dyn DeliveryInterface>)]);
+		let delivery_svc = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
+		let service = TransactionBumpService::new(
+			service.config.clone(),
+			storage.clone(),
+			attempt_store.clone(),
+			delivery_svc,
+			service.event_bus.clone(),
+			recorder.clone(),
+		);
+
+		// Wait so the age threshold elapses.
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		service.tick().await.unwrap();
+
+		let all = attempt_store.attempts_for_order("order-1").await.unwrap();
+		assert_eq!(all.len(), 2, "should now have parent + child");
+		let parent = all.iter().find(|a| a.id == "parent-1").unwrap();
+		assert!(parent.replaced_by.is_some(), "parent.replaced_by hint set");
+		let child = all.iter().find(|a| a.id != "parent-1").unwrap();
+		assert_eq!(child.replacement_of.as_deref(), Some("parent-1"));
+		// 15% bump default: 10 gwei -> 11.5 gwei
+		assert_eq!(child.tx.max_fee_per_gas, Some(11_500_000_000));
+	}
+
+	// =====================================================================
+	// 2. Disabled config: run() exits without ticking.
+	// =====================================================================
+	#[tokio::test]
+	async fn disabled_skips_dispatch() {
+		let mut cfg = default_enabled_config();
+		cfg.enabled = false;
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_submit().times(0);
+		// No need for other mocks because run() exits immediately when disabled.
+
+		let (svc, _store, _storage, _bus, _tmp) = test_service(cfg, mock);
+		let svc = Arc::new(svc);
+		let (tx, rx) = tokio::sync::watch::channel(false);
+		let svc2 = svc.clone();
+		let h = tokio::spawn(async move { svc2.run(rx).await });
+		tokio::time::sleep(Duration::from_millis(100)).await;
+		let _ = tx.send(true);
+		h.await.unwrap();
+		// expect_submit().times(0) asserts on drop.
+	}
+
+	// =====================================================================
+	// 3. Chain not in allowlist: skipped silently.
+	// =====================================================================
+	#[tokio::test]
+	async fn chain_not_in_allowlist_skips() {
+		let mut cfg = default_enabled_config();
+		cfg.chains.clear();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_submit().times(0);
+		// submission_signer / balance may or may not be called depending on
+		// where the allowlist check sits; configure them as no-strict mocks.
+		mock.expect_submission_signer()
+			.returning(|_| Some(Address(vec![9; 20])));
+		mock_large_balance(&mut mock);
+
+		let (svc, store, storage, _bus, _tmp) = test_service(cfg, mock);
+		seed_active_order(&storage, "order-1").await;
+		seed_attempt(
+			&store,
+			"parent-1",
+			TransactionAttemptStatus::Broadcast,
+			None,
+			Some(Address(vec![9; 20])),
+			10_000_000_000,
+		)
+		.await;
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		svc.tick().await.unwrap();
+	}
+
+	// =====================================================================
+	// 4. Age below threshold: skipped.
+	// =====================================================================
+	#[tokio::test]
+	async fn age_below_threshold_skips() {
+		let mut cfg = default_enabled_config();
+		cfg.default_pending_threshold_secs = 3600;
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_submit().times(0);
+		mock.expect_submission_signer()
+			.returning(|_| Some(Address(vec![9; 20])));
+		mock_large_balance(&mut mock);
+
+		let (svc, store, storage, _bus, _tmp) = test_service(cfg, mock);
+		seed_active_order(&storage, "order-1").await;
+		seed_attempt(
+			&store,
+			"parent-1",
+			TransactionAttemptStatus::Broadcast,
+			None,
+			Some(Address(vec![9; 20])),
+			10_000_000_000,
+		)
+		.await;
+		svc.tick().await.unwrap();
+	}
+
+	// =====================================================================
+	// 5. Cap reached: skipped with BumpCapReached event.
+	// =====================================================================
+	#[tokio::test]
+	async fn cap_reached_skips_with_event() {
+		let mut cfg = default_enabled_config();
+		cfg.default_max_fee_per_gas_cap_wei = Some("11000000000".into());
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_submit().times(0);
+		mock.expect_submission_signer()
+			.returning(|_| Some(Address(vec![9; 20])));
+		mock_large_balance(&mut mock);
+
+		let (svc, store, storage, bus, _tmp) = test_service(cfg, mock);
+		seed_active_order(&storage, "order-1").await;
+		seed_attempt(
+			&store,
+			"parent-1",
+			TransactionAttemptStatus::Broadcast,
+			None,
+			Some(Address(vec![9; 20])),
+			10_000_000_000, // bumped 15% -> 11.5 gwei, exceeds 11 gwei cap
+		)
+		.await;
+		let mut sub = bus.subscribe();
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		svc.tick().await.unwrap();
+		let events = drain_bus_events(&mut sub);
+		assert!(
+			events.iter().any(|e| matches!(
+				e,
+				SolverEvent::Delivery(DeliveryEvent::BumpCapReached {
+					cap_field: BumpCapField::MaxFeePerGas,
+					..
+				})
+			)),
+			"expected BumpCapReached, got events: {events:?}"
+		);
+	}
+
+	// =====================================================================
+	// 6. Max replacements reached: skipped with BumpMaxReplacementsReached.
+	// =====================================================================
+	#[tokio::test]
+	async fn max_replacements_reached_skips_with_event() {
+		let mut cfg = default_enabled_config();
+		// Allow only 2 replacements per stage.
+		if let Some(c) = cfg.chains.get_mut(&1) {
+			c.max_replacements_per_stage = Some(2);
+		}
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_submit().times(0);
+		mock.expect_submission_signer()
+			.returning(|_| Some(Address(vec![9; 20])));
+		mock_large_balance(&mut mock);
+
+		let (svc, store, storage, bus, _tmp) = test_service(cfg, mock);
+		seed_active_order(&storage, "order-1").await;
+		seed_attempt(
+			&store,
+			"a",
+			TransactionAttemptStatus::Broadcast,
+			None,
+			Some(Address(vec![9; 20])),
+			10_000_000_000,
+		)
+		.await;
+		seed_attempt(
+			&store,
+			"b",
+			TransactionAttemptStatus::Broadcast,
+			Some("a"),
+			Some(Address(vec![9; 20])),
+			11_500_000_000,
+		)
+		.await;
+		seed_attempt(
+			&store,
+			"c",
+			TransactionAttemptStatus::Broadcast,
+			Some("b"),
+			Some(Address(vec![9; 20])),
+			13_225_000_000,
+		)
+		.await;
+
+		let mut sub = bus.subscribe();
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		svc.tick().await.unwrap();
+		let events = drain_bus_events(&mut sub);
+		assert!(
+			events.iter().any(|e| matches!(
+				e,
+				SolverEvent::Delivery(DeliveryEvent::BumpMaxReplacementsReached { .. })
+			)),
+			"expected BumpMaxReplacementsReached, got events: {events:?}"
+		);
+	}
+
+	// =====================================================================
+	// 7. ReplacementUnderpriced preserves the rejected child's fees on its row.
+	// =====================================================================
+	#[tokio::test]
+	async fn replacement_underpriced_preserves_rejected_child_fees() {
+		let cfg = default_enabled_config();
+		let (service, attempt_store, storage, bus, _tmp) =
+			test_service(cfg, MockDeliveryInterface::new());
+		seed_active_order(&storage, "order-1").await;
+		let signer = Address(vec![9; 20]);
+		seed_attempt(
+			&attempt_store,
+			"parent-1",
+			TransactionAttemptStatus::Broadcast,
+			None,
+			Some(signer.clone()),
+			10_000_000_000,
+		)
+		.await;
+
+		let recorder: Arc<dyn TransactionAttemptRecorder> = attempt_store.clone();
+		let recorder_for_mock = recorder.clone();
+		let mut mock = MockDeliveryInterface::new();
+		let signer_clone = signer.clone();
+		mock.expect_submission_signer()
+			.returning(move |_| Some(signer_clone.clone()));
+		mock_large_balance(&mut mock);
+		mock.expect_submit()
+			.times(1)
+			.returning(move |tx, tracking| {
+				let recorder = recorder_for_mock.clone();
+				Box::pin(async move {
+					let tracking = tracking.expect("sweeper must supply tracking");
+					let outcome: Result<TransactionHash, DeliveryError> =
+						Err(DeliveryError::ReplacementUnderpriced {
+							hint: "node says too low".into(),
+						});
+					simulate_submit_recording(
+						&recorder,
+						&tracking,
+						&tx,
+						&outcome,
+						Some(Address(vec![9; 20])),
+					)
+					.await;
+					outcome
+				})
+			});
+		let delivery_impls: HashMap<u64, Arc<dyn DeliveryInterface>> =
+			HashMap::from([(1u64, Arc::new(mock) as Arc<dyn DeliveryInterface>)]);
+		let delivery_svc = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
+		let service = TransactionBumpService::new(
+			service.config.clone(),
+			storage.clone(),
+			attempt_store.clone(),
+			delivery_svc,
+			bus.clone(),
+			recorder.clone(),
+		);
+
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		service.tick().await.unwrap();
+
+		let all = attempt_store.attempts_for_order("order-1").await.unwrap();
+		assert_eq!(all.len(), 2);
+		let child = all.iter().find(|a| a.id != "parent-1").unwrap();
+		assert_eq!(child.status, TransactionAttemptStatus::SubmitRejected);
+		assert!(
+			child.tx.max_fee_per_gas.unwrap() > 10_000_000_000,
+			"child fee {} must be > parent 10 gwei (proof of 15% bump preserved)",
+			child.tx.max_fee_per_gas.unwrap()
+		);
+	}
+
+	// =====================================================================
+	// 8. ReplacementUnderpriced self-escalates: tick 2 dispatches at higher fee.
+	// =====================================================================
+	#[tokio::test]
+	async fn replacement_underpriced_self_escalates_on_second_tick() {
+		let cfg = default_enabled_config();
+		let (service, attempt_store, storage, bus, _tmp) =
+			test_service(cfg, MockDeliveryInterface::new());
+		seed_active_order(&storage, "order-1").await;
+		let signer = Address(vec![9; 20]);
+		seed_attempt(
+			&attempt_store,
+			"parent-1",
+			TransactionAttemptStatus::Broadcast,
+			None,
+			Some(signer.clone()),
+			10_000_000_000,
+		)
+		.await;
+
+		let recorder: Arc<dyn TransactionAttemptRecorder> = attempt_store.clone();
+		let recorder_for_mock = recorder.clone();
+		let mut mock = MockDeliveryInterface::new();
+		let signer_clone = signer.clone();
+		mock.expect_submission_signer()
+			.returning(move |_| Some(signer_clone.clone()));
+		mock_large_balance(&mut mock);
+		let counter = Arc::new(AtomicUsize::new(0));
+		let counter_for_mock = counter.clone();
+		// Capture the second-tick tx's max_fee_per_gas for an assertion.
+		let second_tick_fee = Arc::new(std::sync::Mutex::new(None::<u128>));
+		let second_tick_fee_for_mock = second_tick_fee.clone();
+		mock.expect_submit()
+			.times(2)
+			.returning(move |tx, tracking| {
+				let recorder = recorder_for_mock.clone();
+				let n = counter_for_mock.fetch_add(1, Ordering::SeqCst);
+				let second_tick_fee = second_tick_fee_for_mock.clone();
+				Box::pin(async move {
+					let tracking = tracking.expect("sweeper must supply tracking");
+					if n == 0 {
+						let outcome: Result<TransactionHash, DeliveryError> =
+							Err(DeliveryError::ReplacementUnderpriced {
+								hint: "too low".into(),
+							});
+						simulate_submit_recording(
+							&recorder,
+							&tracking,
+							&tx,
+							&outcome,
+							Some(Address(vec![9; 20])),
+						)
+						.await;
+						outcome
+					} else {
+						*second_tick_fee.lock().unwrap() = tx.max_fee_per_gas;
+						let outcome: Result<TransactionHash, DeliveryError> =
+							Ok(TransactionHash(vec![0xcd; 32]));
+						simulate_submit_recording(
+							&recorder,
+							&tracking,
+							&tx,
+							&outcome,
+							Some(Address(vec![9; 20])),
+						)
+						.await;
+						outcome
+					}
+				})
+			});
+		let delivery_impls: HashMap<u64, Arc<dyn DeliveryInterface>> =
+			HashMap::from([(1u64, Arc::new(mock) as Arc<dyn DeliveryInterface>)]);
+		let delivery_svc = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
+		let service = TransactionBumpService::new(
+			service.config.clone(),
+			storage.clone(),
+			attempt_store.clone(),
+			delivery_svc,
+			bus.clone(),
+			recorder.clone(),
+		);
+
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		service.tick().await.unwrap();
+		// Second tick: lineage age has elapsed; rejected child's bumped fee is the new floor.
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		service.tick().await.unwrap();
+
+		// Tick 1 bumped 10 gwei -> 11.5 gwei (rejected). Tick 2 must bump
+		// above 11.5 gwei (self-escalation using rejected child's fees as floor).
+		let f = second_tick_fee
+			.lock()
+			.unwrap()
+			.expect("second tick should have run");
+		assert!(
+			f > 11_500_000_000,
+			"second tick max_fee {f} should exceed first-bump 11.5 gwei (self-escalation)"
+		);
+	}
+
+	// =====================================================================
+	// 9. Reconciliation marks loser as Replaced.
+	// =====================================================================
+	#[tokio::test]
+	async fn reconciliation_marks_loser_replaced() {
+		let cfg = default_enabled_config();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_submit().times(0);
+		mock.expect_submission_signer()
+			.returning(|_| Some(Address(vec![9; 20])));
+		mock_large_balance(&mut mock);
+
+		let (svc, store, storage, _bus, _tmp) = test_service(cfg, mock);
+		seed_active_order(&storage, "order-1").await;
+		seed_attempt(
+			&store,
+			"p",
+			TransactionAttemptStatus::Broadcast,
+			None,
+			Some(Address(vec![9; 20])),
+			10_000_000_000,
+		)
+		.await;
+		seed_attempt(
+			&store,
+			"b",
+			TransactionAttemptStatus::Confirmed,
+			Some("p"),
+			Some(Address(vec![9; 20])),
+			11_500_000_000,
+		)
+		.await;
+		// Make parent.replaced_by = Some("b") to mirror lineage hint.
+		store.set_replaced_by("p", "b").await.unwrap();
+
+		svc.tick().await.unwrap();
+
+		let p = store.get_attempt("p").await.unwrap();
+		assert_eq!(p.status, TransactionAttemptStatus::Replaced);
+	}
+
+	// =====================================================================
+	// 10. Reconciliation still works when parent.replaced_by was never set
+	//     (CAS-fail simulation): traversal is via child.replacement_of only.
+	// =====================================================================
+	#[tokio::test]
+	async fn reconciliation_with_no_lineage_parent() {
+		let cfg = default_enabled_config();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_submit().times(0);
+		mock.expect_submission_signer()
+			.returning(|_| Some(Address(vec![9; 20])));
+		mock_large_balance(&mut mock);
+
+		let (svc, store, storage, _bus, _tmp) = test_service(cfg, mock);
+		seed_active_order(&storage, "order-1").await;
+		seed_attempt(
+			&store,
+			"p",
+			TransactionAttemptStatus::Broadcast,
+			None,
+			Some(Address(vec![9; 20])),
+			10_000_000_000,
+		)
+		.await;
+		seed_attempt(
+			&store,
+			"b",
+			TransactionAttemptStatus::Confirmed,
+			Some("p"),
+			Some(Address(vec![9; 20])),
+			11_500_000_000,
+		)
+		.await;
+		// Intentionally do NOT call set_replaced_by — simulates CAS-fail.
+
+		svc.tick().await.unwrap();
+
+		let p = store.get_attempt("p").await.unwrap();
+		assert_eq!(p.status, TransactionAttemptStatus::Replaced);
+	}
+
+	// =====================================================================
+	// 11. Reconciliation respects is_terminal: Reverted parent is NOT overwritten.
+	// =====================================================================
+	#[tokio::test]
+	async fn reconciliation_respects_is_terminal() {
+		let cfg = default_enabled_config();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_submit().times(0);
+		mock.expect_submission_signer()
+			.returning(|_| Some(Address(vec![9; 20])));
+		mock_large_balance(&mut mock);
+
+		let (svc, store, storage, _bus, _tmp) = test_service(cfg, mock);
+		seed_active_order(&storage, "order-1").await;
+		seed_attempt(
+			&store,
+			"p",
+			TransactionAttemptStatus::Reverted,
+			None,
+			Some(Address(vec![9; 20])),
+			10_000_000_000,
+		)
+		.await;
+		seed_attempt(
+			&store,
+			"b",
+			TransactionAttemptStatus::Confirmed,
+			Some("p"),
+			Some(Address(vec![9; 20])),
+			11_500_000_000,
+		)
+		.await;
+
+		svc.tick().await.unwrap();
+
+		let p = store.get_attempt("p").await.unwrap();
+		assert_eq!(
+			p.status,
+			TransactionAttemptStatus::Reverted,
+			"terminal parent must NOT be overwritten by reconciliation"
+		);
+	}
+
+	// =====================================================================
+	// 12. Signer mismatch emits event and skips.
+	// =====================================================================
+	#[tokio::test]
+	async fn signer_mismatch_emits_event_and_skips() {
+		let cfg = default_enabled_config();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_submit().times(0);
+		let runtime_signer = Address(vec![0xbb; 20]);
+		let runtime_signer_clone = runtime_signer.clone();
+		mock.expect_submission_signer()
+			.returning(move |_| Some(runtime_signer_clone.clone()));
+		mock_large_balance(&mut mock);
+
+		let (svc, store, storage, bus, _tmp) = test_service(cfg, mock);
+		seed_active_order(&storage, "order-1").await;
+		seed_attempt(
+			&store,
+			"parent-1",
+			TransactionAttemptStatus::Broadcast,
+			None,
+			Some(Address(vec![0xaa; 20])),
+			10_000_000_000,
+		)
+		.await;
+		let mut sub = bus.subscribe();
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		svc.tick().await.unwrap();
+		let events = drain_bus_events(&mut sub);
+		assert!(
+			events.iter().any(|e| matches!(
+				e,
+				SolverEvent::Delivery(DeliveryEvent::BumpSignerMismatch { .. })
+			)),
+			"expected BumpSignerMismatch, got events: {events:?}"
+		);
+	}
+
+	// =====================================================================
+	// 13. Tip with missing signer emits BumpMissingSigner and skips (no panic).
+	// =====================================================================
+	#[tokio::test]
+	async fn tip_missing_signer_emits_event_no_panic() {
+		let cfg = default_enabled_config();
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_submit().times(0);
+		mock.expect_submission_signer()
+			.returning(|_| Some(Address(vec![9; 20])));
+		mock_large_balance(&mut mock);
+
+		let (svc, store, storage, bus, _tmp) = test_service(cfg, mock);
+		seed_active_order(&storage, "order-1").await;
+		seed_attempt(
+			&store,
+			"parent-1",
+			TransactionAttemptStatus::Broadcast,
+			None,
+			None, // signer absent
+			10_000_000_000,
+		)
+		.await;
+		let mut sub = bus.subscribe();
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		svc.tick().await.unwrap();
+		let events = drain_bus_events(&mut sub);
+		assert!(
+			events.iter().any(|e| matches!(
+				e,
+				SolverEvent::Delivery(DeliveryEvent::BumpMissingSigner { .. })
+			)),
+			"expected BumpMissingSigner, got events: {events:?}"
+		);
+	}
+}
