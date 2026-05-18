@@ -21,7 +21,7 @@ pub fn current_timestamp() -> u64 {
 ///   bytes32 convention for orderIds).
 /// - ASCII strings (e.g., test placeholders like `"test_order_123"`): copy
 ///   raw bytes, right-align in 32 bytes.
-/// - Invalid hex: fall back to all zeros (does not panic).
+/// - Invalid hex: returns `Err` (does not panic).
 /// - Strings longer than 32 bytes: keep the first 32 bytes (right-aligned
 ///   into the full buffer).
 pub fn order_id_to_bytes32(order_id: &str) -> Result<[u8; 32], String> {

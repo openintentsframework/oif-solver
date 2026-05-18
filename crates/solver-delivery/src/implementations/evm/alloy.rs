@@ -77,7 +77,17 @@ const NONCE_DRIFT_ERROR_AFTER_TICKS: u32 = 15; // ~15 minutes
 /// permanently losing an order whose tx may yet confirm on chain.
 enum PollOutcome {
 	Confirmed(TransactionReceipt),
-	Reverted(String),
+	Reverted {
+		error: String,
+		/// Block number the failed receipt was mined into. Used by
+		/// `monitor_transaction` to replay the call via `get_revert_data`
+		/// against the failed-tx block before forwarding the outcome to the
+		/// caller. May be `None` if the polling loop never read a numbered
+		/// block (defensive; in practice always Some when the revert path
+		/// fires).
+		receipt_block: Option<u64>,
+		classification: crate::RevertClassification,
+	},
 	Indeterminate(String),
 }
 
@@ -1236,12 +1246,19 @@ impl DeliveryInterface for AlloyDelivery {
 			// Erase the root provider to a `DynProvider` so it matches
 			// `monitor_transaction`'s signature (and `ProviderProbe` inside it).
 			let provider_clone = pending_tx.provider().clone().erased();
+			// Capture replay parameters for revert-data classification on revert.
+			let tx_for_replay: SolverTransaction = tx_attempt.clone();
+			let from_for_replay: Option<SolverAddress> = Some(SolverAddress::from(from));
+			let chain_id_for_replay: u64 = chain_id;
 			tokio::spawn(async move {
 				let result = monitor_transaction(
 					provider_clone,
 					tx_hash,
 					tracking.min_confirmations,
 					Duration::from_secs(tracking.tx_confirmation_timeout_seconds),
+					tx_for_replay,
+					from_for_replay,
+					chain_id_for_replay,
 				)
 				.await;
 
@@ -1266,7 +1283,11 @@ impl DeliveryInterface for AlloyDelivery {
 							receipt,
 						});
 					},
-					PollOutcome::Reverted(error) => {
+					PollOutcome::Reverted {
+						error,
+						classification,
+						..
+					} => {
 						if let Some(attempt_id) = monitor_attempt_id.clone() {
 							record_attempt_update_best_effort(
 								monitor_attempt_recorder.clone(),
@@ -1284,6 +1305,7 @@ impl DeliveryInterface for AlloyDelivery {
 							tx_hash: tx_hash_clone,
 							tx_type: tracking.tracking.tx_type,
 							error,
+							classification,
 						});
 					},
 					PollOutcome::Indeterminate(reason) => {
@@ -1665,6 +1687,17 @@ impl DeliveryInterface for AlloyDelivery {
 		Ok(result)
 	}
 
+	async fn get_revert_data(
+		&self,
+		chain_id: u64,
+		tx: SolverTransaction,
+		from: Option<SolverAddress>,
+		block: u64,
+	) -> Result<Option<Vec<u8>>, DeliveryError> {
+		let provider = self.get_provider(chain_id)?.clone();
+		get_revert_data_with_provider(provider, chain_id, tx, from, block).await
+	}
+
 	async fn tx_exists(
 		&self,
 		hash: &solver_types::TransactionHash,
@@ -1737,6 +1770,56 @@ impl DeliveryInterface for AlloyDelivery {
 /// already returns at the existing receipt-check call site.
 type AlloyReceipt = alloy_rpc_types::TransactionReceipt;
 
+/// Replays a transaction via `eth_call` against the given block and returns
+/// the revert payload bytes if the replay reverts.
+///
+/// Shared by `DeliveryInterface::get_revert_data` and the spawned monitor
+/// task. The monitor cannot call the trait method (because `AlloyDelivery`
+/// is not `Clone` and the spawn captures an erased provider), so both go
+/// through this free function with the same `DynProvider`.
+///
+/// Passes `from` through to `TransactionRequest` when present and the
+/// address length is 20 bytes. On mismatch, replays without `from` and logs
+/// a warning — classifications may degrade to `Unknown`, which is the
+/// conservative outcome.
+pub(crate) async fn get_revert_data_with_provider(
+	provider: DynProvider,
+	_chain_id: u64,
+	tx: SolverTransaction,
+	from: Option<SolverAddress>,
+	block: u64,
+) -> Result<Option<Vec<u8>>, DeliveryError> {
+	let mut request: TransactionRequest = tx.into();
+
+	if let Some(addr) = from {
+		if addr.0.len() == 20 {
+			let alloy_addr = Address::from_slice(&addr.0);
+			request = request.from(alloy_addr);
+		} else {
+			tracing::warn!(
+				addr_len = addr.0.len(),
+				"Signer address is not 20 bytes; replaying eth_call without `from` (classification may be Unknown)"
+			);
+		}
+	}
+
+	let block_id = BlockNumberOrTag::Number(block).into();
+
+	match provider.call(request).block(block_id).await {
+		Ok(_bytes) => Ok(None),
+		Err(transport_err) => Ok(extract_revert_bytes_from_transport_err(&transport_err)),
+	}
+}
+
+/// Extracts the revert payload from a `TransportError`. Uses alloy's
+/// `ErrorPayload::as_revert_data()` accessor, which handles the common
+/// shapes of JSON-RPC error responses on the pinned alloy version.
+fn extract_revert_bytes_from_transport_err(err: &TransportError) -> Option<Vec<u8>> {
+	err.as_error_resp()
+		.and_then(|payload| payload.as_revert_data())
+		.map(|bytes| bytes.to_vec())
+}
+
 /// Probe abstraction over the two RPC calls the polling monitor needs.
 /// Production impl wraps a real `DynProvider`; tests provide a `MockProbe`
 /// with controllable response queues so the polling loop can be exercised
@@ -1797,7 +1880,11 @@ async fn poll_for_confirmation(
 			Ok(Some(receipt)) => {
 				if !receipt.status() {
 					tracing::warn!(?tx_hash, "Tx reverted on chain");
-					return PollOutcome::Reverted("Transaction reverted".to_string());
+					return PollOutcome::Reverted {
+						error: "Transaction reverted".to_string(),
+						receipt_block: receipt.block_number,
+						classification: crate::RevertClassification::Unknown,
+					};
 				}
 				let receipt_block = match receipt.block_number {
 					Some(b) => b,
@@ -1851,26 +1938,77 @@ async fn poll_for_confirmation(
 
 /// Monitors a submitted transaction for confirmation, revert, or timeout.
 ///
-/// Thin wrapper around `poll_for_confirmation` that wraps the provider in a
-/// `ProviderProbe` and supplies the module-level poll interval. Returns a
-/// `PollOutcome` so the caller can map a deadline expiry to a non-terminal
-/// `TransactionMonitoringEvent::Indeterminate` rather than the terminal
-/// `Failed` event (which would leave the order permanently `OrderStatus::Failed`
-/// even if the tx later confirms; recovery skips Failed orders).
+/// Wraps `poll_for_confirmation` and, on revert, replays the failed call via
+/// `eth_call` to extract revert bytes and classify them. The classification
+/// flows to `TransactionMonitoringEvent::Failed` so handlers can branch:
+/// `StageComplete` defers to recovery; `Terminal` and `Unknown` terminalize.
+///
+/// Replay parameters (`tx_for_replay`, `from_for_replay`, `chain_id`) are
+/// captured by the caller from the submit-time `tx_attempt` + signer.
 async fn monitor_transaction(
 	provider: DynProvider,
 	tx_hash: B256,
 	min_confirmations: u64,
 	confirmation_timeout: Duration,
+	tx_for_replay: SolverTransaction,
+	from_for_replay: Option<SolverAddress>,
+	chain_id: u64,
 ) -> PollOutcome {
-	poll_for_confirmation(
-		&ProviderProbe(provider),
+	let inner = poll_for_confirmation(
+		&ProviderProbe(provider.clone()),
 		tx_hash,
 		min_confirmations,
 		confirmation_timeout,
 		TX_CONFIRMATION_POLL_INTERVAL,
 	)
-	.await
+	.await;
+
+	match inner {
+		PollOutcome::Reverted {
+			receipt_block: Some(block),
+			..
+		} => {
+			let revert_bytes = get_revert_data_with_provider(
+				provider,
+				chain_id,
+				tx_for_replay,
+				from_for_replay,
+				block,
+			)
+			.await
+			.ok()
+			.flatten()
+			.unwrap_or_default();
+			let classification = crate::classify_revert(&revert_bytes);
+			let error_msg = if revert_bytes.is_empty() {
+				"Transaction reverted (no revert data)".to_string()
+			} else {
+				let head = &revert_bytes[..revert_bytes.len().min(4)];
+				format!("revert 0x{}", hex::encode(head))
+			};
+			PollOutcome::Reverted {
+				error: error_msg,
+				receipt_block: Some(block),
+				classification,
+			}
+		},
+		// Receipt came back without a block number — extremely rare on
+		// post-merge chains, but defensively avoid replaying at block 0
+		// (genesis state, no OIF contracts deployed) which would either
+		// return empty bytes or coincidentally match an unrelated selector
+		// and misclassify. Fall through as Unknown so recovery on the next
+		// pass picks up a complete receipt.
+		PollOutcome::Reverted {
+			error,
+			receipt_block: None,
+			..
+		} => PollOutcome::Reverted {
+			error,
+			receipt_block: None,
+			classification: crate::RevertClassification::Unknown,
+		},
+		other => other,
+	}
 }
 
 /// Factory function to create an HTTP-based delivery provider from configuration.
@@ -2037,6 +2175,54 @@ mod tests {
 	use alloy_signer_local::PrivateKeySigner;
 	use solver_types::utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder};
 	use std::collections::HashMap;
+
+	mod revert_data_extractor_tests {
+		use super::super::extract_revert_bytes_from_transport_err;
+		use alloy_json_rpc::ErrorPayload;
+		use alloy_transport::TransportError;
+
+		#[test]
+		fn extracts_hex_data_from_error_response() {
+			let json = r#"{
+				"code": 3,
+				"message": "execution reverted",
+				"data": "0x646cf558"
+			}"#;
+			let payload: ErrorPayload = serde_json::from_str(json).unwrap();
+			let err = TransportError::ErrorResp(payload);
+
+			let bytes = extract_revert_bytes_from_transport_err(&err).unwrap();
+			assert_eq!(bytes, vec![0x64, 0x6c, 0xf5, 0x58]);
+		}
+
+		#[test]
+		fn returns_none_when_data_field_is_missing() {
+			let json = r#"{
+				"code": 3,
+				"message": "execution reverted"
+			}"#;
+			let payload: ErrorPayload = serde_json::from_str(json).unwrap();
+			let err = TransportError::ErrorResp(payload);
+
+			assert!(extract_revert_bytes_from_transport_err(&err).is_none());
+		}
+
+		#[test]
+		fn extracts_longer_revert_payload_with_args() {
+			// AlreadyClaimed selector + 32 zero bytes of (nonexistent) args
+			let json = r#"{
+				"code": 3,
+				"message": "execution reverted",
+				"data": "0x646cf5580000000000000000000000000000000000000000000000000000000000000000"
+			}"#;
+			let payload: ErrorPayload = serde_json::from_str(json).unwrap();
+			let err = TransportError::ErrorResp(payload);
+
+			let bytes = extract_revert_bytes_from_transport_err(&err).unwrap();
+			assert_eq!(&bytes[..4], &[0x64, 0x6c, 0xf5, 0x58]);
+			assert_eq!(bytes.len(), 36);
+		}
+	}
 
 	// Test private key split to avoid triggering secret scanners in CI
 	// This is Anvil's default test account #0 - DO NOT use in production
@@ -2703,7 +2889,7 @@ mod tests {
 			// First poll returns a reverted receipt — should NOT keep polling.
 			let probe = MockProbe::new(vec![Ok(Some(make_receipt(false, 100)))], vec![Ok(100)]);
 			let outcome = poll_for_confirmation(&probe, B256::ZERO, 3, TIMEOUT_LONG, POLL).await;
-			assert!(matches!(outcome, PollOutcome::Reverted(_)));
+			assert!(matches!(outcome, PollOutcome::Reverted { .. }));
 		}
 
 		#[tokio::test]
@@ -2749,7 +2935,13 @@ mod tests {
 			fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 				match self {
 					PollOutcome::Confirmed(_) => write!(f, "Confirmed(<receipt>)"),
-					PollOutcome::Reverted(s) => write!(f, "Reverted({s:?})"),
+					PollOutcome::Reverted {
+						error,
+						classification,
+						..
+					} => {
+						write!(f, "Reverted({error:?}, {classification:?})")
+					},
 					PollOutcome::Indeterminate(s) => write!(f, "Indeterminate({s:?})"),
 				}
 			}
@@ -2817,6 +3009,7 @@ mod tests {
 				tx_hash: TransactionHash(vec![0x12; 32]),
 				tx_type: TransactionType::PostFill,
 				error: "Transaction reverted".to_string(),
+				classification: crate::RevertClassification::Unknown,
 			});
 
 			assert!(called.load(Ordering::SeqCst));
