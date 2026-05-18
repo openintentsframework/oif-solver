@@ -122,41 +122,103 @@ fn extract_output_details(order: &Order) -> Result<HyperlaneOutput, SettlementEr
 	Ok(order_output_to_hyperlane(first_output))
 }
 
-/// Extract fill details from OutputFilled event in logs
+/// Extract (solver, timestamp) from OutputFilled logs.
+///
+/// Verifies that the log was emitted by the order's expected output settler for the
+/// destination chain AND that the decoded MandateOutput matches the order's output.
+/// Rejects forged logs emitted by malicious contracts in the same fill transaction.
 fn extract_fill_details_from_logs(
 	logs: &[solver_types::Log],
+	order: &solver_types::Order,
 	order_id: &[u8; 32],
-) -> Result<(Vec<u8>, u32), SettlementError> {
-	// OutputFilled event signature: OutputFilled(bytes32,bytes32,uint32,MandateOutput,uint256)
-	let output_filled_signature = keccak256("OutputFilled(bytes32,bytes32,uint32,(bytes32,bytes32,uint256,bytes32,uint256,bytes32,bytes,bytes),uint256)");
+	dest_chain: u64,
+) -> Result<([u8; 32], u32), SettlementError> {
+	use alloy_sol_types::SolEvent;
+	use solver_types::standards::eip7683::interfaces::OutputFilled;
 
+	// 1. Resolve the expected output and emitter from the order.
+	let order_data: solver_types::standards::eip7683::Eip7683OrderData =
+		serde_json::from_value(order.data.clone()).map_err(|e| {
+			SettlementError::ValidationFailed(format!("Failed to parse order_data: {e}"))
+		})?;
+
+	let matched: Vec<&_> = order_data
+		.outputs
+		.iter()
+		.filter(|o| o.chain_id == alloy_primitives::U256::from(dest_chain))
+		.collect();
+	if matched.is_empty() {
+		return Err(SettlementError::ValidationFailed(format!(
+			"Order has no output on destination chain {dest_chain}"
+		)));
+	}
+	if matched.len() > 1 {
+		return Err(SettlementError::ValidationFailed(format!(
+			"Order has multiple outputs on destination chain {dest_chain}; unsupported"
+		)));
+	}
+	let expected_output = matched[0];
+
+	// 2. Convert the signed bytes32 settler to a 20-byte EVM address.
+	if expected_output.settler[0..12].iter().any(|b| *b != 0) {
+		return Err(SettlementError::ValidationFailed(
+			"Order output settler is not a left-padded EVM address".to_string(),
+		));
+	}
+	let mut expected_addr = [0u8; 20];
+	expected_addr.copy_from_slice(&expected_output.settler[12..32]);
+	let expected_emitter = solver_types::Address(expected_addr.to_vec());
+
+	// 3. Filter logs by emitter AND topic match, then decode and compare MandateOutput.
 	for log in logs {
-		// Check if this is an OutputFilled event
-		if log.topics.len() >= 2 && log.topics[0].0 == output_filled_signature.0 {
-			// Topic[1] is indexed orderId
-			if log.topics[1].0 == *order_id {
-				// The data contains: solver (bytes32), timestamp (uint32), MandateOutput, finalAmount
-				// First 32 bytes: solver
-				// Next 32 bytes: timestamp (padded)
-				if log.data.len() >= 64 {
-					let solver = log.data[0..32].to_vec();
-					let timestamp_bytes = &log.data[32..64];
-					// Timestamp is uint32, stored in the last 4 bytes of the 32-byte slot
-					let timestamp = u32::from_be_bytes([
-						timestamp_bytes[28],
-						timestamp_bytes[29],
-						timestamp_bytes[30],
-						timestamp_bytes[31],
-					]);
+		if log.address != expected_emitter {
+			continue;
+		}
+		if log.topics.len() < 2 {
+			continue;
+		}
+		if log.topics[0].0 != OutputFilled::SIGNATURE_HASH.0 {
+			continue;
+		}
+		if log.topics[1].0 != *order_id {
+			continue;
+		}
 
-					return Ok((solver, timestamp));
+		// Decode the non-indexed payload via the sol!-generated event type.
+		// In alloy-sol-types 1.x, `abi_decode_data_validate(data)` performs the
+		// validated decode and returns a tuple matching the event's non-indexed
+		// params: (solver, timestamp, output, finalAmount).
+		match <OutputFilled as SolEvent>::abi_decode_data_validate(&log.data) {
+			Ok((solver_b32, timestamp, sol_output, _final_amount)) => {
+				// Compare the decoded SolMandateOutput against the order's MandateOutput.
+				let oracle_match = sol_output.oracle.0 == expected_output.oracle;
+				let settler_match = sol_output.settler.0 == expected_output.settler;
+				let chain_match = sol_output.chainId == expected_output.chain_id;
+				let token_match = sol_output.token.0 == expected_output.token;
+				let amount_match = sol_output.amount == expected_output.amount;
+				let recipient_match = sol_output.recipient.0 == expected_output.recipient;
+				let call_match =
+					sol_output.callbackData.as_ref() == expected_output.call.as_slice();
+				let context_match =
+					sol_output.context.as_ref() == expected_output.context.as_slice();
+
+				if oracle_match
+					&& settler_match
+					&& chain_match && token_match
+					&& amount_match && recipient_match
+					&& call_match && context_match
+				{
+					return Ok((solver_b32.0, timestamp));
 				}
-			}
+				// Mismatched payload — keep looking; another log might match.
+				continue;
+			},
+			Err(_) => continue, // undecodable data — skip
 		}
 	}
 
 	Err(SettlementError::ValidationFailed(
-		"No OutputFilled event detected in logs. The output may have already been completed by another solver".into(),
+		"no matching OutputFilled log emitted by expected settler".to_string(),
 	))
 }
 
@@ -1064,12 +1126,8 @@ impl SettlementInterface for HyperlaneSettlement {
 			order_id_to_bytes32(&order.id).map_err(SettlementError::ValidationFailed)?;
 
 		// Extract solver and timestamp from OutputFilled event
-		let (solver_bytes, fill_timestamp) =
-			extract_fill_details_from_logs(&fill_receipt.logs, &order_id_bytes)?;
-
-		// Convert solver bytes to bytes32 array
-		let mut solver_identifier = [0u8; 32];
-		solver_identifier.copy_from_slice(&solver_bytes);
+		let (solver_identifier, fill_timestamp) =
+			extract_fill_details_from_logs(&fill_receipt.logs, order, &order_id_bytes, dest_chain)?;
 
 		// Create FillDescription payload
 		// Note: The oracle and settler are NOT part of the FillDescription.
@@ -1208,10 +1266,8 @@ impl SettlementInterface for HyperlaneSettlement {
 
 			let order_id_bytes =
 				order_id_to_bytes32(&order.id).map_err(SettlementError::ValidationFailed)?;
-			let (solver_bytes, timestamp) = extract_fill_details_from_logs(&logs, &order_id_bytes)?;
-
-			let mut solver_id = [0u8; 32];
-			solver_id.copy_from_slice(&solver_bytes);
+			let (solver_id, timestamp) =
+				extract_fill_details_from_logs(&logs, order, &order_id_bytes, dest_chain)?;
 
 			// Compute payload hash once and store it
 			let payload_hash = self.compute_payload_hash(order, solver_id, timestamp)?;
@@ -1303,3 +1359,267 @@ impl solver_types::ImplementationRegistry for Registry {
 }
 
 impl crate::SettlementRegistry for Registry {}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	// === Shared helpers for OutputFilled emitter-filter tests ===
+	// Duplicated from `broadcaster.rs` — extracting to a shared test helper
+	// module is a follow-up tracked in the Fix 2 plan (acceptable per spec).
+	fn build_test_order_for_emitter_tests(
+		order_id: [u8; 32],
+		origin_chain: u64,
+		dest_chain: u64,
+		output: solver_types::standards::eip7683::MandateOutput,
+	) -> solver_types::Order {
+		use solver_types::standards::eip7683::{Eip7683OrderData, GasLimitOverrides};
+
+		let order_data = Eip7683OrderData {
+			user: format!("0x{}", alloy_primitives::hex::encode([0x22u8; 20])),
+			nonce: alloy_primitives::U256::from(1u64),
+			origin_chain_id: alloy_primitives::U256::from(origin_chain),
+			expires: (solver_types::current_timestamp() as u32) + 3600,
+			fill_deadline: (solver_types::current_timestamp() as u32) + 1800,
+			input_oracle: format!("0x{}", alloy_primitives::hex::encode([0x11u8; 20])),
+			inputs: vec![],
+			order_id,
+			gas_limit_overrides: GasLimitOverrides::default(),
+			outputs: vec![output.clone()],
+			raw_order_data: None,
+			signature: None,
+			sponsor: None,
+			lock_type: None,
+		};
+
+		let mut settler_addr = [0u8; 20];
+		settler_addr.copy_from_slice(&output.settler[12..32]);
+
+		solver_types::Order {
+			id: format!("0x{}", alloy_primitives::hex::encode(order_id)),
+			standard: "eip7683".to_string(),
+			created_at: 0,
+			updated_at: 0,
+			status: solver_types::OrderStatus::Pending,
+			data: serde_json::to_value(&order_data).unwrap(),
+			solver_address: solver_types::Address(vec![0x99; 20]),
+			quote_id: None,
+			input_chains: vec![solver_types::order::ChainSettlerInfo {
+				chain_id: origin_chain,
+				settler_address: solver_types::Address(vec![0xCC; 20]),
+			}],
+			output_chains: vec![solver_types::order::ChainSettlerInfo {
+				chain_id: dest_chain,
+				settler_address: solver_types::Address(settler_addr.to_vec()),
+			}],
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			claim_tx_hash: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
+			fill_proof: None,
+			settlement_name: None,
+		}
+	}
+
+	fn make_mandate_output(
+		oracle: [u8; 32],
+		settler: [u8; 32],
+		chain_id: u64,
+		token: [u8; 32],
+		amount: alloy_primitives::U256,
+		recipient: [u8; 32],
+	) -> solver_types::standards::eip7683::MandateOutput {
+		solver_types::standards::eip7683::MandateOutput {
+			oracle,
+			settler,
+			chain_id: alloy_primitives::U256::from(chain_id),
+			token,
+			amount,
+			recipient,
+			call: vec![],
+			context: vec![],
+		}
+	}
+
+	fn encode_output_filled_data(
+		order_id: [u8; 32],
+		solver: [u8; 32],
+		timestamp: u32,
+		output: &solver_types::standards::eip7683::MandateOutput,
+		final_amount: alloy_primitives::U256,
+	) -> Vec<u8> {
+		use alloy_sol_types::SolEvent;
+		use solver_types::standards::eip7683::interfaces::{OutputFilled, SolMandateOutput};
+
+		let sol_output = SolMandateOutput {
+			oracle: alloy_primitives::FixedBytes::from(output.oracle),
+			settler: alloy_primitives::FixedBytes::from(output.settler),
+			chainId: output.chain_id,
+			token: alloy_primitives::FixedBytes::from(output.token),
+			amount: output.amount,
+			recipient: alloy_primitives::FixedBytes::from(output.recipient),
+			callbackData: output.call.clone().into(),
+			context: output.context.clone().into(),
+		};
+
+		let event = OutputFilled {
+			orderId: alloy_primitives::FixedBytes::from(order_id),
+			solver: alloy_primitives::FixedBytes::from(solver),
+			timestamp,
+			output: sol_output,
+			finalAmount: final_amount,
+		};
+
+		event.encode_data()
+	}
+	// === End shared helpers ===
+
+	#[test]
+	fn test_extract_fill_details_rejects_log_from_wrong_emitter() {
+		let order_id: [u8; 32] = [0x42; 32];
+		let expected_settler_addr: [u8; 20] = [0xAA; 20];
+		let attacker_addr: [u8; 20] = [0xBB; 20];
+
+		let mut settler_bytes32 = [0u8; 32];
+		settler_bytes32[12..32].copy_from_slice(&expected_settler_addr);
+
+		let output = make_mandate_output(
+			[0x11; 32],
+			settler_bytes32,
+			137,
+			[0x22; 32],
+			alloy_primitives::U256::from(1000u64),
+			[0x33; 32],
+		);
+		let order = build_test_order_for_emitter_tests(order_id, 1, 137, output.clone());
+
+		let log_data = encode_output_filled_data(
+			order_id,
+			[0x77; 32],
+			1_700_000_000u32,
+			&output,
+			alloy_primitives::U256::from(1000u64),
+		);
+
+		let forged_log = solver_types::Log {
+			address: solver_types::Address(attacker_addr.to_vec()),
+			topics: vec![
+				solver_types::H256(
+					<solver_types::standards::eip7683::interfaces::OutputFilled
+						as alloy_sol_types::SolEvent>::SIGNATURE_HASH.0,
+				),
+				solver_types::H256(order_id),
+			],
+			data: log_data,
+			..Default::default()
+		};
+
+		let result = extract_fill_details_from_logs(&[forged_log], &order, &order_id, 137);
+		assert!(
+			result.is_err(),
+			"forged log from wrong emitter should be rejected"
+		);
+	}
+
+	#[test]
+	fn test_extract_fill_details_rejects_mismatched_mandate_output() {
+		let order_id: [u8; 32] = [0x42; 32];
+		let expected_settler_addr: [u8; 20] = [0xAA; 20];
+		let mut settler_bytes32 = [0u8; 32];
+		settler_bytes32[12..32].copy_from_slice(&expected_settler_addr);
+
+		let order_output = make_mandate_output(
+			[0x11; 32],
+			settler_bytes32,
+			137,
+			[0x22; 32],
+			alloy_primitives::U256::from(1000u64),
+			[0x33; 32],
+		);
+		let order = build_test_order_for_emitter_tests(order_id, 1, 137, order_output.clone());
+
+		let tampered_output = make_mandate_output(
+			[0x11; 32],
+			settler_bytes32,
+			137,
+			[0x22; 32],
+			alloy_primitives::U256::from(9999u64),
+			[0x33; 32],
+		);
+		let log_data = encode_output_filled_data(
+			order_id,
+			[0x77; 32],
+			1_700_000_000u32,
+			&tampered_output,
+			alloy_primitives::U256::from(9999u64),
+		);
+
+		let log = solver_types::Log {
+			address: solver_types::Address(expected_settler_addr.to_vec()),
+			topics: vec![
+				solver_types::H256(
+					<solver_types::standards::eip7683::interfaces::OutputFilled
+						as alloy_sol_types::SolEvent>::SIGNATURE_HASH.0,
+				),
+				solver_types::H256(order_id),
+			],
+			data: log_data,
+			..Default::default()
+		};
+
+		let result = extract_fill_details_from_logs(&[log], &order, &order_id, 137);
+		assert!(
+			result.is_err(),
+			"log with mismatched MandateOutput should be rejected"
+		);
+	}
+
+	#[test]
+	fn test_extract_fill_details_accepts_matching_log() {
+		let order_id: [u8; 32] = [0x42; 32];
+		let expected_settler_addr: [u8; 20] = [0xAA; 20];
+		let mut settler_bytes32 = [0u8; 32];
+		settler_bytes32[12..32].copy_from_slice(&expected_settler_addr);
+
+		let output = make_mandate_output(
+			[0x11; 32],
+			settler_bytes32,
+			137,
+			[0x22; 32],
+			alloy_primitives::U256::from(1000u64),
+			[0x33; 32],
+		);
+		let order = build_test_order_for_emitter_tests(order_id, 1, 137, output.clone());
+
+		let expected_solver = [0x77u8; 32];
+		let expected_timestamp = 1_700_000_000u32;
+
+		let log_data = encode_output_filled_data(
+			order_id,
+			expected_solver,
+			expected_timestamp,
+			&output,
+			alloy_primitives::U256::from(1000u64),
+		);
+
+		let log = solver_types::Log {
+			address: solver_types::Address(expected_settler_addr.to_vec()),
+			topics: vec![
+				solver_types::H256(
+					<solver_types::standards::eip7683::interfaces::OutputFilled
+						as alloy_sol_types::SolEvent>::SIGNATURE_HASH.0,
+				),
+				solver_types::H256(order_id),
+			],
+			data: log_data,
+			..Default::default()
+		};
+
+		let (solver, ts) = extract_fill_details_from_logs(&[log], &order, &order_id, 137)
+			.expect("matching log should be accepted");
+		assert_eq!(solver, expected_solver);
+		assert_eq!(ts, expected_timestamp);
+	}
+}
