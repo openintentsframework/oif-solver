@@ -32,6 +32,7 @@ pub struct TransactionBumpService {
 	delivery: Arc<DeliveryService>,
 	event_bus: EventBus,
 	attempt_recorder: Arc<dyn TransactionAttemptRecorder>,
+	pricing: Arc<solver_pricing::PricingService>,
 }
 
 impl TransactionBumpService {
@@ -42,6 +43,7 @@ impl TransactionBumpService {
 		delivery: Arc<DeliveryService>,
 		event_bus: EventBus,
 		attempt_recorder: Arc<dyn TransactionAttemptRecorder>,
+		pricing: Arc<solver_pricing::PricingService>,
 	) -> Self {
 		Self {
 			config,
@@ -50,6 +52,7 @@ impl TransactionBumpService {
 			delivery,
 			event_bus,
 			attempt_recorder,
+			pricing,
 		}
 	}
 
@@ -316,6 +319,31 @@ impl TransactionBumpService {
 			return;
 		}
 
+		// Per-order profitability gate.
+		let order_opt: Option<solver_types::Order> = match self
+			.storage
+			.retrieve::<solver_types::Order>(solver_types::StorageKey::Orders.as_str(), order_id)
+			.await
+		{
+			Ok(o) => Some(o),
+			Err(e) => {
+				tracing::warn!(
+					%order_id,
+					error = %e,
+					"tx_bump: order retrieve failed; proceeding with bump (fail-open)"
+				);
+				None
+			},
+		};
+		if let Some(order) = order_opt.as_ref() {
+			if self
+				.should_skip_for_profitability(order, &bumped, tip, chain_id, tx_type)
+				.await
+			{
+				return;
+			}
+		}
+
 		// 11. Balance check (best-effort).
 		let signer_hex = expected_signer.to_string();
 		match self.delivery.get_balance(chain_id, &signer_hex, None).await {
@@ -549,6 +577,127 @@ impl TransactionBumpService {
 			},
 		}
 	}
+
+	/// Returns `true` if the bump should be skipped due to insufficient
+	/// order-level profitability headroom. Fails open: any error or
+	/// missing data returns `false` (proceed with bump) and logs a `warn!`.
+	async fn should_skip_for_profitability(
+		&self,
+		order: &solver_types::Order,
+		bumped: &crate::bump::policy::BumpFees,
+		tip: &solver_types::TransactionAttempt,
+		chain_id: u64,
+		tx_type: solver_types::TransactionType,
+	) -> bool {
+		use rust_decimal::Decimal;
+		use std::str::FromStr;
+
+		// Fail-open: no quote_id → no profitability data → proceed silently.
+		let Some(quote_id) = order.quote_id.as_ref() else {
+			return false;
+		};
+
+		// Fail-open: stored quote lookup error → proceed with warn.
+		let stored: solver_types::StoredQuote = match self
+			.storage
+			.retrieve(solver_types::StorageKey::Quotes.as_str(), quote_id)
+			.await
+		{
+			Ok(s) => s,
+			Err(e) => {
+				tracing::warn!(
+					order_id = %order.id,
+					%quote_id,
+					error = %e,
+					"tx_bump: stored quote lookup failed; proceeding with bump (fail-open)"
+				);
+				return false;
+			},
+		};
+		let cb = &stored.cost_context.cost_breakdown;
+
+		// Fail-open: tip has no gas_limit → cannot compute cost.
+		let Some(gas_units) = tip.tx.gas_limit else {
+			tracing::warn!(
+				order_id = %order.id,
+				tip_id = %tip.id,
+				"tx_bump: tip.tx.gas_limit is None; proceeding with bump (fail-open)"
+			);
+			return false;
+		};
+
+		// Take EIP-1559 max_fee_per_gas first; fall back to legacy gas_price.
+		let Some(fee_per_gas) = bumped.max_fee_per_gas.or(bumped.gas_price) else {
+			tracing::warn!(
+				order_id = %order.id,
+				"tx_bump: bumped fees missing both max_fee_per_gas and gas_price; proceeding (fail-open)"
+			);
+			return false;
+		};
+
+		let bumped_cost_wei = fee_per_gas.saturating_mul(gas_units as u128);
+
+		// Fail-open: pricing error → proceed.
+		let bumped_cost_str = match self
+			.pricing
+			.wei_to_currency(&bumped_cost_wei.to_string(), &cb.currency)
+			.await
+		{
+			Ok(s) => s,
+			Err(e) => {
+				tracing::warn!(
+					order_id = %order.id,
+					chain_id,
+					error = %e,
+					"tx_bump: wei_to_currency failed; proceeding with bump (fail-open)"
+				);
+				return false;
+			},
+		};
+
+		let bumped_cost = match Decimal::from_str(&bumped_cost_str) {
+			Ok(d) => d,
+			Err(e) => {
+				tracing::warn!(
+					order_id = %order.id,
+					cost_str = %bumped_cost_str,
+					error = %e,
+					"tx_bump: bumped cost not parseable as Decimal; proceeding (fail-open)"
+				);
+				return false;
+			},
+		};
+
+		let original_budget = match tx_type {
+			solver_types::TransactionType::Prepare => cb.gas_open,
+			solver_types::TransactionType::Fill => cb.gas_fill,
+			solver_types::TransactionType::PostFill => cb.gas_post_fill,
+			solver_types::TransactionType::PreClaim => cb.gas_pre_claim,
+			solver_types::TransactionType::Claim => cb.gas_claim,
+		};
+
+		let headroom = cb.gas_buffer + cb.min_profit;
+		let delta = bumped_cost - original_budget;
+
+		if delta > headroom {
+			self.event_bus
+				.publish(SolverEvent::Delivery(
+					DeliveryEvent::BumpExceedsProfitability {
+						order_id: order.id.clone(),
+						attempt_id: tip.id.clone(),
+						chain_id,
+						tx_type,
+						proposed_cost: bumped_cost.to_string(),
+						original_stage_budget: original_budget.to_string(),
+						headroom: headroom.to_string(),
+						currency: cb.currency.clone(),
+					},
+				))
+				.ok();
+			return true;
+		}
+		false
+	}
 }
 
 /// Compute the up-front native-gas budget required to submit `bumped` over
@@ -698,6 +847,7 @@ mod tests {
 			delivery_svc,
 			event_bus.clone(),
 			recorder,
+			test_pricing(),
 		);
 		(service, attempt_store, storage, event_bus, tmp)
 	}
@@ -726,6 +876,16 @@ mod tests {
 			max_fee_per_gas: Some(max_fee),
 			max_priority_fee_per_gas: Some(max_fee / 10),
 		}
+	}
+
+	fn test_pricing() -> Arc<solver_pricing::PricingService> {
+		Arc::new(solver_pricing::PricingService::new(
+			Box::new(
+				solver_pricing::implementations::mock::MockPricing::new(&serde_json::json!({}))
+					.expect("mock pricing init"),
+			),
+			vec![],
+		))
 	}
 
 	/// Seed an attempt with a fixed id and status. If `status != Planned`,
@@ -767,6 +927,90 @@ mod tests {
 			.with_status(OrderStatus::Executing)
 			.build();
 		sm.store_order(&order).await.unwrap();
+	}
+
+	/// Seed an active order with `quote_id` set + a matching `StoredQuote`.
+	/// Replaces `seed_active_order` for tests that need profitability data.
+	async fn seed_active_order_with_quote(
+		storage: &Arc<StorageService>,
+		order_id: &str,
+		quote_id: &str,
+		gas_fill: rust_decimal::Decimal,
+		gas_buffer: rust_decimal::Decimal,
+		min_profit: rust_decimal::Decimal,
+	) {
+		use crate::state::order::OrderStateMachine;
+		use rust_decimal::Decimal;
+		use solver_types::costs::{CostBreakdown, CostContext};
+		use solver_types::{
+			FailureHandlingMode, OifOrder, OrderPayload, OrderStatus, Quote, QuotePreview,
+			SignatureType, StorageKey, StoredQuote, SwapType,
+		};
+
+		// Order: same status as seed_active_order, with quote_id set.
+		let mut order = OrderBuilder::new()
+			.with_id(order_id.to_string())
+			.with_status(OrderStatus::Executing)
+			.build();
+		order.quote_id = Some(quote_id.to_string());
+
+		let sm = OrderStateMachine::new(storage.clone());
+		sm.store_order(&order).await.unwrap();
+
+		let cb = CostBreakdown {
+			gas_open: Decimal::ZERO,
+			gas_fill,
+			gas_post_fill: Decimal::ZERO,
+			gas_pre_claim: Decimal::ZERO,
+			gas_claim: Decimal::ZERO,
+			gas_buffer,
+			rate_buffer: Decimal::ZERO,
+			base_price: Decimal::ZERO,
+			min_profit,
+			operational_cost: gas_fill + gas_buffer,
+			subtotal: gas_fill + gas_buffer,
+			total: gas_fill + gas_buffer + min_profit,
+			currency: "USD".into(),
+		};
+
+		let stored = StoredQuote {
+			quote: Quote {
+				order: OifOrder::OifEscrowV0 {
+					payload: OrderPayload {
+						signature_type: SignatureType::Eip712,
+						domain: serde_json::json!({}),
+						primary_type: "Order".to_string(),
+						message: serde_json::json!({}),
+						types: Some(serde_json::json!({})),
+					},
+				},
+				failure_handling: FailureHandlingMode::RefundAutomatic,
+				partial_fill: false,
+				valid_until: solver_types::current_timestamp() + 300,
+				eta: Some(60),
+				quote_id: quote_id.to_string(),
+				provider: Some("test_solver".to_string()),
+				preview: QuotePreview {
+					inputs: vec![],
+					outputs: vec![],
+				},
+			},
+			cost_context: CostContext {
+				cost_breakdown: cb,
+				execution_costs_by_chain: std::collections::HashMap::new(),
+				liquidity_cost_adjustment: Decimal::ZERO,
+				protocol_fees: std::collections::HashMap::new(),
+				swap_type: SwapType::ExactInput,
+				cost_amounts_in_tokens: std::collections::HashMap::new(),
+				swap_amounts: std::collections::HashMap::new(),
+				adjusted_amounts: std::collections::HashMap::new(),
+			},
+			settlement_name: None,
+		};
+		storage
+			.store(StorageKey::Quotes.as_str(), quote_id, &stored, None)
+			.await
+			.unwrap();
 	}
 
 	/// Always-large `get_balance` mock (so the balance check never blocks dispatch).
@@ -843,6 +1087,7 @@ mod tests {
 			delivery_svc,
 			service.event_bus.clone(),
 			recorder.clone(),
+			test_pricing(),
 		);
 
 		// Wait so the age threshold elapses.
@@ -1095,6 +1340,7 @@ mod tests {
 			delivery_svc,
 			bus.clone(),
 			recorder.clone(),
+			test_pricing(),
 		);
 
 		tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1191,6 +1437,7 @@ mod tests {
 			delivery_svc,
 			bus.clone(),
 			recorder.clone(),
+			test_pricing(),
 		);
 
 		tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1464,5 +1711,230 @@ mod tests {
 			)),
 			"StageComplete revert must not publish TransactionFailed: {events:?}"
 		);
+	}
+
+	// =====================================================================
+	// 14. Profitability gate: cost exceeds order margin → skip with event.
+	// =====================================================================
+	#[tokio::test]
+	async fn bump_skips_when_cost_exceeds_order_margin() {
+		use rust_decimal::Decimal;
+
+		let cfg = default_enabled_config();
+		let mut mock = MockDeliveryInterface::new();
+		let signer = Address(vec![9; 20]);
+		let signer_clone = signer.clone();
+		mock.expect_submission_signer()
+			.returning(move |_| Some(signer_clone.clone()));
+		mock_large_balance(&mut mock);
+		// The whole point of this test: submit MUST NOT fire.
+		mock.expect_submit().times(0);
+
+		let (svc, store, storage, bus, _tmp) = test_service(cfg, mock);
+
+		// Order-1 with tight headroom: gas_fill=$0.10, buffer=$0.02,
+		// min_profit=$0.03 → headroom = $0.05.
+		seed_active_order_with_quote(
+			&storage,
+			"order-1",
+			"quote-1",
+			Decimal::new(10, 2), // $0.10
+			Decimal::new(2, 2),  // $0.02
+			Decimal::new(3, 2),  // $0.03
+		)
+		.await;
+
+		// Parent at 100 gwei × 100k gas (gas_limit baked into tx_with_fees).
+		// 15% bump → 115 gwei. With MockPricing's default ETH/USD,
+		// bumped_cost = 115e9 × 100_000 wei × ETH price ≫ headroom ($0.05).
+		seed_attempt(
+			&store,
+			"parent-1",
+			TransactionAttemptStatus::Broadcast,
+			None,
+			Some(signer.clone()),
+			100_000_000_000u128, // 100 gwei
+		)
+		.await;
+
+		let mut sub = bus.subscribe();
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		svc.tick().await.unwrap();
+		let events = drain_bus_events(&mut sub);
+
+		assert!(
+			events.iter().any(|e| matches!(
+				e,
+				SolverEvent::Delivery(DeliveryEvent::BumpExceedsProfitability { .. })
+			)),
+			"expected BumpExceedsProfitability, got events: {events:?}"
+		);
+	}
+
+	// =====================================================================
+	// 15. Profitability gate: cost within headroom → bump proceeds.
+	// Uses the same two-stage construction as happy_bump_dispatches_*.
+	// =====================================================================
+	#[tokio::test]
+	async fn bump_proceeds_when_cost_within_order_margin() {
+		use rust_decimal::Decimal;
+
+		let cfg = default_enabled_config();
+		let signer = Address(vec![9; 20]);
+
+		// Stage 1: throwaway service to obtain attempt_store + storage Arcs.
+		let throwaway_mock = {
+			let mut m = MockDeliveryInterface::new();
+			let s = signer.clone();
+			m.expect_submission_signer()
+				.returning(move |_| Some(s.clone()));
+			mock_large_balance(&mut m);
+			m
+		};
+		let (service, attempt_store, storage, _bus, _tmp) =
+			test_service(cfg.clone(), throwaway_mock);
+
+		// Generous headroom: gas_fill=$10, buffer=$5, min_profit=$5 → $10 over.
+		// 10 gwei × 100k gas × ETH price ≪ headroom → bump fires.
+		seed_active_order_with_quote(
+			&storage,
+			"order-1",
+			"quote-1",
+			Decimal::new(10, 0), // $10
+			Decimal::new(5, 0),  // $5
+			Decimal::new(5, 0),  // $5
+		)
+		.await;
+		seed_attempt(
+			&attempt_store,
+			"parent-1",
+			TransactionAttemptStatus::Broadcast,
+			None,
+			Some(signer.clone()),
+			10_000_000_000u128, // 10 gwei
+		)
+		.await;
+
+		// Stage 2: real mock with submit-recording closure.
+		let mut mock = MockDeliveryInterface::new();
+		let signer_clone = signer.clone();
+		mock.expect_submission_signer()
+			.returning(move |_| Some(signer_clone.clone()));
+		mock_large_balance(&mut mock);
+		let recorder: Arc<dyn TransactionAttemptRecorder> = attempt_store.clone();
+		let recorder_for_mock = recorder.clone();
+		mock.expect_submit()
+			.times(1)
+			.returning(move |tx, tracking| {
+				let recorder = recorder_for_mock.clone();
+				Box::pin(async move {
+					let tracking = tracking.expect("sweeper must supply tracking");
+					let outcome: Result<TransactionHash, DeliveryError> =
+						Ok(TransactionHash(vec![0xab; 32]));
+					simulate_submit_recording(
+						&recorder,
+						&tracking,
+						&tx,
+						&outcome,
+						Some(Address(vec![9; 20])),
+					)
+					.await;
+					outcome
+				})
+			});
+		let delivery_impls: HashMap<u64, Arc<dyn DeliveryInterface>> =
+			HashMap::from([(1u64, Arc::new(mock) as Arc<dyn DeliveryInterface>)]);
+		let delivery_svc = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
+		let svc = TransactionBumpService::new(
+			service.config.clone(),
+			storage.clone(),
+			attempt_store.clone(),
+			delivery_svc,
+			service.event_bus.clone(),
+			recorder,
+			test_pricing(),
+		);
+
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		svc.tick().await.unwrap();
+		// mock.expect_submit().times(1) panics on Drop if unmet → asserts success.
+	}
+
+	// =====================================================================
+	// 16. Profitability gate fail-open: no quote_id → bump proceeds silently.
+	// =====================================================================
+	#[tokio::test]
+	async fn bump_proceeds_when_order_has_no_quote_id() {
+		let cfg = default_enabled_config();
+		let signer = Address(vec![9; 20]);
+
+		// Stage 1.
+		let throwaway_mock = {
+			let mut m = MockDeliveryInterface::new();
+			let s = signer.clone();
+			m.expect_submission_signer()
+				.returning(move |_| Some(s.clone()));
+			mock_large_balance(&mut m);
+			m
+		};
+		let (service, attempt_store, storage, _bus, _tmp) =
+			test_service(cfg.clone(), throwaway_mock);
+
+		// Use existing seed_active_order → OrderBuilder default leaves
+		// quote_id = None → gate hits fail-open.
+		seed_active_order(&storage, "order-1").await;
+		seed_attempt(
+			&attempt_store,
+			"parent-1",
+			TransactionAttemptStatus::Broadcast,
+			None,
+			Some(signer.clone()),
+			10_000_000_000u128,
+		)
+		.await;
+
+		// Stage 2: real mock — same pattern as test 15.
+		let mut mock = MockDeliveryInterface::new();
+		let signer_clone = signer.clone();
+		mock.expect_submission_signer()
+			.returning(move |_| Some(signer_clone.clone()));
+		mock_large_balance(&mut mock);
+		let recorder: Arc<dyn TransactionAttemptRecorder> = attempt_store.clone();
+		let recorder_for_mock = recorder.clone();
+		mock.expect_submit()
+			.times(1)
+			.returning(move |tx, tracking| {
+				let recorder = recorder_for_mock.clone();
+				Box::pin(async move {
+					let tracking = tracking.expect("sweeper must supply tracking");
+					let outcome: Result<TransactionHash, DeliveryError> =
+						Ok(TransactionHash(vec![0xab; 32]));
+					simulate_submit_recording(
+						&recorder,
+						&tracking,
+						&tx,
+						&outcome,
+						Some(Address(vec![9; 20])),
+					)
+					.await;
+					outcome
+				})
+			});
+		let delivery_impls: HashMap<u64, Arc<dyn DeliveryInterface>> =
+			HashMap::from([(1u64, Arc::new(mock) as Arc<dyn DeliveryInterface>)]);
+		let delivery_svc = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
+		let svc = TransactionBumpService::new(
+			service.config.clone(),
+			storage.clone(),
+			attempt_store.clone(),
+			delivery_svc,
+			service.event_bus.clone(),
+			recorder,
+			test_pricing(),
+		);
+
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		svc.tick().await.unwrap();
+		// expect_submit().times(1) asserts the bump fired despite no quote_id.
 	}
 }

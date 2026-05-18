@@ -107,6 +107,25 @@ pub enum DeliveryEvent {
 		computed_fee_wei: String,
 		cap_wei: String,
 	},
+	/// Bump sweeper found that the proposed bumped transaction's total cost
+	/// exceeds the available profitability headroom (gas_buffer + min_profit)
+	/// over the stage's original quote-time gas budget. Operator intervention
+	/// required (raise headroom or accept loss).
+	BumpExceedsProfitability {
+		order_id: String,
+		attempt_id: String,
+		chain_id: u64,
+		tx_type: TransactionType,
+		/// Proposed total cost of the bumped tx, in `currency`.
+		/// Decimal string for serde stability (mirrors `CostBreakdown` fields).
+		proposed_cost: String,
+		/// The stage's original quote-time gas budget, in `currency`.
+		original_stage_budget: String,
+		/// Available headroom (gas_buffer + min_profit), in `currency`.
+		headroom: String,
+		/// Currency code from the order's CostBreakdown (e.g., "USD").
+		currency: String,
+	},
 	/// Bump sweeper found that the lineage has reached the configured
 	/// max-replacements limit. Operator intervention required.
 	BumpMaxReplacementsReached {
@@ -184,4 +203,26 @@ pub enum TransactionType {
 	PreClaim,
 	/// Transaction that claims rewards on the origin chain.
 	Claim,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn bump_exceeds_profitability_event_round_trips() {
+		let ev = DeliveryEvent::BumpExceedsProfitability {
+			order_id: "order-1".into(),
+			attempt_id: "attempt-1".into(),
+			chain_id: 1,
+			tx_type: TransactionType::Fill,
+			proposed_cost: "1.50".into(),
+			original_stage_budget: "0.10".into(),
+			headroom: "0.09".into(),
+			currency: "USD".into(),
+		};
+		let json = serde_json::to_string(&ev).unwrap();
+		let de: DeliveryEvent = serde_json::from_str(&json).unwrap();
+		assert!(matches!(de, DeliveryEvent::BumpExceedsProfitability { .. }));
+	}
 }

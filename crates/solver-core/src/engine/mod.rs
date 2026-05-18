@@ -523,6 +523,7 @@ impl SolverEngine {
 				self.delivery.clone(),
 				self.event_bus.clone(),
 				attempt_recorder,
+				self.pricing.clone(),
 			);
 			let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 			let handle = tokio::spawn(async move { bump.run(shutdown_rx).await });
