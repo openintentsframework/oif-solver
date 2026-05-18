@@ -19,11 +19,12 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use solver_storage::StorageService;
+#[cfg(test)]
+use solver_types::Eip7683OrderData;
 use solver_types::{
-	bytes32_to_address, order_id_to_bytes32, parse_address, with_0x_prefix, ConfigSchema,
-	Eip7683OrderData, Field, FieldType, FillProof, InteropAddress, NetworksConfig, Order,
-	OrderOutput, PusherL2Params, Schema, Transaction, TransactionHash, TransactionReceipt,
-	TransactionType,
+	order_id_to_bytes32, with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, InteropAddress,
+	NetworksConfig, Order, OrderOutput, PusherL2Params, Schema, Transaction, TransactionHash,
+	TransactionReceipt, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -247,53 +248,21 @@ fn compute_message_slot(message: [u8; 32], publisher: &solver_types::Address) ->
 	keccak256(&encoded)
 }
 
+#[cfg(test)]
 fn parse_eip7683_order_data(order: &Order) -> Result<Eip7683OrderData, SettlementError> {
 	if order.standard != "eip7683" {
 		return Err(SettlementError::ValidationFailed(format!(
-			"Broadcaster settlement only supports eip7683 orders, got '{}'",
+			"Settlement only supports eip7683 orders, got '{}'",
 			order.standard
 		)));
 	}
 
 	serde_json::from_value(order.data.clone()).map_err(|e| {
-		SettlementError::ValidationFailed(format!("Failed to parse broadcaster order data: {e}"))
+		SettlementError::ValidationFailed(format!("Failed to parse eip7683 order data: {e}"))
 	})
 }
 
-fn parse_bound_input_oracle(order: &Order) -> Result<solver_types::Address, SettlementError> {
-	let order_data = parse_eip7683_order_data(order)?;
-	parse_address(&order_data.input_oracle).map_err(|e| {
-		SettlementError::ValidationFailed(format!("Invalid order-bound input oracle: {e}"))
-	})
-}
-
-fn parse_bound_output_oracle(
-	order: &Order,
-	destination_chain: u64,
-) -> Result<solver_types::Address, SettlementError> {
-	let order_data = parse_eip7683_order_data(order)?;
-	let output = order_data
-		.outputs
-		.iter()
-		.find(|output| output.chain_id.to::<u64>() == destination_chain)
-		.ok_or_else(|| {
-			SettlementError::ValidationFailed(format!(
-				"No order output found for destination chain {destination_chain}"
-			))
-		})?;
-
-	if output.oracle == [0u8; 32] {
-		return Err(SettlementError::ValidationFailed(format!(
-			"Order output oracle is zero for destination chain {destination_chain}; \
-			 broadcaster requires an order-bound output oracle"
-		)));
-	}
-
-	let oracle_hex = bytes32_to_address(&output.oracle);
-	parse_address(&oracle_hex).map_err(|e| {
-		SettlementError::ValidationFailed(format!("Invalid order-bound output oracle: {e}"))
-	})
-}
+use crate::{parse_bound_input_oracle, parse_bound_output_oracle};
 
 fn parse_hex_bytes(label: &str, value: &str) -> Result<Vec<u8>, SettlementError> {
 	hex::decode(value.trim_start_matches("0x"))
