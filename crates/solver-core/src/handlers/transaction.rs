@@ -1324,10 +1324,7 @@ mod tests {
 		assert_eq!(
 			events
 				.iter()
-				.filter(|event| matches!(
-					event,
-					SolverEvent::Order(OrderEvent::Executing { .. })
-				))
+				.filter(|event| matches!(event, SolverEvent::Order(OrderEvent::Executing { .. })))
 				.count(),
 			0,
 			"AlreadyApplied with different hash must not republish Executing"
