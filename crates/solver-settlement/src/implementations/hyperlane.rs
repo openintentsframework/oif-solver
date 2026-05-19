@@ -485,6 +485,38 @@ pub struct HyperlaneSettlement {
 }
 
 impl HyperlaneSettlement {
+	/// Validate that the order-bound input oracle is configured for the given
+	/// source chain. Returns the parsed order-bound input oracle on success.
+	fn validate_bound_input_oracle(
+		&self,
+		order: &Order,
+		source_chain: u64,
+	) -> Result<solver_types::Address, SettlementError> {
+		let input_oracle = crate::parse_bound_input_oracle(order)?;
+		if !self.is_input_oracle_supported(source_chain, &input_oracle) {
+			return Err(SettlementError::ValidationFailed(format!(
+				"Order-bound input oracle is not configured for source chain {source_chain}"
+			)));
+		}
+		Ok(input_oracle)
+	}
+
+	/// Validate that the order-bound output oracle is configured for the given
+	/// destination chain. Returns the parsed order-bound output oracle on success.
+	fn validate_bound_output_oracle(
+		&self,
+		order: &Order,
+		destination_chain: u64,
+	) -> Result<solver_types::Address, SettlementError> {
+		let output_oracle = crate::parse_bound_output_oracle(order, destination_chain)?;
+		if !self.is_output_oracle_supported(destination_chain, &output_oracle) {
+			return Err(SettlementError::ValidationFailed(format!(
+				"Order-bound output oracle is not configured for destination chain {destination_chain}"
+			)));
+		}
+		Ok(output_oracle)
+	}
+
 	/// Compute the payload hash that will be checked with isProven
 	fn compute_payload_hash(
 		&self,
@@ -587,15 +619,11 @@ impl HyperlaneSettlement {
 		let payload_hash = submission.payload_hash;
 
 		// Select oracles
-		// We need the input oracle on the destination chain (where we check isProven)
-		let input_oracle = self
-			.select_oracle(&self.get_input_oracles(dest_chain), None)
-			.ok_or_else(|| SettlementError::ValidationFailed("No input oracle".to_string()))?;
-
-		// We need the output oracle on the origin chain (the remote oracle)
-		let output_oracle = self
-			.select_oracle(&self.get_output_oracles(origin_chain), None)
-			.ok_or_else(|| SettlementError::ValidationFailed("No output oracle".to_string()))?;
+		// Security: bind to the order's signed input oracle on the destination chain
+		// (where we check isProven) and the order's signed output oracle on the
+		// origin chain. Reject any divergence from the order-bound oracles.
+		let input_oracle = self.validate_bound_input_oracle(order, dest_chain)?;
+		let output_oracle = self.validate_bound_output_oracle(order, origin_chain)?;
 
 		// Get application address (OutputSettler)
 		let application = order
@@ -902,27 +930,10 @@ impl SettlementInterface for HyperlaneSettlement {
 			))
 		})?;
 
-		// Get the oracle address using selection strategy
-		let oracle_addresses = self.get_input_oracles(origin_chain_id);
-		if oracle_addresses.is_empty() {
-			return Err(SettlementError::ValidationFailed(format!(
-				"No input oracle configured for chain {origin_chain_id}"
-			)));
-		}
-
-		// Use order ID hash for deterministic oracle selection
-		let order_id_hash = keccak256(&order.id);
-		let selection_context =
-			u64::from_be_bytes(order_id_hash[0..8].try_into().map_err(|_| {
-				SettlementError::ValidationFailed("Failed to convert hash bytes".to_string())
-			})?);
-		let oracle_address = self
-			.select_oracle(&oracle_addresses, Some(selection_context))
-			.ok_or_else(|| {
-				SettlementError::ValidationFailed(format!(
-					"Failed to select oracle for chain {origin_chain_id}"
-				))
-			})?;
+		// Security: use the order-bound input oracle from canonical order_data.
+		// Any mismatch with the configured input oracle set for the source chain
+		// is a security event and surfaces as ValidationFailed.
+		let oracle_address = self.validate_bound_input_oracle(order, origin_chain_id)?;
 
 		// Get transaction receipt
 		let hash = FixedBytes::<32>::from_slice(&tx_hash.0);
@@ -1036,25 +1047,19 @@ impl SettlementInterface for HyperlaneSettlement {
 			.map(|c| c.chain_id)
 			.ok_or_else(|| SettlementError::ValidationFailed("No input chains".into()))?;
 
-		// Get output oracle on destination chain
-		let output_oracles = self.get_output_oracles(dest_chain);
-		if output_oracles.is_empty() {
-			return Ok(None); // No oracle configured
-		}
-
-		let oracle_address = self
-			.select_oracle(&output_oracles, None)
-			.ok_or_else(|| SettlementError::ValidationFailed("Failed to select oracle".into()))?;
-
-		// Get input oracle on origin chain (recipient)
-		let input_oracles = self.get_input_oracles(origin_chain);
-		if input_oracles.is_empty() {
+		// Preserve legitimate "no oracle configured for this chain = skip post-fill"
+		// semantics. Any mismatch between the order-bound oracle and the configured
+		// supported set MUST surface as ValidationFailed below, not as Ok(None).
+		if self.get_output_oracles(dest_chain).is_empty() {
 			return Ok(None);
 		}
-
-		let recipient_oracle = self.select_oracle(&input_oracles, None).ok_or_else(|| {
-			SettlementError::ValidationFailed("Failed to select recipient".into())
-		})?;
+		if self.get_input_oracles(origin_chain).is_empty() {
+			return Ok(None);
+		}
+		// Security: bind to the order's signed output oracle (destination) and
+		// signed input oracle (origin / recipient).
+		let oracle_address = self.validate_bound_output_oracle(order, dest_chain)?;
+		let recipient_oracle = self.validate_bound_input_oracle(order, origin_chain)?;
 
 		// Extract fill details from order
 		let output = extract_output_details(order)?;
@@ -1303,3 +1308,164 @@ impl solver_types::ImplementationRegistry for Registry {
 }
 
 impl crate::SettlementRegistry for Registry {}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::OracleSelectionStrategy;
+	use solver_types::standards::eip7683::MandateOutput;
+	use solver_types::utils::tests::builders::{
+		Eip7683OrderDataBuilder, MandateOutputBuilder, OrderBuilder,
+	};
+
+	fn test_storage() -> Arc<StorageService> {
+		Arc::new(StorageService::new(Box::new(
+			solver_storage::implementations::memory::MemoryStorage::new(),
+		)))
+	}
+
+	fn test_hyperlane_settlement(oracle_config: OracleConfig) -> HyperlaneSettlement {
+		HyperlaneSettlement {
+			providers: HashMap::new(),
+			oracle_config,
+			mailbox_addresses: HashMap::new(),
+			igp_addresses: HashMap::new(),
+			message_tracker: Arc::new(MessageTracker::new(test_storage())),
+			default_gas_limit: 500_000,
+		}
+	}
+
+	fn make_eip7683_order_data_for_binding(
+		input_oracle: &solver_types::Address,
+		outputs: Vec<MandateOutput>,
+	) -> serde_json::Value {
+		let data = Eip7683OrderDataBuilder::new()
+			.origin_chain_id(U256::from(1u64))
+			.input_oracle(with_0x_prefix(&hex::encode(&input_oracle.0)))
+			.outputs(outputs)
+			.build();
+		serde_json::to_value(data).unwrap()
+	}
+
+	fn make_output_for_binding(destination_chain: u64, output_oracle: [u8; 32]) -> MandateOutput {
+		MandateOutputBuilder::new()
+			.oracle(output_oracle)
+			.chain_id(U256::from(destination_chain))
+			.token([0x11; 32])
+			.amount(U256::from(42u64))
+			.recipient([0x22; 32])
+			.build()
+	}
+
+	#[test]
+	fn test_validate_bound_input_oracle_success() {
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let order = OrderBuilder::new()
+			.with_data(make_eip7683_order_data_for_binding(
+				&input_oracle,
+				vec![make_output_for_binding(137, [0u8; 32])],
+			))
+			.build();
+		let oracle_config = OracleConfig {
+			input_oracles: HashMap::from([(1u64, vec![input_oracle.clone()])]),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		};
+		let settlement = test_hyperlane_settlement(oracle_config);
+
+		assert_eq!(
+			settlement.validate_bound_input_oracle(&order, 1).unwrap(),
+			input_oracle
+		);
+	}
+
+	#[test]
+	fn test_validate_bound_input_oracle_rejects_unsupported() {
+		let signed_oracle = solver_types::Address(vec![0x33; 20]);
+		let configured_oracle = solver_types::Address(vec![0x44; 20]);
+		let order = OrderBuilder::new()
+			.with_data(make_eip7683_order_data_for_binding(
+				&signed_oracle,
+				vec![make_output_for_binding(137, [0u8; 32])],
+			))
+			.build();
+		let oracle_config = OracleConfig {
+			input_oracles: HashMap::from([(1u64, vec![configured_oracle])]),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		};
+		let settlement = test_hyperlane_settlement(oracle_config);
+
+		let err = settlement
+			.validate_bound_input_oracle(&order, 1)
+			.unwrap_err();
+		assert!(
+			err.to_string()
+				.contains("not configured for source chain 1"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[test]
+	fn test_validate_bound_output_oracle_success() {
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let output_oracle = solver_types::Address(vec![0x44; 20]);
+		let order = OrderBuilder::new()
+			.with_data(make_eip7683_order_data_for_binding(
+				&input_oracle,
+				vec![make_output_for_binding(
+					137,
+					address_to_bytes32(&output_oracle),
+				)],
+			))
+			.build();
+		let oracle_config = OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::from([(137u64, vec![output_oracle.clone()])]),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		};
+		let settlement = test_hyperlane_settlement(oracle_config);
+
+		assert_eq!(
+			settlement
+				.validate_bound_output_oracle(&order, 137)
+				.unwrap(),
+			output_oracle
+		);
+	}
+
+	#[test]
+	fn test_validate_bound_output_oracle_rejects_unsupported() {
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let signed_output_oracle = solver_types::Address(vec![0x44; 20]);
+		let configured_output_oracle = solver_types::Address(vec![0x55; 20]);
+		let order = OrderBuilder::new()
+			.with_data(make_eip7683_order_data_for_binding(
+				&input_oracle,
+				vec![make_output_for_binding(
+					137,
+					address_to_bytes32(&signed_output_oracle),
+				)],
+			))
+			.build();
+		let oracle_config = OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::from([(137u64, vec![configured_output_oracle])]),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		};
+		let settlement = test_hyperlane_settlement(oracle_config);
+
+		let err = settlement
+			.validate_bound_output_oracle(&order, 137)
+			.unwrap_err();
+		assert!(
+			err.to_string()
+				.contains("not configured for destination chain 137"),
+			"unexpected error: {err}"
+		);
+	}
+}
