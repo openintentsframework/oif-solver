@@ -47,6 +47,83 @@ pub enum OrderStateError {
 	TimeError(String),
 }
 
+/// Static transition table — each state maps to its allowed forward next states.
+///
+/// Lifted to module scope so both `is_valid_transition` and `is_at_or_past`
+/// (used by `try_transition_order_status`) can share a single edge list.
+static TRANSITIONS: Lazy<HashMap<OrderStatusKind, HashSet<OrderStatusKind>>> = Lazy::new(|| {
+	let mut m = HashMap::new();
+	m.insert(
+		OrderStatusKind::Created,
+		HashSet::from([
+			OrderStatusKind::Pending,
+			OrderStatusKind::Executing,
+			OrderStatusKind::Failed,
+		]),
+	);
+	m.insert(
+		OrderStatusKind::Pending,
+		HashSet::from([OrderStatusKind::Executing, OrderStatusKind::Failed]),
+	);
+	m.insert(
+		OrderStatusKind::Executing,
+		HashSet::from([OrderStatusKind::Executed, OrderStatusKind::Failed]),
+	);
+	m.insert(
+		OrderStatusKind::Executed,
+		HashSet::from([
+			OrderStatusKind::PostFilled,
+			OrderStatusKind::Settled,
+			OrderStatusKind::Failed,
+		]),
+	);
+	m.insert(
+		OrderStatusKind::PostFilled,
+		HashSet::from([OrderStatusKind::Settled, OrderStatusKind::Failed]),
+	);
+	m.insert(
+		OrderStatusKind::PreClaimed,
+		HashSet::from([OrderStatusKind::Finalized, OrderStatusKind::Failed]),
+	);
+	m.insert(
+		OrderStatusKind::Settled,
+		HashSet::from([
+			OrderStatusKind::PreClaimed,
+			OrderStatusKind::Finalized,
+			OrderStatusKind::Failed,
+		]),
+	);
+	m.insert(OrderStatusKind::Failed, HashSet::new()); // terminal
+	m.insert(OrderStatusKind::Finalized, HashSet::new()); // terminal
+	m
+});
+
+/// Outcome of an idempotent order-status transition.
+#[derive(Debug, Clone)]
+pub enum OrderTransitionOutcome {
+	/// Status actually changed.
+	Applied(Order),
+	/// Current status is at-or-downstream of the target in the state
+	/// graph (target was already passed). No write performed.
+	AlreadyApplied(Order),
+}
+
+impl OrderTransitionOutcome {
+	pub fn applied(&self) -> bool {
+		matches!(self, Self::Applied(_))
+	}
+	pub fn order(&self) -> &Order {
+		match self {
+			Self::Applied(o) | Self::AlreadyApplied(o) => o,
+		}
+	}
+	pub fn into_order(self) -> Order {
+		match self {
+			Self::Applied(o) | Self::AlreadyApplied(o) => o,
+		}
+	}
+}
+
 /// Manages order state transitions and persistence
 pub struct OrderStateMachine {
 	storage: Arc<StorageService>,
@@ -126,61 +203,88 @@ impl OrderStateMachine {
 
 	/// Checks if a state transition is valid
 	fn is_valid_transition(from: &OrderStatus, to: &OrderStatus) -> bool {
-		// Static transition table - each state maps to allowed next states
-		static TRANSITIONS: Lazy<HashMap<OrderStatusKind, HashSet<OrderStatusKind>>> =
-			Lazy::new(|| {
-				let mut m = HashMap::new();
-				m.insert(
-					OrderStatusKind::Created,
-					HashSet::from([
-						OrderStatusKind::Pending,
-						OrderStatusKind::Executing,
-						OrderStatusKind::Failed,
-					]),
-				);
-				m.insert(
-					OrderStatusKind::Pending,
-					HashSet::from([OrderStatusKind::Executing, OrderStatusKind::Failed]),
-				);
-				m.insert(
-					OrderStatusKind::Executing,
-					HashSet::from([OrderStatusKind::Executed, OrderStatusKind::Failed]),
-				);
-				m.insert(
-					OrderStatusKind::Executed,
-					HashSet::from([
-						OrderStatusKind::PostFilled,
-						OrderStatusKind::Settled,
-						OrderStatusKind::Failed,
-					]),
-				);
-				m.insert(
-					OrderStatusKind::PostFilled,
-					HashSet::from([OrderStatusKind::Settled, OrderStatusKind::Failed]),
-				);
-				m.insert(
-					OrderStatusKind::PreClaimed,
-					HashSet::from([OrderStatusKind::Finalized, OrderStatusKind::Failed]),
-				);
-				m.insert(
-					OrderStatusKind::Settled,
-					HashSet::from([
-						OrderStatusKind::PreClaimed,
-						OrderStatusKind::Finalized,
-						OrderStatusKind::Failed,
-					]),
-				);
-				m.insert(OrderStatusKind::Failed, HashSet::new()); // terminal
-				m.insert(OrderStatusKind::Finalized, HashSet::new()); // terminal
-				m
-			});
-
 		let from_kind = status_kind(from);
 		let to_kind = status_kind(to);
 
 		TRANSITIONS
 			.get(&from_kind)
 			.is_some_and(|set| set.contains(&to_kind))
+	}
+
+	/// Idempotent variant of `transition_order_status`. Returns:
+	/// - `Applied(Order)`        when the transition fired and persisted
+	/// - `AlreadyApplied(Order)` when the current status is at-or-past the
+	///   target in the forward transition graph
+	/// - `Err(InvalidTransition)` only for genuinely backward moves
+	///
+	/// Used by handlers that may receive duplicate `Confirmed` callbacks
+	/// from same-nonce lineages to gate downstream event publication on
+	/// the actual transition.
+	pub async fn try_transition_order_status(
+		&self,
+		order_id: &str,
+		new_status: OrderStatus,
+	) -> Result<OrderTransitionOutcome, OrderStateError> {
+		let order: Order = self
+			.storage
+			.retrieve(StorageKey::Orders.as_str(), order_id)
+			.await
+			.map_err(|e| OrderStateError::Storage(e.to_string()))?;
+
+		// Same-kind → no-op idempotency (matches existing behavior).
+		if status_kind(&order.status) == status_kind(&new_status) {
+			return Ok(OrderTransitionOutcome::AlreadyApplied(order));
+		}
+
+		// Current is downstream of target (current at-or-past) → no-op.
+		if Self::is_at_or_past(&order.status, &new_status) {
+			return Ok(OrderTransitionOutcome::AlreadyApplied(order));
+		}
+
+		// Otherwise validate forward transition.
+		if !Self::is_valid_transition(&order.status, &new_status) {
+			return Err(OrderStateError::InvalidTransition {
+				from: order.status,
+				to: new_status,
+			});
+		}
+
+		let updated = self
+			.update_order_with(order_id, |o| {
+				o.status = new_status;
+			})
+			.await?;
+		Ok(OrderTransitionOutcome::Applied(updated))
+	}
+
+	/// `current` is "at or past" `target` iff `current` is reachable from
+	/// `target` going forward through the transition graph — i.e., `current`
+	/// is downstream of `target`. Reuses the module-level `TRANSITIONS`
+	/// static. Same-kind case is handled by the caller.
+	fn is_at_or_past(current: &OrderStatus, target: &OrderStatus) -> bool {
+		let current_kind = status_kind(current);
+		let target_kind = status_kind(target);
+		if current_kind == target_kind {
+			return true;
+		}
+		// BFS from `target_kind` over forward edges. If `current_kind` is
+		// reachable, then current is downstream of target → at-or-past.
+		let mut frontier: Vec<OrderStatusKind> = vec![target_kind];
+		let mut seen: HashSet<OrderStatusKind> = HashSet::new();
+		seen.insert(target_kind);
+		while let Some(kind) = frontier.pop() {
+			if let Some(nexts) = TRANSITIONS.get(&kind) {
+				for next in nexts {
+					if *next == current_kind {
+						return true;
+					}
+					if seen.insert(*next) {
+						frontier.push(*next);
+					}
+				}
+			}
+		}
+		false
 	}
 
 	/// Gets an order by ID
@@ -494,5 +598,86 @@ mod tests {
 			&OrderStatus::Finalized,
 			&OrderStatus::Pending
 		));
+	}
+
+	async fn test_state_machine_with_order(
+		status: OrderStatus,
+	) -> (Arc<OrderStateMachine>, tempfile::TempDir) {
+		use solver_storage::implementations::file::{FileStorage, TtlConfig};
+		let temp = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let sm = Arc::new(OrderStateMachine::new(storage));
+		let mut order = create_test_order();
+		order.status = status;
+		sm.store_order(&order).await.unwrap();
+		(sm, temp)
+	}
+
+	#[tokio::test]
+	async fn try_transition_returns_applied_when_status_changes() {
+		let (state_machine, _temp) = test_state_machine_with_order(OrderStatus::Executing).await;
+		let outcome = state_machine
+			.try_transition_order_status("test_order_1", OrderStatus::Executed)
+			.await
+			.unwrap();
+		assert!(outcome.applied());
+		assert_eq!(outcome.order().status, OrderStatus::Executed);
+	}
+
+	#[tokio::test]
+	async fn try_transition_returns_already_applied_when_status_matches() {
+		let (state_machine, _temp) = test_state_machine_with_order(OrderStatus::Executed).await;
+		let outcome = state_machine
+			.try_transition_order_status("test_order_1", OrderStatus::Executed)
+			.await
+			.unwrap();
+		assert!(!outcome.applied());
+		assert!(matches!(outcome, OrderTransitionOutcome::AlreadyApplied(_)));
+	}
+
+	#[tokio::test]
+	async fn try_transition_returns_already_applied_when_current_is_downstream() {
+		let (state_machine, _temp) = test_state_machine_with_order(OrderStatus::PostFilled).await;
+		let outcome = state_machine
+			.try_transition_order_status("test_order_1", OrderStatus::Executed)
+			.await
+			.unwrap();
+		assert!(!outcome.applied());
+		assert!(matches!(outcome, OrderTransitionOutcome::AlreadyApplied(_)));
+	}
+
+	#[tokio::test]
+	async fn try_transition_returns_already_applied_when_current_is_finalized() {
+		let (state_machine, _temp) = test_state_machine_with_order(OrderStatus::Finalized).await;
+		let outcome = state_machine
+			.try_transition_order_status("test_order_1", OrderStatus::Executed)
+			.await
+			.unwrap();
+		assert!(matches!(outcome, OrderTransitionOutcome::AlreadyApplied(_)));
+	}
+
+	#[tokio::test]
+	async fn try_transition_errors_on_backward_move() {
+		// A truly invalid transition is one where:
+		//   - the current status is NOT downstream of the target (so we don't
+		//     short-circuit to `AlreadyApplied`)
+		//   - AND there is no direct forward edge from current to target
+		//
+		// `Created → Settled` qualifies: Settled is not reachable from Created
+		// in one hop (must pass through Executing → Executed first), and
+		// Created is not downstream of Settled in the forward graph. Backward
+		// moves between states on the same lineage (e.g. Executing → Created)
+		// are absorbed into `AlreadyApplied` by design — the current status
+		// is already past the target — so they do NOT surface as errors.
+		let (state_machine, _temp) = test_state_machine_with_order(OrderStatus::Created).await;
+
+		let err = state_machine
+			.try_transition_order_status("test_order_1", OrderStatus::Settled)
+			.await
+			.unwrap_err();
+		assert!(matches!(err, OrderStateError::InvalidTransition { .. }));
 	}
 }

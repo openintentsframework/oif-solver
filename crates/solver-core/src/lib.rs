@@ -6,6 +6,7 @@
 //! and modular design for building solver instances.
 
 pub mod builder;
+pub mod bump;
 pub mod engine;
 pub mod handlers;
 pub mod monitoring;

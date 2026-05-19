@@ -71,8 +71,8 @@ pub use operator_config::{
 	OperatorNetworkConfig, OperatorOracleConfig, OperatorOracleSelectionStrategy,
 	OperatorPricingConfig, OperatorPusherDirectionConfig, OperatorRebalanceConfig,
 	OperatorRebalancePairConfig, OperatorRpcEndpoint, OperatorSettlementConfig,
-	OperatorSettlementType, OperatorSolverConfig, OperatorToken, OperatorWithdrawalsConfig,
-	PusherL2Params, RebalancePairSide,
+	OperatorSettlementType, OperatorSolverConfig, OperatorToken, OperatorTxBumpChainConfig,
+	OperatorTxBumpConfig, OperatorWithdrawalsConfig, PusherL2Params, RebalancePairSide,
 };
 pub use order::*;
 pub use pricing::*;

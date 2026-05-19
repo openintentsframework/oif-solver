@@ -4,8 +4,8 @@ use alloy_primitives::{Bytes, U256};
 use async_trait::async_trait;
 use solver_core::state::transaction_attempt::TransactionAttemptStore;
 use solver_delivery::{
-	DeliveryError, DeliveryInterface, DeliveryService, FeeParams, TransactionAttemptRecorder,
-	TransactionTracking,
+	DeliveryError, DeliveryInterface, DeliveryService, FeeParams, PlannedAttemptInit,
+	TransactionAttemptRecorder, TransactionTracking,
 };
 use solver_storage::{
 	implementations::file::{FileStorage, TtlConfig},
@@ -47,12 +47,14 @@ impl DeliveryInterface for RecordingDelivery {
 		let attempt = tracking
 			.tracking
 			.attempt_recorder
-			.record_planned_attempt(
-				&tracking.tracking.id,
-				Some(self.signer.clone()),
-				tracking.tracking.tx_type,
+			.record_planned_attempt(PlannedAttemptInit {
+				order_id: tracking.tracking.id.clone(),
+				signer: Some(self.signer.clone()),
+				tx_type: tracking.tracking.tx_type,
 				tx,
-			)
+				attempt_id_override: None,
+				replacement_of: None,
+			})
 			.await
 			.map_err(|e| DeliveryError::Network(e.to_string()))?;
 
@@ -190,6 +192,8 @@ async fn delivery_service_persists_attempt_ledger_through_tracking() {
 		tx_type: TransactionType::Fill,
 		attempt_recorder: attempt_store.clone() as Arc<dyn TransactionAttemptRecorder>,
 		callback: Box::new(|_| {}),
+		attempt_id: None,
+		replacement_of: None,
 	};
 
 	let returned_hash = service.deliver(sample_tx(), Some(tracking)).await.unwrap();

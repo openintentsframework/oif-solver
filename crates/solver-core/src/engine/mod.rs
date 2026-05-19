@@ -508,6 +508,31 @@ impl SolverEngine {
 			None
 		};
 
+		let bump_handle = if self.static_config.tx_bump.enabled {
+			let attempt_store = Arc::new(
+				crate::state::transaction_attempt::TransactionAttemptStore::new(
+					self.storage.clone(),
+				),
+			);
+			let attempt_recorder: Arc<dyn solver_delivery::TransactionAttemptRecorder> =
+				attempt_store.clone();
+			let bump = crate::bump::TransactionBumpService::new(
+				self.static_config.tx_bump.clone(),
+				self.storage.clone(),
+				attempt_store,
+				self.delivery.clone(),
+				self.event_bus.clone(),
+				attempt_recorder,
+				self.pricing.clone(),
+			);
+			let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+			let handle = tokio::spawn(async move { bump.run(shutdown_rx).await });
+			tracing::info!("tx_bump sweeper spawned");
+			Some((handle, shutdown_tx))
+		} else {
+			None
+		};
+
 		loop {
 			tokio::select! {
 				// Handle discovered intents
@@ -738,6 +763,12 @@ impl SolverEngine {
 			let _ = shutdown_tx.send(true);
 			handle.abort();
 			tracing::info!("Rebalance monitor stopped");
+		}
+
+		if let Some((handle, shutdown_tx)) = bump_handle {
+			let _ = shutdown_tx.send(true);
+			handle.abort();
+			tracing::info!("tx_bump sweeper stopped");
 		}
 
 		self.discovery

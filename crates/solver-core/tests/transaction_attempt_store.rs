@@ -244,7 +244,7 @@ async fn recorder_update_persists_confirmed_receipt() {
 		stored.receipt.as_ref().unwrap().block_number,
 		receipt.block_number
 	);
-	assert_eq!(stored.receipt.as_ref().unwrap().success, true);
+	assert!(stored.receipt.as_ref().unwrap().success);
 	assert!(stored.is_terminal());
 }
 

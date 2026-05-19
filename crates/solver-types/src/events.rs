@@ -4,7 +4,9 @@
 //! communication between different components. Events flow through an event bus
 //! allowing services to react to state changes in other parts of the system.
 
-use crate::{ExecutionParams, FillProof, Intent, Order, TransactionHash, TransactionReceipt};
+use crate::{
+	Address, ExecutionParams, FillProof, Intent, Order, TransactionHash, TransactionReceipt,
+};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
@@ -85,6 +87,82 @@ pub enum DeliveryEvent {
 		tx_type: TransactionType,
 		error: String,
 	},
+	/// Emitted when the live tx-confirmation monitor gives up before
+	/// reaching `min_confirmations`. Order stays in its current status;
+	/// recovery reconciles via direct chain query.
+	TransactionIndeterminate {
+		order_id: String,
+		tx_hash: TransactionHash,
+		tx_type: TransactionType,
+		reason: String,
+	},
+	/// Bump sweeper found that the bumped fees exceed a per-chain cap.
+	/// Operator intervention required (raise the cap or wait).
+	BumpCapReached {
+		order_id: String,
+		attempt_id: String,
+		chain_id: u64,
+		tx_type: TransactionType,
+		cap_field: BumpCapField,
+		computed_fee_wei: String,
+		cap_wei: String,
+	},
+	/// Bump sweeper found that the proposed bumped transaction's total cost
+	/// exceeds the available profitability headroom (gas_buffer + min_profit)
+	/// over the stage's original quote-time gas budget. Operator intervention
+	/// required (raise headroom or accept loss).
+	BumpExceedsProfitability {
+		order_id: String,
+		attempt_id: String,
+		chain_id: u64,
+		tx_type: TransactionType,
+		/// Proposed total cost of the bumped tx, in `currency`.
+		/// Decimal string for serde stability (mirrors `CostBreakdown` fields).
+		proposed_cost: String,
+		/// The stage's original quote-time gas budget, in `currency`.
+		original_stage_budget: String,
+		/// Available headroom (gas_buffer + min_profit), in `currency`.
+		headroom: String,
+		/// Currency code from the order's CostBreakdown (e.g., "USD").
+		currency: String,
+	},
+	/// Bump sweeper found that the lineage has reached the configured
+	/// max-replacements limit. Operator intervention required.
+	BumpMaxReplacementsReached {
+		order_id: String,
+		attempt_id: String,
+		chain_id: u64,
+		tx_type: TransactionType,
+		lineage_depth: u32,
+	},
+	/// Bump sweeper found that the chain's currently-configured signer
+	/// no longer matches the original signer of the lineage tip.
+	/// Same-signer invariant prevents bumping.
+	BumpSignerMismatch {
+		order_id: String,
+		attempt_id: String,
+		chain_id: u64,
+		tx_type: TransactionType,
+		expected_signer: Address,
+		submission_signer: Address,
+	},
+	/// Bump sweeper found a non-terminal lineage tip whose `signer`
+	/// field is `None`. Abnormal for EVM attempts.
+	BumpMissingSigner {
+		order_id: String,
+		attempt_id: String,
+		chain_id: u64,
+		tx_type: TransactionType,
+	},
+}
+
+/// Which EIP-1559 cap was the binding constraint on a blocked bump.
+/// Legacy chains report `MaxFeePerGas` (gas_price cap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BumpCapField {
+	MaxFeePerGas,
+	MaxPriorityFeePerGas,
 }
 
 /// Events related to settlement operations.
@@ -125,4 +203,26 @@ pub enum TransactionType {
 	PreClaim,
 	/// Transaction that claims rewards on the origin chain.
 	Claim,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn bump_exceeds_profitability_event_round_trips() {
+		let ev = DeliveryEvent::BumpExceedsProfitability {
+			order_id: "order-1".into(),
+			attempt_id: "attempt-1".into(),
+			chain_id: 1,
+			tx_type: TransactionType::Fill,
+			proposed_cost: "1.50".into(),
+			original_stage_budget: "0.10".into(),
+			headroom: "0.09".into(),
+			currency: "USD".into(),
+		};
+		let json = serde_json::to_string(&ev).unwrap();
+		let de: DeliveryEvent = serde_json::from_str(&json).unwrap();
+		assert!(matches!(de, DeliveryEvent::BumpExceedsProfitability { .. }));
+	}
 }

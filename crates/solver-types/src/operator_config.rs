@@ -88,6 +88,11 @@ pub struct OperatorConfig {
 	/// the auto-generated delivery config.
 	#[serde(default)]
 	pub fee_policy: Option<crate::seed_overrides::FeePolicyOverride>,
+
+	/// Transaction-bump policy. Default-disabled; per-chain entries opt
+	/// chains into the same-nonce gas-bumping sweep loop.
+	#[serde(default)]
+	pub tx_bump: OperatorTxBumpConfig,
 }
 
 /// Account configuration for signing backends.
@@ -721,6 +726,36 @@ pub struct OperatorRebalancePairConfig {
 	pub bridge_route: Option<serde_json::Value>,
 }
 
+/// Operator-facing bootstrap mirror of `solver_config::TxBumpConfig`.
+/// Translated to the runtime type in `solver-service/src/config_merge.rs`.
+///
+/// Defined here (not in `solver-config`) to avoid a crate cycle:
+/// `solver-types` is the dependency floor for both `solver-config` and
+/// `solver-service`. Translation lives in `config_merge.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct OperatorTxBumpConfig {
+	pub enabled: bool,
+	pub sweep_interval_secs: Option<u64>,
+	pub default_pending_threshold_secs: Option<u64>,
+	pub default_bump_percent: Option<u32>,
+	pub default_max_replacements_per_stage: Option<u32>,
+	pub default_max_fee_per_gas_cap_wei: Option<String>,
+	pub default_max_priority_fee_per_gas_cap_wei: Option<String>,
+	pub chains: HashMap<u64, OperatorTxBumpChainConfig>,
+}
+
+/// Operator-facing bootstrap mirror of `solver_config::TxBumpChainConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct OperatorTxBumpChainConfig {
+	pub pending_threshold_secs: Option<u64>,
+	pub bump_percent: Option<u32>,
+	pub max_replacements_per_stage: Option<u32>,
+	pub max_fee_per_gas_cap_wei: Option<String>,
+	pub max_priority_fee_per_gas_cap_wei: Option<String>,
+}
+
 /// One side of a rebalance pair.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RebalancePairSide {
@@ -1110,6 +1145,7 @@ mod tests {
 			account: None,
 			rebalance: None,
 			fee_policy: None,
+			tx_bump: OperatorTxBumpConfig::default(),
 		};
 
 		let json = serde_json::to_string_pretty(&config).unwrap();

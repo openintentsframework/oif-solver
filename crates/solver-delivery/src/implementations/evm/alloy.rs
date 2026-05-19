@@ -15,7 +15,7 @@ use crate::implementations::evm::nonce::{
 	classify_submission_outcome, ResettableNonceManager, SubmissionOutcome,
 };
 use crate::{
-	DeliveryError, DeliveryInterface, FeeParams, InsufficientNativeGasInfo,
+	DeliveryError, DeliveryInterface, FeeParams, InsufficientNativeGasInfo, PlannedAttemptInit,
 	TransactionAttemptRecorder, TransactionMonitoringEvent, TransactionTrackingWithConfig,
 };
 use alloy_consensus::BlockHeader;
@@ -233,6 +233,23 @@ fn nonce_action_for_outcome(outcome: SubmissionOutcome) -> NonceCacheAction {
 	}
 }
 
+/// Same-nonce invariant for replacement submissions: must NOT retry with a
+/// fresh nonce on `NonceTooLow`. The replacement was crafted with the parent's
+/// exact nonce; `NonceTooLow` means the parent (or a sibling) already consumed
+/// that nonce on-chain. Retrying with a resynced nonce would submit a second
+/// tx with a different nonce, breaking the same-nonce invariant and blurring
+/// the attempt ledger. Treat it as `Keep`: log, keep cache advanced, return
+/// the classified error so the sweeper can move on — the bump reconciliation
+/// pass will mark the rejected child `Replaced` once chain-truth catches up.
+fn resolve_nonce_action(outcome: SubmissionOutcome, is_replacement: bool) -> NonceCacheAction {
+	let base = nonce_action_for_outcome(outcome);
+	if is_replacement && matches!(base, NonceCacheAction::NonceTooLowRetry) {
+		NonceCacheAction::Keep
+	} else {
+		base
+	}
+}
+
 fn attempt_status_for_submission_outcome(outcome: SubmissionOutcome) -> TransactionAttemptStatus {
 	match outcome {
 		SubmissionOutcome::NonceTooLow | SubmissionOutcome::DefinitelyRejected => {
@@ -252,16 +269,20 @@ async fn record_planned_attempt(
 	tracking: &TransactionTrackingWithConfig,
 	signer: SolverAddress,
 	tx: SolverTransaction,
+	attempt_id_override: Option<String>,
+	replacement_of: Option<String>,
 ) -> Result<TransactionAttempt, DeliveryError> {
 	tracking
 		.tracking
 		.attempt_recorder
-		.record_planned_attempt(
-			&tracking.tracking.id,
-			Some(signer),
-			tracking.tracking.tx_type,
+		.record_planned_attempt(PlannedAttemptInit {
+			order_id: tracking.tracking.id.clone(),
+			signer: Some(signer),
+			tx_type: tracking.tracking.tx_type,
 			tx,
-		)
+			attempt_id_override,
+			replacement_of,
+		})
 		.await
 		.map_err(|e| {
 			DeliveryError::Network(format!(
@@ -930,6 +951,8 @@ impl DeliveryInterface for AlloyDelivery {
 					tracking,
 					solver_address_from_alloy(from),
 					tx_attempt.clone(),
+					tracking.tracking.attempt_id.clone(),
+					tracking.tracking.replacement_of.clone(),
 				)
 				.await?,
 			)
@@ -965,6 +988,10 @@ impl DeliveryInterface for AlloyDelivery {
 			Err(first_err) => {
 				let first_err_str = first_err.to_string();
 				let outcome = classify_submission_outcome(&first_err_str);
+				let is_replacement = tracking
+					.as_ref()
+					.map(|t| t.tracking.replacement_of.is_some())
+					.unwrap_or(false);
 				if let (Some(tracking), Some(attempt)) = (tracking.as_ref(), first_attempt.as_ref())
 				{
 					record_attempt_update_best_effort(
@@ -978,10 +1005,12 @@ impl DeliveryInterface for AlloyDelivery {
 					)
 					.await;
 				}
-				match nonce_action_for_outcome(outcome) {
+				match resolve_nonce_action(outcome, is_replacement) {
 					NonceCacheAction::NonceTooLowRetry => {
 						// EXISTING path — resync local cache from chain
 						// pending and retry once with the resynced nonce.
+						// `resolve_nonce_action` guarantees `is_replacement = false`
+						// here, so we never violate the same-nonce invariant.
 						tracing::warn!(
 							chain_id,
 							signer = %from,
@@ -999,6 +1028,8 @@ impl DeliveryInterface for AlloyDelivery {
 									tracking,
 									solver_address_from_alloy(from),
 									retry_tx.clone(),
+									tracking.tracking.attempt_id.clone(),
+									tracking.tracking.replacement_of.clone(),
 								)
 								.await?,
 							)
@@ -1123,9 +1154,7 @@ impl DeliveryInterface for AlloyDelivery {
 									chain_id,
 									retry_err
 								);
-								return Err(DeliveryError::Network(format!(
-									"Resynced nonce retry failed: {retry_err}"
-								)));
+								return Err(classify_submit_error(&retry_err, is_replacement));
 							},
 						}
 					},
@@ -1166,9 +1195,7 @@ impl DeliveryInterface for AlloyDelivery {
 								"tx rejected pre-pool BUT chain-pending fetch failed; nonce cache kept advanced (no authoritative state)"
 							);
 						}
-						return Err(DeliveryError::Network(format!(
-							"Failed to send transaction: {first_err}"
-						)));
+						return Err(classify_submit_error(&first_err, is_replacement));
 					},
 					action @ NonceCacheAction::Keep => {
 						let mgr = self.get_nonce_manager(chain_id)?;
@@ -1182,9 +1209,7 @@ impl DeliveryInterface for AlloyDelivery {
 							error = %first_err_str,
 							"tx submission did not accept; nonce cache kept advanced (replacement-class or ambiguous error)"
 						);
-						return Err(DeliveryError::Network(format!(
-							"Failed to send transaction: {first_err}"
-						)));
+						return Err(classify_submit_error(&first_err, is_replacement));
 					},
 				}
 			},
@@ -1698,6 +1723,12 @@ impl DeliveryInterface for AlloyDelivery {
 		get_revert_data_with_provider(provider, chain_id, tx, from, block).await
 	}
 
+	fn submission_signer(&self, chain_id: u64) -> Option<SolverAddress> {
+		self.signer_addresses
+			.get(&chain_id)
+			.map(|alloy_addr| SolverAddress::from(*alloy_addr))
+	}
+
 	async fn tx_exists(
 		&self,
 		hash: &solver_types::TransactionHash,
@@ -1809,6 +1840,30 @@ pub(crate) async fn get_revert_data_with_provider(
 		Ok(_bytes) => Ok(None),
 		Err(transport_err) => Ok(extract_revert_bytes_from_transport_err(&transport_err)),
 	}
+}
+
+/// Classify a `TransportError` from `submit()`'s broadcast path into a
+/// typed `DeliveryError`. The `is_replacement` flag controls whether
+/// replacement-class strings get mapped to `ReplacementUnderpriced`
+/// or pass through as `Network` (existing behavior for original submits).
+///
+/// Called from `submit()` when `provider.send_transaction(...)` fails.
+/// `is_replacement` is `tracking.tracking.replacement_of.is_some()` — set
+/// only by the bump sweeper.
+pub(crate) fn classify_submit_error(err: &TransportError, is_replacement: bool) -> DeliveryError {
+	let msg = err.to_string();
+	if is_replacement && is_replacement_class_error(&msg) {
+		return DeliveryError::ReplacementUnderpriced { hint: msg };
+	}
+	DeliveryError::Network(msg)
+}
+
+fn is_replacement_class_error(msg: &str) -> bool {
+	// Lowercase comparison; node implementations vary in capitalization.
+	let lower = msg.to_lowercase();
+	lower.contains("replacement transaction underpriced")
+		|| lower.contains("replacement fee too low")
+		|| lower.contains("transaction already exists")
 }
 
 /// Extracts the revert payload from a `TransportError`. Uses alloy's
@@ -2176,6 +2231,57 @@ mod tests {
 	use solver_types::utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder};
 	use std::collections::HashMap;
 
+	mod replacement_classification_tests {
+		use super::*;
+		use alloy_json_rpc::ErrorPayload;
+		use alloy_transport::TransportError;
+
+		/// Helper: build a `TransportError` with a given JSON-RPC error message.
+		fn transport_err(msg: &str) -> TransportError {
+			let json = format!(r#"{{"code": -32000, "message": "{msg}"}}"#);
+			let payload: ErrorPayload = serde_json::from_str(&json).unwrap();
+			TransportError::ErrorResp(payload)
+		}
+
+		#[test]
+		fn classify_replacement_class_only_when_replacement_of_is_some() {
+			let err = transport_err("replacement transaction underpriced");
+
+			// With is_replacement=true → ReplacementUnderpriced
+			let classified = classify_submit_error(&err, true);
+			assert!(matches!(
+				classified,
+				DeliveryError::ReplacementUnderpriced { .. }
+			));
+
+			// With is_replacement=false → Network (existing behavior preserved)
+			let classified = classify_submit_error(&err, false);
+			assert!(matches!(classified, DeliveryError::Network(_)));
+		}
+
+		#[test]
+		fn classify_unrelated_error_is_network_regardless_of_replacement_flag() {
+			let err = transport_err("connection reset by peer");
+			assert!(matches!(
+				classify_submit_error(&err, true),
+				DeliveryError::Network(_)
+			));
+			assert!(matches!(
+				classify_submit_error(&err, false),
+				DeliveryError::Network(_)
+			));
+		}
+
+		#[test]
+		fn classify_replacement_fee_too_low_is_recognized() {
+			let err = transport_err("replacement fee too low");
+			assert!(matches!(
+				classify_submit_error(&err, true),
+				DeliveryError::ReplacementUnderpriced { .. }
+			));
+		}
+	}
+
 	mod revert_data_extractor_tests {
 		use super::super::extract_revert_bytes_from_transport_err;
 		use alloy_json_rpc::ErrorPayload;
@@ -2497,6 +2603,43 @@ mod tests {
 	}
 
 	#[test]
+	fn resolve_nonce_action_downgrades_nonce_too_low_for_replacement() {
+		use NonceCacheAction::*;
+		use SubmissionOutcome::*;
+		// Replacement + NonceTooLow → Keep (no resync-and-retry; parent
+		// already consumed the nonce). Guards the same-nonce invariant.
+		assert_eq!(resolve_nonce_action(NonceTooLow, true), Keep);
+	}
+
+	#[test]
+	fn resolve_nonce_action_preserves_non_replacement_paths() {
+		use NonceCacheAction::*;
+		use SubmissionOutcome::*;
+		// Non-replacement: identical to `nonce_action_for_outcome`.
+		assert_eq!(resolve_nonce_action(NonceTooLow, false), NonceTooLowRetry);
+		assert_eq!(
+			resolve_nonce_action(DefinitelyRejected, false),
+			AttemptRollback
+		);
+		assert_eq!(resolve_nonce_action(Replacement, false), Keep);
+		assert_eq!(resolve_nonce_action(Ambiguous, false), Keep);
+	}
+
+	#[test]
+	fn resolve_nonce_action_replacement_passes_non_nonce_too_low_through() {
+		use NonceCacheAction::*;
+		use SubmissionOutcome::*;
+		// Replacement only downgrades `NonceTooLow`. All other outcomes
+		// keep their base action.
+		assert_eq!(
+			resolve_nonce_action(DefinitelyRejected, true),
+			AttemptRollback
+		);
+		assert_eq!(resolve_nonce_action(Replacement, true), Keep);
+		assert_eq!(resolve_nonce_action(Ambiguous, true), Keep);
+	}
+
+	#[test]
 	fn submission_outcome_maps_to_attempt_status() {
 		use SubmissionOutcome::*;
 
@@ -2744,6 +2887,37 @@ mod tests {
 			.await;
 
 			assert!(delivery.is_ok());
+		}
+
+		/// Task 6: `submission_signer` returns the configured signer address
+		/// for chains the backend manages, and `None` for chains it does not.
+		/// Both chains in this test share the same `AccountSigner`, so the
+		/// returned addresses must be equal.
+		#[tokio::test]
+		async fn submission_signer_returns_configured_address() {
+			let networks = NetworksConfigBuilder::new()
+				.add_network(1, NetworkConfigBuilder::new().build())
+				.add_network(137, NetworkConfigBuilder::new().build())
+				.build();
+			let signer = create_test_signer();
+			let delivery = AlloyDelivery::new(
+				vec![1, 137],
+				&networks,
+				HashMap::new(),
+				signer,
+				&test_fee_policy(),
+			)
+			.await
+			.unwrap();
+
+			let s1 = delivery.submission_signer(1);
+			let s137 = delivery.submission_signer(137);
+			let s99 = delivery.submission_signer(99); // not configured
+
+			assert!(s1.is_some());
+			assert!(s137.is_some());
+			assert_eq!(s1, s137);
+			assert!(s99.is_none());
 		}
 
 		// ====================================================================
@@ -3393,6 +3567,8 @@ mod tests {
 				tx_type: TransactionType::Fill,
 				attempt_recorder: Arc::new(NoopTransactionAttemptRecorder),
 				callback,
+				attempt_id: None,
+				replacement_of: None,
 			};
 
 			let config = TransactionTrackingWithConfig {
@@ -3425,11 +3601,41 @@ mod tests {
 					tx_type,
 					attempt_recorder: Arc::new(NoopTransactionAttemptRecorder),
 					callback,
+					attempt_id: None,
+					replacement_of: None,
 				};
 
 				// Verify each type can be used in tracking
 				assert!(!tracking.id.is_empty());
 			}
+		}
+
+		#[test]
+		fn transaction_tracking_default_lineage_fields_are_none() {
+			let tracking = TransactionTracking {
+				id: "order-1".into(),
+				tx_type: TransactionType::Fill,
+				attempt_recorder: Arc::new(NoopTransactionAttemptRecorder),
+				callback: Box::new(|_: crate::TransactionMonitoringEvent| {}),
+				attempt_id: None,
+				replacement_of: None,
+			};
+			assert!(tracking.attempt_id.is_none());
+			assert!(tracking.replacement_of.is_none());
+		}
+
+		#[test]
+		fn transaction_tracking_with_lineage_fields() {
+			let tracking = TransactionTracking {
+				id: "order-1".into(),
+				tx_type: TransactionType::Fill,
+				attempt_recorder: Arc::new(NoopTransactionAttemptRecorder),
+				callback: Box::new(|_: crate::TransactionMonitoringEvent| {}),
+				attempt_id: Some("forced-id".into()),
+				replacement_of: Some("parent-id".into()),
+			};
+			assert_eq!(tracking.attempt_id.as_deref(), Some("forced-id"));
+			assert_eq!(tracking.replacement_of.as_deref(), Some("parent-id"));
 		}
 	}
 }

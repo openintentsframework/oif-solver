@@ -185,7 +185,9 @@ impl TransactionHandler {
 	/// Handles confirmed fill transactions.
 	///
 	/// Updates status to Executed and emits PostFillReady event to trigger
-	/// post-fill transaction generation if needed.
+	/// post-fill transaction generation if needed. The downstream event is
+	/// gated on `outcome.applied()` so a duplicate `Confirmed` callback from
+	/// a same-nonce lineage does not double-publish PostFillReady.
 	async fn handle_fill_confirmed(
 		&self,
 		_tx_hash: TransactionHash,
@@ -193,18 +195,26 @@ impl TransactionHandler {
 	) -> Result<(), TransactionError> {
 		let order_id = order.id;
 
-		// Update status from Executing to Executed (fill completed)
-		self.state_machine
-			.transition_order_status(&order_id, OrderStatus::Executed)
+		// Update status from Executing to Executed (fill completed).
+		let outcome = self
+			.state_machine
+			.try_transition_order_status(&order_id, OrderStatus::Executed)
 			.await
 			.map_err(|e| TransactionError::State(e.to_string()))?;
 
-		// Emit PostFillReady event - handler will determine if transaction needed
-		self.event_bus
-			.publish(SolverEvent::Settlement(SettlementEvent::PostFillReady {
-				order_id,
-			}))
-			.ok();
+		if outcome.applied() {
+			// Emit PostFillReady event - handler will determine if transaction needed
+			self.event_bus
+				.publish(SolverEvent::Settlement(SettlementEvent::PostFillReady {
+					order_id,
+				}))
+				.ok();
+		} else {
+			tracing::debug!(
+				order_id = %truncate_id(&order_id),
+				"fill confirmation: order already at/past Executed; skipping PostFillReady"
+			);
+		}
 
 		Ok(())
 	}
@@ -212,7 +222,9 @@ impl TransactionHandler {
 	/// Handles confirmed post-fill transactions.
 	///
 	/// Updates status to PostFilled and emits StartMonitoring event to begin
-	/// monitoring for settlement readiness.
+	/// monitoring for settlement readiness. The downstream event is gated on
+	/// `outcome.applied()` so a duplicate `Confirmed` from a same-nonce
+	/// lineage does not double-publish StartMonitoring.
 	async fn handle_post_fill_confirmed(
 		&self,
 		_tx_hash: TransactionHash,
@@ -220,24 +232,32 @@ impl TransactionHandler {
 	) -> Result<(), TransactionError> {
 		let order_id = order.id;
 
-		// Update status to PostFilled
-		self.state_machine
-			.transition_order_status(&order_id, OrderStatus::PostFilled)
+		// Update status to PostFilled.
+		let outcome = self
+			.state_machine
+			.try_transition_order_status(&order_id, OrderStatus::PostFilled)
 			.await
 			.map_err(|e| TransactionError::State(e.to_string()))?;
 
-		// Get fill transaction hash for monitoring
-		let fill_tx_hash = order
-			.fill_tx_hash
-			.clone()
-			.ok_or_else(|| TransactionError::Service("Missing fill transaction hash: required for post-fill transaction processing and settlement monitoring".into()))?;
+		if outcome.applied() {
+			// Get fill transaction hash for monitoring
+			let fill_tx_hash = order
+				.fill_tx_hash
+				.clone()
+				.ok_or_else(|| TransactionError::Service("Missing fill transaction hash: required for post-fill transaction processing and settlement monitoring".into()))?;
 
-		self.event_bus
-			.publish(SolverEvent::Settlement(SettlementEvent::StartMonitoring {
-				order_id,
-				fill_tx_hash,
-			}))
-			.ok();
+			self.event_bus
+				.publish(SolverEvent::Settlement(SettlementEvent::StartMonitoring {
+					order_id,
+					fill_tx_hash,
+				}))
+				.ok();
+		} else {
+			tracing::debug!(
+				order_id = %truncate_id(&order_id),
+				"post-fill confirmation: order already at/past PostFilled; skipping StartMonitoring"
+			);
+		}
 
 		Ok(())
 	}
@@ -245,54 +265,86 @@ impl TransactionHandler {
 	/// Handles confirmed pre-claim transactions.
 	///
 	/// Updates status to PreClaimed and emits ClaimReady event to trigger
-	/// the final claim transaction.
+	/// the final claim transaction. The downstream event is gated on
+	/// `outcome.applied()` so a duplicate `Confirmed` from a same-nonce
+	/// lineage does not double-publish ClaimReady.
 	async fn handle_pre_claim_confirmed(
 		&self,
 		_tx_hash: TransactionHash,
 		order: Order,
 	) -> Result<(), TransactionError> {
 		let order_id = order.id;
-		// Update status from Settled to PreClaimed
-		self.state_machine
-			.transition_order_status(&order_id, OrderStatus::PreClaimed)
+		// Update status from Settled to PreClaimed.
+		let outcome = self
+			.state_machine
+			.try_transition_order_status(&order_id, OrderStatus::PreClaimed)
 			.await
 			.map_err(|e| TransactionError::State(e.to_string()))?;
 
-		// PreClaim confirmed, emit ClaimReady
-		self.event_bus
-			.publish(SolverEvent::Settlement(SettlementEvent::ClaimReady {
-				order_id,
-			}))
-			.ok();
+		if outcome.applied() {
+			// PreClaim confirmed, emit ClaimReady
+			self.event_bus
+				.publish(SolverEvent::Settlement(SettlementEvent::ClaimReady {
+					order_id,
+				}))
+				.ok();
+		} else {
+			tracing::debug!(
+				order_id = %truncate_id(&order_id),
+				"pre-claim confirmation: order already at/past PreClaimed; skipping ClaimReady"
+			);
+		}
 
 		Ok(())
 	}
 
 	/// Handles confirmed claim transactions.
 	///
-	/// Updates status to Finalized and emits Completed event to signal
-	/// successful order completion.
+	/// Updates status to Finalized, records `claim_tx_hash`, and emits the
+	/// Completed event. The downstream event is gated on `outcome.applied()`
+	/// so a duplicate `Confirmed` from a same-nonce lineage does not
+	/// double-publish Completed.
 	async fn handle_claim_confirmed(
 		&self,
 		tx_hash: TransactionHash,
 		order: Order,
 	) -> Result<(), TransactionError> {
 		let order_id = order.id;
-		// Update order with claim transaction hash and mark as finalized
-		self.state_machine
-			.update_order_with(&order_id, |order| {
-				order.claim_tx_hash = Some(tx_hash.clone());
-				order.status = OrderStatus::Finalized;
-			})
+
+		// Transition to Finalized first; the outcome tells us whether this
+		// confirmation actually advanced the order's status. We do the
+		// claim_tx_hash write only when the transition fires so duplicate
+		// confirmations from same-nonce lineages don't overwrite the
+		// canonical claim hash recorded on the first Confirmed.
+		let outcome = self
+			.state_machine
+			.try_transition_order_status(&order_id, OrderStatus::Finalized)
 			.await
 			.map_err(|e| TransactionError::State(e.to_string()))?;
 
-		// Publish completed event
-		self.event_bus
-			.publish(SolverEvent::Settlement(
-				solver_types::SettlementEvent::Completed { order_id },
-			))
-			.ok();
+		if outcome.applied() {
+			// Record the claim transaction hash now that we've taken ownership
+			// of the Finalized transition.
+			let tx_hash_for_update = tx_hash.clone();
+			self.state_machine
+				.update_order_with(&order_id, move |o| {
+					o.claim_tx_hash = Some(tx_hash_for_update);
+				})
+				.await
+				.map_err(|e| TransactionError::State(e.to_string()))?;
+
+			// Publish completed event
+			self.event_bus
+				.publish(SolverEvent::Settlement(
+					solver_types::SettlementEvent::Completed { order_id },
+				))
+				.ok();
+		} else {
+			tracing::debug!(
+				order_id = %truncate_id(&order_id),
+				"claim confirmation: order already at/past Finalized; skipping Completed"
+			);
+		}
 
 		Ok(())
 	}
@@ -872,11 +924,17 @@ mod tests {
 			let finalized_order_bytes: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
 			let finalized_order_bytes_clone = finalized_order_bytes.clone();
 
-			// Mock the retrieve call for getting the order by order ID (handle_confirmed + update_order_with)
+			// Mock the retrieve call for getting the order by order ID.
+			// handle_claim_confirmed performs:
+			//   handle_confirmed retrieve (1x)
+			//   try_transition_order_status → retrieve + update_order_with retrieve (2x)
+			//   update_order_with for claim_tx_hash → retrieve (1x)
+			//   final state_machine.get_order assertion (1x)
+			// = 5 retrieves total.
 			storage
 				.expect_get_bytes()
 				.with(eq("orders:test_order_123"))
-				.times(3) // Called: handle_confirmed (1x), update_order_with (2x)
+				.times(5)
 				.returning(move |_| {
 					// Check if we have a finalized version saved
 					let finalized = finalized_order_bytes_clone.lock().unwrap();
@@ -891,19 +949,20 @@ mod tests {
 					}
 				});
 
-			// Mock exists check for update_order_with
+			// Mock exists check for both update_order_with calls
+			// (one inside try_transition_order_status, one for claim_tx_hash).
 			storage
 				.expect_exists()
 				.with(eq("orders:test_order_123"))
-				.times(1)
+				.times(2)
 				.returning(|_| Box::pin(async move { Ok(true) }));
 
-			// Mock set_bytes for update_order_with (saves order with Finalized status)
+			// Mock set_bytes: one for status transition, one for claim_tx_hash.
 			storage
 				.expect_set_bytes()
-				.times(1)
+				.times(2)
 				.returning(move |_, bytes, _, _| {
-					// Store the finalized order bytes
+					// Store the latest order bytes
 					*finalized_order_bytes.lock().unwrap() = Some(bytes.to_vec());
 					Box::pin(async move { Ok(()) })
 				});
@@ -1052,6 +1111,96 @@ mod tests {
 			TransactionError::Storage(_) => {}, // Expected
 			_ => panic!("Expected Storage error"),
 		}
+	}
+
+	/// Drains the given broadcast subscriber non-blockingly and counts events
+	/// matching the predicate. Used by idempotency-gating tests.
+	fn drain_count<F>(sub: &mut tokio::sync::broadcast::Receiver<SolverEvent>, pred: F) -> usize
+	where
+		F: Fn(&SolverEvent) -> bool,
+	{
+		let mut count = 0;
+		while let Ok(ev) = sub.try_recv() {
+			if pred(&ev) {
+				count += 1;
+			}
+		}
+		count
+	}
+
+	/// Regression test: a duplicate `Confirmed` callback arriving from a
+	/// same-nonce lineage (e.g., gas-bumped replacement) must NOT re-publish
+	/// the downstream Settlement event. Without the
+	/// `try_transition_order_status` + `outcome.applied()` gate this test
+	/// fails because the second handler call re-publishes PostFillReady.
+	#[tokio::test]
+	async fn handle_fill_confirmed_publishes_post_fill_ready_only_once() {
+		// Build an order at Executing — the precondition for handle_fill_confirmed.
+		let order_at_executing = OrderBuilder::new()
+			.with_id("test_order_dup_fill")
+			.with_status(OrderStatus::Executing)
+			.with_execution_params(Some(ExecutionParams {
+				gas_price: U256::from(20_000_000_000u64),
+				priority_fee: Some(U256::from(1_000_000_000u64)),
+			}))
+			.with_fill_tx_hash(Some(TransactionHash(vec![0xab; 32])))
+			.build();
+
+		// Use a real in-memory storage so both handler calls observe the
+		// status update produced by the first call. The mock-based pattern
+		// used elsewhere in this file isn't well suited to multi-call
+		// idempotency tests because the mocked retrieve doesn't naturally
+		// reflect intermediate writes across two `transition` calls.
+		let storage_impl = solver_storage::implementations::memory::MemoryStorage::new();
+		let storage = Arc::new(StorageService::new(Box::new(storage_impl)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let mut subscriber = event_bus.subscribe();
+
+		let handler = TransactionHandler::new(
+			storage.clone(),
+			state_machine.clone(),
+			Arc::new(SettlementService::new(HashMap::new(), String::new(), 20)),
+			event_bus,
+		);
+
+		// Seed the order in storage at Executing.
+		state_machine
+			.store_order(&order_at_executing)
+			.await
+			.unwrap();
+
+		// First confirmation: Executing → Executed. Should publish PostFillReady.
+		handler
+			.handle_fill_confirmed(TransactionHash(vec![0xaa; 32]), order_at_executing.clone())
+			.await
+			.unwrap();
+		let first = drain_count(&mut subscriber, |e| {
+			matches!(
+				e,
+				SolverEvent::Settlement(SettlementEvent::PostFillReady { .. })
+			)
+		});
+		assert_eq!(first, 1, "first confirmation must publish PostFillReady");
+
+		// Duplicate confirmation arrives (e.g., bumped tx's receipt fires
+		// after the canonical tx already landed). Order is now at Executed.
+		let mut order_at_executed = order_at_executing.clone();
+		order_at_executed.status = OrderStatus::Executed;
+		handler
+			.handle_fill_confirmed(TransactionHash(vec![0xbb; 32]), order_at_executed)
+			.await
+			.unwrap();
+		let second = drain_count(&mut subscriber, |e| {
+			matches!(
+				e,
+				SolverEvent::Settlement(SettlementEvent::PostFillReady { .. })
+			)
+		});
+		assert_eq!(
+			second, 0,
+			"duplicate Confirmed must not double-publish PostFillReady"
+		);
 	}
 
 	#[tokio::test]

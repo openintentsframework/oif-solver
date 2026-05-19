@@ -72,6 +72,10 @@ pub struct Config {
 	/// Optional cross-chain rebalancing configuration.
 	#[serde(default)]
 	pub rebalance: Option<RebalanceConfig>,
+	/// Transaction-bumping policy. Default-disabled; per-chain entries opt
+	/// chains into the same-nonce gas-bumping sweep loop.
+	#[serde(default)]
+	pub tx_bump: TxBumpConfig,
 }
 
 /// Configuration specific to the solver instance.
@@ -439,6 +443,202 @@ pub struct RebalancePairSideConfig {
 	pub token_address: String,
 	/// OFT contract address on this chain (hex string with 0x prefix).
 	pub oft_address: String,
+}
+
+/// Per-chain transaction-bump override config.
+///
+/// All fields are optional; unset fields fall back to the top-level defaults
+/// from `TxBumpConfig`. Caps are decimal strings in wei so operators can
+/// express values that exceed `u64::MAX` without losing precision in JSON
+/// numeric serialization (e.g. very-high-gas L1 mainnet caps).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TxBumpChainConfig {
+	pub pending_threshold_secs: Option<u64>,
+	pub bump_percent: Option<u32>,
+	pub max_replacements_per_stage: Option<u32>,
+	pub max_fee_per_gas_cap_wei: Option<String>,
+	pub max_priority_fee_per_gas_cap_wei: Option<String>,
+}
+
+/// Top-level transaction-bump policy.
+///
+/// Default-disabled. When `enabled=true`, the `BumpService` sweep loop polls
+/// in-flight transactions at `sweep_interval_secs` and considers any tx older
+/// than the per-chain `pending_threshold_secs` for fee bumping. Per-chain
+/// entries in `chains` opt that chain into the bump policy *and* may override
+/// the defaults. Chains not in `chains` are never bumped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxBumpConfig {
+	#[serde(default)]
+	pub enabled: bool,
+	#[serde(default = "default_sweep_interval_secs")]
+	pub sweep_interval_secs: u64,
+	#[serde(default = "default_pending_threshold_secs")]
+	pub default_pending_threshold_secs: u64,
+	#[serde(default = "default_bump_percent")]
+	pub default_bump_percent: u32,
+	#[serde(default = "default_max_replacements_per_stage")]
+	pub default_max_replacements_per_stage: u32,
+	#[serde(default)]
+	pub default_max_fee_per_gas_cap_wei: Option<String>,
+	#[serde(default)]
+	pub default_max_priority_fee_per_gas_cap_wei: Option<String>,
+	#[serde(default)]
+	pub chains: HashMap<u64, TxBumpChainConfig>,
+}
+
+fn default_sweep_interval_secs() -> u64 {
+	15
+}
+fn default_pending_threshold_secs() -> u64 {
+	60
+}
+fn default_bump_percent() -> u32 {
+	15
+}
+fn default_max_replacements_per_stage() -> u32 {
+	3
+}
+
+impl Default for TxBumpConfig {
+	fn default() -> Self {
+		Self {
+			enabled: false,
+			sweep_interval_secs: default_sweep_interval_secs(),
+			default_pending_threshold_secs: default_pending_threshold_secs(),
+			default_bump_percent: default_bump_percent(),
+			default_max_replacements_per_stage: default_max_replacements_per_stage(),
+			default_max_fee_per_gas_cap_wei: None,
+			default_max_priority_fee_per_gas_cap_wei: None,
+			chains: HashMap::new(),
+		}
+	}
+}
+
+/// Resolved per-chain policy with caps parsed to `u128`.
+///
+/// Produced by `TxBumpConfig::for_chain` for chains that are present in the
+/// allowlist. Returns `None` for chains not opted into the bump policy.
+#[derive(Debug, Clone)]
+pub struct EffectiveTxBumpPolicy {
+	pub pending_threshold_secs: u64,
+	pub bump_percent: u32,
+	pub max_replacements_per_stage: u32,
+	pub max_fee_per_gas_cap_wei: Option<u128>,
+	pub max_priority_fee_per_gas_cap_wei: Option<u128>,
+}
+
+impl TxBumpConfig {
+	/// Returns the effective policy for `chain_id`, parsing caps to u128.
+	/// `None` when the chain is not in the allowlist OR when a cap string
+	/// fails to parse (validation should have caught the latter at startup).
+	pub fn for_chain(&self, chain_id: u64) -> Option<EffectiveTxBumpPolicy> {
+		let chain = self.chains.get(&chain_id)?;
+		let parse_cap = |opt: &Option<String>| -> Option<u128> {
+			opt.as_ref().and_then(|s| s.parse::<u128>().ok())
+		};
+		Some(EffectiveTxBumpPolicy {
+			pending_threshold_secs: chain
+				.pending_threshold_secs
+				.unwrap_or(self.default_pending_threshold_secs),
+			bump_percent: chain.bump_percent.unwrap_or(self.default_bump_percent),
+			max_replacements_per_stage: chain
+				.max_replacements_per_stage
+				.unwrap_or(self.default_max_replacements_per_stage),
+			max_fee_per_gas_cap_wei: parse_cap(&chain.max_fee_per_gas_cap_wei)
+				.or_else(|| parse_cap(&self.default_max_fee_per_gas_cap_wei)),
+			max_priority_fee_per_gas_cap_wei: parse_cap(&chain.max_priority_fee_per_gas_cap_wei)
+				.or_else(|| parse_cap(&self.default_max_priority_fee_per_gas_cap_wei)),
+		})
+	}
+
+	/// Validates self-consistency. Call from `Config::validate()`.
+	pub fn validate(&self) -> Result<(), String> {
+		if self.sweep_interval_secs == 0 {
+			return Err("tx_bump.sweep_interval_secs must be >= 1".into());
+		}
+		if !(10..=100).contains(&self.default_bump_percent) {
+			return Err(format!(
+				"tx_bump.default_bump_percent must be in [10, 100], got {}",
+				self.default_bump_percent
+			));
+		}
+		if self.default_max_replacements_per_stage == 0 {
+			return Err("tx_bump.default_max_replacements_per_stage must be >= 1".into());
+		}
+		let default_fee_cap = self
+			.default_max_fee_per_gas_cap_wei
+			.as_ref()
+			.map(|s| {
+				s.parse::<u128>().map_err(|e| {
+					format!("tx_bump.default_max_fee_per_gas_cap_wei parse error: {e}")
+				})
+			})
+			.transpose()?;
+		let default_priority_cap = self
+			.default_max_priority_fee_per_gas_cap_wei
+			.as_ref()
+			.map(|s| {
+				s.parse::<u128>().map_err(|e| {
+					format!("tx_bump.default_max_priority_fee_per_gas_cap_wei parse error: {e}")
+				})
+			})
+			.transpose()?;
+		if let (Some(p), Some(f)) = (default_priority_cap, default_fee_cap) {
+			if p > f {
+				return Err("tx_bump default: priority cap must be <= fee cap".into());
+			}
+		}
+		for (chain_id, c) in &self.chains {
+			if let Some(bp) = c.bump_percent {
+				if !(10..=100).contains(&bp) {
+					return Err(format!(
+						"tx_bump.chains.{chain_id}.bump_percent must be in [10, 100], got {bp}"
+					));
+				}
+			}
+			let chain_fee_cap = if let Some(s) = &c.max_fee_per_gas_cap_wei {
+				Some(s.parse::<u128>().map_err(|e| {
+					format!("tx_bump.chains.{chain_id}.max_fee_per_gas_cap_wei: {e}")
+				})?)
+			} else {
+				None
+			};
+			let chain_priority_cap = if let Some(s) = &c.max_priority_fee_per_gas_cap_wei {
+				Some(s.parse::<u128>().map_err(|e| {
+					format!("tx_bump.chains.{chain_id}.max_priority_fee_per_gas_cap_wei: {e}")
+				})?)
+			} else {
+				None
+			};
+			let effective_fee_cap = chain_fee_cap.or(default_fee_cap);
+			let effective_priority_cap = chain_priority_cap.or(default_priority_cap);
+			if let (Some(p), Some(f)) = (effective_priority_cap, effective_fee_cap) {
+				if p > f {
+					return Err(format!(
+						"tx_bump.chains.{chain_id}: priority cap must be <= fee cap"
+					));
+				}
+			}
+		}
+		Ok(())
+	}
+
+	/// Validates that every chain id in `tx_bump.chains` appears in the
+	/// configured `networks`. Catches operator typos at startup.
+	pub fn validate_against_networks(
+		&self,
+		configured_chain_ids: &std::collections::HashSet<u64>,
+	) -> Result<(), String> {
+		for chain_id in self.chains.keys() {
+			if !configured_chain_ids.contains(chain_id) {
+				return Err(format!(
+					"tx_bump.chains.{chain_id} not present in networks config"
+				));
+			}
+		}
+		Ok(())
+	}
 }
 
 /// Configuration for quote generation parameters.
@@ -834,6 +1034,13 @@ impl Config {
 				}
 			}
 		}
+
+		// Validate tx_bump config and its chain allowlist against configured networks.
+		self.tx_bump.validate().map_err(ConfigError::Validation)?;
+		let chain_ids: std::collections::HashSet<u64> = self.networks.keys().copied().collect();
+		self.tx_bump
+			.validate_against_networks(&chain_ids)
+			.map_err(ConfigError::Validation)?;
 
 		Ok(())
 	}
@@ -1542,5 +1749,129 @@ mod tests {
 			Err(ConfigError::Validation(message))
 				if message.contains("Duplicate rebalance pair_id")
 		));
+	}
+
+	#[test]
+	fn tx_bump_default_is_disabled() {
+		let cfg = TxBumpConfig::default();
+		assert!(!cfg.enabled);
+		assert_eq!(cfg.sweep_interval_secs, 15);
+		assert_eq!(cfg.default_pending_threshold_secs, 60);
+		assert_eq!(cfg.default_bump_percent, 15);
+		assert_eq!(cfg.default_max_replacements_per_stage, 3);
+	}
+
+	#[test]
+	fn tx_bump_for_chain_falls_back_to_defaults_on_empty_override() {
+		let mut cfg = TxBumpConfig::default();
+		cfg.chains.insert(1, TxBumpChainConfig::default());
+		let eff = cfg.for_chain(1).unwrap();
+		assert_eq!(
+			eff.pending_threshold_secs,
+			cfg.default_pending_threshold_secs
+		);
+		assert_eq!(eff.bump_percent, cfg.default_bump_percent);
+	}
+
+	#[test]
+	fn tx_bump_for_chain_uses_overrides_when_set() {
+		let mut cfg = TxBumpConfig::default();
+		cfg.chains.insert(
+			1,
+			TxBumpChainConfig {
+				pending_threshold_secs: Some(90),
+				bump_percent: Some(20),
+				max_replacements_per_stage: None,
+				max_fee_per_gas_cap_wei: Some("50000000000".into()),
+				max_priority_fee_per_gas_cap_wei: None,
+			},
+		);
+		let eff = cfg.for_chain(1).unwrap();
+		assert_eq!(eff.pending_threshold_secs, 90);
+		assert_eq!(eff.bump_percent, 20);
+		assert_eq!(eff.max_fee_per_gas_cap_wei, Some(50_000_000_000u128));
+	}
+
+	#[test]
+	fn tx_bump_for_chain_returns_none_when_chain_not_in_allowlist() {
+		let cfg = TxBumpConfig::default();
+		assert!(cfg.for_chain(1).is_none());
+	}
+
+	#[test]
+	fn tx_bump_validation_rejects_bump_percent_below_min() {
+		let cfg = TxBumpConfig {
+			default_bump_percent: 5,
+			..TxBumpConfig::default()
+		};
+		assert!(cfg.validate().is_err());
+	}
+
+	#[test]
+	fn tx_bump_validation_rejects_unparseable_cap() {
+		let mut cfg = TxBumpConfig::default();
+		cfg.chains.insert(
+			1,
+			TxBumpChainConfig {
+				max_fee_per_gas_cap_wei: Some("not-a-number".into()),
+				..Default::default()
+			},
+		);
+		let err = cfg.validate().unwrap_err();
+		assert!(err.to_string().contains("max_fee_per_gas_cap_wei"));
+	}
+
+	#[test]
+	fn tx_bump_validation_rejects_priority_cap_above_fee_cap() {
+		let cfg = TxBumpConfig {
+			default_max_fee_per_gas_cap_wei: Some("100".into()),
+			default_max_priority_fee_per_gas_cap_wei: Some("200".into()),
+			..TxBumpConfig::default()
+		};
+		let err = cfg.validate().unwrap_err();
+		assert!(err.to_string().contains("priority"));
+	}
+
+	#[test]
+	fn tx_bump_validation_rejects_per_chain_priority_above_fee_cap() {
+		let mut cfg = TxBumpConfig::default();
+		cfg.chains.insert(
+			1u64,
+			TxBumpChainConfig {
+				max_fee_per_gas_cap_wei: Some("100".into()),
+				max_priority_fee_per_gas_cap_wei: Some("200".into()),
+				..Default::default()
+			},
+		);
+		let err = cfg.validate().unwrap_err();
+		assert!(err.contains("chains.1"));
+		assert!(err.contains("priority"));
+	}
+
+	#[test]
+	fn tx_bump_validation_rejects_effective_chain_priority_above_default_fee_cap() {
+		let mut cfg = TxBumpConfig {
+			default_max_fee_per_gas_cap_wei: Some("100".into()),
+			..TxBumpConfig::default()
+		};
+		cfg.chains.insert(
+			1u64,
+			TxBumpChainConfig {
+				max_priority_fee_per_gas_cap_wei: Some("200".into()),
+				..Default::default()
+			},
+		);
+		let err = cfg.validate().unwrap_err();
+		assert!(err.contains("chains.1"));
+		assert!(err.contains("priority"));
+	}
+
+	#[test]
+	fn tx_bump_validation_rejects_chain_not_in_networks() {
+		let mut cfg = TxBumpConfig::default();
+		cfg.chains.insert(99u64, TxBumpChainConfig::default());
+		let configured = std::collections::HashSet::from([1u64]);
+		let err = cfg.validate_against_networks(&configured).unwrap_err();
+		assert!(err.to_string().contains("99"));
 	}
 }

@@ -84,7 +84,8 @@ fn recovery_status_rank(status: TransactionAttemptStatus) -> Option<u8> {
 		TransactionAttemptStatus::Indeterminate => Some(1),
 		TransactionAttemptStatus::Planned
 		| TransactionAttemptStatus::SubmitRejected
-		| TransactionAttemptStatus::Reverted => None,
+		| TransactionAttemptStatus::Reverted
+		| TransactionAttemptStatus::Replaced => None,
 	}
 }
 
@@ -1702,6 +1703,53 @@ mod tests {
 			Some(0xcc),
 			100,
 		)];
+
+		assert!(choose_recovery_attempt_hash(&attempts, TransactionType::Fill).is_none());
+	}
+
+	#[test]
+	fn recovery_picks_confirmed_attempt_when_lineage_present() {
+		let a = sample_attempt(
+			"A",
+			TransactionType::Fill,
+			TransactionAttemptStatus::Indeterminate,
+			Some(0xaa),
+			100,
+		);
+		let mut b = sample_attempt(
+			"B",
+			TransactionType::Fill,
+			TransactionAttemptStatus::Confirmed,
+			Some(0xbb),
+			200,
+		);
+		b.replacement_of = Some("A".to_string());
+
+		let attempts = vec![a, b];
+		let hash = choose_recovery_attempt_hash(&attempts, TransactionType::Fill).unwrap();
+
+		assert_eq!(hash, TransactionHash(vec![0xbb; 32]));
+	}
+
+	#[test]
+	fn recovery_skips_submit_rejected_and_replaced() {
+		let a = sample_attempt(
+			"A",
+			TransactionType::Fill,
+			TransactionAttemptStatus::SubmitRejected,
+			None,
+			100,
+		);
+		let mut b = sample_attempt(
+			"B",
+			TransactionType::Fill,
+			TransactionAttemptStatus::Replaced,
+			Some(0xbb),
+			200,
+		);
+		b.replacement_of = Some("A".to_string());
+
+		let attempts = vec![a, b];
 
 		assert!(choose_recovery_attempt_hash(&attempts, TransactionType::Fill).is_none());
 	}

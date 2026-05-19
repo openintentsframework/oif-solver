@@ -155,6 +155,8 @@ impl OrderHandler {
 				tx_type: TransactionType::Prepare,
 				attempt_recorder: self.transaction_attempt_recorder(),
 				callback,
+				attempt_id: None,
+				replacement_of: None,
 			};
 
 			let prepare_tx_hash = self
@@ -293,6 +295,8 @@ impl OrderHandler {
 			tx_type: TransactionType::Fill,
 			attempt_recorder: self.transaction_attempt_recorder(),
 			callback,
+			attempt_id: None,
+			replacement_of: None,
 		};
 
 		let tx_hash = self

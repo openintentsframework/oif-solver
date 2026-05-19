@@ -233,6 +233,8 @@ impl SettlementHandler {
 					tx_type: TransactionType::PostFill,
 					attempt_recorder: self.transaction_attempt_recorder(),
 					callback,
+					attempt_id: None,
+					replacement_of: None,
 				};
 
 				let tx_hash = self
@@ -398,6 +400,8 @@ impl SettlementHandler {
 					tx_type: TransactionType::PreClaim,
 					attempt_recorder: self.transaction_attempt_recorder(),
 					callback,
+					attempt_id: None,
+					replacement_of: None,
 				};
 
 				let tx_hash = self
@@ -543,6 +547,8 @@ impl SettlementHandler {
 				tx_type: TransactionType::Claim,
 				attempt_recorder: self.transaction_attempt_recorder(),
 				callback,
+				attempt_id: None,
+				replacement_of: None,
 			};
 
 			let claim_tx_hash = self

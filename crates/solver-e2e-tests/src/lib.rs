@@ -258,6 +258,32 @@ pub struct HarnessOptions {
 	pub run_solver: bool,
 }
 
+async fn read_order_from_storage_root(
+	root: &std::path::Path,
+	order_id: &str,
+) -> Result<solver_types::Order> {
+	use solver_storage::{
+		implementations::file::{FileStorage, TtlConfig},
+		StorageService,
+	};
+
+	let storage_root = root.join("data/storage");
+	let storage = StorageService::new(Box::new(FileStorage::new(
+		storage_root,
+		TtlConfig::default(),
+	)));
+	storage
+		.retrieve(solver_types::StorageKey::Orders.as_str(), order_id)
+		.await
+		.with_context(|| format!("read order {order_id} from file storage"))
+}
+
+fn log_file_contains(path: &std::path::Path, needle: &str) -> Result<bool> {
+	let contents = std::fs::read_to_string(path)
+		.with_context(|| format!("read solver log {}", path.display()))?;
+	Ok(contents.contains(needle))
+}
+
 impl Default for HarnessOptions {
 	fn default() -> Self {
 		Self {
@@ -482,6 +508,19 @@ impl Harness {
 			Err(e) => eprintln!("(could not read log file: {e})"),
 		}
 		eprintln!("========== end solver logs ==========\n");
+	}
+
+	/// Read an order directly from the solver subprocess file-storage root.
+	///
+	/// The solver child is spawned with `STORAGE_PATH=<harness-tempdir>/data/storage`,
+	/// so this helper can assert subprocess outcomes without EventBus access.
+	pub async fn read_order_from_storage(&self, order_id: &str) -> Result<solver_types::Order> {
+		read_order_from_storage_root(self._tempdir.path(), order_id).await
+	}
+
+	/// Return true if the captured solver stdout/stderr log contains `needle`.
+	pub fn solver_log_contains(&self, needle: &str) -> Result<bool> {
+		log_file_contains(&self.solver_stderr_path, needle)
 	}
 
 	/// Print the bootstrap config that was passed to the solver. Useful when
@@ -1770,5 +1809,49 @@ impl<'a> StandardOrderBuilder<'a> {
 				context: Default::default(),
 			}],
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use solver_storage::{
+		implementations::file::{FileStorage, TtlConfig},
+		StorageService,
+	};
+	use solver_types::{utils::tests::builders::OrderBuilder, StorageKey};
+	use std::sync::Arc;
+
+	#[tokio::test]
+	async fn read_order_from_storage_root_loads_file_storage_order() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let root = tmp.path().join("data/storage");
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			root,
+			TtlConfig::default(),
+		))));
+		let order = OrderBuilder::new().with_id("order-1").build();
+		storage
+			.store(StorageKey::Orders.as_str(), &order.id, &order, None)
+			.await
+			.unwrap();
+
+		let loaded = read_order_from_storage_root(tmp.path(), &order.id)
+			.await
+			.unwrap();
+		assert_eq!(loaded.id, order.id);
+	}
+
+	#[test]
+	fn log_file_contains_finds_substring() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let path = tmp.path().join("solver.log");
+		std::fs::write(
+			&path,
+			"alpha\nInsufficient native gas for transaction preflight\n",
+		)
+		.unwrap();
+		assert!(log_file_contains(&path, "Insufficient native gas").unwrap());
+		assert!(!log_file_contains(&path, "not present").unwrap());
 	}
 }
