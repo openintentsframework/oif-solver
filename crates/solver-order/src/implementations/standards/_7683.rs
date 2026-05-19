@@ -419,8 +419,11 @@ impl OrderInterface for Eip7683OrderImpl {
 		let user_address = hex_to_alloy_address(&order_data.user)
 			.map_err(|e| OrderError::ValidationFailed(format!("Invalid user address: {e}")))?;
 
-		// Parse oracle address
-		let oracle_address = hex_to_alloy_address(&fill_proof.oracle_address)
+		// Security: use the order-bound input oracle from canonical order_data, not
+		// the FillProof's oracle_address. The settlement service's get_attestation
+		// guard enforces that these match, so this preserves the order identity at
+		// claim time even if a future settlement impl regresses.
+		let oracle_address = hex_to_alloy_address(&order_data.input_oracle)
 			.map_err(|e| OrderError::ValidationFailed(format!("Invalid oracle address: {e}")))?;
 
 		// Create inputs array from order data
@@ -1139,6 +1142,66 @@ mod tests {
 		assert_eq!(tx.chain_id, 1); // origin chain
 		assert_eq!(tx.to, Some(Address(vec![0x11; 20])));
 		assert!(!tx.data.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_generate_claim_transaction_uses_order_bound_oracle() {
+		use alloy_sol_types::SolCall;
+
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		// Build an order whose canonical input_oracle is the StandardOrder's inputOracle.
+		let standard_order = create_valid_standard_order();
+		let canonical_oracle_bytes: [u8; 20] = standard_order.inputOracle.0 .0;
+		let order_bytes = encode_standard_order(&standard_order);
+		let solver_address = Address(vec![0x99; 20]);
+
+		let order = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&None,
+				"permit2_escrow",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await
+			.expect("validate_and_create_order should succeed");
+
+		// FillProof carries a DIFFERENT oracle address (attacker / wrong).
+		let attacker_oracle_hex = "0x".to_string() + &hex::encode([0x99u8; 20]);
+		let fill_proof = FillProof {
+			tx_hash: TransactionHash(vec![0u8; 32]),
+			block_number: 1,
+			attestation_data: None,
+			filled_timestamp: 1_700_000_000,
+			oracle_address: attacker_oracle_hex,
+		};
+
+		let claim_tx = order_impl
+			.generate_claim_transaction(&order, &fill_proof)
+			.await
+			.expect("generate_claim_transaction should succeed");
+
+		// Decode the StandardOrder embedded in the finaliseCall calldata and assert
+		// its inputOracle matches the canonical (signed) value, NOT the FillProof oracle.
+		assert!(claim_tx.data.len() >= 4, "calldata shorter than selector");
+		let decoded =
+			interfaces::IInputSettlerEscrow::finaliseCall::abi_decode_raw(&claim_tx.data[4..])
+				.expect("finaliseCall::abi_decode_raw should succeed");
+		let decoded_input_oracle: [u8; 20] = decoded.order.inputOracle.0 .0;
+
+		assert_eq!(
+			decoded_input_oracle, canonical_oracle_bytes,
+			"claim calldata used FillProof oracle instead of order-bound oracle"
+		);
+		// And explicitly assert the FillProof oracle was NOT used.
+		assert_ne!(
+			decoded_input_oracle, [0x99u8; 20],
+			"FillProof oracle leaked into StandardOrder.inputOracle"
+		);
 	}
 
 	#[test]

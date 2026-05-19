@@ -56,6 +56,38 @@ impl DirectSettlement {
 			dispute_period_seconds,
 		})
 	}
+
+	/// Validate that the order-bound input oracle is configured for the given
+	/// source chain. Returns the parsed order-bound input oracle on success.
+	fn validate_bound_input_oracle(
+		&self,
+		order: &Order,
+		source_chain: u64,
+	) -> Result<solver_types::Address, SettlementError> {
+		let input_oracle = crate::parse_bound_input_oracle(order)?;
+		if !self.is_input_oracle_supported(source_chain, &input_oracle) {
+			return Err(SettlementError::ValidationFailed(format!(
+				"Order-bound input oracle is not configured for source chain {source_chain}"
+			)));
+		}
+		Ok(input_oracle)
+	}
+
+	/// Validate that the order-bound output oracle is configured for the given
+	/// destination chain. Returns the parsed order-bound output oracle on success.
+	fn validate_bound_output_oracle(
+		&self,
+		order: &Order,
+		destination_chain: u64,
+	) -> Result<solver_types::Address, SettlementError> {
+		let output_oracle = crate::parse_bound_output_oracle(order, destination_chain)?;
+		if !self.is_output_oracle_supported(destination_chain, &output_oracle) {
+			return Err(SettlementError::ValidationFailed(format!(
+				"Order-bound output oracle is not configured for destination chain {destination_chain}"
+			)));
+		}
+		Ok(output_oracle)
+	}
 }
 
 /// Configuration schema for DirectSettlement.
@@ -149,27 +181,10 @@ impl SettlementInterface for DirectSettlement {
 			))
 		})?;
 
-		// Get the oracle address for this chain using the selection strategy
-		let oracle_addresses = self.get_input_oracles(origin_chain_id);
-		if oracle_addresses.is_empty() {
-			return Err(SettlementError::ValidationFailed(format!(
-				"No input oracle configured for chain {origin_chain_id}"
-			)));
-		}
-
-		// Use order ID hash as selection context for deterministic oracle selection
-		// This ensures the same oracle is consistently selected for a given order
-		let order_id_bytes = order.id.as_bytes();
-		let mut hasher = std::collections::hash_map::DefaultHasher::new();
-		std::hash::Hasher::write(&mut hasher, order_id_bytes);
-		let selection_context = std::hash::Hasher::finish(&hasher);
-		let oracle_address = self
-			.select_oracle(&oracle_addresses, Some(selection_context))
-			.ok_or_else(|| {
-				SettlementError::ValidationFailed(format!(
-					"Failed to select oracle for chain {origin_chain_id}"
-				))
-			})?;
+		// Security: use the order-bound input oracle from canonical order_data.
+		// Any mismatch with the configured input oracle set for the source chain
+		// is a security event and surfaces as ValidationFailed.
+		let oracle_address = self.validate_bound_input_oracle(order, origin_chain_id)?;
 
 		// Convert tx hash
 		let hash = FixedBytes::<32>::from_slice(&tx_hash.0);
@@ -266,11 +281,15 @@ impl SettlementInterface for DirectSettlement {
 			.map(|c| c.chain_id)
 			.ok_or_else(|| SettlementError::ValidationFailed("No output chains in order".into()))?;
 
-		let oracle_addresses = self.get_output_oracles(dest_chain);
-		if oracle_addresses.is_empty() {
-			// No oracle configured, no PostFill needed
+		// Preserve "no output oracle configured for this chain = skip post-fill"
+		// semantics for legitimate unconfigured chains.
+		if self.get_output_oracles(dest_chain).is_empty() {
 			return Ok(None);
 		}
+		// At least one output oracle is configured for this chain; require the
+		// order-bound output oracle to be in the supported set. A mismatch is a
+		// security event and surfaces as ValidationFailed (not Ok(None)).
+		let _output_oracle = self.validate_bound_output_oracle(order, dest_chain)?;
 
 		// For testing: send to solver's own address (from the order)
 		// This simulates a PostFill oracle interaction that modifies state
@@ -306,11 +325,15 @@ impl SettlementInterface for DirectSettlement {
 			.map(|c| c.chain_id)
 			.ok_or_else(|| SettlementError::ValidationFailed("No input chains in order".into()))?;
 
-		let oracle_addresses = self.get_input_oracles(origin_chain);
-		if oracle_addresses.is_empty() {
-			// No oracle configured, no PreClaim needed
+		// Preserve "no input oracle configured for this chain = skip pre-claim"
+		// semantics for legitimate unconfigured chains.
+		if self.get_input_oracles(origin_chain).is_empty() {
 			return Ok(None);
 		}
+		// At least one input oracle is configured for this chain; require the
+		// order-bound input oracle to be in the supported set. A mismatch is a
+		// security event and surfaces as ValidationFailed (not Ok(None)).
+		let _input_oracle = self.validate_bound_input_oracle(order, origin_chain)?;
 
 		// For testing: send to solver's own address (from the order)
 		// This simulates a PreClaim oracle interaction that modifies state
@@ -824,6 +847,165 @@ mod tests {
 		if let Err(SettlementError::ValidationFailed(msg)) = result {
 			assert!(msg.contains("No HTTP RPC URL configured"));
 		}
+	}
+
+	// ── helpers for order-bound oracle binding tests ────────────────────────
+
+	fn make_eip7683_order_data_for_binding(
+		input_oracle: &solver_types::Address,
+		outputs: Vec<solver_types::standards::eip7683::MandateOutput>,
+	) -> serde_json::Value {
+		use solver_types::utils::tests::builders::Eip7683OrderDataBuilder;
+		let data = Eip7683OrderDataBuilder::new()
+			.origin_chain_id(U256::from(1u64))
+			.input_oracle(solver_types::with_0x_prefix(&hex::encode(&input_oracle.0)))
+			.outputs(outputs)
+			.build();
+		serde_json::to_value(data).unwrap()
+	}
+
+	fn make_output_for_binding(
+		destination_chain: u64,
+		output_oracle: [u8; 32],
+	) -> solver_types::standards::eip7683::MandateOutput {
+		use solver_types::utils::tests::builders::MandateOutputBuilder;
+		MandateOutputBuilder::new()
+			.oracle(output_oracle)
+			.chain_id(U256::from(destination_chain))
+			.token([0x11; 32])
+			.amount(U256::from(42u64))
+			.recipient([0x22; 32])
+			.build()
+	}
+
+	fn test_direct_settlement(oracle_config: OracleConfig) -> DirectSettlement {
+		DirectSettlement {
+			providers: HashMap::new(),
+			oracle_config,
+			dispute_period_seconds: 300,
+		}
+	}
+
+	#[test]
+	fn test_validate_bound_input_oracle_success() {
+		use solver_types::utils::tests::builders::OrderBuilder;
+
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let order = OrderBuilder::new()
+			.with_data(make_eip7683_order_data_for_binding(
+				&input_oracle,
+				vec![make_output_for_binding(137, [0u8; 32])],
+			))
+			.build();
+		let oracle_config = OracleConfig {
+			input_oracles: HashMap::from([(1u64, vec![input_oracle.clone()])]),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		};
+		let settlement = test_direct_settlement(oracle_config);
+
+		assert_eq!(
+			settlement.validate_bound_input_oracle(&order, 1).unwrap(),
+			input_oracle
+		);
+	}
+
+	#[test]
+	fn test_validate_bound_input_oracle_rejects_unsupported() {
+		use solver_types::utils::tests::builders::OrderBuilder;
+
+		let signed_oracle = solver_types::Address(vec![0x33; 20]);
+		let configured_oracle = solver_types::Address(vec![0x44; 20]);
+		let order = OrderBuilder::new()
+			.with_data(make_eip7683_order_data_for_binding(
+				&signed_oracle,
+				vec![make_output_for_binding(137, [0u8; 32])],
+			))
+			.build();
+		let oracle_config = OracleConfig {
+			input_oracles: HashMap::from([(1u64, vec![configured_oracle])]),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		};
+		let settlement = test_direct_settlement(oracle_config);
+
+		let err = settlement
+			.validate_bound_input_oracle(&order, 1)
+			.unwrap_err();
+		assert!(
+			err.to_string()
+				.contains("not configured for source chain 1"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[test]
+	fn test_validate_bound_output_oracle_success() {
+		use crate::utils::address_to_bytes32;
+		use solver_types::utils::tests::builders::OrderBuilder;
+
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let output_oracle = solver_types::Address(vec![0x44; 20]);
+		let order = OrderBuilder::new()
+			.with_data(make_eip7683_order_data_for_binding(
+				&input_oracle,
+				vec![make_output_for_binding(
+					137,
+					address_to_bytes32(&output_oracle),
+				)],
+			))
+			.build();
+		let oracle_config = OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::from([(137u64, vec![output_oracle.clone()])]),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		};
+		let settlement = test_direct_settlement(oracle_config);
+
+		assert_eq!(
+			settlement
+				.validate_bound_output_oracle(&order, 137)
+				.unwrap(),
+			output_oracle
+		);
+	}
+
+	#[test]
+	fn test_validate_bound_output_oracle_rejects_unsupported() {
+		use crate::utils::address_to_bytes32;
+		use solver_types::utils::tests::builders::OrderBuilder;
+
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let signed_output_oracle = solver_types::Address(vec![0x44; 20]);
+		let configured_output_oracle = solver_types::Address(vec![0x55; 20]);
+		let order = OrderBuilder::new()
+			.with_data(make_eip7683_order_data_for_binding(
+				&input_oracle,
+				vec![make_output_for_binding(
+					137,
+					address_to_bytes32(&signed_output_oracle),
+				)],
+			))
+			.build();
+		let oracle_config = OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::from([(137u64, vec![configured_output_oracle])]),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		};
+		let settlement = test_direct_settlement(oracle_config);
+
+		let err = settlement
+			.validate_bound_output_oracle(&order, 137)
+			.unwrap_err();
+		assert!(
+			err.to_string()
+				.contains("not configured for destination chain 137"),
+			"unexpected error: {err}"
+		);
 	}
 
 	#[test]
