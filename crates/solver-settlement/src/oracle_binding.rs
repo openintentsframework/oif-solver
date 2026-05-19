@@ -20,9 +20,17 @@ fn parse_eip7683_order_data(order: &Order) -> Result<Eip7683OrderData, Settlemen
 /// Parse the order-bound input oracle from canonical `Order.data`.
 pub(crate) fn parse_bound_input_oracle(order: &Order) -> Result<Address, SettlementError> {
 	let order_data = parse_eip7683_order_data(order)?;
-	parse_address(&order_data.input_oracle).map_err(|e| {
+	let input_oracle = parse_address(&order_data.input_oracle).map_err(|e| {
 		SettlementError::ValidationFailed(format!("Invalid order-bound input oracle: {e}"))
-	})
+	})?;
+
+	if input_oracle.0.iter().all(|byte| *byte == 0) {
+		return Err(SettlementError::ValidationFailed(
+			"Order input oracle is zero; order-bound input oracle is required".to_string(),
+		));
+	}
+
+	Ok(input_oracle)
 }
 
 /// Parse the order-bound output oracle for the given destination chain.
