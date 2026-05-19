@@ -753,8 +753,16 @@ fn parse_scopes(scopes: Option<Vec<String>>) -> Result<Vec<AuthScope>, String> {
 /// Parse scopes for public self-registration flow (admin scope not allowed).
 fn parse_public_scopes(scopes: Option<Vec<String>>) -> Result<Vec<AuthScope>, String> {
 	let scopes = parse_scopes(scopes)?;
-	if scopes.contains(&AuthScope::AdminAll) {
-		return Err("admin-all scope is not allowed on /auth/register".to_string());
+	for scope in &scopes {
+		if !matches!(
+			scope,
+			AuthScope::ReadOrders
+				| AuthScope::CreateOrders
+				| AuthScope::ReadQuotes
+				| AuthScope::CreateQuotes
+		) {
+			return Err(format!("{scope} scope is not allowed on /auth/register"));
+		}
 	}
 	Ok(scopes)
 }
@@ -923,6 +931,16 @@ mod tests {
 		assert!(result
 			.unwrap_err()
 			.contains("admin-all scope is not allowed"));
+	}
+
+	#[test]
+	fn test_parse_public_scopes_rejects_admin_read() {
+		let input = Some(vec!["admin-read".to_string()]);
+		let result = parse_public_scopes(input);
+		assert!(result.is_err());
+		assert!(result
+			.unwrap_err()
+			.contains("admin-read scope is not allowed"));
 	}
 
 	#[test]
@@ -1121,6 +1139,29 @@ mod tests {
 			.as_str()
 			.unwrap()
 			.contains("admin-all scope is not allowed"));
+	}
+
+	#[tokio::test]
+	async fn test_register_client_rejects_admin_read_scope() {
+		let jwt_service = create_test_jwt_service();
+		let request = RegisterRequest {
+			client_id: "test-client".to_string(),
+			client_name: None,
+			scopes: Some(vec!["admin-read".to_string()]),
+		};
+
+		let response =
+			register_client(axum::extract::State(Some(jwt_service)), Json(request)).await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+
+		let json_body = extract_json_from_body(body).await;
+		assert!(json_body["error"]
+			.as_str()
+			.unwrap()
+			.contains("admin-read scope is not allowed"));
 	}
 
 	#[tokio::test]
