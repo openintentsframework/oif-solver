@@ -33,6 +33,11 @@ pub mod utils;
 /// Block-hash pusher for L1→L2 buffer advancement
 pub mod pusher;
 
+/// Shared helpers for decoding order-bound oracle addresses from canonical
+/// EIP-7683 order data.
+mod oracle_binding;
+pub(crate) use oracle_binding::{parse_bound_input_oracle, parse_bound_output_oracle};
+
 /// Errors that can occur during settlement operations.
 #[derive(Debug, Error)]
 pub enum SettlementError {
@@ -751,7 +756,25 @@ impl SettlementService {
 		tx_hash: &TransactionHash,
 	) -> Result<FillProof, SettlementError> {
 		let implementation = self.find_settlement_for_order(order)?;
-		implementation.get_attestation(order, tx_hash).await
+		let proof = implementation.get_attestation(order, tx_hash).await?;
+
+		// Security: every FillProof must carry the order-bound input oracle.
+		// This is the central guard that protects against settlement implementations
+		// that select an oracle from configuration instead of binding to the signed
+		// order (cf. Fix 3, security/input-oracle-binding).
+		let expected = crate::parse_bound_input_oracle(order)?;
+		let actual = solver_types::utils::conversion::parse_address(&proof.oracle_address)
+			.map_err(|e| {
+				SettlementError::ValidationFailed(format!("Invalid FillProof oracle_address: {e}"))
+			})?;
+		if actual != expected {
+			return Err(SettlementError::ValidationFailed(format!(
+				"fill_proof.oracle_address 0x{} does not match order-bound input_oracle 0x{}",
+				alloy_primitives::hex::encode(&actual.0),
+				alloy_primitives::hex::encode(&expected.0),
+			)));
+		}
+		Ok(proof)
 	}
 
 	/// Checks if an order can be claimed using the appropriate settlement implementation.
@@ -1448,5 +1471,87 @@ mod tests {
 				.chain_id,
 			11
 		);
+	}
+
+	// ── Fix 3 Part C: SettlementService::get_attestation guard ─────────────
+
+	fn make_order_with_input_oracle(input_oracle_hex: &str) -> Order {
+		// OrderBuilder defaults already provide valid eip7683 fields; only override
+		// the input_oracle inside the data blob.
+		let mut order = OrderBuilder::new()
+			.with_settlement_name(Some("bound"))
+			.build();
+		let mut data = order.data.as_object().cloned().unwrap();
+		data.insert(
+			"input_oracle".to_string(),
+			serde_json::Value::String(input_oracle_hex.to_string()),
+		);
+		order.data = serde_json::Value::Object(data);
+		order
+	}
+
+	fn fill_proof_with_oracle(oracle_hex: &str) -> FillProof {
+		FillProof {
+			tx_hash: TransactionHash(vec![0xaa; 32]),
+			block_number: 1,
+			attestation_data: None,
+			filled_timestamp: 1,
+			oracle_address: oracle_hex.to_string(),
+		}
+	}
+
+	fn make_service_with_mock(attestation: FillProof) -> SettlementService {
+		let mut settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		settlement.attestation = Some(attestation);
+		SettlementService::new(
+			HashMap::from([(
+				"bound".to_string(),
+				Box::new(settlement) as Box<dyn SettlementInterface>,
+			)]),
+			"bound".to_string(),
+			1,
+		)
+	}
+
+	#[tokio::test]
+	async fn test_get_attestation_rejects_mismatched_fill_proof_oracle() {
+		let canonical_oracle_hex = "0xAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaa";
+		let attacker_oracle_hex = "0xBBbbBBbbBBbbBBbbBBbbBBbbBBbbBBbbBBbbBBbb";
+
+		let order = make_order_with_input_oracle(canonical_oracle_hex);
+		let attesting_proof = fill_proof_with_oracle(attacker_oracle_hex);
+		let service = make_service_with_mock(attesting_proof);
+
+		let tx_hash = TransactionHash(vec![0u8; 32]);
+		let result = service.get_attestation(&order, &tx_hash).await;
+		assert!(
+			matches!(result, Err(SettlementError::ValidationFailed(_))),
+			"expected ValidationFailed; got: {:?}",
+			result.map(|_| "Ok")
+		);
+		if let Err(SettlementError::ValidationFailed(msg)) = result {
+			assert!(
+				msg.contains("does not match order-bound input_oracle"),
+				"unexpected error message: {msg}"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn test_get_attestation_passes_matching_fill_proof_oracle() {
+		let canonical_oracle_hex = "0xAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaaAAaa";
+
+		let order = make_order_with_input_oracle(canonical_oracle_hex);
+		let attesting_proof = fill_proof_with_oracle(canonical_oracle_hex);
+		let service = make_service_with_mock(attesting_proof);
+
+		let tx_hash = TransactionHash(vec![0u8; 32]);
+		let result = service.get_attestation(&order, &tx_hash).await;
+		assert!(result.is_ok(), "expected Ok; got {:?}", result.err());
 	}
 }
