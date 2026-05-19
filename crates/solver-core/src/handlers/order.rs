@@ -148,6 +148,29 @@ impl OrderHandler {
 						"Live tx monitor indeterminate; order left in current status"
 					);
 				},
+				TransactionMonitoringEvent::AttemptLedgerConflict {
+					id,
+					attempt_id,
+					tx_type,
+					tx_hash,
+					attempted_status,
+					error,
+					context,
+				} => {
+					event_bus
+						.publish(SolverEvent::Delivery(
+							DeliveryEvent::TransactionAttemptLedgerConflict {
+								order_id: id,
+								attempt_id,
+								tx_type,
+								tx_hash,
+								attempted_status,
+								error,
+								context: context.to_string(),
+							},
+						))
+						.ok();
+				},
 			});
 
 			let tracking = TransactionTracking {
@@ -190,7 +213,7 @@ impl OrderHandler {
 			self.state_machine
 				.update_order_with(&order.id, |o| {
 					o.status = OrderStatus::Pending;
-					o.prepare_tx_hash = Some(prepare_tx_hash);
+					o.prepare_tx_hash = Some(prepare_tx_hash.clone());
 				})
 				.await
 				.map_err(|e| OrderError::State(e.to_string()))?;
@@ -287,6 +310,29 @@ impl OrderHandler {
 					%reason,
 					"Live tx monitor indeterminate; order left in current status"
 				);
+			},
+			TransactionMonitoringEvent::AttemptLedgerConflict {
+				id,
+				attempt_id,
+				tx_type,
+				tx_hash,
+				attempted_status,
+				error,
+				context,
+			} => {
+				event_bus
+					.publish(SolverEvent::Delivery(
+						DeliveryEvent::TransactionAttemptLedgerConflict {
+							order_id: id,
+							attempt_id,
+							tx_type,
+							tx_hash,
+							attempted_status,
+							error,
+							context: context.to_string(),
+						},
+					))
+					.ok();
 			},
 		});
 
@@ -474,8 +520,9 @@ mod tests {
 				});
 
 				mock_storage
-					.expect_set_bytes()
-					.returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+					.expect_compare_and_swap_with_indexes()
+					.times(1)
+					.returning(|_, _, _, _, _| Box::pin(async { Ok(true) }));
 			},
 		)
 		.await;
@@ -539,8 +586,9 @@ mod tests {
 				});
 
 				mock_storage
-					.expect_set_bytes()
-					.returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+					.expect_compare_and_swap_with_indexes()
+					.times(1)
+					.returning(|_, _, _, _, _| Box::pin(async { Ok(true) }));
 			},
 		)
 		.await;
@@ -732,6 +780,11 @@ mod tests {
 			},
 			|mock_storage| {
 				let order_clone = order_clone.clone();
+				mock_storage
+					.expect_set_bytes()
+					.times(1)
+					.returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+
 				// Mock for state machine storage operations
 				mock_storage
 					.expect_exists()
@@ -743,8 +796,9 @@ mod tests {
 				});
 
 				mock_storage
-					.expect_set_bytes()
-					.returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+					.expect_compare_and_swap_with_indexes()
+					.times(1)
+					.returning(|_, _, _, _, _| Box::pin(async { Ok(true) }));
 			},
 		)
 		.await;

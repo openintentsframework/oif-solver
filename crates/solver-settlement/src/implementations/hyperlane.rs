@@ -1174,10 +1174,15 @@ impl SettlementInterface for HyperlaneSettlement {
 				SettlementError::ValidationFailed(format!("No provider for chain {dest_chain}"))
 			})?;
 
+			let fill_tx_hash = order.fill_tx_hash.as_ref().ok_or_else(|| {
+				SettlementError::ValidationFailed(
+					"Missing fill transaction hash: required for Hyperlane post-fill processing"
+						.to_string(),
+				)
+			})?;
+
 			let fill_receipt = dest_provider
-				.get_transaction_receipt(FixedBytes::<32>::from_slice(
-					&order.fill_tx_hash.as_ref().unwrap().0,
-				))
+				.get_transaction_receipt(FixedBytes::<32>::from_slice(&fill_tx_hash.0))
 				.await
 				.map_err(|e| {
 					SettlementError::ValidationFailed(format!("Failed to get fill receipt: {e}"))

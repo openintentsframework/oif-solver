@@ -16,7 +16,8 @@ use crate::implementations::evm::nonce::{
 };
 use crate::{
 	DeliveryError, DeliveryInterface, FeeParams, InsufficientNativeGasInfo, PlannedAttemptInit,
-	TransactionAttemptRecorder, TransactionMonitoringEvent, TransactionTrackingWithConfig,
+	TransactionAttemptRecorder, TransactionCallback, TransactionMonitoringEvent,
+	TransactionTrackingWithConfig,
 };
 use alloy_consensus::BlockHeader;
 use alloy_network::{BlockResponse, EthereumWallet};
@@ -34,7 +35,7 @@ use solver_account::AccountSigner;
 use solver_types::{
 	Address as SolverAddress, ConfigSchema, Field, FieldType, NetworksConfig, Schema,
 	Transaction as SolverTransaction, TransactionAttempt, TransactionAttemptStatus,
-	TransactionHash, TransactionReceipt,
+	TransactionHash, TransactionReceipt, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -293,7 +294,10 @@ async fn record_planned_attempt(
 
 async fn record_attempt_update_best_effort(
 	recorder: Arc<dyn TransactionAttemptRecorder>,
+	callback: Option<&TransactionCallback>,
+	order_id: &str,
 	attempt_id: String,
+	tx_type: TransactionType,
 	status: TransactionAttemptStatus,
 	tx_hash: Option<TransactionHash>,
 	receipt: Option<TransactionReceipt>,
@@ -301,15 +305,26 @@ async fn record_attempt_update_best_effort(
 	context: &'static str,
 ) {
 	if let Err(err) = recorder
-		.record_attempt_update(&attempt_id, status, tx_hash, receipt, error)
+		.record_attempt_update(&attempt_id, status, tx_hash.clone(), receipt, error)
 		.await
 	{
 		tracing::error!(
-			attempt_id,
+			%attempt_id,
 			%err,
 			context,
 			"Failed to update transaction attempt ledger"
 		);
+		if let Some(callback) = callback {
+			callback(TransactionMonitoringEvent::AttemptLedgerConflict {
+				id: order_id.to_string(),
+				attempt_id,
+				tx_type,
+				tx_hash,
+				attempted_status: status,
+				error: err.to_string(),
+				context,
+			});
+		}
 	}
 }
 
@@ -973,7 +988,10 @@ impl DeliveryInterface for AlloyDelivery {
 				{
 					record_attempt_update_best_effort(
 						tracking.tracking.attempt_recorder.clone(),
+						Some(&tracking.tracking.callback),
+						&tracking.tracking.id,
 						attempt.id.clone(),
+						tracking.tracking.tx_type,
 						TransactionAttemptStatus::Broadcast,
 						Some(TransactionHash(p.tx_hash().0.to_vec())),
 						None,
@@ -996,7 +1014,10 @@ impl DeliveryInterface for AlloyDelivery {
 				{
 					record_attempt_update_best_effort(
 						tracking.tracking.attempt_recorder.clone(),
+						Some(&tracking.tracking.callback),
+						&tracking.tracking.id,
 						attempt.id.clone(),
+						tracking.tracking.tx_type,
 						attempt_status_for_submission_outcome(outcome),
 						None,
 						None,
@@ -1050,7 +1071,10 @@ impl DeliveryInterface for AlloyDelivery {
 								{
 									record_attempt_update_best_effort(
 										tracking.tracking.attempt_recorder.clone(),
+										Some(&tracking.tracking.callback),
+										&tracking.tracking.id,
 										attempt.id.clone(),
+										tracking.tracking.tx_type,
 										TransactionAttemptStatus::Broadcast,
 										Some(TransactionHash(p.tx_hash().0.to_vec())),
 										None,
@@ -1070,7 +1094,10 @@ impl DeliveryInterface for AlloyDelivery {
 								{
 									record_attempt_update_best_effort(
 										tracking.tracking.attempt_recorder.clone(),
+										Some(&tracking.tracking.callback),
+										&tracking.tracking.id,
 										attempt.id.clone(),
+										tracking.tracking.tx_type,
 										attempt_status_for_submission_outcome(retry_outcome),
 										None,
 										None,
@@ -1292,7 +1319,10 @@ impl DeliveryInterface for AlloyDelivery {
 						if let Some(attempt_id) = monitor_attempt_id.clone() {
 							record_attempt_update_best_effort(
 								monitor_attempt_recorder.clone(),
+								Some(&tracking.tracking.callback),
+								&tracking.tracking.id,
 								attempt_id,
+								tracking.tracking.tx_type,
 								TransactionAttemptStatus::Confirmed,
 								Some(tx_hash_clone.clone()),
 								Some(receipt.clone()),
@@ -1316,7 +1346,10 @@ impl DeliveryInterface for AlloyDelivery {
 						if let Some(attempt_id) = monitor_attempt_id.clone() {
 							record_attempt_update_best_effort(
 								monitor_attempt_recorder.clone(),
+								Some(&tracking.tracking.callback),
+								&tracking.tracking.id,
 								attempt_id,
+								tracking.tracking.tx_type,
 								TransactionAttemptStatus::Reverted,
 								Some(tx_hash_clone.clone()),
 								None,
@@ -1337,7 +1370,10 @@ impl DeliveryInterface for AlloyDelivery {
 						if let Some(attempt_id) = monitor_attempt_id.clone() {
 							record_attempt_update_best_effort(
 								monitor_attempt_recorder.clone(),
+								Some(&tracking.tracking.callback),
+								&tracking.tracking.id,
 								attempt_id,
+								tracking.tracking.tx_type,
 								TransactionAttemptStatus::Indeterminate,
 								Some(tx_hash_clone.clone()),
 								None,
@@ -3128,10 +3164,38 @@ mod tests {
 
 	mod callback_tests {
 		use super::*;
-		use crate::TransactionMonitoringEvent;
-		use solver_types::TransactionType;
+		use crate::{
+			PlannedAttemptInit, TransactionAttemptRecorder, TransactionAttemptRecorderError,
+			TransactionCallback, TransactionMonitoringEvent,
+		};
+		use solver_types::{TransactionAttempt, TransactionAttemptStatus, TransactionType};
 		use std::sync::atomic::{AtomicBool, Ordering};
 		use std::sync::Arc;
+
+		struct FailingRecorder;
+
+		#[async_trait::async_trait]
+		impl TransactionAttemptRecorder for FailingRecorder {
+			async fn record_planned_attempt(
+				&self,
+				_init: PlannedAttemptInit,
+			) -> Result<TransactionAttempt, TransactionAttemptRecorderError> {
+				unreachable!("not used by this test")
+			}
+
+			async fn record_attempt_update(
+				&self,
+				_attempt_id: &str,
+				_status: TransactionAttemptStatus,
+				_tx_hash: Option<TransactionHash>,
+				_receipt: Option<TransactionReceipt>,
+				_error: Option<String>,
+			) -> Result<(), TransactionAttemptRecorderError> {
+				Err(TransactionAttemptRecorderError::Storage(
+					"terminal attempt".to_string(),
+				))
+			}
+		}
 
 		/// Test that callback is invoked with Confirmed event
 		#[test]
@@ -3188,6 +3252,63 @@ mod tests {
 
 			assert!(called.load(Ordering::SeqCst));
 			assert_eq!(*error_msg.lock().unwrap(), "Transaction reverted");
+		}
+
+		#[tokio::test]
+		async fn monitor_emits_attempt_ledger_conflict_when_confirmed_update_hits_terminal_row() {
+			let observed = Arc::new(std::sync::Mutex::new(None));
+			let observed_for_callback = observed.clone();
+			let callback: TransactionCallback = Box::new(move |event| {
+				*observed_for_callback.lock().unwrap() = Some(event);
+			});
+			let tx_hash = TransactionHash(vec![0x55; 32]);
+			let receipt = TransactionReceipt {
+				hash: tx_hash.clone(),
+				block_number: 12345,
+				success: true,
+				block_timestamp: Some(1234567890),
+				logs: vec![],
+			};
+
+			record_attempt_update_best_effort(
+				Arc::new(FailingRecorder),
+				Some(&callback),
+				"order-1",
+				"attempt-1".to_string(),
+				TransactionType::Fill,
+				TransactionAttemptStatus::Confirmed,
+				Some(tx_hash.clone()),
+				Some(receipt),
+				None,
+				"monitor_confirmed",
+			)
+			.await;
+
+			let event = observed
+				.lock()
+				.unwrap()
+				.take()
+				.expect("expected conflict callback");
+			match event {
+				TransactionMonitoringEvent::AttemptLedgerConflict {
+					id,
+					attempt_id,
+					tx_type,
+					tx_hash: event_tx_hash,
+					attempted_status,
+					error,
+					context,
+				} => {
+					assert_eq!(id, "order-1");
+					assert_eq!(attempt_id, "attempt-1");
+					assert_eq!(tx_type, TransactionType::Fill);
+					assert_eq!(event_tx_hash, Some(tx_hash));
+					assert_eq!(attempted_status, TransactionAttemptStatus::Confirmed);
+					assert!(error.contains("terminal attempt"));
+					assert_eq!(context, "monitor_confirmed");
+				},
+				other => panic!("expected AttemptLedgerConflict, got {other:?}"),
+			}
 		}
 
 		/// Test TransactionType variants used in monitoring

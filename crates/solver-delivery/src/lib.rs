@@ -399,6 +399,17 @@ pub enum TransactionMonitoringEvent {
 		tx_type: TransactionType,
 		reason: String,
 	},
+	/// Attempt ledger rejected a chain-truth/status write that the delivery
+	/// layer attempted after observing a transaction outcome.
+	AttemptLedgerConflict {
+		id: String,
+		attempt_id: String,
+		tx_type: TransactionType,
+		tx_hash: Option<TransactionHash>,
+		attempted_status: TransactionAttemptStatus,
+		error: String,
+		context: &'static str,
+	},
 }
 
 /// Options for tracking transaction confirmation

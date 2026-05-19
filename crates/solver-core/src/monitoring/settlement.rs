@@ -349,7 +349,7 @@ mod tests {
 				storage
 					.expect_get_bytes()
 					.with(eq("orders:test_order_123"))
-					.times(2) // Only called once for set_fill_proof
+					.times(2)
 					.returning({
 						let order = order.clone();
 						move |_| {
@@ -359,9 +359,9 @@ mod tests {
 					});
 
 				storage
-					.expect_set_bytes()
-					.times(1) // Only called once for set_fill_proof
-					.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+					.expect_compare_and_swap_with_indexes()
+					.times(1)
+					.returning(|_, _, _, _, _| Box::pin(async move { Ok(true) }));
 			},
 			1,
 		)
@@ -470,7 +470,6 @@ mod tests {
 				storage
 					.expect_exists()
 					.with(eq("orders:test_order_123"))
-					.times(1)
 					.returning(|_| Box::pin(async move { Ok(true) }));
 
 				// Mock get_bytes for retrieve operation in set_fill_proof
@@ -486,14 +485,16 @@ mod tests {
 						}
 					});
 
-				// Mock set_bytes to fail (this should cause the storage error)
-				storage.expect_set_bytes().times(1).returning(|_, _, _, _| {
-					Box::pin(async move {
-						Err(solver_storage::StorageError::Serialization(
-							"Test storage error".to_string(),
-						))
-					})
-				});
+				storage
+					.expect_compare_and_swap_with_indexes()
+					.times(1)
+					.returning(|_, _, _, _, _| {
+						Box::pin(async move {
+							Err(solver_storage::StorageError::Serialization(
+								"Test storage error".to_string(),
+							))
+						})
+					});
 			},
 			1,
 		)
@@ -566,9 +567,9 @@ mod tests {
 						}
 					});
 				storage
-					.expect_set_bytes()
+					.expect_compare_and_swap_with_indexes()
 					.times(1)
-					.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+					.returning(|_, _, _, _, _| Box::pin(async move { Ok(true) }));
 			},
 			1,
 		)
@@ -655,9 +656,9 @@ mod tests {
 						}
 					});
 				storage
-					.expect_set_bytes()
+					.expect_compare_and_swap_with_indexes()
 					.times(1)
-					.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+					.returning(|_, _, _, _, _| Box::pin(async move { Ok(true) }));
 			},
 			1,
 		)

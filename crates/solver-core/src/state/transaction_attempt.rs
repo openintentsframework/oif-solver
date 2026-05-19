@@ -253,6 +253,24 @@ impl TransactionAttemptStore {
 			attempt_id.to_string(),
 		))
 	}
+
+	pub async fn mark_attempt_confirmed_from_receipt(
+		&self,
+		attempt_id: &str,
+		tx_hash: TransactionHash,
+		receipt: TransactionReceipt,
+	) -> Result<TransactionAttempt, TransactionAttemptStoreError> {
+		self.update_attempt_status(
+			attempt_id,
+			TransactionAttemptStatus::Confirmed,
+			None,
+			|attempt| {
+				attempt.tx_hash = Some(tx_hash.clone());
+				attempt.receipt = Some(receipt.clone());
+			},
+		)
+		.await
+	}
 }
 
 #[async_trait::async_trait]

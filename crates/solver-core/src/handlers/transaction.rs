@@ -31,6 +31,26 @@ pub enum TransactionError {
 	Service(String),
 }
 
+fn stage_hash(order: &Order, tx_type: TransactionType) -> Option<&TransactionHash> {
+	match tx_type {
+		TransactionType::Prepare => order.prepare_tx_hash.as_ref(),
+		TransactionType::Fill => order.fill_tx_hash.as_ref(),
+		TransactionType::PostFill => order.post_fill_tx_hash.as_ref(),
+		TransactionType::PreClaim => order.pre_claim_tx_hash.as_ref(),
+		TransactionType::Claim => order.claim_tx_hash.as_ref(),
+	}
+}
+
+fn set_stage_hash(order: &mut Order, tx_type: TransactionType, tx_hash: TransactionHash) {
+	match tx_type {
+		TransactionType::Prepare => order.prepare_tx_hash = Some(tx_hash),
+		TransactionType::Fill => order.fill_tx_hash = Some(tx_hash),
+		TransactionType::PostFill => order.post_fill_tx_hash = Some(tx_hash),
+		TransactionType::PreClaim => order.pre_claim_tx_hash = Some(tx_hash),
+		TransactionType::Claim => order.claim_tx_hash = Some(tx_hash),
+	}
+}
+
 /// Handler for managing blockchain transaction lifecycle.
 ///
 /// The TransactionHandler manages transaction confirmations, failures,
@@ -56,6 +76,59 @@ impl TransactionHandler {
 			state_machine,
 			settlement,
 			event_bus,
+		}
+	}
+
+	async fn reconcile_already_applied_stage_hash(
+		&self,
+		order_id: &str,
+		tx_type: TransactionType,
+		observed_hash: &TransactionHash,
+		order: &Order,
+	) -> Result<(), TransactionError> {
+		match stage_hash(order, tx_type) {
+			Some(stored_hash) if stored_hash == observed_hash => Ok(()),
+			Some(stored_hash) => {
+				self.event_bus
+					.publish(SolverEvent::Delivery(
+						DeliveryEvent::TransactionCanonicalHashConflict {
+							order_id: order_id.to_string(),
+							tx_type,
+							stored_hash: stored_hash.clone(),
+							observed_hash: observed_hash.clone(),
+						},
+					))
+					.ok();
+				Ok(())
+			},
+			None => {
+				let repair_hash = observed_hash.clone();
+				let updated = self
+					.state_machine
+					.update_order_with(order_id, |order| {
+						if stage_hash(order, tx_type).is_none() {
+							set_stage_hash(order, tx_type, repair_hash.clone());
+						}
+					})
+					.await
+					.map_err(|e| TransactionError::State(e.to_string()))?;
+
+				if let Some(stored_hash) = stage_hash(&updated, tx_type) {
+					if stored_hash != observed_hash {
+						self.event_bus
+							.publish(SolverEvent::Delivery(
+								DeliveryEvent::TransactionCanonicalHashConflict {
+									order_id: order_id.to_string(),
+									tx_type,
+									stored_hash: stored_hash.clone(),
+									observed_hash: observed_hash.clone(),
+								},
+							))
+							.ok();
+					}
+				}
+				Ok(())
+			},
 		}
 	}
 
@@ -160,7 +233,7 @@ impl TransactionHandler {
 	/// to trigger the fill transaction.
 	async fn handle_prepare_confirmed(
 		&self,
-		_tx_hash: TransactionHash,
+		_: TransactionHash,
 		order: Order,
 	) -> Result<(), TransactionError> {
 		// Extract execution params
@@ -190,15 +263,18 @@ impl TransactionHandler {
 	/// a same-nonce lineage does not double-publish PostFillReady.
 	async fn handle_fill_confirmed(
 		&self,
-		_tx_hash: TransactionHash,
+		tx_hash: TransactionHash,
 		order: Order,
 	) -> Result<(), TransactionError> {
 		let order_id = order.id;
 
 		// Update status from Executing to Executed (fill completed).
+		let tx_hash_for_update = tx_hash.clone();
 		let outcome = self
 			.state_machine
-			.try_transition_order_status(&order_id, OrderStatus::Executed)
+			.try_transition_order_status(&order_id, OrderStatus::Executed, move |o| {
+				o.fill_tx_hash = Some(tx_hash_for_update.clone());
+			})
 			.await
 			.map_err(|e| TransactionError::State(e.to_string()))?;
 
@@ -210,6 +286,13 @@ impl TransactionHandler {
 				}))
 				.ok();
 		} else {
+			self.reconcile_already_applied_stage_hash(
+				&order_id,
+				TransactionType::Fill,
+				&tx_hash,
+				outcome.order(),
+			)
+			.await?;
 			tracing::debug!(
 				order_id = %truncate_id(&order_id),
 				"fill confirmation: order already at/past Executed; skipping PostFillReady"
@@ -227,15 +310,18 @@ impl TransactionHandler {
 	/// lineage does not double-publish StartMonitoring.
 	async fn handle_post_fill_confirmed(
 		&self,
-		_tx_hash: TransactionHash,
+		tx_hash: TransactionHash,
 		order: Order,
 	) -> Result<(), TransactionError> {
 		let order_id = order.id;
 
 		// Update status to PostFilled.
+		let tx_hash_for_update = tx_hash.clone();
 		let outcome = self
 			.state_machine
-			.try_transition_order_status(&order_id, OrderStatus::PostFilled)
+			.try_transition_order_status(&order_id, OrderStatus::PostFilled, move |o| {
+				o.post_fill_tx_hash = Some(tx_hash_for_update.clone());
+			})
 			.await
 			.map_err(|e| TransactionError::State(e.to_string()))?;
 
@@ -253,6 +339,13 @@ impl TransactionHandler {
 				}))
 				.ok();
 		} else {
+			self.reconcile_already_applied_stage_hash(
+				&order_id,
+				TransactionType::PostFill,
+				&tx_hash,
+				outcome.order(),
+			)
+			.await?;
 			tracing::debug!(
 				order_id = %truncate_id(&order_id),
 				"post-fill confirmation: order already at/past PostFilled; skipping StartMonitoring"
@@ -270,14 +363,17 @@ impl TransactionHandler {
 	/// lineage does not double-publish ClaimReady.
 	async fn handle_pre_claim_confirmed(
 		&self,
-		_tx_hash: TransactionHash,
+		tx_hash: TransactionHash,
 		order: Order,
 	) -> Result<(), TransactionError> {
 		let order_id = order.id;
 		// Update status from Settled to PreClaimed.
+		let tx_hash_for_update = tx_hash.clone();
 		let outcome = self
 			.state_machine
-			.try_transition_order_status(&order_id, OrderStatus::PreClaimed)
+			.try_transition_order_status(&order_id, OrderStatus::PreClaimed, move |o| {
+				o.pre_claim_tx_hash = Some(tx_hash_for_update.clone());
+			})
 			.await
 			.map_err(|e| TransactionError::State(e.to_string()))?;
 
@@ -289,6 +385,13 @@ impl TransactionHandler {
 				}))
 				.ok();
 		} else {
+			self.reconcile_already_applied_stage_hash(
+				&order_id,
+				TransactionType::PreClaim,
+				&tx_hash,
+				outcome.order(),
+			)
+			.await?;
 			tracing::debug!(
 				order_id = %truncate_id(&order_id),
 				"pre-claim confirmation: order already at/past PreClaimed; skipping ClaimReady"
@@ -316,23 +419,16 @@ impl TransactionHandler {
 		// claim_tx_hash write only when the transition fires so duplicate
 		// confirmations from same-nonce lineages don't overwrite the
 		// canonical claim hash recorded on the first Confirmed.
+		let tx_hash_for_update = tx_hash.clone();
 		let outcome = self
 			.state_machine
-			.try_transition_order_status(&order_id, OrderStatus::Finalized)
+			.try_transition_order_status(&order_id, OrderStatus::Finalized, move |o| {
+				o.claim_tx_hash = Some(tx_hash_for_update.clone());
+			})
 			.await
 			.map_err(|e| TransactionError::State(e.to_string()))?;
 
 		if outcome.applied() {
-			// Record the claim transaction hash now that we've taken ownership
-			// of the Finalized transition.
-			let tx_hash_for_update = tx_hash.clone();
-			self.state_machine
-				.update_order_with(&order_id, move |o| {
-					o.claim_tx_hash = Some(tx_hash_for_update);
-				})
-				.await
-				.map_err(|e| TransactionError::State(e.to_string()))?;
-
 			// Publish completed event
 			self.event_bus
 				.publish(SolverEvent::Settlement(
@@ -340,6 +436,13 @@ impl TransactionHandler {
 				))
 				.ok();
 		} else {
+			self.reconcile_already_applied_stage_hash(
+				&order_id,
+				TransactionType::Claim,
+				&tx_hash,
+				outcome.order(),
+			)
+			.await?;
 			tracing::debug!(
 				order_id = %truncate_id(&order_id),
 				"claim confirmation: order already at/past Finalized; skipping Completed"
@@ -423,6 +526,31 @@ mod tests {
 		(handler, receiver)
 	}
 
+	async fn create_memory_handler_with_order(
+		order: Order,
+	) -> (
+		TransactionHandler,
+		broadcast::Receiver<SolverEvent>,
+		Arc<OrderStateMachine>,
+	) {
+		let storage_impl = solver_storage::implementations::memory::MemoryStorage::new();
+		let storage = Arc::new(StorageService::new(Box::new(storage_impl)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let receiver = event_bus.subscribe();
+
+		state_machine.store_order(&order).await.unwrap();
+
+		let handler = TransactionHandler::new(
+			storage,
+			state_machine.clone(),
+			Arc::new(SettlementService::new(HashMap::new(), String::new(), 20)),
+			event_bus,
+		);
+
+		(handler, receiver, state_machine)
+	}
+
 	#[tokio::test]
 	async fn test_handle_confirmed_with_failed_receipt() {
 		// No storage mock needed since failed receipts return early
@@ -463,56 +591,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_handle_prepare_confirmed() {
-		let (handler, mut receiver) = create_test_handler_with_mocks(|storage| {
-			// Track whether we've updated the order
-			use std::sync::{Arc, Mutex};
-			let updated_order_bytes: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-			let updated_order_bytes_clone = updated_order_bytes.clone();
-
-			// Mock the retrieve call for getting the order
-			storage
-				.expect_get_bytes()
-				.with(eq("orders:test_order_123".to_string()))
-				.times(4) // Called: handle_confirmed (1x), transition_order_status (2x), get_order final check (1x)
-				.returning(move |_| {
-					// Check if we have an updated version saved
-					let updated = updated_order_bytes_clone.lock().unwrap();
-					if let Some(bytes) = updated.as_ref() {
-						let bytes = bytes.clone();
-						Box::pin(async move { Ok(bytes) })
-					} else {
-						// Return initial order before update
-						let order = create_test_order(true);
-						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
-					}
-				});
-
-			// Mock exists check for transition_order_status
-			storage
-				.expect_exists()
-				.with(eq("orders:test_order_123"))
-				.times(1)
-				.returning(|_| Box::pin(async move { Ok(true) }));
-
-			// Mock set_bytes for store_order (initial) and transition_order_status
-			storage
-				.expect_set_bytes()
-				.times(2)
-				.returning(move |_, bytes, _, _| {
-					// Store the updated order bytes
-					*updated_order_bytes.lock().unwrap() = Some(bytes.to_vec());
-					Box::pin(async move { Ok(()) })
-				});
-		})
-		.await;
-
-		// Store the order in state machine first
 		let order_for_state = create_test_order(true);
-		handler
-			.state_machine
-			.store_order(&order_for_state)
-			.await
-			.unwrap();
+		let (handler, mut receiver, state_machine) =
+			create_memory_handler_with_order(order_for_state.clone()).await;
 
 		let receipt = create_test_receipt(true);
 
@@ -538,11 +619,7 @@ mod tests {
 		}
 
 		// Verify order status was updated to Executing
-		let updated_order = handler
-			.state_machine
-			.get_order(&order_for_state.id)
-			.await
-			.unwrap();
+		let updated_order = state_machine.get_order(&order_for_state.id).await.unwrap();
 		assert_eq!(updated_order.status, OrderStatus::Executing);
 	}
 
@@ -586,7 +663,6 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_handle_fill_confirmed() {
-		// Create order with Executing status since fill confirmation transitions to Executed
 		let order = OrderBuilder::new()
 			.with_status(OrderStatus::Executing)
 			.with_execution_params(Some(ExecutionParams {
@@ -595,47 +671,15 @@ mod tests {
 			}))
 			.with_fill_tx_hash(Some(TransactionHash(vec![0xab; 32])))
 			.build();
-
+		let tx_hash = create_test_receipt(true).hash;
 		let receipt = create_test_receipt(true);
-
-		let (handler, mut receiver) = create_test_handler_with_mocks(|storage| {
-			// Mock the retrieve call for getting the order by order ID
-			storage
-				.expect_get_bytes()
-				.with(eq("orders:test_order_123"))
-				.times(4) // Called 3 times: handle_confirmed, transition_order_status, update_order_with
-				.returning(|_| {
-					// Return order with Executing status to match the valid transition
-					let order = OrderBuilder::new()
-						.with_status(OrderStatus::Executing)
-						.with_execution_params(Some(ExecutionParams {
-							gas_price: U256::from(20_000_000_000u64),
-							priority_fee: Some(U256::from(1_000_000_000u64)),
-						}))
-						.with_fill_tx_hash(Some(TransactionHash(vec![0xab; 32])))
-						.build();
-					Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
-				});
-
-			// Mock exists check for state transition
-			storage
-				.expect_exists()
-				.with(eq("orders:test_order_123"))
-				.times(1)
-				.returning(|_| Box::pin(async move { Ok(true) }));
-
-			// Mock set_bytes for state transition update (called twice: initial store + update)
-			storage
-				.expect_set_bytes()
-				.times(1)
-				.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
-		})
-		.await;
+		let (handler, mut receiver, state_machine) =
+			create_memory_handler_with_order(order.clone()).await;
 
 		let result = handler
 			.handle_confirmed(
 				"test_order_123".to_string(),
-				receipt.hash.clone(),
+				tx_hash.clone(),
 				TransactionType::Fill,
 				receipt,
 			)
@@ -652,75 +696,221 @@ mod tests {
 			_ => panic!("Expected PostFillReady event, got: {event:?}"),
 		}
 
-		// Verify order status was updated to Executed by checking the state machine
-		let updated_order = handler.state_machine.get_order(&order.id).await.unwrap();
-		assert_eq!(updated_order.status, OrderStatus::Executing);
+		let updated_order = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(updated_order.status, OrderStatus::Executed);
+		assert_eq!(updated_order.fill_tx_hash, Some(tx_hash));
+	}
+
+	#[tokio::test]
+	async fn fill_confirmed_writes_status_and_hash_in_one_persisted_order() {
+		let order = OrderBuilder::new()
+			.with_status(OrderStatus::Executing)
+			.with_execution_params(Some(ExecutionParams {
+				gas_price: U256::from(20_000_000_000u64),
+				priority_fee: Some(U256::from(1_000_000_000u64)),
+			}))
+			.build();
+		let tx_hash = TransactionHash(vec![0x33; 32]);
+		let (handler, mut receiver, state_machine) =
+			create_memory_handler_with_order(order.clone()).await;
+
+		handler
+			.handle_confirmed(
+				order.id.clone(),
+				tx_hash.clone(),
+				TransactionType::Fill,
+				create_test_receipt(true),
+			)
+			.await
+			.unwrap();
+
+		let updated_order = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(updated_order.status, OrderStatus::Executed);
+		assert_eq!(updated_order.fill_tx_hash, Some(tx_hash));
+		let events = drain_events(&mut receiver);
+		assert_eq!(
+			events
+				.iter()
+				.filter(|event| matches!(
+					event,
+					SolverEvent::Settlement(SettlementEvent::PostFillReady { .. })
+				))
+				.count(),
+			1
+		);
+		assert_eq!(
+			events
+				.iter()
+				.filter(|event| matches!(
+					event,
+					SolverEvent::Delivery(DeliveryEvent::TransactionCanonicalHashConflict { .. })
+				))
+				.count(),
+			0
+		);
+	}
+
+	#[tokio::test]
+	async fn fill_confirmed_replaces_parent_hash_without_conflict_event() {
+		let parent_hash = TransactionHash(vec![0x11; 32]);
+		let child_hash = TransactionHash(vec![0x33; 32]);
+		let order = OrderBuilder::new()
+			.with_status(OrderStatus::Executing)
+			.with_fill_tx_hash(Some(parent_hash))
+			.with_execution_params(Some(ExecutionParams {
+				gas_price: U256::from(20_000_000_000u64),
+				priority_fee: Some(U256::from(1_000_000_000u64)),
+			}))
+			.build();
+		let (handler, mut receiver, state_machine) =
+			create_memory_handler_with_order(order.clone()).await;
+
+		handler
+			.handle_confirmed(
+				order.id.clone(),
+				child_hash.clone(),
+				TransactionType::Fill,
+				create_test_receipt(true),
+			)
+			.await
+			.unwrap();
+
+		let updated_order = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(updated_order.status, OrderStatus::Executed);
+		assert_eq!(updated_order.fill_tx_hash, Some(child_hash));
+		let events = drain_events(&mut receiver);
+		assert_eq!(
+			events
+				.iter()
+				.filter(|event| matches!(
+					event,
+					SolverEvent::Settlement(SettlementEvent::PostFillReady { .. })
+				))
+				.count(),
+			1
+		);
+		assert_eq!(
+			events
+				.iter()
+				.filter(|event| matches!(
+					event,
+					SolverEvent::Delivery(DeliveryEvent::TransactionCanonicalHashConflict { .. })
+				))
+				.count(),
+			0
+		);
+	}
+
+	#[tokio::test]
+	async fn duplicate_fill_confirmed_repairs_missing_hash_without_republishing() {
+		let tx_hash = TransactionHash(vec![0x33; 32]);
+		let order = OrderBuilder::new()
+			.with_status(OrderStatus::Executed)
+			.with_fill_tx_hash(None)
+			.build();
+		let (handler, mut receiver, state_machine) =
+			create_memory_handler_with_order(order.clone()).await;
+
+		handler
+			.handle_confirmed(
+				order.id.clone(),
+				tx_hash.clone(),
+				TransactionType::Fill,
+				create_test_receipt(true),
+			)
+			.await
+			.unwrap();
+
+		let updated_order = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(updated_order.status, OrderStatus::Executed);
+		assert_eq!(updated_order.fill_tx_hash, Some(tx_hash));
+		let events = drain_events(&mut receiver);
+		assert_eq!(
+			events
+				.iter()
+				.filter(|event| matches!(
+					event,
+					SolverEvent::Settlement(SettlementEvent::PostFillReady { .. })
+				))
+				.count(),
+			0
+		);
+	}
+
+	#[tokio::test]
+	async fn duplicate_fill_confirmed_with_different_hash_emits_canonical_hash_conflict() {
+		let stored_hash = TransactionHash(vec![0x33; 32]);
+		let observed_hash = TransactionHash(vec![0x44; 32]);
+		let order = OrderBuilder::new()
+			.with_status(OrderStatus::Executed)
+			.with_fill_tx_hash(Some(stored_hash.clone()))
+			.build();
+		let (handler, mut receiver, state_machine) =
+			create_memory_handler_with_order(order.clone()).await;
+
+		handler
+			.handle_confirmed(
+				order.id.clone(),
+				observed_hash.clone(),
+				TransactionType::Fill,
+				create_test_receipt(true),
+			)
+			.await
+			.unwrap();
+
+		let updated_order = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(updated_order.fill_tx_hash, Some(stored_hash.clone()));
+		let events = drain_events(&mut receiver);
+		assert_eq!(
+			events
+				.iter()
+				.filter(|event| matches!(
+					event,
+					SolverEvent::Settlement(SettlementEvent::PostFillReady { .. })
+				))
+				.count(),
+			0
+		);
+		let conflicts = events
+			.iter()
+			.filter(|event| {
+				matches!(
+					event,
+					SolverEvent::Delivery(DeliveryEvent::TransactionCanonicalHashConflict { .. })
+				)
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(conflicts.len(), 1);
+		match conflicts[0] {
+			SolverEvent::Delivery(DeliveryEvent::TransactionCanonicalHashConflict {
+				order_id,
+				tx_type,
+				stored_hash: event_stored_hash,
+				observed_hash: event_observed_hash,
+			}) => {
+				assert_eq!(order_id, &order.id);
+				assert_eq!(*tx_type, TransactionType::Fill);
+				assert_eq!(event_stored_hash, &stored_hash);
+				assert_eq!(event_observed_hash, &observed_hash);
+			},
+			other => panic!("expected TransactionCanonicalHashConflict, got {other:?}"),
+		}
 	}
 
 	#[tokio::test]
 	async fn test_handle_post_fill_confirmed() {
-		let order = create_test_order(true);
+		let mut order = create_test_order(true);
+		order.status = OrderStatus::Executed;
 		let tx_hash = create_test_tx_hash();
-
-		let (handler, mut receiver) = create_test_handler_with_mocks(|storage| {
-			// Track whether we've updated the order
-			use std::sync::{Arc, Mutex};
-			let updated_order_bytes: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-			let updated_order_bytes_clone = updated_order_bytes.clone();
-
-			// Mock the retrieve call for getting the order by order ID
-			storage
-				.expect_get_bytes()
-				.with(eq("orders:test_order_123"))
-				.times(4) // Called: handle_confirmed (1x), transition_order_status (2x), get_order final check (1x)
-				.returning(move |_| {
-					// Check if we have an updated version saved
-					let updated = updated_order_bytes_clone.lock().unwrap();
-					if let Some(bytes) = updated.as_ref() {
-						let bytes = bytes.clone();
-						Box::pin(async move { Ok(bytes) })
-					} else {
-						// Return initial order with Executed status (required for PostFill transition)
-						let mut order = create_test_order(true);
-						order.status = OrderStatus::Executed;
-						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
-					}
-				});
-
-			// Mock exists check for state transition
-			storage
-				.expect_exists()
-				.with(eq("orders:test_order_123"))
-				.times(1)
-				.returning(|_| Box::pin(async move { Ok(true) }));
-
-			// Mock set_bytes for store_order (initial) and state transition update
-			storage
-				.expect_set_bytes()
-				.times(2)
-				.returning(move |_, bytes, _, _| {
-					// Store the updated order bytes
-					*updated_order_bytes.lock().unwrap() = Some(bytes.to_vec());
-					Box::pin(async move { Ok(()) })
-				});
-		})
-		.await;
-
-		// Store the order in state machine first with Executed status (required for PostFill transition)
-		let mut order_for_state = order.clone();
-		order_for_state.status = OrderStatus::Executed;
-		handler
-			.state_machine
-			.store_order(&order_for_state)
-			.await
-			.unwrap();
+		let (handler, mut receiver, state_machine) =
+			create_memory_handler_with_order(order.clone()).await;
 
 		let receipt = create_test_receipt(true);
 
 		let result = handler
 			.handle_confirmed(
 				"test_order_123".to_string(),
-				tx_hash,
+				tx_hash.clone(),
 				TransactionType::PostFill,
 				receipt,
 			)
@@ -742,69 +932,18 @@ mod tests {
 		}
 
 		// Verify order status was updated to PostFilled
-		let updated_order = handler.state_machine.get_order(&order.id).await.unwrap();
+		let updated_order = state_machine.get_order(&order.id).await.unwrap();
 		assert_eq!(updated_order.status, OrderStatus::PostFilled);
+		assert_eq!(updated_order.post_fill_tx_hash, Some(tx_hash));
 	}
 
 	#[tokio::test]
 	async fn test_handle_post_fill_confirmed_missing_fill_tx_hash() {
 		let mut order = create_test_order(true);
 		order.fill_tx_hash = None; // Remove fill tx hash
+		order.status = OrderStatus::Executed;
 		let tx_hash = create_test_tx_hash();
-
-		let (handler, _) = create_test_handler_with_mocks(|storage| {
-			// Track whether we've updated the order
-			use std::sync::{Arc, Mutex};
-			let updated_order_bytes: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-			let updated_order_bytes_clone = updated_order_bytes.clone();
-
-			// Mock the retrieve call for getting the order by order ID
-			storage
-				.expect_get_bytes()
-				.with(eq("orders:test_order_123"))
-				.times(3) // Called: handle_confirmed (1x), transition_order_status (2x) - fails before final get
-				.returning(move |_| {
-					// Check if we have an updated version saved
-					let updated = updated_order_bytes_clone.lock().unwrap();
-					if let Some(bytes) = updated.as_ref() {
-						let bytes = bytes.clone();
-						Box::pin(async move { Ok(bytes) })
-					} else {
-						// Return order with Executed status but missing fill_tx_hash
-						let mut order = create_test_order(true);
-						order.fill_tx_hash = None;
-						order.status = OrderStatus::Executed;
-						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
-					}
-				});
-
-			// Mock exists check for state transition
-			storage
-				.expect_exists()
-				.with(eq("orders:test_order_123"))
-				.times(1)
-				.returning(|_| Box::pin(async move { Ok(true) }));
-
-			// Mock set_bytes for store_order (initial) and state transition
-			storage
-				.expect_set_bytes()
-				.times(2)
-				.returning(move |_, bytes, _, _| {
-					// Store the updated order bytes
-					*updated_order_bytes.lock().unwrap() = Some(bytes.to_vec());
-					Box::pin(async move { Ok(()) })
-				});
-		})
-		.await;
-
-		// Store the order in state machine first with Executed status
-		let mut order_for_state = order.clone();
-		order_for_state.status = OrderStatus::Executed;
-		handler
-			.state_machine
-			.store_order(&order_for_state)
-			.await
-			.unwrap();
+		let (handler, _, _state_machine) = create_memory_handler_with_order(order).await;
 
 		let receipt = create_test_receipt(true);
 
@@ -829,59 +968,10 @@ mod tests {
 	#[tokio::test]
 	async fn test_handle_pre_claim_confirmed() {
 		let tx_hash = create_test_tx_hash();
-
-		let (handler, mut receiver) = create_test_handler_with_mocks(|storage| {
-			// Track whether we've updated the order
-			use std::sync::{Arc, Mutex};
-			let updated_order_bytes: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-			let updated_order_bytes_clone = updated_order_bytes.clone();
-
-			// Mock the retrieve call for getting the order by order ID
-			storage
-				.expect_get_bytes()
-				.with(eq("orders:test_order_123"))
-				.times(4) // Called: handle_confirmed (1x), transition_order_status (2x), get_order final check (1x)
-				.returning(move |_| {
-					// Check if we have an updated version saved
-					let updated = updated_order_bytes_clone.lock().unwrap();
-					if let Some(bytes) = updated.as_ref() {
-						let bytes = bytes.clone();
-						Box::pin(async move { Ok(bytes) })
-					} else {
-						// Return initial order with Settled status (required for PreClaim transition)
-						let mut order = create_test_order(true);
-						order.status = OrderStatus::Settled;
-						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
-					}
-				});
-
-			// Mock exists check for state transition
-			storage
-				.expect_exists()
-				.with(eq("orders:test_order_123"))
-				.times(1)
-				.returning(|_| Box::pin(async move { Ok(true) }));
-
-			// Mock set_bytes for store_order (initial) and state transition update
-			storage
-				.expect_set_bytes()
-				.times(2)
-				.returning(move |_, bytes, _, _| {
-					// Store the updated order bytes
-					*updated_order_bytes.lock().unwrap() = Some(bytes.to_vec());
-					Box::pin(async move { Ok(()) })
-				});
-		})
-		.await;
-
-		// Store the order in state machine first with Settled status (required for PreClaim transition)
 		let mut order_for_state = create_test_order(true);
 		order_for_state.status = OrderStatus::Settled;
-		handler
-			.state_machine
-			.store_order(&order_for_state)
-			.await
-			.unwrap();
+		let (handler, mut receiver, state_machine) =
+			create_memory_handler_with_order(order_for_state.clone()).await;
 
 		let receipt = create_test_receipt(true);
 
@@ -906,68 +996,18 @@ mod tests {
 		}
 
 		// Verify order status was updated to PreClaimed
-		let updated_order = handler
-			.state_machine
-			.get_order(&order_for_state.id)
-			.await
-			.unwrap();
+		let updated_order = state_machine.get_order(&order_for_state.id).await.unwrap();
 		assert_eq!(updated_order.status, OrderStatus::PreClaimed);
+		assert_eq!(updated_order.pre_claim_tx_hash, Some(tx_hash));
 	}
 
 	#[tokio::test]
 	async fn test_handle_claim_confirmed() {
 		let tx_hash = create_test_tx_hash();
-
-		let (handler, mut receiver) = create_test_handler_with_mocks(|storage| {
-			// Track whether we've saved the finalized order
-			use std::sync::{Arc, Mutex};
-			let finalized_order_bytes: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-			let finalized_order_bytes_clone = finalized_order_bytes.clone();
-
-			// Mock the retrieve call for getting the order by order ID.
-			// handle_claim_confirmed performs:
-			//   handle_confirmed retrieve (1x)
-			//   try_transition_order_status → retrieve + update_order_with retrieve (2x)
-			//   update_order_with for claim_tx_hash → retrieve (1x)
-			//   final state_machine.get_order assertion (1x)
-			// = 5 retrieves total.
-			storage
-				.expect_get_bytes()
-				.with(eq("orders:test_order_123"))
-				.times(5)
-				.returning(move |_| {
-					// Check if we have a finalized version saved
-					let finalized = finalized_order_bytes_clone.lock().unwrap();
-					if let Some(bytes) = finalized.as_ref() {
-						let bytes = bytes.clone();
-						Box::pin(async move { Ok(bytes) })
-					} else {
-						// Return PreClaimed order before update
-						let mut order = create_test_order(true);
-						order.status = OrderStatus::PreClaimed;
-						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
-					}
-				});
-
-			// Mock exists check for both update_order_with calls
-			// (one inside try_transition_order_status, one for claim_tx_hash).
-			storage
-				.expect_exists()
-				.with(eq("orders:test_order_123"))
-				.times(2)
-				.returning(|_| Box::pin(async move { Ok(true) }));
-
-			// Mock set_bytes: one for status transition, one for claim_tx_hash.
-			storage
-				.expect_set_bytes()
-				.times(2)
-				.returning(move |_, bytes, _, _| {
-					// Store the latest order bytes
-					*finalized_order_bytes.lock().unwrap() = Some(bytes.to_vec());
-					Box::pin(async move { Ok(()) })
-				});
-		})
-		.await;
+		let mut order_for_state = create_test_order(true);
+		order_for_state.status = OrderStatus::PreClaimed;
+		let (handler, mut receiver, state_machine) =
+			create_memory_handler_with_order(order_for_state.clone()).await;
 
 		let receipt = create_test_receipt(true);
 
@@ -992,67 +1032,16 @@ mod tests {
 		}
 
 		// Verify order status was updated to Finalized and claim_tx_hash was set
-		let updated_order = handler
-			.state_machine
-			.get_order("test_order_123")
-			.await
-			.unwrap();
+		let updated_order = state_machine.get_order("test_order_123").await.unwrap();
 		assert_eq!(updated_order.status, OrderStatus::Finalized);
 		assert_eq!(updated_order.claim_tx_hash, Some(tx_hash));
 	}
 
 	#[tokio::test]
 	async fn test_handle_failed_transaction() {
-		let (handler, _) = create_test_handler_with_mocks(|storage| {
-			// Track whether we've updated the order
-			use std::sync::{Arc, Mutex};
-			let updated_order_bytes: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
-			let updated_order_bytes_clone = updated_order_bytes.clone();
-
-			// Mock get_bytes for transition_order_status and final get_order
-			storage
-				.expect_get_bytes()
-				.with(eq("orders:test_order_123"))
-				.times(3) // Called: transition (2x), final get_order (1x)
-				.returning(move |_| {
-					// Check if we have an updated version saved
-					let updated = updated_order_bytes_clone.lock().unwrap();
-					if let Some(bytes) = updated.as_ref() {
-						let bytes = bytes.clone();
-						Box::pin(async move { Ok(bytes) })
-					} else {
-						// Return initial order
-						let order = create_test_order(true);
-						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
-					}
-				});
-
-			// Mock exists check for transition_order_status
-			storage
-				.expect_exists()
-				.with(eq("orders:test_order_123"))
-				.times(1)
-				.returning(|_| Box::pin(async move { Ok(true) }));
-
-			// Mock set_bytes for store_order and transition_order_status
-			storage
-				.expect_set_bytes()
-				.times(2)
-				.returning(move |_, bytes, _, _| {
-					// Store the updated order bytes
-					*updated_order_bytes.lock().unwrap() = Some(bytes.to_vec());
-					Box::pin(async move { Ok(()) })
-				});
-		})
-		.await;
-
-		// Store the order in state machine first
 		let order_for_state = create_test_order(true);
-		handler
-			.state_machine
-			.store_order(&order_for_state)
-			.await
-			.unwrap();
+		let (handler, _, state_machine) =
+			create_memory_handler_with_order(order_for_state.clone()).await;
 
 		let result = handler
 			.handle_failed(
@@ -1066,11 +1055,7 @@ mod tests {
 		assert!(result.is_ok());
 
 		// Verify order status was updated to Failed
-		let updated_order = handler
-			.state_machine
-			.get_order(&order_for_state.id)
-			.await
-			.unwrap();
+		let updated_order = state_machine.get_order(&order_for_state.id).await.unwrap();
 		assert_eq!(
 			updated_order.status,
 			OrderStatus::Failed(TransactionType::Fill, "Gas limit exceeded".to_string())
@@ -1126,6 +1111,14 @@ mod tests {
 			}
 		}
 		count
+	}
+
+	fn drain_events(sub: &mut tokio::sync::broadcast::Receiver<SolverEvent>) -> Vec<SolverEvent> {
+		let mut events = Vec::new();
+		while let Ok(ev) = sub.try_recv() {
+			events.push(ev);
+		}
+		events
 	}
 
 	/// Regression test: a duplicate `Confirmed` callback arriving from a

@@ -163,6 +163,25 @@ pub trait OrderParsable: Send + Sync {
 	/// - Estimating gas costs on destination chains
 	/// - Validating order feasibility
 	fn destination_chain_ids(&self) -> Vec<u64>;
+
+	/// Returns the on-chain fill deadline (unix seconds), if the standard
+	/// exposes one. Used by the bump sweeper to skip fee escalation on
+	/// transactions that the destination settler will reject regardless of
+	/// fee. Returning `None` opts the standard out of deadline-aware bumping
+	/// (the sweeper falls back to its existing behavior — bump until cap or
+	/// max-replacements).
+	fn fill_deadline_secs(&self) -> Option<u64> {
+		None
+	}
+
+	/// Returns the on-chain order expiry (unix seconds), if the standard
+	/// exposes one. After this timestamp, the user can refund their escrow
+	/// on the input chain; bumping a Claim past this deadline is wasted gas
+	/// if the user refunds first. `None` opts the standard out of
+	/// deadline-aware bumping for the Claim stage.
+	fn expires_secs(&self) -> Option<u64> {
+		None
+	}
 }
 
 /// Callback function type for computing order IDs.

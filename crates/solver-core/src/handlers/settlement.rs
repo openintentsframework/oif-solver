@@ -226,6 +226,29 @@ impl SettlementHandler {
 							"Live tx monitor indeterminate; order left in current status"
 						);
 					},
+					TransactionMonitoringEvent::AttemptLedgerConflict {
+						id,
+						attempt_id,
+						tx_type,
+						tx_hash,
+						attempted_status,
+						error,
+						context,
+					} => {
+						event_bus
+							.publish(SolverEvent::Delivery(
+								DeliveryEvent::TransactionAttemptLedgerConflict {
+									order_id: id,
+									attempt_id,
+									tx_type,
+									tx_hash,
+									attempted_status,
+									error,
+									context: context.to_string(),
+								},
+							))
+							.ok();
+					},
 				});
 
 				let tracking = TransactionTracking {
@@ -393,6 +416,29 @@ impl SettlementHandler {
 							"Live tx monitor indeterminate; order left in current status"
 						);
 					},
+					TransactionMonitoringEvent::AttemptLedgerConflict {
+						id,
+						attempt_id,
+						tx_type,
+						tx_hash,
+						attempted_status,
+						error,
+						context,
+					} => {
+						event_bus
+							.publish(SolverEvent::Delivery(
+								DeliveryEvent::TransactionAttemptLedgerConflict {
+									order_id: id,
+									attempt_id,
+									tx_type,
+									tx_hash,
+									attempted_status,
+									error,
+									context: context.to_string(),
+								},
+							))
+							.ok();
+					},
 				});
 
 				let tracking = TransactionTracking {
@@ -539,6 +585,29 @@ impl SettlementHandler {
 						%reason,
 						"Live tx monitor indeterminate; order left in current status"
 					);
+				},
+				TransactionMonitoringEvent::AttemptLedgerConflict {
+					id,
+					attempt_id,
+					tx_type,
+					tx_hash,
+					attempted_status,
+					error,
+					context,
+				} => {
+					event_bus
+						.publish(SolverEvent::Delivery(
+							DeliveryEvent::TransactionAttemptLedgerConflict {
+								order_id: id,
+								attempt_id,
+								tx_type,
+								tx_hash,
+								attempted_status,
+								error,
+								context: context.to_string(),
+							},
+						))
+						.ok();
 				},
 			});
 
@@ -779,13 +848,16 @@ mod tests {
 				mock_storage
 					.expect_exists()
 					.with(eq("orders:test_order_123"))
-					.times(1)
 					.returning(|_| Box::pin(async move { Ok(true) }));
 				// Mock storage for transaction hash mapping
 				mock_storage
 					.expect_set_bytes()
-					.times(2)
+					.times(1)
 					.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+				mock_storage
+					.expect_compare_and_swap_with_indexes()
+					.times(1)
+					.returning(|_, _, _, _, _| Box::pin(async move { Ok(true) }));
 			},
 			|mock_settlement| {
 				mock_settlement

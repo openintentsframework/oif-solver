@@ -746,6 +746,7 @@ pub struct OperatorTxBumpConfig {
 	/// `solver_config::TxBumpConfig::default_profitability_gate_fail_closed`.
 	/// `None` resolves to the runtime default (`false`).
 	pub default_profitability_gate_fail_closed: Option<bool>,
+	pub default_receipt_preflight_fail_closed: Option<bool>,
 	pub chains: HashMap<u64, OperatorTxBumpChainConfig>,
 }
 
@@ -761,6 +762,7 @@ pub struct OperatorTxBumpChainConfig {
 	/// Bootstrap mirror of
 	/// `solver_config::TxBumpChainConfig::profitability_gate_fail_closed`.
 	pub profitability_gate_fail_closed: Option<bool>,
+	pub receipt_preflight_fail_closed: Option<bool>,
 }
 
 /// One side of a rebalance pair.

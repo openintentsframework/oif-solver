@@ -465,6 +465,10 @@ pub struct TxBumpChainConfig {
 	/// `BumpProfitabilityCheckSkipped` event fires in both modes — only
 	/// the proceed/skip decision changes.
 	pub profitability_gate_fail_closed: Option<bool>,
+	/// Per-chain override for receipt preflight failures. When true, the
+	/// sweeper skips a replacement if it cannot check whether the tip already
+	/// mined.
+	pub receipt_preflight_fail_closed: Option<bool>,
 }
 
 /// Top-level transaction-bump policy.
@@ -494,6 +498,10 @@ pub struct TxBumpConfig {
 	/// `false` (the default) preserves Nahim's fail-open behavior.
 	#[serde(default)]
 	pub default_profitability_gate_fail_closed: bool,
+	/// Default for `TxBumpChainConfig::receipt_preflight_fail_closed`.
+	/// `true` avoids submitting a sibling when receipt status cannot be checked.
+	#[serde(default = "default_receipt_preflight_fail_closed")]
+	pub default_receipt_preflight_fail_closed: bool,
 	#[serde(default)]
 	pub chains: HashMap<u64, TxBumpChainConfig>,
 }
@@ -510,6 +518,9 @@ fn default_bump_percent() -> u32 {
 fn default_max_replacements_per_stage() -> u32 {
 	3
 }
+fn default_receipt_preflight_fail_closed() -> bool {
+	true
+}
 
 impl Default for TxBumpConfig {
 	fn default() -> Self {
@@ -522,6 +533,7 @@ impl Default for TxBumpConfig {
 			default_max_fee_per_gas_cap_wei: None,
 			default_max_priority_fee_per_gas_cap_wei: None,
 			default_profitability_gate_fail_closed: false,
+			default_receipt_preflight_fail_closed: true,
 			chains: HashMap::new(),
 		}
 	}
@@ -544,6 +556,7 @@ pub struct EffectiveTxBumpPolicy {
 	/// branch; when `false` (default), the gate proceeds with the bump
 	/// while still emitting `BumpProfitabilityCheckSkipped`.
 	pub profitability_gate_fail_closed: bool,
+	pub receipt_preflight_fail_closed: bool,
 }
 
 impl TxBumpConfig {
@@ -570,6 +583,9 @@ impl TxBumpConfig {
 			profitability_gate_fail_closed: chain
 				.profitability_gate_fail_closed
 				.unwrap_or(self.default_profitability_gate_fail_closed),
+			receipt_preflight_fail_closed: chain
+				.receipt_preflight_fail_closed
+				.unwrap_or(self.default_receipt_preflight_fail_closed),
 		})
 	}
 
@@ -1806,12 +1822,42 @@ mod tests {
 				max_fee_per_gas_cap_wei: Some("50000000000".into()),
 				max_priority_fee_per_gas_cap_wei: None,
 				profitability_gate_fail_closed: None,
+				receipt_preflight_fail_closed: None,
 			},
 		);
 		let eff = cfg.for_chain(1).unwrap();
 		assert_eq!(eff.pending_threshold_secs, 90);
 		assert_eq!(eff.bump_percent, 20);
 		assert_eq!(eff.max_fee_per_gas_cap_wei, Some(50_000_000_000u128));
+	}
+
+	#[test]
+	fn tx_bump_receipt_preflight_defaults_fail_closed() {
+		let mut cfg = TxBumpConfig {
+			enabled: true,
+			..Default::default()
+		};
+		cfg.chains.insert(1, TxBumpChainConfig::default());
+		let eff = cfg.for_chain(1).unwrap();
+		assert!(eff.receipt_preflight_fail_closed);
+	}
+
+	#[test]
+	fn tx_bump_receipt_preflight_per_chain_override_unlocks_fail_open() {
+		let mut cfg = TxBumpConfig {
+			enabled: true,
+			default_receipt_preflight_fail_closed: true,
+			..Default::default()
+		};
+		cfg.chains.insert(
+			1,
+			TxBumpChainConfig {
+				receipt_preflight_fail_closed: Some(false),
+				..Default::default()
+			},
+		);
+		let eff = cfg.for_chain(1).unwrap();
+		assert!(!eff.receipt_preflight_fail_closed);
 	}
 
 	#[test]

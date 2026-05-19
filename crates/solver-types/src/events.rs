@@ -5,7 +5,8 @@
 //! allowing services to react to state changes in other parts of the system.
 
 use crate::{
-	Address, ExecutionParams, FillProof, Intent, Order, TransactionHash, TransactionReceipt,
+	Address, ExecutionParams, FillProof, Intent, Order, TransactionAttemptStatus, TransactionHash,
+	TransactionReceipt,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -96,6 +97,25 @@ pub enum DeliveryEvent {
 		tx_type: TransactionType,
 		reason: String,
 	},
+	/// A duplicate confirmation observed a different canonical hash than
+	/// the one already stored for this stage. The stored hash is preserved.
+	TransactionCanonicalHashConflict {
+		order_id: String,
+		tx_type: TransactionType,
+		stored_hash: TransactionHash,
+		observed_hash: TransactionHash,
+	},
+	/// The attempt ledger rejected a chain-truth update, usually because a
+	/// concurrent path had already terminalized the attempt.
+	TransactionAttemptLedgerConflict {
+		order_id: String,
+		attempt_id: String,
+		tx_type: TransactionType,
+		tx_hash: Option<TransactionHash>,
+		attempted_status: TransactionAttemptStatus,
+		error: String,
+		context: String,
+	},
 	/// Bump sweeper found that the bumped fees exceed a per-chain cap.
 	/// Operator intervention required (raise the cap or wait).
 	BumpCapReached {
@@ -135,6 +155,19 @@ pub enum DeliveryEvent {
 		tx_type: TransactionType,
 		lineage_depth: u32,
 	},
+	/// Bump sweeper skipped a replacement because the on-chain deadline has
+	/// already passed — any new tx at this stage will revert regardless of
+	/// fee. For `Fill`, the deadline is `fillDeadline`; for `Claim`, it is
+	/// the order `expires`. Operator-visible signal that the stuck lineage
+	/// will resolve via refund or whatever in-flight tx happens to mine.
+	BumpDeadlineExpired {
+		order_id: String,
+		attempt_id: String,
+		chain_id: u64,
+		tx_type: TransactionType,
+		current_time: u64,
+		deadline: u64,
+	},
 	/// Bump sweeper found that the chain's currently-configured signer
 	/// no longer matches the original signer of the lineage tip.
 	/// Same-signer invariant prevents bumping.
@@ -153,6 +186,49 @@ pub enum DeliveryEvent {
 		attempt_id: String,
 		chain_id: u64,
 		tx_type: TransactionType,
+	},
+	BumpSubmissionSignerUnavailable {
+		order_id: String,
+		attempt_id: String,
+		chain_id: u64,
+		tx_type: TransactionType,
+	},
+	BumpMissingNonce {
+		order_id: String,
+		attempt_id: String,
+		chain_id: u64,
+		tx_type: TransactionType,
+	},
+	BumpBalanceCheckSkipped {
+		order_id: String,
+		attempt_id: String,
+		chain_id: u64,
+		tx_type: TransactionType,
+		reason: String,
+	},
+	BumpReceiptPreflightSkipped {
+		order_id: String,
+		attempt_id: String,
+		chain_id: u64,
+		tx_type: TransactionType,
+		tx_hash: TransactionHash,
+		error: String,
+		fail_closed: bool,
+	},
+	BumpSubmitFailed {
+		order_id: String,
+		parent_attempt_id: String,
+		chain_id: u64,
+		tx_type: TransactionType,
+		error: String,
+	},
+	BumpTipAlreadyMined {
+		order_id: String,
+		attempt_id: String,
+		chain_id: u64,
+		tx_type: TransactionType,
+		tx_hash: TransactionHash,
+		success: bool,
 	},
 	/// Bump sweeper's profitability gate could not run a strict check for
 	/// this attempt — emitted from each fail-open branch of
@@ -242,5 +318,113 @@ mod tests {
 		let json = serde_json::to_string(&ev).unwrap();
 		let de: DeliveryEvent = serde_json::from_str(&json).unwrap();
 		assert!(matches!(de, DeliveryEvent::BumpExceedsProfitability { .. }));
+	}
+
+	#[test]
+	fn canonical_hash_conflict_event_round_trips() {
+		let ev = DeliveryEvent::TransactionCanonicalHashConflict {
+			order_id: "order-1".into(),
+			tx_type: TransactionType::Fill,
+			stored_hash: TransactionHash(vec![0x33; 32]),
+			observed_hash: TransactionHash(vec![0x44; 32]),
+		};
+		let json = serde_json::to_string(&ev).unwrap();
+		let de: DeliveryEvent = serde_json::from_str(&json).unwrap();
+		assert!(matches!(
+			de,
+			DeliveryEvent::TransactionCanonicalHashConflict { .. }
+		));
+	}
+
+	#[test]
+	fn attempt_ledger_conflict_event_round_trips() {
+		let ev = DeliveryEvent::TransactionAttemptLedgerConflict {
+			order_id: "order-1".into(),
+			attempt_id: "attempt-1".into(),
+			tx_type: TransactionType::Fill,
+			tx_hash: Some(TransactionHash(vec![0x55; 32])),
+			attempted_status: TransactionAttemptStatus::Confirmed,
+			error: "terminal attempt".into(),
+			context: "monitor confirmed".into(),
+		};
+		let json = serde_json::to_string(&ev).unwrap();
+		let de: DeliveryEvent = serde_json::from_str(&json).unwrap();
+		assert!(matches!(
+			de,
+			DeliveryEvent::TransactionAttemptLedgerConflict { .. }
+		));
+	}
+
+	#[test]
+	fn bump_sweeper_observability_events_round_trip() {
+		macro_rules! assert_round_trip {
+			($event:expr, $pattern:pat) => {{
+				let json = serde_json::to_string(&$event).unwrap();
+				let de: DeliveryEvent = serde_json::from_str(&json).unwrap();
+				assert!(matches!(de, $pattern));
+			}};
+		}
+
+		assert_round_trip!(
+			DeliveryEvent::BumpSubmissionSignerUnavailable {
+				order_id: "order-1".into(),
+				attempt_id: "attempt-1".into(),
+				chain_id: 1,
+				tx_type: TransactionType::Fill,
+			},
+			DeliveryEvent::BumpSubmissionSignerUnavailable { .. }
+		);
+		assert_round_trip!(
+			DeliveryEvent::BumpMissingNonce {
+				order_id: "order-1".into(),
+				attempt_id: "attempt-1".into(),
+				chain_id: 1,
+				tx_type: TransactionType::Fill,
+			},
+			DeliveryEvent::BumpMissingNonce { .. }
+		);
+		assert_round_trip!(
+			DeliveryEvent::BumpBalanceCheckSkipped {
+				order_id: "order-1".into(),
+				attempt_id: "attempt-1".into(),
+				chain_id: 1,
+				tx_type: TransactionType::Fill,
+				reason: "balance RPC error".into(),
+			},
+			DeliveryEvent::BumpBalanceCheckSkipped { .. }
+		);
+		assert_round_trip!(
+			DeliveryEvent::BumpReceiptPreflightSkipped {
+				order_id: "order-1".into(),
+				attempt_id: "attempt-1".into(),
+				chain_id: 1,
+				tx_type: TransactionType::Fill,
+				tx_hash: TransactionHash(vec![0x11; 32]),
+				error: "receipt RPC error".into(),
+				fail_closed: true,
+			},
+			DeliveryEvent::BumpReceiptPreflightSkipped { .. }
+		);
+		assert_round_trip!(
+			DeliveryEvent::BumpSubmitFailed {
+				order_id: "order-1".into(),
+				parent_attempt_id: "attempt-1".into(),
+				chain_id: 1,
+				tx_type: TransactionType::Fill,
+				error: "submit failed".into(),
+			},
+			DeliveryEvent::BumpSubmitFailed { .. }
+		);
+		assert_round_trip!(
+			DeliveryEvent::BumpTipAlreadyMined {
+				order_id: "order-1".into(),
+				attempt_id: "attempt-1".into(),
+				chain_id: 1,
+				tx_type: TransactionType::Fill,
+				tx_hash: TransactionHash(vec![0x22; 32]),
+				success: true,
+			},
+			DeliveryEvent::BumpTipAlreadyMined { success: true, .. }
+		);
 	}
 }
