@@ -16,7 +16,7 @@ use solver_types::{
 			IInputSettlerCompact, IInputSettlerEscrow, IOutputSettlerSimple, SolMandateOutput,
 			SolveParams, StandardOrder,
 		},
-		LockType,
+		GasLimitOverrides, LockType,
 	},
 	utils::conversion::hex_to_alloy_address,
 	Address, ConfigSchema, Eip7683OrderData, ExecutionParams, FillProof, NetworksConfig, Order,
@@ -419,8 +419,11 @@ impl OrderInterface for Eip7683OrderImpl {
 		let user_address = hex_to_alloy_address(&order_data.user)
 			.map_err(|e| OrderError::ValidationFailed(format!("Invalid user address: {e}")))?;
 
-		// Parse oracle address
-		let oracle_address = hex_to_alloy_address(&fill_proof.oracle_address)
+		// Security: use the order-bound input oracle from canonical order_data, not
+		// the FillProof's oracle_address. The settlement service's get_attestation
+		// guard enforces that these match, so this preserves the order identity at
+		// claim time even if a future settlement impl regresses.
+		let oracle_address = hex_to_alloy_address(&order_data.input_oracle)
 			.map_err(|e| OrderError::ValidationFailed(format!("Invalid oracle address: {e}")))?;
 
 		// Create inputs array from order data
@@ -591,6 +594,55 @@ impl OrderInterface for Eip7683OrderImpl {
 			));
 		}
 
+		// Reject orders with no outputs. The per-output loops below are no-ops on an
+		// empty `outputs` slice, so without this check a zero-output order would pass
+		// validation here and only fail later at fill-transaction generation.
+		if standard_order.outputs.is_empty() {
+			return Err(OrderError::ValidationFailed(
+				"order has no outputs".to_string(),
+			));
+		}
+
+		// Per-output shape and settler validation.
+		let origin_chain_id = u64::try_from(standard_order.originChainId)
+			.map_err(|_| OrderError::ValidationFailed("originChainId out of range".to_string()))?;
+		let mut seen_chains = std::collections::HashSet::new();
+		for (i, output) in standard_order.outputs.iter().enumerate() {
+			let output_chain_id = u64::try_from(output.chainId).map_err(|_| {
+				OrderError::ValidationFailed(format!("output[{i}] chainId out of range"))
+			})?;
+
+			// 1. Reject same-chain outputs (unsupported by current fill/claim builders).
+			if output_chain_id == origin_chain_id {
+				return Err(OrderError::ValidationFailed(format!(
+					"output[{i}] targets origin chain {origin_chain_id}; same-chain outputs are unsupported"
+				)));
+			}
+
+			// 2. Reject duplicate output chains.
+			if !seen_chains.insert(output_chain_id) {
+				return Err(OrderError::ValidationFailed(format!(
+					"output[{i}] duplicates an earlier output on chain {output_chain_id}; multi-output to the same chain is unsupported"
+				)));
+			}
+
+			// 3. Reject mismatched output settler.
+			let network = self.networks.get(&output_chain_id).ok_or_else(|| {
+				OrderError::ValidationFailed(format!(
+					"output[{i}] chain {output_chain_id} not configured"
+				))
+			})?;
+			let mut expected = [0u8; 32];
+			expected[12..32].copy_from_slice(&network.output_settler_address.0);
+			if output.settler.0 != expected {
+				return Err(OrderError::ValidationFailed(format!(
+					"output[{i}].settler {} does not match configured settler {} for chain {output_chain_id}",
+					alloy_primitives::hex::encode(output.settler.0),
+					alloy_primitives::hex::encode(&network.output_settler_address.0),
+				)));
+			}
+		}
+
 		// Validate oracle routes
 		let origin_chain = standard_order.originChainId.to::<u64>();
 		let input_oracle = standard_order.inputOracle;
@@ -619,11 +671,6 @@ impl OrderInterface for Eip7683OrderImpl {
 		// Single pass validation for all outputs
 		for output in &standard_order.outputs {
 			let dest_chain = output.chainId.to::<u64>();
-
-			// Skip same-chain outputs as they don't need cross-chain routes
-			if dest_chain == origin_chain {
-				continue;
-			}
 
 			// First check if destination chain is supported at all
 			if !supported_destinations.contains(&dest_chain) {
@@ -744,25 +791,25 @@ impl OrderInterface for Eip7683OrderImpl {
 		// Try to use existing Eip7683OrderData from intent_data if available,
 		// otherwise create from StandardOrder
 		use std::convert::TryFrom;
+		let canonical = Eip7683OrderData::from(standard_order.clone());
 		let mut order_data = match intent_data {
-			Some(data) => {
-				// Try to parse the intent data as Eip7683OrderData
-				match Eip7683OrderData::try_from(data) {
-					Ok(parsed_data) => {
-						// Successfully parsed - use the existing data (preserves sponsor/signature)
-						parsed_data
-					},
-					Err(_) => {
-						// Failed to parse - create fresh from StandardOrder
-						Eip7683OrderData::from(standard_order.clone())
-					},
-				}
-			},
-			None => {
-				// No intent data provided - create fresh from StandardOrder
-				Eip7683OrderData::from(standard_order.clone())
-			},
+			Some(data) => Eip7683OrderData::try_from(data).unwrap_or_else(|_| canonical.clone()),
+			None => canonical.clone(),
 		};
+
+		// Canonicalize security-critical fields from the decoded StandardOrder; intent_data only contributes sponsor/signature/settlement_name/lock_type.
+		order_data.input_oracle = canonical.input_oracle;
+		order_data.outputs = canonical.outputs;
+		order_data.inputs = canonical.inputs;
+		order_data.expires = canonical.expires;
+		order_data.fill_deadline = canonical.fill_deadline;
+		order_data.user = canonical.user;
+		order_data.nonce = canonical.nonce;
+		order_data.origin_chain_id = canonical.origin_chain_id;
+		// Force the canonical default for gas_limit_overrides so a crafted intent_data
+		// cannot dictate prepare/fill/claim gas limits. StandardOrder does not carry
+		// gas hints, so the canonical view is always the default.
+		order_data.gas_limit_overrides = GasLimitOverrides::default();
 
 		order_data.order_id = order_id_array;
 		order_data.lock_type = Some(lock_type);
@@ -900,6 +947,18 @@ mod tests {
 			.build()
 	}
 
+	// 32-byte left-padded form of the default `output_settler_address` used by
+	// `NetworkConfigBuilder::new()` (0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f).
+	// Tests must use this value so Fix 1 Part A's settler check accepts them.
+	fn default_output_settler_bytes32() -> alloy_primitives::B256 {
+		let mut bytes = [0u8; 32];
+		bytes[12..32].copy_from_slice(&[
+			0x5C, 0x69, 0xbE, 0xe7, 0x01, 0xef, 0x81, 0x4a, 0x2B, 0x6a, 0x3E, 0xDD, 0x4B, 0x16,
+			0x52, 0xCB, 0x9c, 0xc5, 0xaA, 0x6f,
+		]);
+		alloy_primitives::B256::from(bytes)
+	}
+
 	// Helper function to create a valid StandardOrder for testing
 	fn create_valid_standard_order() -> interfaces::StandardOrder {
 		use alloy_primitives::{Address as AlloyAddress, B256};
@@ -916,8 +975,8 @@ mod tests {
 			inputs: vec![[U256::from(100), U256::from(200)]],
 			outputs: vec![interfaces::SolMandateOutput {
 				oracle: B256::from([11u8; 32]), // Matches test oracle routes
-				settler: B256::from([0x44; 32]),
-				chainId: U256::from(137), // Cross-chain output
+				settler: default_output_settler_bytes32(), // Matches NetworkConfigBuilder default
+				chainId: U256::from(137),       // Cross-chain output
 				token: B256::from([0x55; 32]),
 				amount: U256::from(1000),
 				recipient: B256::from([0x66; 32]),
@@ -1141,6 +1200,66 @@ mod tests {
 		assert!(!tx.data.is_empty());
 	}
 
+	#[tokio::test]
+	async fn test_generate_claim_transaction_uses_order_bound_oracle() {
+		use alloy_sol_types::SolCall;
+
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		// Build an order whose canonical input_oracle is the StandardOrder's inputOracle.
+		let standard_order = create_valid_standard_order();
+		let canonical_oracle_bytes: [u8; 20] = standard_order.inputOracle.0 .0;
+		let order_bytes = encode_standard_order(&standard_order);
+		let solver_address = Address(vec![0x99; 20]);
+
+		let order = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&None,
+				"permit2_escrow",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await
+			.expect("validate_and_create_order should succeed");
+
+		// FillProof carries a DIFFERENT oracle address (attacker / wrong).
+		let attacker_oracle_hex = "0x".to_string() + &hex::encode([0x99u8; 20]);
+		let fill_proof = FillProof {
+			tx_hash: TransactionHash(vec![0u8; 32]),
+			block_number: 1,
+			attestation_data: None,
+			filled_timestamp: 1_700_000_000,
+			oracle_address: attacker_oracle_hex,
+		};
+
+		let claim_tx = order_impl
+			.generate_claim_transaction(&order, &fill_proof)
+			.await
+			.expect("generate_claim_transaction should succeed");
+
+		// Decode the StandardOrder embedded in the finaliseCall calldata and assert
+		// its inputOracle matches the canonical (signed) value, NOT the FillProof oracle.
+		assert!(claim_tx.data.len() >= 4, "calldata shorter than selector");
+		let decoded =
+			interfaces::IInputSettlerEscrow::finaliseCall::abi_decode_raw(&claim_tx.data[4..])
+				.expect("finaliseCall::abi_decode_raw should succeed");
+		let decoded_input_oracle: [u8; 20] = decoded.order.inputOracle.0 .0;
+
+		assert_eq!(
+			decoded_input_oracle, canonical_oracle_bytes,
+			"claim calldata used FillProof oracle instead of order-bound oracle"
+		);
+		// And explicitly assert the FillProof oracle was NOT used.
+		assert_ne!(
+			decoded_input_oracle, [0x99u8; 20],
+			"FillProof oracle leaked into StandardOrder.inputOracle"
+		);
+	}
+
 	#[test]
 	fn test_config_schema_validation() {
 		let schema = Eip7683OrderSchema;
@@ -1304,16 +1423,18 @@ mod tests {
 		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let mut standard_order = create_valid_standard_order();
-		// Use unsupported destination chain
+		// Use unsupported destination chain. After Fix 1 Part A, the per-output
+		// "chain not configured" check rejects this before the oracle-route check.
 		standard_order.outputs[0].chainId = U256::from(999); // Unsupported chain
 		let order_bytes = encode_standard_order(&standard_order);
 
 		let result = order_impl.validate_order(&order_bytes).await;
 		assert!(result.is_err());
-		assert!(result
-			.unwrap_err()
-			.to_string()
-			.contains("Route from chain 1 to chain 999 is not supported"));
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("chain 999 not configured"),
+			"unexpected error message: {err}"
+		);
 	}
 
 	#[tokio::test]
@@ -1356,7 +1477,9 @@ mod tests {
 		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let mut standard_order = create_valid_standard_order();
-		// Add a second output with unsupported chain
+		// Add a second output with unsupported chain (chain 999 is not configured in
+		// create_test_networks()). After Fix 1 Part A, this fails the per-output
+		// "chain not configured" check before the oracle-route check.
 		standard_order.outputs.push(interfaces::SolMandateOutput {
 			oracle: alloy_primitives::B256::from([11u8; 32]),
 			settler: alloy_primitives::B256::from([0x44; 32]),
@@ -1371,10 +1494,155 @@ mod tests {
 
 		let result = order_impl.validate_order(&order_bytes).await;
 		assert!(result.is_err());
-		assert!(result
-			.unwrap_err()
-			.to_string()
-			.contains("Route from chain 1 to chain 999 is not supported"));
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("chain 999 not configured"),
+			"unexpected error message: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_rejects_same_chain_output() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		// Make outputs[0] target the origin chain (same-chain output).
+		standard_order.outputs[0].chainId = standard_order.originChainId;
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(result.is_err(), "expected same-chain output to be rejected");
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("same-chain outputs are unsupported"),
+			"unexpected error message: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_rejects_duplicate_output_chain() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		// Duplicate the first cross-chain output: second output targets same chain as outputs[0].
+		let dup = standard_order.outputs[0].clone();
+		standard_order.outputs.push(dup);
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(
+			result.is_err(),
+			"expected duplicate output chain to be rejected"
+		);
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("duplicates an earlier output"),
+			"unexpected error message: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_rejects_mismatched_output_settler() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		// Replace outputs[0].settler with a random 32-byte value that does NOT match the
+		// configured output_settler_address for the destination chain in create_test_networks().
+		standard_order.outputs[0].settler = alloy_primitives::B256::from([0xAB; 32]);
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(
+			result.is_err(),
+			"expected mismatched output settler to be rejected"
+		);
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("does not match configured settler"),
+			"unexpected error message: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_rejects_empty_outputs() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		// Clear all outputs. The per-output loops further down are no-ops on an empty
+		// `outputs` slice, so without an explicit early-return this would pass validation.
+		standard_order.outputs.clear();
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(result.is_err(), "expected zero-output order to be rejected");
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("order has no outputs"),
+			"unexpected error message: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_canonicalizes_gas_limit_overrides() {
+		use solver_types::standards::eip7683::GasLimitOverrides;
+
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let standard_order = create_valid_standard_order();
+		let order_bytes = encode_standard_order(&standard_order);
+		let solver_address = Address(vec![0x99; 20]);
+
+		// Build an intent_data with non-default gas_limit_overrides. If the canonical
+		// path does not force the default, these values would leak into the stored
+		// order and drive prepare/fill/claim gas limits.
+		let mut existing_order_data = Eip7683OrderData::from(standard_order.clone());
+		existing_order_data.gas_limit_overrides = GasLimitOverrides {
+			settle_gas_limit: Some(9_999_999),
+			fill_gas_limit: Some(9_999_999),
+			prepare_gas_limit: Some(9_999_999),
+		};
+		let intent_data = Some(serde_json::to_value(&existing_order_data).unwrap());
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&intent_data,
+				"permit2_escrow",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await;
+
+		assert!(result.is_ok(), "expected order to validate successfully");
+		let order = result.unwrap();
+		let order_data: Eip7683OrderData = serde_json::from_value(order.data).unwrap();
+
+		// The canonical path must force GasLimitOverrides::default(), regardless of
+		// what intent_data tried to set.
+		let default_overrides = GasLimitOverrides::default();
+		assert_eq!(
+			order_data.gas_limit_overrides.settle_gas_limit, default_overrides.settle_gas_limit,
+			"settle_gas_limit must be canonicalized to default"
+		);
+		assert_eq!(
+			order_data.gas_limit_overrides.fill_gas_limit, default_overrides.fill_gas_limit,
+			"fill_gas_limit must be canonicalized to default"
+		);
+		assert_eq!(
+			order_data.gas_limit_overrides.prepare_gas_limit, default_overrides.prepare_gas_limit,
+			"prepare_gas_limit must be canonicalized to default"
+		);
 	}
 
 	// Helper function to create a mock order ID callback
@@ -1752,10 +2020,11 @@ mod tests {
 		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
 
 		let mut standard_order = create_valid_standard_order();
-		// Add a second output on a different destination chain (Arbitrum)
+		// Add a second output on a different destination chain (Arbitrum). The settler must
+		// match the configured `output_settler_address` for chain 42161 (Fix 1 Part A).
 		standard_order.outputs.push(interfaces::SolMandateOutput {
 			oracle: alloy_primitives::B256::from([12u8; 32]), // Different oracle for Arbitrum
-			settler: alloy_primitives::B256::from([0x44; 32]),
+			settler: default_output_settler_bytes32(),
 			chainId: U256::from(42161), // Arbitrum chain ID (different from first output)
 			token: alloy_primitives::B256::from([0x77; 32]),
 			amount: U256::from(500),
@@ -1788,5 +2057,125 @@ mod tests {
 
 		let order_data: Eip7683OrderData = serde_json::from_value(order.data).unwrap();
 		assert_eq!(order_data.outputs.len(), 2);
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_canonicalizes_input_oracle_from_decoded_bytes() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		// Build a valid StandardOrder; capture its inputOracle as the canonical value.
+		let standard_order = create_valid_standard_order();
+		let canonical_input_oracle_bytes: [u8; 20] = standard_order.inputOracle.0.into();
+		let order_bytes = encode_standard_order(&standard_order);
+
+		// Build an intent_data JSON whose embedded Eip7683OrderData has a *different* input_oracle.
+		// The decoded StandardOrder bytes must win.
+		let mut tampered_data = create_test_order_data();
+		tampered_data.input_oracle =
+			"0x".to_string() + &alloy_primitives::hex::encode([0x99u8; 20]); // attacker-chosen oracle
+
+		let intent_data = Some(serde_json::to_value(&tampered_data).unwrap());
+		let solver_address = Address(vec![0x99; 20]);
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&intent_data,
+				"permit2_escrow",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await
+			.expect("validate_and_create_order should succeed");
+
+		let stored: Eip7683OrderData = serde_json::from_value(result.data).unwrap();
+		let stored_oracle_lower = stored.input_oracle.trim_start_matches("0x").to_lowercase();
+		let canonical_hex = alloy_primitives::hex::encode(canonical_input_oracle_bytes);
+		assert_eq!(
+			stored_oracle_lower, canonical_hex,
+			"input_oracle was not canonicalized from decoded StandardOrder"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_canonicalizes_outputs_from_decoded_bytes() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let standard_order = create_valid_standard_order();
+		let canonical_outputs_len = standard_order.outputs.len();
+		let order_bytes = encode_standard_order(&standard_order);
+
+		// Tamper with intent_data: pretend the order had zero outputs.
+		let mut tampered_data = create_test_order_data();
+		tampered_data.outputs = vec![];
+
+		let intent_data = Some(serde_json::to_value(&tampered_data).unwrap());
+		let solver_address = Address(vec![0x99; 20]);
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&intent_data,
+				"permit2_escrow",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await
+			.expect("validate_and_create_order should succeed");
+
+		let stored: Eip7683OrderData = serde_json::from_value(result.data).unwrap();
+		assert_eq!(
+			stored.outputs.len(),
+			canonical_outputs_len,
+			"outputs were not canonicalized from decoded StandardOrder"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_preserves_sponsor_signature_from_intent_data() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let standard_order = create_valid_standard_order();
+		let order_bytes = encode_standard_order(&standard_order);
+
+		// intent_data carries sponsor + signature that the canonical decode cannot supply.
+		let mut data = create_test_order_data();
+		data.sponsor = Some("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string());
+		data.signature =
+			Some("0xc0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00".to_string());
+
+		let intent_data = Some(serde_json::to_value(&data).unwrap());
+		let solver_address = Address(vec![0x99; 20]);
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&intent_data,
+				"permit2_escrow",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await
+			.expect("validate_and_create_order should succeed");
+
+		let stored: Eip7683OrderData = serde_json::from_value(result.data).unwrap();
+		assert_eq!(
+			stored.sponsor.as_deref(),
+			Some("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+			"sponsor from intent_data was not preserved"
+		);
+		assert!(
+			stored.signature.is_some(),
+			"signature from intent_data was not preserved"
+		);
 	}
 }
