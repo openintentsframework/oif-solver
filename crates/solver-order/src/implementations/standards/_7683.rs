@@ -1569,18 +1569,15 @@ mod tests {
 		// what intent_data tried to set.
 		let default_overrides = GasLimitOverrides::default();
 		assert_eq!(
-			order_data.gas_limit_overrides.settle_gas_limit,
-			default_overrides.settle_gas_limit,
+			order_data.gas_limit_overrides.settle_gas_limit, default_overrides.settle_gas_limit,
 			"settle_gas_limit must be canonicalized to default"
 		);
 		assert_eq!(
-			order_data.gas_limit_overrides.fill_gas_limit,
-			default_overrides.fill_gas_limit,
+			order_data.gas_limit_overrides.fill_gas_limit, default_overrides.fill_gas_limit,
 			"fill_gas_limit must be canonicalized to default"
 		);
 		assert_eq!(
-			order_data.gas_limit_overrides.prepare_gas_limit,
-			default_overrides.prepare_gas_limit,
+			order_data.gas_limit_overrides.prepare_gas_limit, default_overrides.prepare_gas_limit,
 			"prepare_gas_limit must be canonicalized to default"
 		);
 	}
