@@ -292,6 +292,7 @@ async fn record_planned_attempt(
 		})
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_attempt_update_best_effort(
 	recorder: Arc<dyn TransactionAttemptRecorder>,
 	callback: Option<&TransactionCallback>,

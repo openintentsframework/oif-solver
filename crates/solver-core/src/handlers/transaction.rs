@@ -229,28 +229,56 @@ impl TransactionHandler {
 
 	/// Handles prepare transaction confirmation.
 	///
-	/// Updates status to Executing and publishes OrderEvent::Executing
-	/// to trigger the fill transaction.
+	/// Updates status to Executing and persists the canonical `prepare_tx_hash`
+	/// in one atomic write. Publishes `OrderEvent::Executing` only when the
+	/// transition was actually applied; a duplicate `Confirmed` callback from
+	/// a same-nonce lineage falls into the `AlreadyApplied` branch and
+	/// reconciles the canonical hash without re-triggering the fill.
 	async fn handle_prepare_confirmed(
 		&self,
-		_: TransactionHash,
+		tx_hash: TransactionHash,
 		order: Order,
 	) -> Result<(), TransactionError> {
-		// Extract execution params
+		// Extract execution params — precondition for publishing Executing.
+		// Checked before the transition so a missing-params order does not
+		// silently advance state without ever emitting the downstream event.
 		let params = order.execution_params.clone().ok_or_else(|| {
 			TransactionError::Service("Order missing execution params".to_string())
 		})?;
 
-		// Update order status to executing (prepare done, fill in progress)
-		self.state_machine
-			.transition_order_status(&order.id, OrderStatus::Executing)
+		let order_id = order.id.clone();
+		let tx_hash_for_update = tx_hash.clone();
+
+		// Atomic transition + prepare_tx_hash write.
+		let outcome = self
+			.state_machine
+			.try_transition_order_status(&order_id, OrderStatus::Executing, move |o| {
+				o.prepare_tx_hash = Some(tx_hash_for_update.clone());
+			})
 			.await
 			.map_err(|e| TransactionError::State(e.to_string()))?;
 
-		// Now publish Executing event to proceed with fill
-		self.event_bus
-			.publish(SolverEvent::Order(OrderEvent::Executing { order, params }))
-			.ok();
+		if outcome.applied() {
+			let updated_order = outcome.order().clone();
+			self.event_bus
+				.publish(SolverEvent::Order(OrderEvent::Executing {
+					order: updated_order,
+					params,
+				}))
+				.ok();
+		} else {
+			self.reconcile_already_applied_stage_hash(
+				&order_id,
+				TransactionType::Prepare,
+				&tx_hash,
+				outcome.order(),
+			)
+			.await?;
+			tracing::debug!(
+				order_id = %truncate_id(&order_id),
+				"prepare confirmation: order already at/past Executing; skipping OrderEvent::Executing"
+			);
+		}
 
 		Ok(())
 	}
@@ -596,11 +624,12 @@ mod tests {
 			create_memory_handler_with_order(order_for_state.clone()).await;
 
 		let receipt = create_test_receipt(true);
+		let tx_hash = create_test_tx_hash();
 
 		let result = handler
 			.handle_confirmed(
 				"test_order_123".to_string(),
-				create_test_tx_hash(),
+				tx_hash.clone(),
 				TransactionType::Prepare,
 				receipt,
 			)
@@ -608,19 +637,24 @@ mod tests {
 
 		assert!(result.is_ok());
 
-		// Should emit Executing event
+		// Should emit Executing event with the post-transition order carrying
+		// the canonical prepare_tx_hash.
 		let event = receiver.recv().await.unwrap();
 		match event {
 			SolverEvent::Order(OrderEvent::Executing { order, params }) => {
 				assert_eq!(order.id, "test_order_123");
+				assert_eq!(order.status, OrderStatus::Executing);
+				assert_eq!(order.prepare_tx_hash, Some(tx_hash.clone()));
 				assert_eq!(params.gas_price, U256::from(20_000_000_000u64));
 			},
 			_ => panic!("Expected Executing event, got: {event:?}"),
 		}
 
-		// Verify order status was updated to Executing
+		// Verify order status was updated to Executing and prepare_tx_hash
+		// was persisted atomically with the transition.
 		let updated_order = state_machine.get_order(&order_for_state.id).await.unwrap();
 		assert_eq!(updated_order.status, OrderStatus::Executing);
+		assert_eq!(updated_order.prepare_tx_hash, Some(tx_hash));
 	}
 
 	#[tokio::test]
@@ -1194,6 +1228,134 @@ mod tests {
 			second, 0,
 			"duplicate Confirmed must not double-publish PostFillReady"
 		);
+	}
+
+	/// Regression for the Prepare counterpart of the Fill idempotency test.
+	/// A duplicate `Confirmed` callback for the Prepare stage (e.g., a
+	/// same-nonce gas-bumped replacement landing after the parent already
+	/// advanced the order) must NOT re-publish `OrderEvent::Executing` — that
+	/// would re-trigger the fill submission.
+	#[tokio::test]
+	async fn handle_prepare_confirmed_publishes_executing_only_once() {
+		let order_at_created = OrderBuilder::new()
+			.with_id("test_order_dup_prepare")
+			.with_status(OrderStatus::Created)
+			.with_execution_params(Some(ExecutionParams {
+				gas_price: U256::from(20_000_000_000u64),
+				priority_fee: Some(U256::from(1_000_000_000u64)),
+			}))
+			.build();
+
+		let storage_impl = solver_storage::implementations::memory::MemoryStorage::new();
+		let storage = Arc::new(StorageService::new(Box::new(storage_impl)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let mut subscriber = event_bus.subscribe();
+
+		let handler = TransactionHandler::new(
+			storage.clone(),
+			state_machine.clone(),
+			Arc::new(SettlementService::new(HashMap::new(), String::new(), 20)),
+			event_bus,
+		);
+
+		state_machine.store_order(&order_at_created).await.unwrap();
+
+		// First confirmation: Created → Executing. Should publish Executing.
+		handler
+			.handle_prepare_confirmed(TransactionHash(vec![0xaa; 32]), order_at_created.clone())
+			.await
+			.unwrap();
+		let first = drain_count(&mut subscriber, |e| {
+			matches!(e, SolverEvent::Order(OrderEvent::Executing { .. }))
+		});
+		assert_eq!(first, 1, "first confirmation must publish Executing");
+
+		// Duplicate confirmation (e.g., bumped-tx receipt arrives after the
+		// parent already advanced the order). Order is now at Executing.
+		let mut order_at_executing = order_at_created.clone();
+		order_at_executing.status = OrderStatus::Executing;
+		handler
+			.handle_prepare_confirmed(TransactionHash(vec![0xbb; 32]), order_at_executing)
+			.await
+			.unwrap();
+		let second = drain_count(&mut subscriber, |e| {
+			matches!(e, SolverEvent::Order(OrderEvent::Executing { .. }))
+		});
+		assert_eq!(
+			second, 0,
+			"duplicate Confirmed must not re-publish OrderEvent::Executing"
+		);
+	}
+
+	/// Regression for the AlreadyApplied-conflict branch on the Prepare stage.
+	/// An order already past Prepare with a stored `prepare_tx_hash` receives
+	/// a duplicate Prepare confirmation carrying a different hash. The
+	/// handler must emit `TransactionCanonicalHashConflict`, leave the stored
+	/// hash unchanged, and NOT re-publish `OrderEvent::Executing`.
+	#[tokio::test]
+	async fn duplicate_prepare_confirmed_with_different_hash_emits_canonical_hash_conflict() {
+		let stored_hash = TransactionHash(vec![0x33; 32]);
+		let observed_hash = TransactionHash(vec![0x44; 32]);
+		let order = OrderBuilder::new()
+			.with_status(OrderStatus::Executing)
+			.with_prepare_tx_hash(Some(stored_hash.clone()))
+			.with_execution_params(Some(ExecutionParams {
+				gas_price: U256::from(20_000_000_000u64),
+				priority_fee: Some(U256::from(1_000_000_000u64)),
+			}))
+			.build();
+		let (handler, mut receiver, state_machine) =
+			create_memory_handler_with_order(order.clone()).await;
+
+		handler
+			.handle_confirmed(
+				order.id.clone(),
+				observed_hash.clone(),
+				TransactionType::Prepare,
+				create_test_receipt(true),
+			)
+			.await
+			.unwrap();
+
+		let updated_order = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(updated_order.prepare_tx_hash, Some(stored_hash.clone()));
+		let events = drain_events(&mut receiver);
+		assert_eq!(
+			events
+				.iter()
+				.filter(|event| matches!(
+					event,
+					SolverEvent::Order(OrderEvent::Executing { .. })
+				))
+				.count(),
+			0,
+			"AlreadyApplied with different hash must not republish Executing"
+		);
+		let conflicts = events
+			.iter()
+			.filter(|event| {
+				matches!(
+					event,
+					SolverEvent::Delivery(DeliveryEvent::TransactionCanonicalHashConflict { .. })
+				)
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(conflicts.len(), 1);
+		match conflicts[0] {
+			SolverEvent::Delivery(DeliveryEvent::TransactionCanonicalHashConflict {
+				order_id,
+				tx_type,
+				stored_hash: event_stored_hash,
+				observed_hash: event_observed_hash,
+			}) => {
+				assert_eq!(order_id, &order.id);
+				assert_eq!(*tx_type, TransactionType::Prepare);
+				assert_eq!(event_stored_hash, &stored_hash);
+				assert_eq!(event_observed_hash, &observed_hash);
+			},
+			other => panic!("expected TransactionCanonicalHashConflict, got {other:?}"),
+		}
 	}
 
 	#[tokio::test]
