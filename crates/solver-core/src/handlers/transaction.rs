@@ -231,9 +231,11 @@ impl TransactionHandler {
 	///
 	/// Updates status to Executing and persists the canonical `prepare_tx_hash`
 	/// in one atomic write. Publishes `OrderEvent::Executing` only when the
-	/// transition was actually applied; a duplicate `Confirmed` callback from
-	/// a same-nonce lineage falls into the `AlreadyApplied` branch and
-	/// reconciles the canonical hash without re-triggering the fill.
+	/// transition was actually applied; duplicate or out-of-order `Confirmed`
+	/// callbacks from monitor replay, recovery/live races, or chain reorg
+	/// reconciliation fall into the `AlreadyApplied` branch, where the handler
+	/// repairs a missing stage hash or emits a canonical-hash conflict without
+	/// re-triggering the fill.
 	async fn handle_prepare_confirmed(
 		&self,
 		tx_hash: TransactionHash,
