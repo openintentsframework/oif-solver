@@ -968,12 +968,17 @@ impl BroadcasterSettlement {
 			Ok(oracle) => oracle,
 			Err(e) => return SettlementReadiness::PermanentFailure(e.to_string()),
 		};
-		let output_oracle = submission.remote_oracle.clone();
-		if !self.is_output_oracle_supported(destination_chain, &output_oracle) {
+		let bound_output_oracle =
+			match self.validate_bound_output_oracle(order, destination_chain) {
+				Ok(oracle) => oracle,
+				Err(e) => return SettlementReadiness::PermanentFailure(e.to_string()),
+			};
+		if submission.remote_oracle != bound_output_oracle {
 			return SettlementReadiness::PermanentFailure(format!(
-				"Stored output oracle is not configured for destination chain {destination_chain}"
+				"Stored output oracle does not match order-bound output oracle for destination chain {destination_chain}"
 			));
 		}
+		let output_oracle = bound_output_oracle;
 
 		let provider = match self.providers.get(&source_chain) {
 			Some(provider) => provider,
@@ -2359,6 +2364,26 @@ mod tests {
 	}
 
 	#[test]
+	fn test_parse_bound_input_oracle_rejects_zero_oracle() {
+		let data = serde_json::json!({
+			"order_id": vec![0u8; 32],
+			"user": "0x1234567890123456789012345678901234567890",
+			"nonce": "1",
+			"origin_chain_id": "1",
+			"expires": 100,
+			"fill_deadline": 50,
+			"input_oracle": "0x0000000000000000000000000000000000000000",
+			"inputs": [],
+			"outputs": [],
+			"gas_limit_overrides": {}
+		});
+		let order = OrderBuilder::new().with_data(data).build();
+
+		let err = parse_bound_input_oracle(&order).unwrap_err();
+		assert!(err.to_string().contains("input oracle is zero"));
+	}
+
+	#[test]
 	fn test_parse_bound_input_oracle_rejects_invalid_address() {
 		let data = serde_json::json!({
 			"order_id": vec![0u8; 32],
@@ -2788,7 +2813,81 @@ mod tests {
 		assert!(matches!(
 			readiness,
 			SettlementReadiness::PermanentFailure(ref msg)
-				if msg.contains("Stored output oracle is not configured")
+				if msg.contains("Stored output oracle does not match order-bound output oracle")
+		));
+	}
+
+	#[tokio::test]
+	async fn test_readiness_internal_rejects_remote_oracle_mismatch() {
+		// Both the configured allow-list and the stored submission.remote_oracle are
+		// in the oracle config, but the stored oracle differs from the order-signed
+		// output oracle. Under the order-bound check, readiness must reject.
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let configured_output_oracle = solver_types::Address(vec![0x44; 20]);
+		let stored_output_oracle = solver_types::Address(vec![0x55; 20]);
+		let order = OrderBuilder::new()
+			.with_id("readiness-bound-mismatch-order")
+			.with_input_chain_ids(vec![421614])
+			.with_output_chain_ids(vec![11155111])
+			.with_data(make_eip7683_order_data(
+				&input_oracle,
+				vec![make_output(
+					11155111,
+					address_to_bytes32(&configured_output_oracle),
+				)],
+			))
+			.build();
+		let settlement = test_settlement(OracleConfig {
+			input_oracles: HashMap::from([(421614u64, vec![input_oracle.clone()])]),
+			// Both oracles are configured – the stored one is in the allow-list,
+			// but does NOT match the order-signed output oracle.
+			output_oracles: HashMap::from([(
+				11155111u64,
+				vec![
+					configured_output_oracle.clone(),
+					stored_output_oracle.clone(),
+				],
+			)]),
+			routes: HashMap::from([(421614u64, vec![11155111u64])]),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		settlement
+			.message_tracker
+			.track_submission(
+				&order.id,
+				BroadcasterSubmission {
+					source_chain: 421614,
+					destination_chain: 11155111,
+					submission_tx_hash: TransactionHash(vec![0x55; 32]),
+					submission_timestamp: 1,
+					submission_block_number: Some(12345),
+					payload_hash: [0x66; 32],
+					message: [0x77; 32],
+					message_data: vec![0x88],
+					application: solver_types::Address(vec![0x99; 20]),
+					remote_oracle: stored_output_oracle,
+				},
+			)
+			.await
+			.unwrap();
+
+		let readiness = settlement
+			.readiness(
+				&order,
+				&FillProof {
+					tx_hash: TransactionHash(vec![0xaa; 32]),
+					block_number: 1,
+					oracle_address: with_0x_prefix(&hex::encode(&input_oracle.0)),
+					attestation_data: None,
+					filled_timestamp: now_seconds(),
+				},
+			)
+			.await;
+
+		assert!(matches!(
+			readiness,
+			SettlementReadiness::PermanentFailure(ref msg)
+				if msg.contains("Stored output oracle does not match order-bound output oracle")
 		));
 	}
 
