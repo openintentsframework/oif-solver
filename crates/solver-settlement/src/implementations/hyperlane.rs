@@ -189,7 +189,7 @@ fn extract_fill_details_from_logs(
 		// validated decode and returns a tuple matching the event's non-indexed
 		// params: (solver, timestamp, output, finalAmount).
 		match <OutputFilled as SolEvent>::abi_decode_data_validate(&log.data) {
-			Ok((solver_b32, timestamp, sol_output, _final_amount)) => {
+			Ok((solver_b32, timestamp, sol_output, final_amount)) => {
 				// Compare the decoded SolMandateOutput against the order's MandateOutput.
 				let oracle_match = sol_output.oracle.0 == expected_output.oracle;
 				let settler_match = sol_output.settler.0 == expected_output.settler;
@@ -208,12 +208,36 @@ fn extract_fill_details_from_logs(
 					&& amount_match && recipient_match
 					&& call_match && context_match
 				{
+					// Surface divergence between the chain-settled `finalAmount` and the
+					// order-requested MandateOutput.amount. Today the shipped settlers
+					// always emit `finalAmount == amount`, so this is a forward-looking
+					// guard against partial-fill / fee-deducting settlers: if the chain
+					// settled a different amount than what we'd build the attestation
+					// payload from, we reject the log rather than silently building a
+					// wrong payload.
+					if final_amount != sol_output.amount {
+						tracing::warn!(
+							order_id = %order.id,
+							log_emitter = %log.address,
+							expected = %sol_output.amount,
+							actual = %final_amount,
+							"OutputFilled finalAmount diverged from MandateOutput.amount; skipping log",
+						);
+						continue;
+					}
 					return Ok((solver_b32.0, timestamp));
 				}
 				// Mismatched payload — keep looking; another log might match.
 				continue;
 			},
-			Err(_) => continue, // undecodable data — skip
+			Err(e) => {
+				tracing::warn!(
+					error = %e,
+					log_emitter = %log.address,
+					"OutputFilled ABI decode failed; skipping log",
+				);
+				continue;
+			},
 		}
 	}
 
