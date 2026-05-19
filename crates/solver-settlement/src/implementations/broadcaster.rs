@@ -968,11 +968,11 @@ impl BroadcasterSettlement {
 			Ok(oracle) => oracle,
 			Err(e) => return SettlementReadiness::PermanentFailure(e.to_string()),
 		};
-		let bound_output_oracle =
-			match self.validate_bound_output_oracle(order, destination_chain) {
-				Ok(oracle) => oracle,
-				Err(e) => return SettlementReadiness::PermanentFailure(e.to_string()),
-			};
+		let bound_output_oracle = match self.validate_bound_output_oracle(order, destination_chain)
+		{
+			Ok(oracle) => oracle,
+			Err(e) => return SettlementReadiness::PermanentFailure(e.to_string()),
+		};
 		if submission.remote_oracle != bound_output_oracle {
 			return SettlementReadiness::PermanentFailure(format!(
 				"Stored output oracle does not match order-bound output oracle for destination chain {destination_chain}"
