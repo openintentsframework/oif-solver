@@ -184,7 +184,7 @@ fn extract_fill_details_from_logs(
 		// validated decode and returns a tuple matching the event's non-indexed
 		// params: (solver, timestamp, output, finalAmount).
 		match <OutputFilled as SolEvent>::abi_decode_data_validate(&log.data) {
-			Ok((solver_b32, timestamp, sol_output, _final_amount)) => {
+			Ok((solver_b32, timestamp, sol_output, final_amount)) => {
 				// Compare the decoded SolMandateOutput against the order's MandateOutput.
 				let oracle_match = sol_output.oracle.0 == expected_output.oracle;
 				let settler_match = sol_output.settler.0 == expected_output.settler;
@@ -203,12 +203,36 @@ fn extract_fill_details_from_logs(
 					&& amount_match && recipient_match
 					&& call_match && context_match
 				{
+					// Surface divergence between the chain-settled `finalAmount` and the
+					// order-requested MandateOutput.amount. Today the shipped settlers
+					// always emit `finalAmount == amount`, so this is a forward-looking
+					// guard against partial-fill / fee-deducting settlers: if the chain
+					// settled a different amount than what we'd build the attestation
+					// payload from, we reject the log rather than silently building a
+					// wrong payload.
+					if final_amount != sol_output.amount {
+						tracing::warn!(
+							order_id = %order.id,
+							log_emitter = %log.address,
+							expected = %sol_output.amount,
+							actual = %final_amount,
+							"OutputFilled finalAmount diverged from MandateOutput.amount; skipping log",
+						);
+						continue;
+					}
 					return Ok((solver_b32.0, timestamp));
 				}
 				// Mismatched payload — keep looking; another log might match.
 				continue;
 			},
-			Err(_) => continue, // undecodable data — skip
+			Err(e) => {
+				tracing::warn!(
+					error = %e,
+					log_emitter = %log.address,
+					"OutputFilled ABI decode failed; skipping log",
+				);
+				continue;
+			},
 		}
 	}
 
@@ -2473,6 +2497,58 @@ mod tests {
 			.expect("matching log should be accepted");
 		assert_eq!(solver, expected_solver);
 		assert_eq!(ts, expected_timestamp);
+	}
+
+	#[test]
+	fn test_extract_fill_details_rejects_diverged_final_amount() {
+		// An OutputFilled log emitted by the expected settler, whose MandateOutput
+		// matches the order in every field, but whose `finalAmount` differs from
+		// `MandateOutput.amount`. Today no shipped settler emits divergent values,
+		// but a future partial-fill / fee-deducting settler could; if so, the
+		// solver must NOT silently build an on-chain attestation payload from the
+		// order-requested amount while the chain settled a different amount.
+		let order_id: [u8; 32] = [0x42; 32];
+		let expected_settler_addr: [u8; 20] = [0xAA; 20];
+		let mut settler_bytes32 = [0u8; 32];
+		settler_bytes32[12..32].copy_from_slice(&expected_settler_addr);
+
+		let output = make_mandate_output(
+			[0x11; 32],
+			settler_bytes32,
+			137,
+			[0x22; 32],
+			alloy_primitives::U256::from(1000u64),
+			[0x33; 32],
+		);
+		let order = build_test_order_for_emitter_tests(order_id, 1, 137, output.clone());
+
+		// MandateOutput.amount = 1000, but finalAmount = 999 (e.g. fee deducted).
+		let log_data = encode_output_filled_data(
+			order_id,
+			[0x77; 32],
+			1_700_000_000u32,
+			&output,
+			alloy_primitives::U256::from(999u64),
+		);
+
+		let log = solver_types::Log {
+			address: solver_types::Address(expected_settler_addr.to_vec()),
+			topics: vec![
+				solver_types::H256(
+					<solver_types::standards::eip7683::interfaces::OutputFilled
+						as alloy_sol_types::SolEvent>::SIGNATURE_HASH.0,
+				),
+				solver_types::H256(order_id),
+			],
+			data: log_data,
+			..Default::default()
+		};
+
+		let result = extract_fill_details_from_logs(&[log], &order, &order_id, 137);
+		assert!(
+			result.is_err(),
+			"log with finalAmount != MandateOutput.amount must be rejected",
+		);
 	}
 
 	#[test]
