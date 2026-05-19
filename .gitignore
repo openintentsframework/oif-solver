@@ -40,3 +40,6 @@ oif-contracts/
 
 # Converage
 *.info
+
+# Claude Code local settings (personal, never commit)
+.claude/settings.local.json
