@@ -16,7 +16,7 @@ use solver_types::{
 			IInputSettlerCompact, IInputSettlerEscrow, IOutputSettlerSimple, SolMandateOutput,
 			SolveParams, StandardOrder,
 		},
-		LockType,
+		GasLimitOverrides, LockType,
 	},
 	utils::conversion::hex_to_alloy_address,
 	Address, ConfigSchema, Eip7683OrderData, ExecutionParams, FillProof, NetworksConfig, Order,
@@ -591,6 +591,15 @@ impl OrderInterface for Eip7683OrderImpl {
 			));
 		}
 
+		// Reject orders with no outputs. The per-output loops below are no-ops on an
+		// empty `outputs` slice, so without this check a zero-output order would pass
+		// validation here and only fail later at fill-transaction generation.
+		if standard_order.outputs.is_empty() {
+			return Err(OrderError::ValidationFailed(
+				"order has no outputs".to_string(),
+			));
+		}
+
 		// Per-output shape and settler validation.
 		let origin_chain_id = u64::try_from(standard_order.originChainId)
 			.map_err(|_| OrderError::ValidationFailed("originChainId out of range".to_string()))?;
@@ -794,6 +803,10 @@ impl OrderInterface for Eip7683OrderImpl {
 		order_data.user = canonical.user;
 		order_data.nonce = canonical.nonce;
 		order_data.origin_chain_id = canonical.origin_chain_id;
+		// Force the canonical default for gas_limit_overrides so a crafted intent_data
+		// cannot dictate prepare/fill/claim gas limits. StandardOrder does not carry
+		// gas hints, so the canonical view is always the default.
+		order_data.gas_limit_overrides = GasLimitOverrides::default();
 
 		order_data.order_id = order_id_array;
 		order_data.lock_type = Some(lock_type);
@@ -1490,6 +1503,85 @@ mod tests {
 		assert!(
 			err.contains("does not match configured settler"),
 			"unexpected error message: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_rejects_empty_outputs() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		// Clear all outputs. The per-output loops further down are no-ops on an empty
+		// `outputs` slice, so without an explicit early-return this would pass validation.
+		standard_order.outputs.clear();
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(result.is_err(), "expected zero-output order to be rejected");
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("order has no outputs"),
+			"unexpected error message: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_canonicalizes_gas_limit_overrides() {
+		use solver_types::standards::eip7683::GasLimitOverrides;
+
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let standard_order = create_valid_standard_order();
+		let order_bytes = encode_standard_order(&standard_order);
+		let solver_address = Address(vec![0x99; 20]);
+
+		// Build an intent_data with non-default gas_limit_overrides. If the canonical
+		// path does not force the default, these values would leak into the stored
+		// order and drive prepare/fill/claim gas limits.
+		let mut existing_order_data = Eip7683OrderData::from(standard_order.clone());
+		existing_order_data.gas_limit_overrides = GasLimitOverrides {
+			settle_gas_limit: Some(9_999_999),
+			fill_gas_limit: Some(9_999_999),
+			prepare_gas_limit: Some(9_999_999),
+		};
+		let intent_data = Some(serde_json::to_value(&existing_order_data).unwrap());
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&intent_data,
+				"permit2_escrow",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await;
+
+		assert!(result.is_ok(), "expected order to validate successfully");
+		let order = result.unwrap();
+		let order_data: Eip7683OrderData = serde_json::from_value(order.data).unwrap();
+
+		// The canonical path must force GasLimitOverrides::default(), regardless of
+		// what intent_data tried to set.
+		let default_overrides = GasLimitOverrides::default();
+		assert_eq!(
+			order_data.gas_limit_overrides.settle_gas_limit,
+			default_overrides.settle_gas_limit,
+			"settle_gas_limit must be canonicalized to default"
+		);
+		assert_eq!(
+			order_data.gas_limit_overrides.fill_gas_limit,
+			default_overrides.fill_gas_limit,
+			"fill_gas_limit must be canonicalized to default"
+		);
+		assert_eq!(
+			order_data.gas_limit_overrides.prepare_gas_limit,
+			default_overrides.prepare_gas_limit,
+			"prepare_gas_limit must be canonicalized to default"
 		);
 	}
 
