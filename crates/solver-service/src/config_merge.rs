@@ -2642,6 +2642,9 @@ fn translate_tx_bump(op: &solver_types::OperatorTxBumpConfig) -> solver_config::
 		default_max_priority_fee_per_gas_cap_wei: op
 			.default_max_priority_fee_per_gas_cap_wei
 			.clone(),
+		default_profitability_gate_fail_closed: op
+			.default_profitability_gate_fail_closed
+			.unwrap_or(defaults.default_profitability_gate_fail_closed),
 		chains: op
 			.chains
 			.iter()
@@ -2656,6 +2659,7 @@ fn translate_tx_bump(op: &solver_types::OperatorTxBumpConfig) -> solver_config::
 						max_priority_fee_per_gas_cap_wei: c
 							.max_priority_fee_per_gas_cap_wei
 							.clone(),
+						profitability_gate_fail_closed: c.profitability_gate_fail_closed,
 					},
 				)
 			})

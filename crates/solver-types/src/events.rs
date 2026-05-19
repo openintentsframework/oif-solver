@@ -154,6 +154,24 @@ pub enum DeliveryEvent {
 		chain_id: u64,
 		tx_type: TransactionType,
 	},
+	/// Bump sweeper's profitability gate could not run a strict check for
+	/// this attempt — emitted from each fail-open branch of
+	/// `should_skip_for_profitability`. The boolean return (proceed vs.
+	/// skip) is controlled by the per-chain `profitability_gate_fail_closed`
+	/// flag; the event fires regardless of mode so operators can alert on
+	/// a non-zero rate of unverified bumps.
+	BumpProfitabilityCheckSkipped {
+		order_id: String,
+		attempt_id: String,
+		chain_id: u64,
+		tx_type: TransactionType,
+		/// Short, human-readable explanation of which branch fired.
+		/// Stable values: "order not found", "no quote_id",
+		/// "stored quote lookup failed", "tip gas_limit missing",
+		/// "bumped fees missing", "wei_to_currency error",
+		/// "decimal parse error".
+		reason: String,
+	},
 }
 
 /// Which EIP-1559 cap was the binding constraint on a blocked bump.

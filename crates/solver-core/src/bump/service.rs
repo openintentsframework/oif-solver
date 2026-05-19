@@ -333,12 +333,22 @@ impl TransactionBumpService {
 					error = %e,
 					"tx_bump: order retrieve failed; proceeding with bump (fail-open)"
 				);
+				self.emit_profitability_check_skipped(
+					order_id,
+					&tip.id,
+					chain_id,
+					tx_type,
+					"order not found",
+				);
+				if policy.profitability_gate_fail_closed {
+					return;
+				}
 				None
 			},
 		};
 		if let Some(order) = order_opt.as_ref() {
 			if self
-				.should_skip_for_profitability(order, &bumped, tip, chain_id, tx_type)
+				.should_skip_for_profitability(order, &bumped, tip, chain_id, tx_type, policy)
 				.await
 			{
 				return;
@@ -579,9 +589,38 @@ impl TransactionBumpService {
 		}
 	}
 
+	/// Emit a `BumpProfitabilityCheckSkipped` event. Called from every
+	/// fail-open branch of `should_skip_for_profitability` (and from the
+	/// order-lookup branch at the call site in `maybe_bump_component`)
+	/// regardless of whether the gate is in fail-open or fail-closed mode.
+	fn emit_profitability_check_skipped(
+		&self,
+		order_id: &str,
+		attempt_id: &str,
+		chain_id: u64,
+		tx_type: solver_types::TransactionType,
+		reason: &str,
+	) {
+		self.event_bus
+			.publish(SolverEvent::Delivery(
+				DeliveryEvent::BumpProfitabilityCheckSkipped {
+					order_id: order_id.to_string(),
+					attempt_id: attempt_id.to_string(),
+					chain_id,
+					tx_type,
+					reason: reason.to_string(),
+				},
+			))
+			.ok();
+	}
+
 	/// Returns `true` if the bump should be skipped due to insufficient
-	/// order-level profitability headroom. Fails open: any error or
-	/// missing data returns `false` (proceed with bump) and logs a `warn!`.
+	/// order-level profitability headroom.
+	///
+	/// Fail-open branches (missing quote, pricing error, decimal parse,
+	/// etc.) emit `BumpProfitabilityCheckSkipped` and then either skip
+	/// (when `policy.profitability_gate_fail_closed == true`) or proceed
+	/// (default) with the bump. The event fires in both modes.
 	async fn should_skip_for_profitability(
 		&self,
 		order: &solver_types::Order,
@@ -589,13 +628,29 @@ impl TransactionBumpService {
 		tip: &solver_types::TransactionAttempt,
 		chain_id: u64,
 		tx_type: solver_types::TransactionType,
+		policy: &EffectiveTxBumpPolicy,
 	) -> bool {
 		use rust_decimal::Decimal;
 		use std::str::FromStr;
 
-		// Fail-open: no quote_id → no profitability data → proceed silently.
+		// `fail_closed` is the boolean the seven fail-open branches return:
+		// `true` skips the bump, `false` proceeds.
+		let fail_closed = policy.profitability_gate_fail_closed;
+
+		// Fail-open: no quote_id → no profitability data.
 		let Some(quote_id) = order.quote_id.as_ref() else {
-			return false;
+			tracing::warn!(
+				order_id = %order.id,
+				"tx_bump: order has no quote_id; profitability gate cannot run (fail-open)"
+			);
+			self.emit_profitability_check_skipped(
+				&order.id,
+				&tip.id,
+				chain_id,
+				tx_type,
+				"no quote_id",
+			);
+			return fail_closed;
 		};
 
 		// Fail-open: stored quote lookup error → proceed with warn.
@@ -612,7 +667,14 @@ impl TransactionBumpService {
 					error = %e,
 					"tx_bump: stored quote lookup failed; proceeding with bump (fail-open)"
 				);
-				return false;
+				self.emit_profitability_check_skipped(
+					&order.id,
+					&tip.id,
+					chain_id,
+					tx_type,
+					"stored quote lookup failed",
+				);
+				return fail_closed;
 			},
 		};
 		let cb = &stored.cost_context.cost_breakdown;
@@ -624,7 +686,14 @@ impl TransactionBumpService {
 				tip_id = %tip.id,
 				"tx_bump: tip.tx.gas_limit is None; proceeding with bump (fail-open)"
 			);
-			return false;
+			self.emit_profitability_check_skipped(
+				&order.id,
+				&tip.id,
+				chain_id,
+				tx_type,
+				"tip gas_limit missing",
+			);
+			return fail_closed;
 		};
 
 		// Take EIP-1559 max_fee_per_gas first; fall back to legacy gas_price.
@@ -633,7 +702,14 @@ impl TransactionBumpService {
 				order_id = %order.id,
 				"tx_bump: bumped fees missing both max_fee_per_gas and gas_price; proceeding (fail-open)"
 			);
-			return false;
+			self.emit_profitability_check_skipped(
+				&order.id,
+				&tip.id,
+				chain_id,
+				tx_type,
+				"bumped fees missing",
+			);
+			return fail_closed;
 		};
 
 		let bumped_cost_wei = fee_per_gas.saturating_mul(gas_units as u128);
@@ -652,7 +728,14 @@ impl TransactionBumpService {
 					error = %e,
 					"tx_bump: wei_to_currency failed; proceeding with bump (fail-open)"
 				);
-				return false;
+				self.emit_profitability_check_skipped(
+					&order.id,
+					&tip.id,
+					chain_id,
+					tx_type,
+					"wei_to_currency error",
+				);
+				return fail_closed;
 			},
 		};
 
@@ -665,7 +748,14 @@ impl TransactionBumpService {
 					error = %e,
 					"tx_bump: bumped cost not parseable as Decimal; proceeding (fail-open)"
 				);
-				return false;
+				self.emit_profitability_check_skipped(
+					&order.id,
+					&tip.id,
+					chain_id,
+					tx_type,
+					"decimal parse error",
+				);
+				return fail_closed;
 			},
 		};
 
@@ -1937,5 +2027,166 @@ mod tests {
 		tokio::time::sleep(Duration::from_secs(2)).await;
 		svc.tick().await.unwrap();
 		// expect_submit().times(1) asserts the bump fired despite no quote_id.
+	}
+
+	// =====================================================================
+	// 17. Profitability gate fail-open (default) emits
+	// `BumpProfitabilityCheckSkipped` with reason="no quote_id" while the
+	// bump still proceeds. Locks in the observability half of OZ's review.
+	// =====================================================================
+	#[tokio::test]
+	async fn bump_proceeds_when_no_quote_id_emits_skipped_event() {
+		let cfg = default_enabled_config();
+		// Sanity-check: default is fail-open across the workspace.
+		assert!(
+			!cfg.chains
+				.get(&1u64)
+				.unwrap()
+				.profitability_gate_fail_closed
+				.unwrap_or(cfg.default_profitability_gate_fail_closed),
+			"default policy must be fail-open"
+		);
+
+		let signer = Address(vec![9; 20]);
+
+		// Stage 1: throwaway service to obtain attempt_store + storage Arcs.
+		let throwaway_mock = {
+			let mut m = MockDeliveryInterface::new();
+			let s = signer.clone();
+			m.expect_submission_signer()
+				.returning(move |_| Some(s.clone()));
+			mock_large_balance(&mut m);
+			m
+		};
+		let (service, attempt_store, storage, bus, _tmp) =
+			test_service(cfg.clone(), throwaway_mock);
+
+		// Default OrderBuilder leaves quote_id = None.
+		seed_active_order(&storage, "order-1").await;
+		seed_attempt(
+			&attempt_store,
+			"parent-1",
+			TransactionAttemptStatus::Broadcast,
+			None,
+			Some(signer.clone()),
+			10_000_000_000u128,
+		)
+		.await;
+
+		// Stage 2: real mock — submit MUST fire (fail-open proceeds).
+		let mut mock = MockDeliveryInterface::new();
+		let signer_clone = signer.clone();
+		mock.expect_submission_signer()
+			.returning(move |_| Some(signer_clone.clone()));
+		mock_large_balance(&mut mock);
+		let recorder: Arc<dyn TransactionAttemptRecorder> = attempt_store.clone();
+		let recorder_for_mock = recorder.clone();
+		mock.expect_submit()
+			.times(1)
+			.returning(move |tx, tracking| {
+				let recorder = recorder_for_mock.clone();
+				Box::pin(async move {
+					let tracking = tracking.expect("sweeper must supply tracking");
+					let outcome: Result<TransactionHash, DeliveryError> =
+						Ok(TransactionHash(vec![0xab; 32]));
+					simulate_submit_recording(
+						&recorder,
+						&tracking,
+						&tx,
+						&outcome,
+						Some(Address(vec![9; 20])),
+					)
+					.await;
+					outcome
+				})
+			});
+		let delivery_impls: HashMap<u64, Arc<dyn DeliveryInterface>> =
+			HashMap::from([(1u64, Arc::new(mock) as Arc<dyn DeliveryInterface>)]);
+		let delivery_svc = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
+		let svc = TransactionBumpService::new(
+			service.config.clone(),
+			storage.clone(),
+			attempt_store.clone(),
+			delivery_svc,
+			service.event_bus.clone(),
+			recorder,
+			test_pricing(),
+		);
+
+		let mut sub = bus.subscribe();
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		svc.tick().await.unwrap();
+		let events = drain_bus_events(&mut sub);
+
+		let found = events.iter().any(|e| {
+			matches!(
+				e,
+				SolverEvent::Delivery(DeliveryEvent::BumpProfitabilityCheckSkipped {
+					order_id, reason, tx_type, chain_id, ..
+				}) if order_id == "order-1"
+					&& reason == "no quote_id"
+					&& *tx_type == TransactionType::Fill
+					&& *chain_id == 1u64
+			)
+		});
+		assert!(
+			found,
+			"expected BumpProfitabilityCheckSkipped(no quote_id), got: {events:?}"
+		);
+		// expect_submit().times(1) on Drop also asserts the bump fired.
+	}
+
+	// =====================================================================
+	// 18. Profitability gate fail-closed: same scenario, but the bump is
+	// skipped while the same event still fires.
+	// =====================================================================
+	#[tokio::test]
+	async fn bump_skipped_when_fail_closed_and_no_quote_id() {
+		let mut cfg = default_enabled_config();
+		// Flip the global default to fail-closed. The chain entry inherits
+		// it through `for_chain`.
+		cfg.default_profitability_gate_fail_closed = true;
+
+		let signer = Address(vec![9; 20]);
+
+		let mut mock = MockDeliveryInterface::new();
+		let signer_clone = signer.clone();
+		mock.expect_submission_signer()
+			.returning(move |_| Some(signer_clone.clone()));
+		mock_large_balance(&mut mock);
+		// The point: submit MUST NOT fire under fail-closed.
+		mock.expect_submit().times(0);
+
+		let (svc, store, storage, bus, _tmp) = test_service(cfg, mock);
+
+		seed_active_order(&storage, "order-1").await;
+		seed_attempt(
+			&store,
+			"parent-1",
+			TransactionAttemptStatus::Broadcast,
+			None,
+			Some(signer.clone()),
+			10_000_000_000u128,
+		)
+		.await;
+
+		let mut sub = bus.subscribe();
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		svc.tick().await.unwrap();
+		let events = drain_bus_events(&mut sub);
+
+		let found = events.iter().any(|e| {
+			matches!(
+				e,
+				SolverEvent::Delivery(DeliveryEvent::BumpProfitabilityCheckSkipped {
+					order_id, reason, ..
+				}) if order_id == "order-1" && reason == "no quote_id"
+			)
+		});
+		assert!(
+			found,
+			"expected BumpProfitabilityCheckSkipped(no quote_id), got: {events:?}"
+		);
+		// expect_submit().times(0) asserts the bump was skipped.
 	}
 }

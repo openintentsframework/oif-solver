@@ -742,6 +742,10 @@ pub struct OperatorTxBumpConfig {
 	pub default_max_replacements_per_stage: Option<u32>,
 	pub default_max_fee_per_gas_cap_wei: Option<String>,
 	pub default_max_priority_fee_per_gas_cap_wei: Option<String>,
+	/// Bootstrap mirror of
+	/// `solver_config::TxBumpConfig::default_profitability_gate_fail_closed`.
+	/// `None` resolves to the runtime default (`false`).
+	pub default_profitability_gate_fail_closed: Option<bool>,
 	pub chains: HashMap<u64, OperatorTxBumpChainConfig>,
 }
 
@@ -754,6 +758,9 @@ pub struct OperatorTxBumpChainConfig {
 	pub max_replacements_per_stage: Option<u32>,
 	pub max_fee_per_gas_cap_wei: Option<String>,
 	pub max_priority_fee_per_gas_cap_wei: Option<String>,
+	/// Bootstrap mirror of
+	/// `solver_config::TxBumpChainConfig::profitability_gate_fail_closed`.
+	pub profitability_gate_fail_closed: Option<bool>,
 }
 
 /// One side of a rebalance pair.

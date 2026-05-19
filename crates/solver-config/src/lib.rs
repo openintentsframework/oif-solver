@@ -458,6 +458,13 @@ pub struct TxBumpChainConfig {
 	pub max_replacements_per_stage: Option<u32>,
 	pub max_fee_per_gas_cap_wei: Option<String>,
 	pub max_priority_fee_per_gas_cap_wei: Option<String>,
+	/// When `true`, the bump sweeper's profitability gate treats every
+	/// fail-open branch (missing quote, pricing error, decimal parse,
+	/// etc.) as a skip instead of proceeding. Default `false` preserves
+	/// the existing liveness-first behavior. The
+	/// `BumpProfitabilityCheckSkipped` event fires in both modes — only
+	/// the proceed/skip decision changes.
+	pub profitability_gate_fail_closed: Option<bool>,
 }
 
 /// Top-level transaction-bump policy.
@@ -483,6 +490,10 @@ pub struct TxBumpConfig {
 	pub default_max_fee_per_gas_cap_wei: Option<String>,
 	#[serde(default)]
 	pub default_max_priority_fee_per_gas_cap_wei: Option<String>,
+	/// Default for `TxBumpChainConfig::profitability_gate_fail_closed`.
+	/// `false` (the default) preserves Nahim's fail-open behavior.
+	#[serde(default)]
+	pub default_profitability_gate_fail_closed: bool,
 	#[serde(default)]
 	pub chains: HashMap<u64, TxBumpChainConfig>,
 }
@@ -510,6 +521,7 @@ impl Default for TxBumpConfig {
 			default_max_replacements_per_stage: default_max_replacements_per_stage(),
 			default_max_fee_per_gas_cap_wei: None,
 			default_max_priority_fee_per_gas_cap_wei: None,
+			default_profitability_gate_fail_closed: false,
 			chains: HashMap::new(),
 		}
 	}
@@ -526,6 +538,12 @@ pub struct EffectiveTxBumpPolicy {
 	pub max_replacements_per_stage: u32,
 	pub max_fee_per_gas_cap_wei: Option<u128>,
 	pub max_priority_fee_per_gas_cap_wei: Option<u128>,
+	/// Resolved per-chain override of
+	/// `default_profitability_gate_fail_closed`. When `true`, the bump
+	/// sweeper's profitability gate skips the bump on every fail-open
+	/// branch; when `false` (default), the gate proceeds with the bump
+	/// while still emitting `BumpProfitabilityCheckSkipped`.
+	pub profitability_gate_fail_closed: bool,
 }
 
 impl TxBumpConfig {
@@ -549,6 +567,9 @@ impl TxBumpConfig {
 				.or_else(|| parse_cap(&self.default_max_fee_per_gas_cap_wei)),
 			max_priority_fee_per_gas_cap_wei: parse_cap(&chain.max_priority_fee_per_gas_cap_wei)
 				.or_else(|| parse_cap(&self.default_max_priority_fee_per_gas_cap_wei)),
+			profitability_gate_fail_closed: chain
+				.profitability_gate_fail_closed
+				.unwrap_or(self.default_profitability_gate_fail_closed),
 		})
 	}
 
@@ -1784,6 +1805,7 @@ mod tests {
 				max_replacements_per_stage: None,
 				max_fee_per_gas_cap_wei: Some("50000000000".into()),
 				max_priority_fee_per_gas_cap_wei: None,
+				profitability_gate_fail_closed: None,
 			},
 		);
 		let eff = cfg.for_chain(1).unwrap();
