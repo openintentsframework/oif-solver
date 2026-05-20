@@ -84,6 +84,7 @@ for local reproduction and simple runners that allow Docker-in-Docker.
 | `failure_e2e_settlement.rs` | fill revert, oracle not proven | `cargo test -p solver-e2e-tests --test failure_e2e_settlement -- --ignored --test-threads=1 --nocapture` | Requires pinned FalseOracle/RevertingOutputSettler artifacts |
 | `api_e2e_orders.rs` | public assets API | `cargo test -p solver-e2e-tests --test api_e2e_orders -- --ignored --test-threads=1 --nocapture` | Permit2 order flow is prepared but not enabled yet |
 | `admin_api_e2e.rs` | SIWE-authenticated admin API | `cargo test -p solver-e2e-tests --test admin_api_e2e -- --ignored --test-threads=1 --nocapture` | Skips when `REDIS_URL` is unset |
+| `tx_bump_resilience_e2e.rs` | same-nonce bump replacement, restart, and receipt-preflight resilience | `cargo test -p solver-e2e-tests --test tx_bump_resilience_e2e -- --ignored --test-threads=1 --nocapture` | Requires Foundry, Anvil, OIF contract artifacts, and Redis-backed CI for CAS coverage |
 
 ## Design decisions
 

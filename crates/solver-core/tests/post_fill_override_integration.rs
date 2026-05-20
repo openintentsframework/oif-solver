@@ -12,20 +12,17 @@
 //!
 //! Required env vars:
 //!   - `OIF_LIVE_RPC=1`
-//!   - `OIF_TEST_DEST_RPC_URL`     — RPC for the destination chain
-//!                                    (where eth_estimateGas runs).
-//!                                    MUST honor `stateOverride`.
+//!   - `OIF_TEST_DEST_RPC_URL` — RPC for the destination chain
+//!     (where eth_estimateGas runs). MUST honor `stateOverride`.
 //!   - `OIF_TEST_DEST_CHAIN_ID`    — destination chain id (e.g. 1, 747474).
-//!   - `OIF_TEST_ORIGIN_CHAIN_ID`  — origin chain id, used as
-//!                                    `destinationDomain` in the synthetic
-//!                                    Hyperlane `submit(...)` call.
+//!   - `OIF_TEST_ORIGIN_CHAIN_ID` — origin chain id, used as
+//!     `destinationDomain` in the synthetic Hyperlane `submit(...)` call.
 //!   - `OIF_TEST_OUTPUT_SETTLER`   — OutputSettler address on dest chain.
-//!   - `OIF_TEST_OUTPUT_ORACLE`    — Hyperlane output oracle address on
-//!                                    dest chain (= `to` of the submit tx).
+//!   - `OIF_TEST_OUTPUT_ORACLE` — Hyperlane output oracle address on
+//!     dest chain (= `to` of the submit tx).
 //!   - `OIF_TEST_RECIPIENT_ORACLE` — Hyperlane input oracle address on
-//!                                    origin chain. Just an address arg
-//!                                    in the synthetic submit() call;
-//!                                    no RPC connection to origin.
+//!     origin chain. Just an address arg in the synthetic submit() call;
+//!     no RPC connection to origin.
 //!
 //! Run for Katana → Ethereum (post-fill on Ethereum):
 //!   OIF_LIVE_RPC=1 \

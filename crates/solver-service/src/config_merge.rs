@@ -436,7 +436,7 @@ pub fn merge_to_operator_config(
 		.monitoring_timeout_seconds
 		.unwrap_or(seed.defaults.monitoring_timeout_seconds);
 
-	Ok(OperatorConfig {
+	let operator_config = OperatorConfig {
 		solver_id: solver_id.clone(),
 		solver_name: Some(initializer.solver_name.clone().unwrap_or(solver_id)),
 		networks,
@@ -513,8 +513,10 @@ pub fn merge_to_operator_config(
 		// merges it on top of the auto-generated defaults at runtime-config
 		// materialization time.
 		fee_policy: initializer.fee_policy.clone(),
-		tx_bump: solver_types::OperatorTxBumpConfig::default(),
-	})
+		tx_bump: initializer.tx_bump.unwrap_or_default(),
+	};
+	validate_operator_tx_bump(&operator_config)?;
+	Ok(operator_config)
 }
 
 /// Merges initializer JSON into a full OperatorConfig without using a seed preset.
@@ -1129,6 +1131,9 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 	let networks = build_networks_from_operator_config(operator_config);
 	let intake_disabled_override = solver_intake_disabled_from_env()?;
 
+	let tx_bump = translate_tx_bump(&operator_config.tx_bump);
+	validate_tx_bump(&tx_bump, &chain_ids)?;
+
 	// Build the full config
 	let config = Config {
 		solver: build_solver_config_from_operator(operator_config, intake_disabled_override),
@@ -1149,10 +1154,27 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 		)?),
 		gas: Some(build_gas_config_from_operator(&operator_config.gas)),
 		rebalance: build_rebalance_config_from_operator(operator_config.rebalance.as_ref())?,
-		tx_bump: translate_tx_bump(&operator_config.tx_bump),
+		tx_bump,
 	};
 
 	Ok(config)
+}
+
+fn validate_operator_tx_bump(operator_config: &OperatorConfig) -> Result<(), MergeError> {
+	let chain_ids: Vec<u64> = operator_config.networks.keys().copied().collect();
+	let tx_bump = translate_tx_bump(&operator_config.tx_bump);
+	validate_tx_bump(&tx_bump, &chain_ids)
+}
+
+fn validate_tx_bump(
+	tx_bump: &solver_config::TxBumpConfig,
+	chain_ids: &[u64],
+) -> Result<(), MergeError> {
+	tx_bump.validate().map_err(MergeError::Validation)?;
+	let configured_chain_ids: HashSet<u64> = chain_ids.iter().copied().collect();
+	tx_bump
+		.validate_against_networks(&configured_chain_ids)
+		.map_err(MergeError::Validation)
 }
 
 fn parse_solver_intake_disabled(raw: &str) -> Result<bool, MergeError> {
@@ -3494,6 +3516,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		}
 	}
 
@@ -3538,6 +3561,166 @@ mod tests {
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).expect("build ok");
 		assert!(!op_config.gas.live_fill_estimate_enabled);
+	}
+
+	fn test_tx_bump_config() -> solver_types::OperatorTxBumpConfig {
+		solver_types::OperatorTxBumpConfig {
+			enabled: true,
+			sweep_interval_secs: Some(2),
+			default_pending_threshold_secs: Some(3),
+			default_bump_percent: Some(15),
+			default_max_replacements_per_stage: Some(4),
+			default_max_fee_per_gas_cap_wei: Some("100000000000".to_string()),
+			default_max_priority_fee_per_gas_cap_wei: Some("10000000000".to_string()),
+			default_profitability_gate_fail_closed: Some(true),
+			default_receipt_preflight_fail_closed: Some(true),
+			chains: HashMap::from([
+				(
+					11155420,
+					solver_types::OperatorTxBumpChainConfig {
+						pending_threshold_secs: Some(5),
+						bump_percent: Some(20),
+						max_replacements_per_stage: Some(2),
+						max_fee_per_gas_cap_wei: Some("200000000000".to_string()),
+						max_priority_fee_per_gas_cap_wei: Some("20000000000".to_string()),
+						profitability_gate_fail_closed: Some(true),
+						receipt_preflight_fail_closed: Some(true),
+					},
+				),
+				(
+					84532,
+					solver_types::OperatorTxBumpChainConfig {
+						pending_threshold_secs: Some(7),
+						bump_percent: Some(25),
+						max_replacements_per_stage: Some(3),
+						max_fee_per_gas_cap_wei: Some("300000000000".to_string()),
+						max_priority_fee_per_gas_cap_wei: Some("30000000000".to_string()),
+						profitability_gate_fail_closed: Some(false),
+						receipt_preflight_fail_closed: Some(false),
+					},
+				),
+			]),
+		}
+	}
+
+	fn assert_tx_bump_preserved(op_config: &OperatorConfig) {
+		assert!(op_config.tx_bump.enabled);
+		assert_eq!(op_config.tx_bump.chains.len(), 2);
+
+		let origin = op_config.tx_bump.chains.get(&11155420).unwrap();
+		assert_eq!(origin.pending_threshold_secs, Some(5));
+		assert_eq!(origin.bump_percent, Some(20));
+		assert_eq!(origin.max_replacements_per_stage, Some(2));
+		assert_eq!(
+			origin.max_fee_per_gas_cap_wei.as_deref(),
+			Some("200000000000")
+		);
+
+		let destination = op_config.tx_bump.chains.get(&84532).unwrap();
+		assert_eq!(destination.pending_threshold_secs, Some(7));
+		assert_eq!(destination.bump_percent, Some(25));
+		assert_eq!(destination.max_replacements_per_stage, Some(3));
+		assert_eq!(
+			destination.max_priority_fee_per_gas_cap_wei.as_deref(),
+			Some("30000000000")
+		);
+	}
+
+	#[test]
+	fn bootstrap_config_preserves_tx_bump_seed_backed() {
+		let mut overrides = test_seed_overrides();
+		overrides.tx_bump = Some(test_tx_bump_config());
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).expect("build ok");
+
+		assert_tx_bump_preserved(&op_config);
+	}
+
+	#[test]
+	fn bootstrap_config_preserves_tx_bump_seedless() {
+		let mut overrides = test_seed_overrides();
+		for network in &mut overrides.networks {
+			network.name = Some(format!("seedless-{}", network.chain_id));
+			network.network_type = Some(NetworkType::New);
+			network.rpc_urls = Some(vec![format!("https://rpc-{}.example", network.chain_id)]);
+			network.input_settler_address =
+				Some(address!("1111111111111111111111111111111111111111"));
+			network.output_settler_address =
+				Some(address!("2222222222222222222222222222222222222222"));
+		}
+		overrides.settlement = Some(solver_types::SettlementOverride {
+			settlement_type: SettlementTypeOverride::Direct,
+			priority: None,
+			hyperlane: None,
+			direct: Some(solver_types::DirectSettlementOverride {
+				oracles: solver_types::OracleOverrides {
+					input: HashMap::from([
+						(
+							11155420,
+							vec![address!("3333333333333333333333333333333333333333")],
+						),
+						(
+							84532,
+							vec![address!("4444444444444444444444444444444444444444")],
+						),
+					]),
+					output: HashMap::from([
+						(
+							11155420,
+							vec![address!("5555555555555555555555555555555555555555")],
+						),
+						(
+							84532,
+							vec![address!("6666666666666666666666666666666666666666")],
+						),
+					]),
+				},
+				routes: HashMap::new(),
+				dispute_period_seconds: None,
+				oracle_selection_strategy: None,
+				intent_min_expiry_seconds: None,
+			}),
+			broadcaster: None,
+		});
+		overrides.tx_bump = Some(test_tx_bump_config());
+
+		let op_config = merge_to_operator_config_seedless(overrides).expect("build ok");
+
+		assert_tx_bump_preserved(&op_config);
+	}
+
+	#[test]
+	fn bootstrap_config_keeps_tx_bump_default_disabled_when_omitted() {
+		let overrides = test_seed_overrides();
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).expect("build ok");
+
+		assert!(!op_config.tx_bump.enabled);
+		assert!(op_config.tx_bump.chains.is_empty());
+	}
+
+	#[test]
+	fn bootstrap_config_rejects_invalid_tx_bump_fee_cap() {
+		let mut overrides = test_seed_overrides();
+		let mut tx_bump = test_tx_bump_config();
+		tx_bump.default_max_fee_per_gas_cap_wei = Some("not-a-number".to_string());
+		overrides.tx_bump = Some(tx_bump);
+
+		let err = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap_err();
+
+		assert!(err.to_string().contains("max_fee_per_gas_cap_wei"));
+	}
+
+	#[test]
+	fn build_runtime_config_rejects_invalid_stored_tx_bump_fee_cap() {
+		let overrides = test_seed_overrides();
+		let mut op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		op_config.tx_bump = test_tx_bump_config();
+		op_config.tx_bump.default_max_fee_per_gas_cap_wei = Some("not-a-number".to_string());
+
+		let err = build_runtime_config(&op_config).unwrap_err();
+
+		assert!(err.to_string().contains("max_fee_per_gas_cap_wei"));
 	}
 
 	#[test]
@@ -3654,6 +3837,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -3714,6 +3898,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -3768,6 +3953,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -3813,6 +3999,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -3904,6 +4091,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -4126,6 +4314,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -4192,6 +4381,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -4283,6 +4473,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -4349,6 +4540,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -4421,6 +4613,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -4543,6 +4736,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -4675,6 +4869,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4745,6 +4940,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4809,6 +5005,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -4908,6 +5105,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -5016,6 +5214,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -5183,6 +5382,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -5322,6 +5522,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5425,6 +5626,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5550,6 +5752,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5706,6 +5909,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -5753,6 +5957,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -5814,6 +6019,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -5868,6 +6074,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -5940,6 +6147,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -7151,6 +7359,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		// Step 1: merge_config should create Config with KMS account

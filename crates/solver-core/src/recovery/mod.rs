@@ -1111,64 +1111,92 @@ impl RecoveryService {
 					.map(|c| c.chain_id)
 					.ok_or_else(|| RecoveryError::Storage("No output chains in order".into()))?;
 
-				match self.delivery.get_receipt(&fill_tx, chain_id).await {
-					Ok(receipt) if receipt.success => {
-						self.mark_recovered_attempt_confirmed(
-							&order.id,
-							TransactionType::Fill,
-							&fill_tx,
-							&receipt,
-						)
-						.await;
-						if order.fill_proof.is_some() {
-							return Ok((
-								order.clone(),
-								ReconcileResult::NeedsPreClaim {
-									fill_proof: order.fill_proof.clone(),
-								},
-							));
-						} else {
-							match self.settlement.recover_post_fill_state(&order).await {
-								Ok(true) => return Ok((order, ReconcileResult::NeedsMonitoring)),
-								Ok(false) => {
-									return Ok((order, ReconcileResult::NeedsPostFill));
-								},
-								Err(e) => {
-									tracing::error!(
-										order_id = %order.id,
-										error = %e,
-										"Failed to recover existing post-fill state during recovery"
-									);
-									return Err(RecoveryError::Settlement(e.to_string()));
-								},
+				let mut candidates = vec![fill_tx.clone()];
+				if let Some(lineage_hash) =
+					choose_recovery_attempt_hash(&attempts, TransactionType::Fill)
+				{
+					if lineage_hash != fill_tx {
+						candidates.push(lineage_hash);
+					}
+				}
+				let mut last_receipt_error = None;
+				for candidate in candidates {
+					match self.delivery.get_receipt(&candidate, chain_id).await {
+						Ok(receipt) if receipt.success => {
+							if candidate != fill_tx {
+								self.write_repaired_hash(
+									&mut order,
+									TransactionType::Fill,
+									candidate.clone(),
+								)
+								.await;
 							}
-						}
-					},
-					Ok(receipt) => {
-						tracing::warn!(
-							"Fill transaction {} reverted",
-							with_0x_prefix(&hex::encode(&fill_tx.0))
-						);
-						let result = self
-							.handle_confirmed_revert(
-								&mut order,
+							self.mark_recovered_attempt_confirmed(
+								&order.id,
 								TransactionType::Fill,
-								&fill_tx,
-								chain_id,
-								receipt.block_number,
-								&attempts,
+								&candidate,
+								&receipt,
 							)
 							.await;
-						return Ok((order, result));
-					},
-					Err(e) => {
-						tracing::warn!(
-							"Could not get fill transaction receipt; treating as Unknown: {}",
-							e
-						);
-						return Ok((order, ReconcileResult::Unknown));
-					},
+							if order.fill_proof.is_some() {
+								return Ok((
+									order.clone(),
+									ReconcileResult::NeedsPreClaim {
+										fill_proof: order.fill_proof.clone(),
+									},
+								));
+							} else {
+								match self.settlement.recover_post_fill_state(&order).await {
+									Ok(true) => {
+										return Ok((order, ReconcileResult::NeedsMonitoring))
+									},
+									Ok(false) => {
+										return Ok((order, ReconcileResult::NeedsPostFill));
+									},
+									Err(e) => {
+										tracing::error!(
+											order_id = %order.id,
+											error = %e,
+											"Failed to recover existing post-fill state during recovery"
+										);
+										return Err(RecoveryError::Settlement(e.to_string()));
+									},
+								}
+							}
+						},
+						Ok(receipt) => {
+							tracing::warn!(
+								"Fill transaction {} reverted",
+								with_0x_prefix(&hex::encode(&candidate.0))
+							);
+							let result = self
+								.handle_confirmed_revert(
+									&mut order,
+									TransactionType::Fill,
+									&candidate,
+									chain_id,
+									receipt.block_number,
+									&attempts,
+								)
+								.await;
+							return Ok((order, result));
+						},
+						Err(e) => {
+							tracing::warn!(
+								"Could not get fill transaction receipt for recovery candidate: {}",
+								e
+							);
+							last_receipt_error = Some(e);
+						},
+					}
 				}
+				if let Some(e) = last_receipt_error {
+					tracing::warn!(
+						"Could not get any fill transaction receipt from order hash or attempt lineage; treating as Unknown: {}",
+						e
+					);
+				}
+				return Ok((order, ReconcileResult::Unknown));
 			},
 			StageResolution::NotFound => { /* fall through to prepare */ },
 		}

@@ -14,12 +14,17 @@ use alloy_rpc_types::{BlockNumberOrTag, Filter, Log, TransactionReceipt, Transac
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{sol, SolEvent, SolValue};
 use anyhow::{anyhow, Context as _, Result};
+use solver_core::state::{transaction_attempt::TransactionAttemptStore, OrderStateMachine};
+use solver_storage::{
+	implementations::file::{FileStorage, TtlConfig as FileTtlConfig},
+	StorageService,
+};
 use std::{
 	collections::HashMap,
 	path::PathBuf,
 	process::{Child, Command, Stdio},
 	str::FromStr,
-	sync::OnceLock,
+	sync::{Arc, OnceLock},
 	time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tempfile::TempDir;
@@ -136,6 +141,8 @@ pub const USER_ADDRESS: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
 /// Anvil's third dev account. Receives the output token on the destination chain.
 pub const RECIPIENT_ADDRESS: &str = "0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC";
 
+pub const E2E_SOLVER_ID: &str = "oif-solver-e2e";
+
 /// Canonical Permit2 deployment address — same on every EVM chain. The
 /// `InputSettlerEscrow` hardcodes this address when handling Permit2-flavored
 /// `openFor` calls, so the harness must plant Permit2's runtime bytecode
@@ -212,6 +219,7 @@ pub struct Harness {
 	solver: Option<Child>,
 	solver_stderr_path: PathBuf,
 	bootstrap_path: PathBuf,
+	options: HarnessOptions,
 	_tempdir: TempDir,
 	/// Held to serialize concurrent `Harness` constructions in the same
 	/// process. Released when the guard is dropped (via the `Drop` impl).
@@ -256,6 +264,9 @@ pub struct HarnessOptions {
 	/// test doesn't trigger a `cargo build -p solver-service --bin solver` it
 	/// doesn't need. Defaults to true.
 	pub run_solver: bool,
+	/// Optional transaction bumping configuration for tests that need the
+	/// sweeper enabled. Passed through to `SeedOverrides` unchanged.
+	pub tx_bump: Option<solver_types::OperatorTxBumpConfig>,
 }
 
 async fn read_order_from_storage_root(
@@ -267,7 +278,7 @@ async fn read_order_from_storage_root(
 		StorageService,
 	};
 
-	let storage_root = root.join("data/storage");
+	let storage_root = root.join("data/storage").join(E2E_SOLVER_ID);
 	let storage = StorageService::new(Box::new(FileStorage::new(
 		storage_root,
 		TtlConfig::default(),
@@ -276,6 +287,47 @@ async fn read_order_from_storage_root(
 		.retrieve(solver_types::StorageKey::Orders.as_str(), order_id)
 		.await
 		.with_context(|| format!("read order {order_id} from file storage"))
+}
+
+async fn scan_attempt_files(
+	storage_root: &std::path::Path,
+	storage: Arc<StorageService>,
+	order_id: &str,
+	alternate_order_id: &str,
+) -> Result<Vec<solver_types::TransactionAttempt>> {
+	let entries = match std::fs::read_dir(storage_root) {
+		Ok(entries) => entries,
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+		Err(e) => return Err(e).with_context(|| format!("scan {}", storage_root.display())),
+	};
+
+	let mut attempts = Vec::new();
+	for entry in entries {
+		let entry = entry.with_context(|| format!("read entry in {}", storage_root.display()))?;
+		let file_name = entry.file_name();
+		let Some(file_name) = file_name.to_str() else {
+			continue;
+		};
+		let Some(id) = file_name
+			.strip_prefix("transaction_attempts_")
+			.and_then(|name| name.strip_suffix(".bin"))
+		else {
+			continue;
+		};
+		let attempt = storage
+			.retrieve::<solver_types::TransactionAttempt>(
+				solver_types::StorageKey::TransactionAttempts.as_str(),
+				id,
+			)
+			.await
+			.with_context(|| format!("read transaction attempt {id}"))?;
+		attempts.push(attempt);
+	}
+
+	Ok(attempts
+		.into_iter()
+		.filter(|attempt| attempt.order_id == order_id || attempt.order_id == alternate_order_id)
+		.collect())
 }
 
 fn log_file_contains(path: &std::path::Path, needle: &str) -> Result<bool> {
@@ -297,6 +349,7 @@ impl Default for HarnessOptions {
 			enable_permit2: false,
 			deny_list_addresses: None,
 			run_solver: true,
+			tx_bump: None,
 		}
 	}
 }
@@ -484,6 +537,7 @@ impl Harness {
 			solver,
 			solver_stderr_path,
 			bootstrap_path,
+			options,
 			_tempdir: tempdir,
 			_lock: lock_guard,
 		})
@@ -553,6 +607,14 @@ impl Harness {
 		format!("http://127.0.0.1:{SOLVER_API_PORT}/api/v1")
 	}
 
+	fn loopback_http_client() -> Result<reqwest::Client> {
+		reqwest::Client::builder()
+			.no_proxy()
+			.timeout(Duration::from_secs(15))
+			.build()
+			.context("build loopback HTTP client")
+	}
+
 	/// Compute the on-chain orderId for a `StandardOrder` by calling the
 	/// origin input settler's `orderIdentifier(order)` view. Off-chain
 	/// submission tests need this *before* the `Open` event fires so we can
@@ -572,7 +634,7 @@ impl Harness {
 	/// `PostOrderResponse` for inspection (status, optional orderId).
 	pub async fn submit_post_order(&self, request: &PostOrderRequest) -> Result<PostOrderResponse> {
 		let url = format!("{}/orders", self.api_base_url());
-		let resp = reqwest::Client::new()
+		let resp = Self::loopback_http_client()?
 			.post(&url)
 			.json(request)
 			.send()
@@ -632,6 +694,185 @@ impl Harness {
 			.await
 			.with_context(|| format!("anvil_setBalance({account}, {wei}) on chain {chain_id}"))?;
 		Ok(())
+	}
+
+	/// Enable or disable Anvil automining on one harness chain.
+	pub async fn set_automine(&self, chain_id: u64, enabled: bool) -> Result<()> {
+		let provider = self.provider_for(chain_id)?;
+		provider
+			.client()
+			.request::<_, serde_json::Value>("evm_setAutomine", (enabled,))
+			.await
+			.with_context(|| format!("evm_setAutomine({enabled}) on chain {chain_id}"))?;
+		Ok(())
+	}
+
+	/// Set Anvil interval mining in seconds on one harness chain.
+	///
+	/// The harness starts Anvil with `--block-time 1`; disabling automine alone
+	/// does not keep transactions pending because interval mining can still
+	/// produce blocks. Use `0` with `set_automine(false)` when a test needs a
+	/// deterministic pending transaction window.
+	pub async fn set_interval_mining(&self, chain_id: u64, seconds: u64) -> Result<()> {
+		let provider = self.provider_for(chain_id)?;
+		provider
+			.client()
+			.request::<_, serde_json::Value>("evm_setIntervalMining", (seconds,))
+			.await
+			.with_context(|| format!("evm_setIntervalMining({seconds}) on chain {chain_id}"))?;
+		Ok(())
+	}
+
+	/// Mine `count` blocks on one harness chain.
+	pub async fn mine_blocks(&self, chain_id: u64, count: u64) -> Result<()> {
+		let provider = self.provider_for(chain_id)?;
+		for _ in 0..count {
+			provider
+				.client()
+				.request::<_, serde_json::Value>("evm_mine", ())
+				.await
+				.with_context(|| format!("evm_mine on chain {chain_id}"))?;
+		}
+		Ok(())
+	}
+
+	/// Set the base fee for the next Anvil block on one harness chain.
+	pub async fn set_next_block_base_fee_per_gas(&self, chain_id: u64, fee: U256) -> Result<()> {
+		let provider = self.provider_for(chain_id)?;
+		provider
+			.client()
+			.request::<_, serde_json::Value>("anvil_setNextBlockBaseFeePerGas", (fee,))
+			.await
+			.with_context(|| {
+				format!("anvil_setNextBlockBaseFeePerGas({fee}) on chain {chain_id}")
+			})?;
+		Ok(())
+	}
+
+	/// Drop a pending transaction from one harness chain's Anvil mempool.
+	pub async fn drop_transaction(
+		&self,
+		chain_id: u64,
+		tx_hash: &solver_types::TransactionHash,
+	) -> Result<()> {
+		let provider = self.provider_for(chain_id)?;
+		let hash = format!("0x{}", hex::encode(&tx_hash.0));
+		provider
+			.client()
+			.request::<_, serde_json::Value>("anvil_dropTransaction", (hash.clone(),))
+			.await
+			.with_context(|| format!("anvil_dropTransaction({hash}) on chain {chain_id}"))?;
+		Ok(())
+	}
+
+	/// Stop the solver subprocess while keeping Anvil chains and storage alive.
+	pub async fn stop_solver(&mut self) -> Result<()> {
+		if let Some(mut solver) = self.solver.take() {
+			solver.kill().context("kill solver subprocess")?;
+			solver.wait().context("wait for solver subprocess exit")?;
+		}
+		Ok(())
+	}
+
+	/// Restart the solver subprocess with the same bootstrap config and storage.
+	pub async fn restart_solver(&mut self) -> Result<()> {
+		self.stop_solver().await?;
+		let child = spawn_solver(
+			&self.bootstrap_path,
+			self._tempdir.path(),
+			&self.solver_stderr_path,
+			&self.options,
+		)?;
+		wait_for_tcp_ready(SOLVER_API_PORT, SOLVER_HEALTH_TIMEOUT).await?;
+		self.solver = Some(child);
+		Ok(())
+	}
+
+	fn storage_service(&self) -> Arc<StorageService> {
+		Arc::new(StorageService::new(Box::new(FileStorage::new(
+			self._tempdir
+				.path()
+				.join("data/storage")
+				.join(E2E_SOLVER_ID),
+			FileTtlConfig::default(),
+		))))
+	}
+
+	/// Read an order directly from the solver's file-backed storage.
+	pub async fn stored_order(&self, order_id: &str) -> Result<solver_types::Order> {
+		let state = OrderStateMachine::new(self.storage_service());
+		state
+			.get_order(order_id)
+			.await
+			.with_context(|| format!("read stored order {order_id}"))
+	}
+
+	/// Read all transaction attempts for an order directly from storage.
+	pub async fn stored_attempts(
+		&self,
+		order_id: &str,
+	) -> Result<Vec<solver_types::TransactionAttempt>> {
+		let store = TransactionAttemptStore::new(self.storage_service());
+		let attempts = store
+			.attempts_for_order(order_id)
+			.await
+			.with_context(|| format!("read attempts for order {order_id}"))?;
+		if !attempts.is_empty() {
+			return Ok(attempts);
+		}
+
+		let alternate_order_id = order_id
+			.strip_prefix("0x")
+			.map(str::to_owned)
+			.unwrap_or_else(|| solver_types::with_0x_prefix(order_id));
+		let attempts = store
+			.attempts_for_order(&alternate_order_id)
+			.await
+			.with_context(|| format!("read attempts for order {alternate_order_id}"))?;
+		if !attempts.is_empty() {
+			return Ok(attempts);
+		}
+
+		let storage = self.storage_service();
+		let storage_root = self
+			._tempdir
+			.path()
+			.join("data/storage")
+			.join(E2E_SOLVER_ID);
+		scan_attempt_files(&storage_root, storage, order_id, &alternate_order_id).await
+	}
+
+	/// Read transaction attempts for an order and transaction type.
+	pub async fn stored_attempts_by_type(
+		&self,
+		order_id: &str,
+		tx_type: solver_types::TransactionType,
+	) -> Result<Vec<solver_types::TransactionAttempt>> {
+		let attempts = self.stored_attempts(order_id).await?;
+		Ok(attempts
+			.into_iter()
+			.filter(|attempt| attempt.tx_type == tx_type)
+			.collect())
+	}
+
+	/// Overwrite a transaction attempt directly in the solver's file-backed
+	/// storage. Used by resilience tests to simulate crash-window ledger
+	/// states that are hard to produce deterministically through public APIs.
+	pub async fn save_stored_attempt(
+		&self,
+		attempt: &solver_types::TransactionAttempt,
+	) -> Result<()> {
+		let store = TransactionAttemptStore::new(self.storage_service());
+		store
+			.save_attempt(attempt)
+			.await
+			.with_context(|| format!("save attempt {}", attempt.id))
+	}
+
+	/// Read the solver subprocess log captured since the latest boot.
+	pub fn solver_log_contents(&self) -> Result<String> {
+		std::fs::read_to_string(&self.solver_stderr_path)
+			.with_context(|| format!("read solver log {}", self.solver_stderr_path.display()))
 	}
 
 	/// Read native (ETH) balance.
@@ -1501,7 +1742,7 @@ fn build_seed_overrides(
 	};
 
 	Ok(solver_types::SeedOverrides {
-		solver_id: Some("oif-solver-e2e".to_string()),
+		solver_id: Some(E2E_SOLVER_ID.to_string()),
 		solver_name: Some("E2E test solver".to_string()),
 		networks: vec![network(origin), network(destination)],
 		settlement: Some(settlement),
@@ -1519,6 +1760,7 @@ fn build_seed_overrides(
 		live_fill_estimate_enabled: None,
 		live_post_fill_estimate_chain_ids: None,
 		fee_policy: None,
+		tx_bump: options.tx_bump.clone(),
 	})
 }
 
@@ -1825,7 +2067,7 @@ mod tests {
 	#[tokio::test]
 	async fn read_order_from_storage_root_loads_file_storage_order() {
 		let tmp = tempfile::TempDir::new().unwrap();
-		let root = tmp.path().join("data/storage");
+		let root = tmp.path().join("data/storage").join(E2E_SOLVER_ID);
 		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
 			root,
 			TtlConfig::default(),
@@ -1840,6 +2082,22 @@ mod tests {
 			.await
 			.unwrap();
 		assert_eq!(loaded.id, order.id);
+	}
+
+	#[tokio::test]
+	async fn scan_attempt_files_treats_missing_storage_root_as_empty() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let root = tmp.path().join("missing-storage-root");
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			root.clone(),
+			TtlConfig::default(),
+		))));
+
+		let attempts = scan_attempt_files(&root, storage, "order-1", "0xorder-1")
+			.await
+			.unwrap();
+
+		assert!(attempts.is_empty());
 	}
 
 	#[test]

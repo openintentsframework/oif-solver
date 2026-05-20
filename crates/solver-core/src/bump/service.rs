@@ -489,6 +489,7 @@ impl TransactionBumpService {
 			if let Some(tip_hash) = tip.tx_hash.clone() {
 				match self.delivery.get_receipt(&tip_hash, chain_id).await {
 					Ok(receipt) if receipt.success => {
+						let receipt_for_event = receipt.clone();
 						self.event_bus
 							.publish(SolverEvent::Delivery(DeliveryEvent::BumpTipAlreadyMined {
 								order_id: order_id.to_string(),
@@ -499,6 +500,15 @@ impl TransactionBumpService {
 								success: true,
 							}))
 							.ok();
+						tracing::warn!(
+							event = "BumpTipAlreadyMined",
+							%order_id,
+							attempt_id = %tip.id,
+							chain_id,
+							?tx_type,
+							success = true,
+							"tx_bump: receipt preflight found confirmed lineage tip"
+						);
 						if let Err(error) = self
 							.attempt_store
 							.mark_attempt_confirmed_from_receipt(&tip.id, tip_hash.clone(), receipt)
@@ -510,7 +520,7 @@ impl TransactionBumpService {
 										order_id: order_id.to_string(),
 										attempt_id: tip.id.clone(),
 										tx_type,
-										tx_hash: Some(tip_hash),
+										tx_hash: Some(tip_hash.clone()),
 										attempted_status: TransactionAttemptStatus::Confirmed,
 										error: error.to_string(),
 										context: "bump receipt preflight confirmed".to_string(),
@@ -518,6 +528,14 @@ impl TransactionBumpService {
 								))
 								.ok();
 						}
+						self.event_bus
+							.publish(SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
+								order_id: order_id.to_string(),
+								tx_hash: tip_hash,
+								tx_type,
+								receipt: receipt_for_event,
+							}))
+							.ok();
 						return;
 					},
 					Ok(receipt) => {
@@ -531,6 +549,15 @@ impl TransactionBumpService {
 								success: false,
 							}))
 							.ok();
+						tracing::warn!(
+							event = "BumpTipAlreadyMined",
+							%order_id,
+							attempt_id = %tip.id,
+							chain_id,
+							?tx_type,
+							success = false,
+							"tx_bump: receipt preflight found reverted lineage tip"
+						);
 						let receipt_for_update = receipt.clone();
 						let hash_for_update = tip_hash.clone();
 						if let Err(error) = self
@@ -552,7 +579,7 @@ impl TransactionBumpService {
 										order_id: order_id.to_string(),
 										attempt_id: tip.id.clone(),
 										tx_type,
-										tx_hash: Some(tip_hash),
+										tx_hash: Some(tip_hash.clone()),
 										attempted_status: TransactionAttemptStatus::Reverted,
 										error: error.to_string(),
 										context: "bump receipt preflight reverted".to_string(),
@@ -563,6 +590,11 @@ impl TransactionBumpService {
 						return;
 					},
 					Err(error) => {
+						let fail_closed = if is_receipt_not_found(&error) {
+							false
+						} else {
+							policy.receipt_preflight_fail_closed
+						};
 						self.event_bus
 							.publish(SolverEvent::Delivery(
 								DeliveryEvent::BumpReceiptPreflightSkipped {
@@ -572,11 +604,11 @@ impl TransactionBumpService {
 									tx_type,
 									tx_hash: tip_hash,
 									error: error.to_string(),
-									fail_closed: policy.receipt_preflight_fail_closed,
+									fail_closed,
 								},
 							))
 							.ok();
-						if policy.receipt_preflight_fail_closed {
+						if fail_closed {
 							return;
 						}
 					},
@@ -1045,6 +1077,13 @@ fn required_balance_wei(bumped: &BumpFees, original_tx: &solver_types::Transacti
 	gas_limit
 		.saturating_mul(U256::from(fee))
 		.saturating_add(original_tx.value)
+}
+
+fn is_receipt_not_found(error: &DeliveryError) -> bool {
+	matches!(
+		error,
+		DeliveryError::Network(message) if message.starts_with("Transaction not found on chain ")
+	)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2768,6 +2807,95 @@ mod tests {
 			)),
 			"expected successful BumpTipAlreadyMined, got: {events:?}"
 		);
+		assert!(
+			events.iter().any(|event| matches!(
+				event,
+				SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
+					order_id,
+					tx_type: TransactionType::Fill,
+					receipt,
+					..
+				}) if order_id == "order-1" && receipt.success
+			)),
+			"expected TransactionConfirmed so the engine can advance the order, got: {events:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn bump_receipt_preflight_not_found_still_submits_replacement() {
+		let cfg = default_enabled_config();
+		let signer = Address(vec![9; 20]);
+		let (service, attempt_store, storage, _bus, _tmp) =
+			test_service(cfg, MockDeliveryInterface::new());
+		seed_active_order(&storage, "order-1").await;
+		seed_attempt(
+			&attempt_store,
+			"parent-1",
+			TransactionAttemptStatus::Indeterminate,
+			None,
+			Some(signer.clone()),
+			10_000_000_000,
+		)
+		.await;
+
+		let mut mock = MockDeliveryInterface::new();
+		let signer_clone = signer.clone();
+		mock.expect_submission_signer()
+			.returning(move |_| Some(signer_clone.clone()));
+		mock.expect_get_receipt().times(1).returning(|_, _| {
+			Box::pin(async move {
+				Err(DeliveryError::Network(
+					"Transaction not found on chain 1".to_string(),
+				))
+			})
+		});
+		mock_large_balance(&mut mock);
+		let recorder: Arc<dyn TransactionAttemptRecorder> = attempt_store.clone();
+		let recorder_for_mock = recorder.clone();
+		mock.expect_submit()
+			.times(1)
+			.returning(move |tx, tracking| {
+				let recorder = recorder_for_mock.clone();
+				Box::pin(async move {
+					let tracking = tracking.expect("sweeper must supply tracking");
+					let outcome: Result<TransactionHash, DeliveryError> =
+						Ok(TransactionHash(vec![0xbc; 32]));
+					simulate_submit_recording(
+						&recorder,
+						&tracking,
+						&tx,
+						&outcome,
+						Some(Address(vec![9; 20])),
+					)
+					.await;
+					outcome
+				})
+			});
+
+		let delivery_impls: HashMap<u64, Arc<dyn DeliveryInterface>> =
+			HashMap::from([(1u64, Arc::new(mock) as Arc<dyn DeliveryInterface>)]);
+		let delivery_svc = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
+		let service = TransactionBumpService::new(
+			service.config.clone(),
+			storage.clone(),
+			attempt_store.clone(),
+			delivery_svc,
+			service.event_bus.clone(),
+			recorder,
+			test_pricing(),
+		);
+
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		service.tick().await.unwrap();
+
+		let attempts = attempt_store.attempts_for_order("order-1").await.unwrap();
+		assert_eq!(attempts.len(), 2, "missing receipt must not block bumping");
+		assert!(
+			attempts
+				.iter()
+				.any(|a| a.replacement_of.as_deref() == Some("parent-1")),
+			"replacement child should be recorded, got {attempts:?}"
+		);
 	}
 
 	#[tokio::test]
@@ -2830,6 +2958,13 @@ mod tests {
 				}) if attempt_id == "parent-1"
 			)),
 			"expected reverted BumpTipAlreadyMined, got: {events:?}"
+		);
+		assert!(
+			!events.iter().any(|event| matches!(
+				event,
+				SolverEvent::Delivery(DeliveryEvent::TransactionFailed { .. })
+			)),
+			"receipt preflight cannot classify reverted receipts; recovery must reconcile instead of failing the order: {events:?}"
 		);
 	}
 

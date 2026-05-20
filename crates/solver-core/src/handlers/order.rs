@@ -439,6 +439,9 @@ mod tests {
 		setup_order(&mut mock_order);
 		setup_delivery(&mut mock_delivery);
 		setup_storage(&mut mock_storage);
+		mock_storage
+			.expect_compare_and_swap_with_indexes()
+			.returning(|_, _, _, _, _| Box::pin(async { Ok(true) }));
 
 		// Create services with configured mocks
 		let order_service = Arc::new(OrderService::new(
