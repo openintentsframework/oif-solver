@@ -333,7 +333,27 @@ async fn scan_attempt_files(
 fn log_file_contains(path: &std::path::Path, needle: &str) -> Result<bool> {
 	let contents = std::fs::read_to_string(path)
 		.with_context(|| format!("read solver log {}", path.display()))?;
-	Ok(contents.contains(needle))
+	Ok(contents.contains(needle) || strip_ansi_codes(&contents).contains(needle))
+}
+
+fn strip_ansi_codes(input: &str) -> String {
+	let mut output = String::with_capacity(input.len());
+	let mut chars = input.chars().peekable();
+
+	while let Some(ch) = chars.next() {
+		if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+			chars.next();
+			for next in chars.by_ref() {
+				if next.is_ascii_alphabetic() {
+					break;
+				}
+			}
+			continue;
+		}
+		output.push(ch);
+	}
+
+	output
 }
 
 impl Default for HarnessOptions {
@@ -2111,5 +2131,18 @@ mod tests {
 		.unwrap();
 		assert!(log_file_contains(&path, "Insufficient native gas").unwrap());
 		assert!(!log_file_contains(&path, "not present").unwrap());
+	}
+
+	#[test]
+	fn log_file_contains_matches_ansi_formatted_tracing_fields() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let path = tmp.path().join("solver.log");
+		std::fs::write(
+			&path,
+			"tx_bump: receipt preflight found confirmed lineage tip \u{1b}[3mevent\u{1b}[0m\u{1b}[2m=\u{1b}[0m\"BumpTipAlreadyMined\" \u{1b}[3msuccess\u{1b}[0m\u{1b}[2m=\u{1b}[0mtrue\n",
+		)
+		.unwrap();
+		assert!(log_file_contains(&path, "event=\"BumpTipAlreadyMined\"").unwrap());
+		assert!(log_file_contains(&path, "success=true").unwrap());
 	}
 }
