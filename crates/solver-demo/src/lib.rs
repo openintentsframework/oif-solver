@@ -143,11 +143,18 @@ impl Context {
 		let signing = SigningService::new();
 
 		// Create JWT service with API URL
-		let api_url = if let Some(api_config) = &config.solver.api {
-			format!("http://{}:{}", api_config.host, api_config.port)
-		} else {
-			"http://localhost:3000".to_string()
-		};
+		// OIF_DEMO_API_URL env var overrides the config-derived host:port so the
+		// demo can drive a remote/HTTPS deployed solver. Empty values are ignored.
+		let api_url = std::env::var("OIF_DEMO_API_URL")
+			.ok()
+			.filter(|s| !s.is_empty())
+			.unwrap_or_else(|| {
+				if let Some(api_config) = &config.solver.api {
+					format!("http://{}:{}", api_config.host, api_config.port)
+				} else {
+					"http://localhost:3000".to_string()
+				}
+			});
 		let jwt = JwtService::new(api_url);
 
 		Ok(Self {
@@ -200,12 +207,19 @@ impl Context {
 	/// # Errors
 	/// Returns Error if JWT token retrieval fails (when auth is enabled) or API client creation fails
 	pub async fn api_client(&self) -> Result<ApiClient> {
-		// Get API URL from config if available, otherwise use default
-		let api_url = if let Some(api_config) = &self.config.solver.api {
-			format!("http://{}:{}", api_config.host, api_config.port)
-		} else {
-			"http://localhost:3000".to_string()
-		};
+		// Get API URL from config if available, otherwise use default.
+		// OIF_DEMO_API_URL env var takes precedence (used to point at a remote/HTTPS
+		// deployed solver). Empty values are ignored.
+		let api_url = std::env::var("OIF_DEMO_API_URL")
+			.ok()
+			.filter(|s| !s.is_empty())
+			.unwrap_or_else(|| {
+				if let Some(api_config) = &self.config.solver.api {
+					format!("http://{}:{}", api_config.host, api_config.port)
+				} else {
+					"http://localhost:3000".to_string()
+				}
+			});
 
 		// Check if the public Orders API requires a JWT.
 		let orders_auth_enabled = self
@@ -305,11 +319,18 @@ impl Context {
 		let signing = SigningService::new();
 
 		// Create JWT service with API URL
-		let api_url = if let Some(api_config) = &config.solver.api {
-			format!("http://{}:{}", api_config.host, api_config.port)
-		} else {
-			"http://localhost:3000".to_string()
-		};
+		// OIF_DEMO_API_URL env var overrides the config-derived host:port so the
+		// demo can drive a remote/HTTPS deployed solver. Empty values are ignored.
+		let api_url = std::env::var("OIF_DEMO_API_URL")
+			.ok()
+			.filter(|s| !s.is_empty())
+			.unwrap_or_else(|| {
+				if let Some(api_config) = &config.solver.api {
+					format!("http://{}:{}", api_config.host, api_config.port)
+				} else {
+					"http://localhost:3000".to_string()
+				}
+			});
 		let jwt = JwtService::new(api_url);
 
 		Ok(Self {
