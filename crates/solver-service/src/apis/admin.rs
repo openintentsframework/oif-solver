@@ -1757,6 +1757,7 @@ mod tests {
 			account: None,
 			rebalance: None,
 			fee_policy: None,
+			tx_bump: solver_types::OperatorTxBumpConfig::default(),
 		}
 	}
 

@@ -15,6 +15,7 @@ path = "src/lib.rs"
 # (`SeedOverrides`) with typed Rust values rather than hand-rolled JSON. That
 # was the source of the previous "expected a sequence" parse failure.
 solver-types = { path = "../solver-types" }
+solver-storage = { path = "../solver-storage" }
 
 # Direct alloy access for: deploys, contract calls, log polling, event ABI
 # decoding. We deliberately avoid `solver-delivery`/`solver-discovery` here —
@@ -44,4 +45,3 @@ async-trait = { workspace = true }
 solver-core = { path = "../solver-core" }
 solver-delivery = { path = "../solver-delivery" }
 solver-settlement = { path = "../solver-settlement", features = ["testing"] }
-solver-storage = { path = "../solver-storage" }

@@ -6,6 +6,7 @@
 
 mod chain_evidence;
 
+use crate::bump::lineage::{lineage_components, lineage_tip};
 use crate::engine::event_bus::EventBus;
 use crate::state::order::{
 	FAILED_STATUS_KIND_INDEX_VALUE, FINALIZED_STATUS_KIND_INDEX_VALUE, STATUS_KIND_INDEX_FIELD,
@@ -17,8 +18,9 @@ use solver_delivery::DeliveryService;
 use solver_settlement::{SettlementReadiness, SettlementService};
 use solver_storage::{QueryFilter, StorageService};
 use solver_types::{
-	with_0x_prefix, Intent, Order, OrderEvent, OrderStatus, SettlementEvent, SolverEvent,
-	StorageKey, TransactionAttempt, TransactionAttemptStatus, TransactionHash, TransactionType,
+	with_0x_prefix, DeliveryEvent, Intent, Order, OrderEvent, OrderStatus, SettlementEvent,
+	SolverEvent, StorageKey, TransactionAttempt, TransactionAttemptStatus, TransactionHash,
+	TransactionReceipt, TransactionType,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -77,31 +79,43 @@ enum ReconcileResult {
 	Finalized,
 }
 
-fn recovery_status_rank(status: TransactionAttemptStatus) -> Option<u8> {
-	match status {
-		TransactionAttemptStatus::Confirmed => Some(3),
-		TransactionAttemptStatus::Broadcast => Some(2),
-		TransactionAttemptStatus::Indeterminate => Some(1),
-		TransactionAttemptStatus::Planned
-		| TransactionAttemptStatus::SubmitRejected
-		| TransactionAttemptStatus::Reverted => None,
-	}
-}
-
 fn choose_recovery_attempt_hash(
 	attempts: &[TransactionAttempt],
 	tx_type: TransactionType,
 ) -> Option<TransactionHash> {
-	attempts
+	let stage_attempts: Vec<TransactionAttempt> = attempts
 		.iter()
 		.filter(|attempt| attempt.tx_type == tx_type)
-		.filter_map(|attempt| {
-			let rank = recovery_status_rank(attempt.status)?;
-			let tx_hash = attempt.tx_hash.clone()?;
-			Some((rank, attempt.updated_at, tx_hash))
+		.cloned()
+		.collect();
+	let components = lineage_components(&stage_attempts);
+
+	for component in &components {
+		if let Some(confirmed) = component
+			.iter()
+			.find(|attempt| attempt.status == TransactionAttemptStatus::Confirmed)
+		{
+			if let Some(hash) = confirmed.tx_hash.clone() {
+				return Some(hash);
+			}
+		}
+	}
+
+	components
+		.iter()
+		.filter_map(|component| {
+			let tip = lineage_tip(component)?;
+			if matches!(
+				tip.status,
+				TransactionAttemptStatus::Broadcast | TransactionAttemptStatus::Indeterminate
+			) {
+				tip.tx_hash.clone().map(|hash| (tip.updated_at, hash))
+			} else {
+				None
+			}
 		})
-		.max_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)))
-		.map(|(_, _, tx_hash)| tx_hash)
+		.max_by_key(|(updated_at, _)| *updated_at)
+		.map(|(_, hash)| hash)
 }
 
 fn order_stage_hash(order: &Order, tx_type: TransactionType) -> Option<TransactionHash> {
@@ -362,6 +376,78 @@ impl RecoveryService {
 		}
 	}
 
+	async fn mark_recovered_attempt_confirmed(
+		&self,
+		order_id: &str,
+		tx_type: TransactionType,
+		tx_hash: &TransactionHash,
+		receipt: &TransactionReceipt,
+	) {
+		match self.attempt_store.attempt_by_hash(tx_hash).await {
+			Ok(Some(attempt)) if attempt.order_id == order_id && attempt.tx_type == tx_type => {
+				if let Err(error) = self
+					.attempt_store
+					.mark_attempt_confirmed_from_receipt(
+						&attempt.id,
+						tx_hash.clone(),
+						receipt.clone(),
+					)
+					.await
+				{
+					tracing::error!(
+						%order_id,
+						attempt_id = %attempt.id,
+						?tx_type,
+						?tx_hash,
+						%error,
+						"Recovery proved transaction confirmed but attempt ledger update failed"
+					);
+					self.event_bus
+						.publish(SolverEvent::Delivery(
+							DeliveryEvent::TransactionAttemptLedgerConflict {
+								order_id: order_id.to_string(),
+								attempt_id: attempt.id,
+								tx_type,
+								tx_hash: Some(tx_hash.clone()),
+								attempted_status: TransactionAttemptStatus::Confirmed,
+								error: error.to_string(),
+								context: "recovery mark confirmed".to_string(),
+							},
+						))
+						.ok();
+				}
+			},
+			Ok(Some(attempt)) => {
+				tracing::debug!(
+					%order_id,
+					attempt_id = %attempt.id,
+					attempt_order_id = %attempt.order_id,
+					attempt_tx_type = ?attempt.tx_type,
+					expected_tx_type = ?tx_type,
+					?tx_hash,
+					"Recovery found attempt by hash but order/stage did not match; not marking confirmed"
+				);
+			},
+			Ok(None) => {
+				tracing::debug!(
+					%order_id,
+					?tx_type,
+					?tx_hash,
+					"Recovery proved transaction confirmed but no attempt row matched the hash"
+				);
+			},
+			Err(error) => {
+				tracing::warn!(
+					%order_id,
+					?tx_type,
+					?tx_hash,
+					%error,
+					"Recovery could not look up attempt by recovered hash"
+				);
+			},
+		}
+	}
+
 	async fn fill_chain_evidence(&self, order: &mut Order) -> StageResolution {
 		let chain_id = match order.output_chains.first().map(|c| c.chain_id) {
 			Some(id) => id,
@@ -411,6 +497,70 @@ impl RecoveryService {
 
 		self.evidence_to_resolution(order, TransactionType::Fill, evidence)
 			.await
+	}
+
+	async fn prepare_chain_evidence(&self, order: &mut Order) -> StageResolution {
+		let chain_id = match order.input_chains.first().map(|c| c.chain_id) {
+			Some(id) => id,
+			None => {
+				tracing::warn!(
+					order_id = %order.id,
+					"Order has no input_chains; prepare chain probe skipped"
+				);
+				return StageResolution::Unknown;
+			},
+		};
+		let network = match self.networks_config.get(&chain_id) {
+			Some(n) => n,
+			None => {
+				tracing::warn!(
+					chain_id,
+					order_id = %order.id,
+					"no NetworkConfig for input chain; prepare chain probe skipped"
+				);
+				return StageResolution::NotFound;
+			},
+		};
+		let order_id_bytes = match solver_types::order_id_to_bytes32(&order.id) {
+			Ok(bytes) => bytes,
+			Err(error) => {
+				tracing::warn!(
+					order_id = %order.id,
+					%error,
+					"invalid order id for prepare chain probe"
+				);
+				return StageResolution::Unknown;
+			},
+		};
+
+		let candidates: Vec<&solver_types::Address> =
+			std::iter::once(&network.input_settler_address)
+				.chain(network.input_settler_compact_address.iter())
+				.collect();
+
+		for settler in candidates {
+			let evidence = chain_evidence::chain_evidence_for_prepare_open(
+				&self.delivery,
+				chain_id,
+				settler,
+				&order_id_bytes,
+				chain_evidence::DEFAULT_RECOVERY_SCAN_WINDOW_BLOCKS,
+			)
+			.await;
+
+			match evidence {
+				chain_evidence::ChainEvidence::Proven { .. }
+				| chain_evidence::ChainEvidence::NegativeTerminal { .. }
+				| chain_evidence::ChainEvidence::Unknown { .. } => {
+					return self
+						.evidence_to_resolution(order, TransactionType::Prepare, evidence)
+						.await;
+				},
+				chain_evidence::ChainEvidence::NotFound => continue,
+			}
+		}
+
+		StageResolution::NotFound
 	}
 
 	async fn claim_chain_evidence(
@@ -643,10 +793,27 @@ impl RecoveryService {
 					},
 				}
 			},
-			TransactionType::Fill | TransactionType::PostFill | TransactionType::Prepare => {
+			TransactionType::Prepare => {
+				let resolution = self.prepare_chain_evidence(order).await;
+				match resolution {
+					StageResolution::Hash(_) => ReconcileResult::NeedsFill,
+					StageResolution::Terminated => {
+						ReconcileResult::Failed(TransactionType::Prepare)
+					},
+					StageResolution::NotFound | StageResolution::Unknown => {
+						tracing::warn!(
+							order_id = %order.id,
+							?reason,
+							"Prepare StageComplete classification but Open event was not proven; returning Unknown"
+						);
+						ReconcileResult::Unknown
+					},
+				}
+			},
+			TransactionType::Fill | TransactionType::PostFill => {
 				// PR 05 does not promote AlreadyFilled to StageComplete (fill
 				// evidence is too weak); and no idempotency errors exist on
-				// PostFill/Prepare in OIF. Defensive fallback.
+				// PostFill in OIF. Defensive fallback.
 				tracing::warn!(
 					order_id = %order.id,
 					?tx_type,
@@ -722,6 +889,7 @@ impl RecoveryService {
 
 		// Layer 3: chain log probe
 		match tx_type {
+			TransactionType::Prepare => self.prepare_chain_evidence(order).await,
 			TransactionType::Fill => self.fill_chain_evidence(order).await,
 			TransactionType::Claim => self.claim_chain_evidence(order, attempts).await,
 			_ => StageResolution::NotFound,
@@ -770,6 +938,13 @@ impl RecoveryService {
 
 				match self.delivery.get_receipt(&claim_tx, chain_id).await {
 					Ok(receipt) if receipt.success => {
+						self.mark_recovered_attempt_confirmed(
+							&order.id,
+							TransactionType::Claim,
+							&claim_tx,
+							&receipt,
+						)
+						.await;
 						return Ok((order, ReconcileResult::Finalized));
 					},
 					Ok(receipt) => {
@@ -817,6 +992,13 @@ impl RecoveryService {
 
 				match self.delivery.get_receipt(&pre_claim_tx, chain_id).await {
 					Ok(receipt) if receipt.success => {
+						self.mark_recovered_attempt_confirmed(
+							&order.id,
+							TransactionType::PreClaim,
+							&pre_claim_tx,
+							&receipt,
+						)
+						.await;
 						return Ok((
 							order.clone(),
 							ReconcileResult::NeedsClaim {
@@ -871,6 +1053,13 @@ impl RecoveryService {
 
 				match self.delivery.get_receipt(&post_fill_tx, chain_id).await {
 					Ok(receipt) if receipt.success => {
+						self.mark_recovered_attempt_confirmed(
+							&order.id,
+							TransactionType::PostFill,
+							&post_fill_tx,
+							&receipt,
+						)
+						.await;
 						if order.fill_proof.is_some() {
 							return Ok((
 								order.clone(),
@@ -924,6 +1113,13 @@ impl RecoveryService {
 
 				match self.delivery.get_receipt(&fill_tx, chain_id).await {
 					Ok(receipt) if receipt.success => {
+						self.mark_recovered_attempt_confirmed(
+							&order.id,
+							TransactionType::Fill,
+							&fill_tx,
+							&receipt,
+						)
+						.await;
 						if order.fill_proof.is_some() {
 							return Ok((
 								order.clone(),
@@ -995,6 +1191,13 @@ impl RecoveryService {
 
 				match self.delivery.get_receipt(&prepare_tx, chain_id).await {
 					Ok(receipt) if receipt.success => {
+						self.mark_recovered_attempt_confirmed(
+							&order.id,
+							TransactionType::Prepare,
+							&prepare_tx,
+							&receipt,
+						)
+						.await;
 						return Ok((order, ReconcileResult::NeedsFill));
 					},
 					Ok(receipt) => {
@@ -1706,6 +1909,111 @@ mod tests {
 		assert!(choose_recovery_attempt_hash(&attempts, TransactionType::Fill).is_none());
 	}
 
+	#[test]
+	fn recovery_picks_confirmed_attempt_when_lineage_present() {
+		let a = sample_attempt(
+			"A",
+			TransactionType::Fill,
+			TransactionAttemptStatus::Indeterminate,
+			Some(0xaa),
+			100,
+		);
+		let mut b = sample_attempt(
+			"B",
+			TransactionType::Fill,
+			TransactionAttemptStatus::Confirmed,
+			Some(0xbb),
+			200,
+		);
+		b.replacement_of = Some("A".to_string());
+
+		let attempts = vec![a, b];
+		let hash = choose_recovery_attempt_hash(&attempts, TransactionType::Fill).unwrap();
+
+		assert_eq!(hash, TransactionHash(vec![0xbb; 32]));
+	}
+
+	#[test]
+	fn recovery_attempt_hash_uses_lineage_tip_when_no_confirmed_member_exists() {
+		let mut parent = sample_attempt(
+			"parent",
+			TransactionType::Fill,
+			TransactionAttemptStatus::Indeterminate,
+			Some(0xaa),
+			300,
+		);
+		parent.replaced_by = None;
+		let mut child = sample_attempt(
+			"child",
+			TransactionType::Fill,
+			TransactionAttemptStatus::Broadcast,
+			Some(0xbb),
+			200,
+		);
+		child.replacement_of = Some("parent".to_string());
+
+		let attempts = vec![parent, child];
+		let hash = choose_recovery_attempt_hash(&attempts, TransactionType::Fill).unwrap();
+
+		assert_eq!(hash, TransactionHash(vec![0xbb; 32]));
+	}
+
+	#[test]
+	fn recovery_skips_submit_rejected_and_replaced() {
+		let a = sample_attempt(
+			"A",
+			TransactionType::Fill,
+			TransactionAttemptStatus::SubmitRejected,
+			None,
+			100,
+		);
+		let mut b = sample_attempt(
+			"B",
+			TransactionType::Fill,
+			TransactionAttemptStatus::Replaced,
+			Some(0xbb),
+			200,
+		);
+		b.replacement_of = Some("A".to_string());
+
+		let attempts = vec![a, b];
+
+		assert!(choose_recovery_attempt_hash(&attempts, TransactionType::Fill).is_none());
+	}
+
+	#[test]
+	fn recovery_attempt_hash_skips_rejected_reverted_replaced_members() {
+		let mut replaced = sample_attempt(
+			"replaced",
+			TransactionType::Fill,
+			TransactionAttemptStatus::Replaced,
+			Some(0xaa),
+			100,
+		);
+		let mut rejected = sample_attempt(
+			"rejected",
+			TransactionType::Fill,
+			TransactionAttemptStatus::SubmitRejected,
+			Some(0xbb),
+			200,
+		);
+		rejected.replacement_of = Some("replaced".to_string());
+		let mut reverted = sample_attempt(
+			"reverted",
+			TransactionType::Fill,
+			TransactionAttemptStatus::Reverted,
+			Some(0xcc),
+			300,
+		);
+		reverted.replacement_of = Some("rejected".to_string());
+		replaced.replaced_by = Some("rejected".to_string());
+		rejected.replaced_by = Some("reverted".to_string());
+
+		let attempts = vec![replaced, rejected, reverted];
+
+		assert!(choose_recovery_attempt_hash(&attempts, TransactionType::Fill).is_none());
+	}
+
 	fn sample_tx(chain_id: u64) -> Transaction {
 		Transaction {
 			to: Some(Address(vec![3; 20])),
@@ -1721,7 +2029,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn recovery_repairs_missing_fill_hash_from_broadcast_attempt() {
+	async fn recovery_marks_matching_broadcast_attempt_confirmed_when_fill_receipt_is_proven() {
 		let temp_dir = tempfile::tempdir().unwrap();
 		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
 			temp_dir.path().to_path_buf(),
@@ -1806,7 +2114,7 @@ mod tests {
 			delivery,
 			settlement,
 			event_bus,
-			attempt_store,
+			attempt_store.clone(),
 			empty_networks_config(),
 		);
 
@@ -1819,6 +2127,128 @@ mod tests {
 		assert_eq!(repaired_order.fill_tx_hash, Some(tx_hash.clone()));
 		let stored = state_machine.get_order(&order.id).await.unwrap();
 		assert_eq!(stored.fill_tx_hash, Some(tx_hash));
+		let attempt = attempt_store.get_attempt(&attempt.id).await.unwrap();
+		assert_eq!(attempt.status, TransactionAttemptStatus::Confirmed);
+		assert!(attempt.receipt.is_some());
+	}
+
+	#[tokio::test]
+	async fn recovery_terminal_attempt_conflict_is_operator_visible_not_silent() {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let attempt_store = Arc::new(TransactionAttemptStore::new(storage.clone()));
+
+		let tx_hash = TransactionHash(vec![0xcc; 32]);
+		let mut order = create_test_order_with_status(OrderStatus::Executing);
+		order.fill_tx_hash = Some(tx_hash.clone());
+		order.post_fill_tx_hash = None;
+		order.settlement_name = Some("eip7683".to_string());
+		state_machine.store_order(&order).await.unwrap();
+
+		let attempt = attempt_store
+			.create_planned_attempt(
+				&order.id,
+				Some(Address(vec![9; 20])),
+				TransactionType::Fill,
+				sample_tx(137),
+			)
+			.await
+			.unwrap();
+		attempt_store
+			.update_attempt_status(
+				&attempt.id,
+				TransactionAttemptStatus::Replaced,
+				None,
+				|attempt| {
+					attempt.tx_hash = Some(tx_hash.clone());
+				},
+			)
+			.await
+			.unwrap();
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(tx_hash.clone()), eq(137u64))
+			.times(1)
+			.returning(move |hash, _| {
+				let hash = hash.clone();
+				Box::pin(async move {
+					Ok(solver_types::TransactionReceipt {
+						hash,
+						block_number: 12345,
+						success: true,
+						block_timestamp: None,
+						logs: vec![],
+					})
+				})
+			});
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				137u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			20,
+			60,
+		));
+
+		let mut mock_settlement = MockSettlementInterface::new();
+		mock_settlement
+			.expect_recover_post_fill_state()
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+		let settlement = Arc::new(SettlementService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]),
+			String::new(),
+			20,
+		));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+
+		let recovery_service = RecoveryService::new(
+			storage,
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+			empty_networks_config(),
+		);
+
+		let (_repaired_order, result) = recovery_service
+			.reconcile_with_blockchain(&order)
+			.await
+			.unwrap();
+
+		assert!(matches!(result, ReconcileResult::NeedsPostFill));
+		let event = receiver.try_recv().expect("expected conflict event");
+		match event {
+			SolverEvent::Delivery(DeliveryEvent::TransactionAttemptLedgerConflict {
+				order_id,
+				attempt_id,
+				tx_type,
+				tx_hash: event_tx_hash,
+				attempted_status,
+				context,
+				..
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(attempt_id, attempt.id);
+				assert_eq!(tx_type, TransactionType::Fill);
+				assert_eq!(event_tx_hash, Some(tx_hash));
+				assert_eq!(attempted_status, TransactionAttemptStatus::Confirmed);
+				assert_eq!(context, "recovery mark confirmed");
+			},
+			other => panic!("expected TransactionAttemptLedgerConflict, got {other:?}"),
+		}
 	}
 
 	#[tokio::test]
@@ -2789,32 +3219,14 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_publish_recovery_event_needs_claim_ready() {
-		let mut mock_storage = MockStorageInterface::new();
-
-		// Mock the exists call first
-		mock_storage
-			.expect_exists()
-			.with(eq("orders:test_order_123"))
-			.returning(|_| Box::pin(async { Ok(true) }));
-
-		// Mock the get_bytes call that happens when retrieving the order
-		let order = create_test_order_with_status(OrderStatus::Executed);
-		let order_bytes = serde_json::to_vec(&order).unwrap();
-		mock_storage
-			.expect_get_bytes()
-			.with(eq("orders:test_order_123"))
-			.returning(move |_| {
-				let order_bytes = order_bytes.clone();
-				Box::pin(async move { Ok(order_bytes) })
-			});
-
-		// Mock the set_bytes call that happens when updating the order
-		mock_storage
-			.expect_set_bytes()
-			.returning(|_, _, _, _| Box::pin(async { Ok(()) }));
-
-		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let order = create_test_order_with_status(OrderStatus::Settled);
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		state_machine.store_order(&order).await.unwrap();
 		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
 			HashMap::new();
 		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
@@ -2859,32 +3271,14 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_publish_recovery_event_needs_execution() {
-		let mut mock_storage = MockStorageInterface::new();
-
-		// Mock the exists call first
-		mock_storage
-			.expect_exists()
-			.with(eq("orders:test_order_123"))
-			.returning(|_| Box::pin(async { Ok(true) }));
-
-		// Mock the get_bytes call that happens when retrieving the order
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
 		let order = create_test_order_with_status(OrderStatus::Created);
-		let order_bytes = serde_json::to_vec(&order).unwrap();
-		mock_storage
-			.expect_get_bytes()
-			.with(eq("orders:test_order_123"))
-			.returning(move |_| {
-				let order_bytes = order_bytes.clone();
-				Box::pin(async move { Ok(order_bytes) })
-			});
-
-		// Mock the set_bytes call that happens when updating the order
-		mock_storage
-			.expect_set_bytes()
-			.returning(|_, _, _, _| Box::pin(async { Ok(()) }));
-
-		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		state_machine.store_order(&order).await.unwrap();
 		let delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
 			HashMap::new();
 		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
@@ -2907,7 +3301,6 @@ mod tests {
 			empty_networks_config(),
 		);
 
-		let order = create_test_order_with_status(OrderStatus::Created);
 		recovery_service
 			.publish_recovery_event(order.clone(), ReconcileResult::NeedsExecution)
 			.await;
@@ -3102,7 +3495,7 @@ mod tests {
 	// ========================================================================
 
 	use solver_types::standards::eip7683::interfaces::{
-		Finalised, OrderPurchased, OutputFilled, Refunded,
+		Finalised, Open, OrderPurchased, OutputFilled, Refunded,
 	};
 
 	/// Match `filter.topics()[0]` against the expected event's signature hash.
@@ -3140,6 +3533,153 @@ mod tests {
 			the_compact_address: None,
 			allocator_address: None,
 		}
+	}
+
+	#[tokio::test]
+	async fn prepare_stage_complete_with_open_event_recovers_to_needs_fill() {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let attempt_store = Arc::new(TransactionAttemptStore::new(storage.clone()));
+		let input_settler = Address(vec![0xcc; 20]);
+		let prepare_hash = TransactionHash(vec![0xab; 32]);
+		let networks = networks_with(
+			1,
+			test_network_config(input_settler.clone(), Address(vec![0xaa; 20])),
+		);
+
+		let mut order = OrderBuilder::new()
+			.with_id(format!("0x{}", "11".repeat(32)))
+			.with_status(OrderStatus::Pending)
+			.with_execution_params(Some(ExecutionParams {
+				gas_price: alloy_primitives::U256::from(1000000000u64),
+				priority_fee: Some(alloy_primitives::U256::from(1000000u64)),
+			}))
+			.build();
+		state_machine.store_order(&order).await.unwrap();
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_block_number()
+			.with(eq(1u64))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(1_000_000u64) }));
+		let prepare_hash_for_logs = prepare_hash.clone();
+		mock_delivery
+			.expect_get_logs()
+			.withf(|chain_id, filter| *chain_id == 1 && matches_event::<Open>(filter))
+			.times(1)
+			.returning(move |_, _| {
+				let tx_hash = prepare_hash_for_logs.clone();
+				Box::pin(async move {
+					Ok(vec![solver_types::Log {
+						address: Address(vec![0xcc; 20]),
+						topics: vec![],
+						data: vec![],
+						transaction_hash: Some(tx_hash),
+						block_number: Some(995_000),
+					}])
+				})
+			});
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				1u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			20,
+			60,
+		));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let recovery_service = RecoveryService::new(
+			storage,
+			state_machine,
+			delivery,
+			settlement,
+			EventBus::new(100),
+			attempt_store,
+			networks,
+		);
+
+		let result = recovery_service
+			.stage_complete_recovery(
+				&mut order,
+				TransactionType::Prepare,
+				solver_delivery::StageCompleteReason::EscrowInvalidOrderStatus,
+				&[],
+			)
+			.await;
+
+		assert!(matches!(result, ReconcileResult::NeedsFill));
+		assert_eq!(order.prepare_tx_hash, Some(prepare_hash));
+	}
+
+	#[tokio::test]
+	async fn prepare_stage_complete_without_open_evidence_does_not_advance() {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let attempt_store = Arc::new(TransactionAttemptStore::new(storage.clone()));
+		let input_settler = Address(vec![0xcc; 20]);
+		let networks = networks_with(
+			1,
+			test_network_config(input_settler.clone(), Address(vec![0xaa; 20])),
+		);
+
+		let mut order = OrderBuilder::new()
+			.with_id(format!("0x{}", "22".repeat(32)))
+			.with_status(OrderStatus::Pending)
+			.build();
+		state_machine.store_order(&order).await.unwrap();
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_block_number()
+			.with(eq(1u64))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(1_000_000u64) }));
+		mock_delivery
+			.expect_get_logs()
+			.withf(|chain_id, filter| *chain_id == 1 && matches_event::<Open>(filter))
+			.times(1)
+			.returning(|_, _| Box::pin(async move { Ok(vec![]) }));
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				1u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			20,
+			60,
+		));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let recovery_service = RecoveryService::new(
+			storage,
+			state_machine,
+			delivery,
+			settlement,
+			EventBus::new(100),
+			attempt_store,
+			networks,
+		);
+
+		let result = recovery_service
+			.stage_complete_recovery(
+				&mut order,
+				TransactionType::Prepare,
+				solver_delivery::StageCompleteReason::EscrowInvalidOrderStatus,
+				&[],
+			)
+			.await;
+
+		assert!(matches!(result, ReconcileResult::Unknown));
+		assert!(order.prepare_tx_hash.is_none());
 	}
 
 	#[tokio::test]
@@ -3754,12 +4294,12 @@ mod tests {
 		mock_delivery_1
 			.expect_get_block_number()
 			.with(eq(1u64))
-			.times(1)
+			.times(2)
 			.returning(|_| Box::pin(async move { Ok(20_000_000u64) }));
-		// All 3 origin queries (Finalised, Refunded, OrderPurchased) return empty.
+		// Claim queries (Finalised, Refunded, OrderPurchased) and Prepare Open return empty.
 		mock_delivery_1
 			.expect_get_logs()
-			.times(3)
+			.times(4)
 			.returning(|_, _| Box::pin(async move { Ok(vec![]) }));
 
 		let mut mock_delivery_137 = MockDeliveryInterface::new();
@@ -3849,16 +4389,16 @@ mod tests {
 		order.claim_tx_hash = None;
 		state_machine.store_order(&order).await.unwrap();
 
-		// Claim probe on chain 1 runs (configured); returns empty.
+		// Claim and Prepare probes on chain 1 run (configured); both return empty.
 		let mut mock_delivery_1 = MockDeliveryInterface::new();
 		mock_delivery_1
 			.expect_get_block_number()
 			.with(eq(1u64))
-			.times(1)
+			.times(2)
 			.returning(|_| Box::pin(async move { Ok(20_000_000u64) }));
 		mock_delivery_1
 			.expect_get_logs()
-			.times(3)
+			.times(4)
 			.returning(|_, _| Box::pin(async move { Ok(vec![]) }));
 
 		let delivery = Arc::new(DeliveryService::new(

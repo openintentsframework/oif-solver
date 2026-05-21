@@ -206,6 +206,7 @@ impl ConfigBuilder {
 				live_post_fill_estimate_chain_ids: HashSet::new(),
 			}),
 			rebalance: None,
+			tx_bump: crate::TxBumpConfig::default(),
 		}
 	}
 }

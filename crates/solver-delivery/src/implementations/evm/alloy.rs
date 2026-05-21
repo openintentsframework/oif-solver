@@ -15,11 +15,12 @@ use crate::implementations::evm::nonce::{
 	classify_submission_outcome, ResettableNonceManager, SubmissionOutcome,
 };
 use crate::{
-	DeliveryError, DeliveryInterface, FeeParams, InsufficientNativeGasInfo,
-	TransactionAttemptRecorder, TransactionMonitoringEvent, TransactionTrackingWithConfig,
+	DeliveryError, DeliveryInterface, FeeParams, InsufficientNativeGasInfo, PlannedAttemptInit,
+	TransactionAttemptRecorder, TransactionCallback, TransactionMonitoringEvent,
+	TransactionTrackingWithConfig,
 };
-use alloy_consensus::BlockHeader;
-use alloy_network::{BlockResponse, EthereumWallet};
+use alloy_consensus::{BlockHeader, SignableTransaction, TxEnvelope};
+use alloy_network::{eip2718::Encodable2718, BlockResponse, EthereumWallet, TxSigner};
 use alloy_primitives::{Address, Bytes, FixedBytes, B256, U256};
 use alloy_provider::{
 	fillers::{ChainIdFiller, GasFiller},
@@ -34,7 +35,7 @@ use solver_account::AccountSigner;
 use solver_types::{
 	Address as SolverAddress, ConfigSchema, Field, FieldType, NetworksConfig, Schema,
 	Transaction as SolverTransaction, TransactionAttempt, TransactionAttemptStatus,
-	TransactionHash, TransactionReceipt,
+	TransactionHash, TransactionReceipt, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -198,6 +199,11 @@ pub struct AlloyDelivery {
 	/// Signer address per chain — needed to call `eth_getTransactionCount(from, "pending")`
 	/// for the resync path. The signer itself stays inside the provider's wallet filler.
 	signer_addresses: HashMap<u64, Address>,
+	/// Per-chain signers for pre-broadcast local signing. Cloned from
+	/// the signers consumed into each chain's EthereumWallet. Required
+	/// because the provider is type-erased via .erased() (DynProvider),
+	/// which does not expose the FillProvider::fill() inherent method.
+	signers: HashMap<u64, AccountSigner>,
 	/// Short-lived per-chain cache of resolved `FeeParams`. See
 	/// `FeeParamsCache` and `fee_params_cache_ttl` for rationale and TTL
 	/// defaults.
@@ -208,38 +214,102 @@ pub struct AlloyDelivery {
 	fee_policy: FeePolicyRegistry,
 }
 
-/// What the broadcast wrapper should do with the local nonce cache,
-/// given a classified submission outcome. Pure decision, no I/O.
+/// What the broadcast wrapper should do with the local nonce cache after a
+/// raw-send rejection. Pure decision, no I/O.
+///
+/// Only one variant today: pre-sign + mandatory-persist + raw-send funnels
+/// every rejection outcome (`DefinitelyRejected`, `NonceTooLow`,
+/// pre-broadcast persist failure) through the same rollback shape. Kept as
+/// a named single-variant enum so `apply_nonce_cache_action` remains an
+/// explicit, unit-testable policy primitive rather than an anonymous helper.
+/// New rejection classes should be added as variants here, not as branches
+/// inside callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NonceCacheAction {
-	/// Tx accepted (or kept-advanced for replacement / ambiguous outcomes) —
-	/// keep cache advanced as-is.
-	Keep,
 	/// Tx provably rejected pre-pool. Caller should attempt to fetch
 	/// chain pending and call `reset_next_nonce`. If the fetch fails,
-	/// caller MUST fall back to `Keep` — we don't roll back without
+	/// caller MUST keep the cache advanced — we don't roll back without
 	/// authoritative chain state.
 	AttemptRollback,
-	/// Caller should run the existing nonce_too_low resync-and-retry path.
-	NonceTooLowRetry,
 }
 
-/// Pure outcome → action mapping. No I/O, easy to unit-test.
-fn nonce_action_for_outcome(outcome: SubmissionOutcome) -> NonceCacheAction {
-	match outcome {
-		SubmissionOutcome::DefinitelyRejected => NonceCacheAction::AttemptRollback,
-		SubmissionOutcome::NonceTooLow => NonceCacheAction::NonceTooLowRetry,
-		SubmissionOutcome::Replacement | SubmissionOutcome::Ambiguous => NonceCacheAction::Keep,
+/// Outcome of a raw-send attempt, after pre-sign persisted the hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RawSendVerdict {
+	/// Tx accepted (RPC Ok) or RPC-saw-this-exact-raw-tx-already
+	/// ("already known"). Idempotent acceptance for our pre-signed
+	/// envelope. Monitor and return Ok.
+	Accepted,
+	/// RPC response was ambiguous (transport error, response loss).
+	/// Hash MAY be in mempool. Monitor and return Ok so the caller can
+	/// poll for a receipt rather than resubmitting at a new nonce.
+	Ambiguous,
+	/// Tx was definitively never accepted because of a true pre-pool
+	/// rejection (signature/balance/intrinsic gas/pool full/etc). The
+	/// nonce was NOT consumed by any tx, so the caller must mark the
+	/// ledger row SubmitRejected, roll back the nonce, and return Err.
+	DefinitelyRejected { reason: String },
+	/// Replacement-class rejection ("replacement transaction underpriced"):
+	/// ANOTHER tx already holds this nonce in the mempool. Caller must
+	/// mark the ledger row SubmitRejected but MUST NOT roll back the
+	/// nonce cache — rolling back would let us reuse a nonce that already
+	/// has a tx, causing self-replacement loops or replacement-underpriced
+	/// loops. See `classify_submission_outcome` in nonce.rs:166-171.
+	ReplacementRejected { reason: String },
+	/// Nonce-too-low. The signed envelope has the old nonce; resyncing
+	/// the cache will not change that. Caller must mark SubmitRejected
+	/// and surface DeliveryError::NonceTooLow. No replay possible.
+	NonceTooLow { reason: String },
+}
+
+/// Pure classifier for the raw-send outcome. No side effects.
+///
+/// `error_message` is `None` when send_raw_transaction returned Ok,
+/// or `Some(msg)` when it returned an error. We take the message
+/// (not the typed error) because Alloy's send_raw_transaction
+/// return type is a builder, not a TxHash — passing a typed result
+/// would force an unhelpful generic signature here.
+pub(crate) fn classify_raw_send_outcome(error_message: Option<&str>) -> RawSendVerdict {
+	let Some(msg) = error_message else {
+		return RawSendVerdict::Accepted;
+	};
+	let lower = msg.to_lowercase();
+
+	// "already known" specifically: the RPC has SEEN this exact raw tx.
+	// Idempotent for our pre-signed envelope. Pre-check BEFORE delegating
+	// to classify_submission_outcome (which groups this with the unsafe
+	// "replacement transaction underpriced" case).
+	if lower.contains("already known") {
+		return RawSendVerdict::Accepted;
 	}
-}
 
-fn attempt_status_for_submission_outcome(outcome: SubmissionOutcome) -> TransactionAttemptStatus {
-	match outcome {
-		SubmissionOutcome::NonceTooLow | SubmissionOutcome::DefinitelyRejected => {
-			TransactionAttemptStatus::SubmitRejected
+	// Replacement-class rejection: another tx already holds this nonce.
+	// These phrases are emitted by various nodes when a replacement bid
+	// loses the slot (geth/reth/erigon variants of the same condition).
+	// Pre-check here BEFORE delegating to classify_submission_outcome,
+	// which only recognizes "replacement transaction underpriced".
+	if lower.contains("replacement fee too low") || lower.contains("transaction already exists") {
+		return RawSendVerdict::ReplacementRejected {
+			reason: msg.to_string(),
+		};
+	}
+
+	match classify_submission_outcome(msg) {
+		// After the "already known" pre-check above, anything still
+		// classified as Replacement is "replacement transaction
+		// underpriced" — ANOTHER tx already holds this nonce slot.
+		// Our attempt was rejected, but the nonce IS consumed by some
+		// other tx in the mempool, so the cache MUST stay advanced.
+		// See classify_submission_outcome in nonce.rs:166-171.
+		SubmissionOutcome::Replacement => RawSendVerdict::ReplacementRejected {
+			reason: msg.to_string(),
 		},
-		SubmissionOutcome::Replacement | SubmissionOutcome::Ambiguous => {
-			TransactionAttemptStatus::Indeterminate
+		SubmissionOutcome::Ambiguous => RawSendVerdict::Ambiguous,
+		SubmissionOutcome::DefinitelyRejected => RawSendVerdict::DefinitelyRejected {
+			reason: msg.to_string(),
+		},
+		SubmissionOutcome::NonceTooLow => RawSendVerdict::NonceTooLow {
+			reason: msg.to_string(),
 		},
 	}
 }
@@ -252,16 +322,20 @@ async fn record_planned_attempt(
 	tracking: &TransactionTrackingWithConfig,
 	signer: SolverAddress,
 	tx: SolverTransaction,
+	attempt_id_override: Option<String>,
+	replacement_of: Option<String>,
 ) -> Result<TransactionAttempt, DeliveryError> {
 	tracking
 		.tracking
 		.attempt_recorder
-		.record_planned_attempt(
-			&tracking.tracking.id,
-			Some(signer),
-			tracking.tracking.tx_type,
+		.record_planned_attempt(PlannedAttemptInit {
+			order_id: tracking.tracking.id.clone(),
+			signer: Some(signer),
+			tx_type: tracking.tracking.tx_type,
 			tx,
-		)
+			attempt_id_override,
+			replacement_of,
+		})
 		.await
 		.map_err(|e| {
 			DeliveryError::Network(format!(
@@ -270,9 +344,13 @@ async fn record_planned_attempt(
 		})
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_attempt_update_best_effort(
 	recorder: Arc<dyn TransactionAttemptRecorder>,
+	callback: Option<&TransactionCallback>,
+	order_id: &str,
 	attempt_id: String,
+	tx_type: TransactionType,
 	status: TransactionAttemptStatus,
 	tx_hash: Option<TransactionHash>,
 	receipt: Option<TransactionReceipt>,
@@ -280,15 +358,26 @@ async fn record_attempt_update_best_effort(
 	context: &'static str,
 ) {
 	if let Err(err) = recorder
-		.record_attempt_update(&attempt_id, status, tx_hash, receipt, error)
+		.record_attempt_update(&attempt_id, status, tx_hash.clone(), receipt, error)
 		.await
 	{
 		tracing::error!(
-			attempt_id,
+			%attempt_id,
 			%err,
 			context,
 			"Failed to update transaction attempt ledger"
 		);
+		if let Some(callback) = callback {
+			callback(TransactionMonitoringEvent::AttemptLedgerConflict {
+				id: order_id.to_string(),
+				attempt_id,
+				tx_type,
+				tx_hash,
+				attempted_status: status,
+				error: err.to_string(),
+				context,
+			});
+		}
 	}
 }
 
@@ -315,18 +404,12 @@ fn apply_nonce_cache_action(
 	chain_pending: Option<u64>,
 ) -> Option<u64> {
 	match action {
-		NonceCacheAction::Keep => mgr.peek(signer),
 		NonceCacheAction::AttemptRollback => match chain_pending {
 			Some(pending) => Some(mgr.reset_next_nonce(signer, pending)),
 			// No authoritative chain state — KEEP advanced. We never reset
 			// the cache without a successful pending-fetch.
 			None => mgr.peek(signer),
 		},
-		// The nonce_too_low path has its own existing resync-and-retry; the
-		// helper short-circuits to a no-op here so callers can't accidentally
-		// invoke double-handling. Production code paths that classify as
-		// NonceTooLow MUST take the existing retry branch, not this helper.
-		NonceCacheAction::NonceTooLowRetry => mgr.peek(signer),
 	}
 }
 
@@ -483,6 +566,7 @@ impl AlloyDelivery {
 		let mut providers = HashMap::new();
 		let mut nonce_managers = HashMap::new();
 		let mut signer_addresses = HashMap::new();
+		let mut signers_map: HashMap<u64, AccountSigner> = HashMap::new();
 
 		for network_id in &network_ids {
 			// Get network configuration
@@ -511,6 +595,7 @@ impl AlloyDelivery {
 			// Create signer with chain ID
 			let chain_signer = signer.with_chain_id(Some(*network_id));
 			let signer_address = chain_signer.address();
+			let chain_signer_for_storage = chain_signer.clone();
 			let wallet = EthereumWallet::from(chain_signer);
 
 			// Retry only the rate-limit / transient cases (default policy). Execution
@@ -573,6 +658,7 @@ impl AlloyDelivery {
 			providers.insert(*network_id, dyn_provider);
 			nonce_managers.insert(*network_id, ResettableNonceManager::new());
 			signer_addresses.insert(*network_id, signer_address);
+			signers_map.insert(*network_id, chain_signer_for_storage);
 		}
 
 		// Spawn the passive nonce-drift monitor. The monitor is observability
@@ -590,6 +676,7 @@ impl AlloyDelivery {
 			providers,
 			nonce_managers,
 			signer_addresses,
+			signers: signers_map,
 			fee_params_cache: Arc::new(FeeParamsCache::default()),
 			fee_policy,
 		})
@@ -619,6 +706,14 @@ impl AlloyDelivery {
 			.ok_or_else(|| {
 				DeliveryError::Network(format!("No signer configured for chain ID {chain_id}"))
 			})
+	}
+
+	/// Gets the signer for a specific chain ID. Used for pre-broadcast
+	/// local signing of typed transactions.
+	fn get_signer(&self, chain_id: u64) -> Result<&AccountSigner, DeliveryError> {
+		self.signers.get(&chain_id).ok_or_else(|| {
+			DeliveryError::Network(format!("No signer configured for chain ID {chain_id}"))
+		})
 	}
 
 	/// Returns the next nonce to use for `from` on `chain_id`, taking it from the
@@ -659,31 +754,33 @@ impl AlloyDelivery {
 		Ok(nonce_taken)
 	}
 
-	/// Resync the local nonce manager from chain pending and return the next
-	/// nonce to use for the resync retry. Advances the cache past whatever
-	/// the chain already knows about.
-	async fn resync_nonce_for(&self, chain_id: u64, from: Address) -> Result<u64, DeliveryError> {
-		let provider = self.get_provider(chain_id)?;
-		let pending = provider
-			.get_transaction_count(from)
-			.pending()
+	/// Builds a signed transaction envelope from a fully-populated request.
+	/// Returns the envelope, its hash, and the EIP-2718 encoded bytes.
+	///
+	/// Requires that `request` has chain_id, nonce, gas_limit, and fee fields
+	/// already set. Estimate-gas + nonce-allocation must happen BEFORE this
+	/// helper is called so estimate-revert does not burn a nonce.
+	async fn build_signed_envelope(
+		&self,
+		chain_id: u64,
+		request: TransactionRequest,
+	) -> Result<(TxEnvelope, TransactionHash, Vec<u8>), DeliveryError> {
+		let signer = self.get_signer(chain_id)?;
+
+		let mut typed = request.build_typed_tx().map_err(|_| {
+			DeliveryError::TransactionFailed(
+				"failed to build typed transaction (missing required field?)".to_string(),
+			)
+		})?;
+
+		let signature = TxSigner::sign_transaction(signer, &mut typed)
 			.await
-			.map_err(|e| {
-				DeliveryError::Network(format!("Failed to fetch pending nonce for resync: {e}"))
-			})?;
-		let mgr = self.get_nonce_manager(chain_id)?;
-		let before = mgr.peek(from);
-		mgr.reset_next_nonce(from, pending);
-		tracing::warn!(
-			chain_id,
-			signer = %from,
-			previous_local_next_nonce = ?before,
-			chain_pending_nonce = pending,
-			"Reset EVM delivery nonce cache from chain pending"
-		);
-		Ok(mgr
-			.take_next(from)
-			.expect("nonce just reset via reset_next_nonce"))
+			.map_err(|e| DeliveryError::TransactionFailed(format!("signer failed: {e}")))?;
+
+		let envelope: TxEnvelope = typed.into_signed(signature).into();
+		let tx_hash = TransactionHash(envelope.tx_hash().0.to_vec());
+		let encoded = envelope.encoded_2718();
+		Ok((envelope, tx_hash, encoded))
 	}
 }
 
@@ -888,6 +985,110 @@ impl DeliveryInterface for AlloyDelivery {
 			"PRE-SUBMIT diagnostic snapshot"
 		);
 
+		// Estimate gas before allocating a nonce so an execution-reverted
+		// estimate does not burn a nonce. Letting GasFiller inside
+		// `provider.send_transaction` run the estimate after allocation would
+		// leak the nonce on revert.
+		//
+		// Only run when no gas_limit has been pre-set by the caller; an
+		// externally provided gas_limit is honored so callers that intentionally
+		// bypass estimation (bump/replacement paths) keep working.
+		if tx_attempt.gas_limit.is_none() {
+			let estimate_request = build_estimate_request(&tx_attempt);
+			match provider.estimate_gas(estimate_request).await {
+				Ok(gas) => {
+					tx_attempt.gas_limit = Some(gas);
+				},
+				Err(e) => {
+					let msg = e.to_string();
+					let lower = msg.to_lowercase();
+					// Accept the plain "execution reverted" phrasing that
+					// estimate_gas typically emits, and also fall through to
+					// classify_submission_outcome's revert heuristics where
+					// applicable.
+					let is_revert = lower.contains("revert")
+						|| lower.contains("execution reverted")
+						|| classify_submission_outcome(&msg)
+							== SubmissionOutcome::DefinitelyRejected;
+					if is_revert {
+						tracing::warn!(
+							chain_id,
+							signer = %from,
+							error = %msg,
+							"Gas estimate reverted; no nonce allocated."
+						);
+						return Err(DeliveryError::TransactionFailed(format!(
+							"gas estimate reverted: {msg}"
+						)));
+					}
+					tracing::warn!(
+						chain_id,
+						signer = %from,
+						error = %msg,
+						"Gas estimate transport error; no nonce allocated."
+					);
+					return Err(DeliveryError::Network(format!(
+						"gas estimate transport error: {msg}"
+					)));
+				},
+			}
+		}
+
+		// Recheck native gas affordability after the estimate-first block
+		// populated tx_attempt.gas_limit. The pre-estimate preflight is a
+		// no-op when gas_limit is None; without this recheck a tx that
+		// cannot afford its estimated gas would burn a nonce, persist an
+		// unmineable hash, and fail only at send_raw_transaction. Fail-open
+		// on balance-read failure (matches the earlier preflight): if
+		// pre_submit_balance is None, log and proceed without re-fetching.
+		let post_estimate_gas_budget = native_gas_budget_wei(&tx_attempt);
+		let post_estimate_shortfall = match (pre_submit_balance, post_estimate_gas_budget.as_ref())
+		{
+			(Some(balance), Some(budget)) => native_gas_shortfall(balance, budget.required_wei),
+			_ => None,
+		};
+		if let (Some(balance), Some(budget), Some(shortfall)) = (
+			pre_submit_balance,
+			post_estimate_gas_budget.as_ref(),
+			post_estimate_shortfall,
+		) {
+			tracing::error!(
+				chain_id,
+				signer = %from,
+				balance_wei = %balance,
+				required_wei = %budget.required_wei,
+				shortfall_wei = %shortfall,
+				gas_budget_wei = %budget.gas_budget_wei,
+				value_wei = %tx_attempt.value,
+				gas_limit = ?tx_attempt.gas_limit,
+				gas_price = ?tx_attempt.gas_price,
+				max_fee_per_gas = ?tx_attempt.max_fee_per_gas,
+				max_priority_fee_per_gas = ?tx_attempt.max_priority_fee_per_gas,
+				"Insufficient native gas after gas estimation; top up signer before retrying"
+			);
+			return Err(DeliveryError::InsufficientNativeGas(Box::new(
+				InsufficientNativeGasInfo {
+					chain_id,
+					signer: from.to_string(),
+					balance_wei: balance.to_string(),
+					required_wei: budget.required_wei.to_string(),
+					shortfall_wei: shortfall.to_string(),
+					gas_limit: tx_attempt.gas_limit,
+					max_fee_per_gas: tx_attempt.max_fee_per_gas,
+					gas_price: tx_attempt.gas_price,
+					value_wei: tx_attempt.value.to_string(),
+				},
+			)));
+		}
+		if pre_submit_balance.is_none() {
+			tracing::warn!(
+				chain_id,
+				signer = %from,
+				gas_limit = ?tx_attempt.gas_limit,
+				"Post-estimate gas affordability recheck skipped (pre-submit balance unknown); proceeding (fail-open)"
+			);
+		}
+
 		// Fill nonce from the resettable manager only after preflight succeeds.
 		// Insufficient native gas must not advance the local nonce cache.
 		if tx_attempt.nonce.is_none() {
@@ -919,10 +1120,11 @@ impl DeliveryInterface for AlloyDelivery {
 			);
 		}
 
-		// First attempt. Classify any submission error into one of four buckets
-		// (NonceTooLow / DefinitelyRejected / Replacement / Ambiguous) and act
-		// on the local nonce cache accordingly. See `nonce_action_for_outcome`
-		// and `apply_nonce_cache_action`.
+		// First attempt. Any raw-send error is classified into one of four
+		// buckets (NonceTooLow / DefinitelyRejected / Replacement / Ambiguous
+		// — see `classify_raw_send_outcome` / `RawSendVerdict`) and the
+		// local nonce cache is updated accordingly via
+		// `apply_nonce_cache_action`.
 		let mut broadcast_attempt_id: Option<String> = None;
 		let first_attempt = if let Some(tracking) = tracking.as_ref() {
 			Some(
@@ -930,6 +1132,8 @@ impl DeliveryInterface for AlloyDelivery {
 					tracking,
 					solver_address_from_alloy(from),
 					tx_attempt.clone(),
+					tracking.tracking.attempt_id.clone(),
+					tracking.tracking.replacement_of.clone(),
 				)
 				.await?,
 			)
@@ -937,22 +1141,186 @@ impl DeliveryInterface for AlloyDelivery {
 			None
 		};
 
-		let pending_tx = match provider.send_transaction(request).await {
-			Ok(p) => {
+		// Sign the typed transaction locally so we know tx_hash before
+		// broadcast, then persist the hash to the attempt ledger. If the
+		// persist fails, do NOT broadcast — roll back the nonce and return
+		// Err. Broadcasting an unpersisted hash would lose the recovery
+		// anchor.
+		//
+		// If local signing fails (KMS network error, signer hardware error,
+		// etc.) propagating via `?` would orphan the Planned row recorded
+		// above and leak a nonce. Mark the planned attempt SubmitRejected
+		// and roll back the nonce cache before propagating.
+		let (_envelope, tx_hash, encoded) = match self
+			.build_signed_envelope(chain_id, request.clone())
+			.await
+		{
+			Ok(v) => v,
+			Err(sign_err) => {
+				let err_msg = sign_err.to_string();
+				if let (Some(tracking_ref), Some(planned_attempt)) =
+					(tracking.as_ref(), first_attempt.as_ref())
+				{
+					record_attempt_update_best_effort(
+						tracking_ref.tracking.attempt_recorder.clone(),
+						Some(&tracking_ref.tracking.callback),
+						&tracking_ref.tracking.id,
+						planned_attempt.id.clone(),
+						tracking_ref.tracking.tx_type,
+						TransactionAttemptStatus::SubmitRejected,
+						None,
+						None,
+						Some(err_msg.clone()),
+						"local signing failed before broadcast",
+					)
+					.await;
+				}
+
+				// Rollback: fetch authoritative chain pending; on Some(pending)
+				// reset the cache, on None keep it advanced (no authoritative
+				// state — never roll back without it).
+				let failed_nonce = first_attempt
+					.as_ref()
+					.and_then(|a| a.nonce)
+					.or(tx_attempt.nonce);
+				let mgr = self.get_nonce_manager(chain_id)?;
+				let cache_before = mgr.peek(from);
+				let pending_result = provider.get_transaction_count(from).pending().await;
+				let (pending_opt, fetch_err): (Option<u64>, Option<String>) = match pending_result {
+					Ok(p) => (Some(p), None),
+					Err(e) => (None, Some(e.to_string())),
+				};
+				let cache_after = apply_nonce_cache_action(
+					mgr,
+					from,
+					NonceCacheAction::AttemptRollback,
+					pending_opt,
+				);
+				if let Some(pending) = pending_opt {
+					tracing::error!(
+						chain_id,
+						signer = %from,
+						failed_nonce = ?failed_nonce,
+						chain_pending = pending,
+						cache_before = ?cache_before,
+						cache_after = ?cache_after,
+						error = %err_msg,
+						"local signing failed before broadcast; nonce cache rolled back to chain pending"
+					);
+				} else {
+					tracing::error!(
+						chain_id,
+						signer = %from,
+						failed_nonce = ?failed_nonce,
+						cache_before = ?cache_before,
+						cache_after = ?cache_after,
+						error = %err_msg,
+						pending_fetch_error = ?fetch_err,
+						"local signing failed before broadcast; chain-pending fetch failed so nonce cache kept advanced"
+					);
+				}
+				return Err(sign_err);
+			},
+		};
+
+		// Hash persist must succeed before broadcast — broadcasting an
+		// unpersisted hash would lose the recovery anchor. The best-effort
+		// `record_attempt_update_best_effort` wrapper is bypassed so the
+		// failure propagates. Only persist when we have a tracking handle
+		// and a recorded planned attempt; otherwise there is no ledger row
+		// to update.
+		if let (Some(tracking_ref), Some(planned_attempt)) =
+			(tracking.as_ref(), first_attempt.as_ref())
+		{
+			let persist_result = tracking_ref
+				.tracking
+				.attempt_recorder
+				.record_attempt_update(
+					&planned_attempt.id,
+					TransactionAttemptStatus::Broadcast,
+					Some(tx_hash.clone()),
+					None,
+					None,
+				)
+				.await;
+
+			if let Err(persist_err) = persist_result {
+				// Signed envelope exists locally but ledger durability cannot
+				// be proven — refuse to broadcast. Roll back the nonce since
+				// nothing went out: fetch authoritative chain pending; on
+				// Some(pending) reset the cache, on None keep it advanced
+				// (never roll back without authoritative state).
+				let failed_nonce = planned_attempt.nonce.unwrap();
+				let mgr = self.get_nonce_manager(chain_id)?;
+				let cache_before = mgr.peek(from);
+				let pending_result = provider.get_transaction_count(from).pending().await;
+				let (pending_opt, fetch_err): (Option<u64>, Option<String>) = match pending_result {
+					Ok(p) => (Some(p), None),
+					Err(e) => (None, Some(e.to_string())),
+				};
+				let cache_after = apply_nonce_cache_action(
+					mgr,
+					from,
+					NonceCacheAction::AttemptRollback,
+					pending_opt,
+				);
+				if let Some(pending) = pending_opt {
+					tracing::error!(
+						chain_id,
+						signer = %from,
+						failed_nonce,
+						chain_pending = pending,
+						cache_before = ?cache_before,
+						cache_after = ?cache_after,
+						error = %persist_err,
+						"pre-broadcast hash persist failed; refusing to broadcast; nonce cache rolled back to chain pending"
+					);
+				} else {
+					tracing::error!(
+						chain_id,
+						signer = %from,
+						failed_nonce,
+						cache_before = ?cache_before,
+						cache_after = ?cache_after,
+						error = %persist_err,
+						pending_fetch_error = ?fetch_err,
+						"pre-broadcast hash persist failed; refusing to broadcast; chain-pending fetch failed so nonce cache kept advanced"
+					);
+				}
+				return Err(DeliveryError::Network(format!(
+					"Failed to persist pre-broadcast tx_hash to attempt ledger: {persist_err}"
+				)));
+			}
+		}
+
+		let raw_send_result = provider.send_raw_transaction(&encoded).await;
+
+		// Normalize and classify the raw-send result. The pre-signed envelope's
+		// hash is already persisted, so Accepted / Ambiguous monitor and
+		// return Ok; DefinitelyRejected / NonceTooLow mark the ledger row
+		// SubmitRejected and roll the nonce cache back.
+		let error_message: Option<String> = raw_send_result.as_ref().err().map(|e| e.to_string());
+		let verdict = classify_raw_send_outcome(error_message.as_deref());
+
+		match verdict {
+			RawSendVerdict::Accepted => {
 				tracing::debug!(
 					chain_id,
 					signer = %from,
 					nonce_used = ?tx_attempt.nonce,
-					tx_hash = %p.tx_hash(),
+					tx_hash = ?tx_hash,
 					"tx submitted; nonce committed"
 				);
 				if let (Some(tracking), Some(attempt)) = (tracking.as_ref(), first_attempt.as_ref())
 				{
 					record_attempt_update_best_effort(
 						tracking.tracking.attempt_recorder.clone(),
+						Some(&tracking.tracking.callback),
+						&tracking.tracking.id,
 						attempt.id.clone(),
+						tracking.tracking.tx_type,
 						TransactionAttemptStatus::Broadcast,
-						Some(TransactionHash(p.tx_hash().0.to_vec())),
+						Some(tx_hash.clone()),
 						None,
 						None,
 						"first_broadcast",
@@ -960,180 +1328,662 @@ impl DeliveryInterface for AlloyDelivery {
 					.await;
 					broadcast_attempt_id = Some(attempt.id.clone());
 				}
-				p
+
+				// POST-SUBMIT DIAGNOSTIC. Logged at DEBUG so it's silent in normal ops
+				// but available via RUST_LOG=solver_delivery=debug for forensic runs.
+				// NOTE: load-balanced RPC providers (e.g. Alchemy) have eventual
+				// consistency between write and read endpoints — `pending_nonce` after
+				// a successful submit can report the pre-submit value for tens of
+				// seconds even though the tx has been accepted, propagated, and is on
+				// its way to mining. Do NOT use it to decide retry/failure.
+				let post_submit_pending = provider.get_transaction_count(from).pending().await.ok();
+				let to_hex = tx_attempt
+					.to
+					.as_ref()
+					.map(|addr| format!("0x{}", hex::encode(&addr.0)));
+				let tx_hash_alloy = FixedBytes::<32>::from_slice(&tx_hash.0);
+				tracing::debug!(
+					chain_id,
+					tx_hash = %tx_hash_alloy,
+					signer = %from,
+					to = ?to_hex,
+					value_wei = %tx_attempt.value,
+					data_len = tx_attempt.data.len(),
+					tx_nonce = ?tx_attempt.nonce,
+					gas_limit = ?tx_attempt.gas_limit,
+					gas_price = ?tx_attempt.gas_price,
+					max_fee_per_gas = ?tx_attempt.max_fee_per_gas,
+					max_priority_fee_per_gas = ?tx_attempt.max_priority_fee_per_gas,
+					pre_submit_pending_nonce = ?pre_submit_pending,
+					post_submit_pending_nonce = ?post_submit_pending,
+					pre_submit_balance_wei = ?pre_submit_balance.map(|b| b.to_string()),
+					gas_budget_wei = ?native_gas_budget.as_ref().map(|b| b.gas_budget_wei.to_string()),
+					required_wei = ?native_gas_budget.as_ref().map(|b| b.required_wei.to_string()),
+					"POST-SUBMIT diagnostic snapshot (read-replica lag may make pending_nonce stale)"
+				);
+
+				// If tracking is provided, set up monitoring
+				if let Some(tracking) = tracking {
+					let tx_hash_clone = tx_hash.clone();
+					let monitor_attempt_id = broadcast_attempt_id.clone();
+					let monitor_attempt_recorder = tracking.tracking.attempt_recorder.clone();
+					// `provider` is already a `&DynProvider`; cloning gives us
+					// the owned handle `monitor_transaction` needs.
+					let provider_clone = provider.clone();
+					// Capture replay parameters for revert-data classification on revert.
+					let tx_for_replay: SolverTransaction = tx_attempt.clone();
+					let from_for_replay: Option<SolverAddress> = Some(SolverAddress::from(from));
+					let chain_id_for_replay: u64 = chain_id;
+					tokio::spawn(async move {
+						let result = monitor_transaction(
+							provider_clone,
+							tx_hash_alloy,
+							tracking.min_confirmations,
+							Duration::from_secs(tracking.tx_confirmation_timeout_seconds),
+							tx_for_replay,
+							from_for_replay,
+							chain_id_for_replay,
+						)
+						.await;
+
+						match result {
+							PollOutcome::Confirmed(receipt) => {
+								if let Some(attempt_id) = monitor_attempt_id.clone() {
+									record_attempt_update_best_effort(
+										monitor_attempt_recorder.clone(),
+										Some(&tracking.tracking.callback),
+										&tracking.tracking.id,
+										attempt_id,
+										tracking.tracking.tx_type,
+										TransactionAttemptStatus::Confirmed,
+										Some(tx_hash_clone.clone()),
+										Some(receipt.clone()),
+										None,
+										"monitor_confirmed",
+									)
+									.await;
+								}
+								(tracking.tracking.callback)(
+									TransactionMonitoringEvent::Confirmed {
+										id: tracking.tracking.id,
+										tx_hash: tx_hash_clone,
+										tx_type: tracking.tracking.tx_type,
+										receipt,
+									},
+								);
+							},
+							PollOutcome::Reverted {
+								error,
+								classification,
+								..
+							} => {
+								if let Some(attempt_id) = monitor_attempt_id.clone() {
+									record_attempt_update_best_effort(
+										monitor_attempt_recorder.clone(),
+										Some(&tracking.tracking.callback),
+										&tracking.tracking.id,
+										attempt_id,
+										tracking.tracking.tx_type,
+										TransactionAttemptStatus::Reverted,
+										Some(tx_hash_clone.clone()),
+										None,
+										Some(error.clone()),
+										"monitor_reverted",
+									)
+									.await;
+								}
+								(tracking.tracking.callback)(TransactionMonitoringEvent::Failed {
+									id: tracking.tracking.id,
+									tx_hash: tx_hash_clone,
+									tx_type: tracking.tracking.tx_type,
+									error,
+									classification,
+								});
+							},
+							PollOutcome::Indeterminate(reason) => {
+								if let Some(attempt_id) = monitor_attempt_id.clone() {
+									record_attempt_update_best_effort(
+										monitor_attempt_recorder.clone(),
+										Some(&tracking.tracking.callback),
+										&tracking.tracking.id,
+										attempt_id,
+										tracking.tracking.tx_type,
+										TransactionAttemptStatus::Indeterminate,
+										Some(tx_hash_clone.clone()),
+										None,
+										Some(reason.clone()),
+										"monitor_indeterminate",
+									)
+									.await;
+								}
+								(tracking.tracking.callback)(
+									TransactionMonitoringEvent::Indeterminate {
+										id: tracking.tracking.id,
+										tx_hash: tx_hash_clone,
+										tx_type: tracking.tracking.tx_type,
+										reason,
+									},
+								);
+							},
+						}
+					});
+				}
+
+				Ok(tx_hash)
 			},
-			Err(first_err) => {
-				let first_err_str = first_err.to_string();
-				let outcome = classify_submission_outcome(&first_err_str);
+			RawSendVerdict::Ambiguous => {
+				// Untracked ambiguous send: return Ok(hash) so the caller can
+				// poll for a receipt. Returning Err would push the caller
+				// toward a fresh submit() that allocates a NEW nonce while
+				// the original tx may still execute — double-execution risk
+				// at two nonces.
+				//
+				// The nonce cache is intentionally NOT rolled back here. An
+				// ambiguous outcome may mean the tx landed; reusing a held
+				// nonce is a worse failure mode than leaking one. The drift
+				// monitor catches leaked nonces.
+				if tracking.as_ref().is_none() {
+					tracing::warn!(
+						chain_id,
+						signer = %from,
+						tx_hash = ?tx_hash,
+						nonce_used = ?tx_attempt.nonce,
+						error = ?error_message,
+						"Submission outcome ambiguous on untracked send; returning known hash so caller can poll. Nonce cache kept advanced."
+					);
+					return Ok(tx_hash);
+				}
+
+				tracing::warn!(
+					chain_id,
+					tx_hash = ?tx_hash,
+					error = ?error_message,
+					"Submission outcome ambiguous; hash already persisted, monitor will resolve."
+				);
 				if let (Some(tracking), Some(attempt)) = (tracking.as_ref(), first_attempt.as_ref())
 				{
 					record_attempt_update_best_effort(
 						tracking.tracking.attempt_recorder.clone(),
+						Some(&tracking.tracking.callback),
+						&tracking.tracking.id,
 						attempt.id.clone(),
-						attempt_status_for_submission_outcome(outcome),
+						tracking.tracking.tx_type,
+						TransactionAttemptStatus::Indeterminate,
+						Some(tx_hash.clone()),
 						None,
+						error_message.clone(),
+						"first_submit_ambiguous",
+					)
+					.await;
+					broadcast_attempt_id = Some(attempt.id.clone());
+				}
+
+				// POST-SUBMIT diagnostic snapshot. Hash MAY be in the mempool;
+				// monitor will resolve.
+				let post_submit_pending = provider.get_transaction_count(from).pending().await.ok();
+				let to_hex = tx_attempt
+					.to
+					.as_ref()
+					.map(|addr| format!("0x{}", hex::encode(&addr.0)));
+				let tx_hash_alloy = FixedBytes::<32>::from_slice(&tx_hash.0);
+				tracing::debug!(
+					chain_id,
+					tx_hash = %tx_hash_alloy,
+					signer = %from,
+					to = ?to_hex,
+					value_wei = %tx_attempt.value,
+					data_len = tx_attempt.data.len(),
+					tx_nonce = ?tx_attempt.nonce,
+					gas_limit = ?tx_attempt.gas_limit,
+					gas_price = ?tx_attempt.gas_price,
+					max_fee_per_gas = ?tx_attempt.max_fee_per_gas,
+					max_priority_fee_per_gas = ?tx_attempt.max_priority_fee_per_gas,
+					pre_submit_pending_nonce = ?pre_submit_pending,
+					post_submit_pending_nonce = ?post_submit_pending,
+					pre_submit_balance_wei = ?pre_submit_balance.map(|b| b.to_string()),
+					gas_budget_wei = ?native_gas_budget.as_ref().map(|b| b.gas_budget_wei.to_string()),
+					required_wei = ?native_gas_budget.as_ref().map(|b| b.required_wei.to_string()),
+					"POST-SUBMIT diagnostic snapshot (ambiguous; monitor will resolve)"
+				);
+
+				// If tracking is provided, set up monitoring.
+				if let Some(tracking) = tracking {
+					let tx_hash_clone = tx_hash.clone();
+					let monitor_attempt_id = broadcast_attempt_id.clone();
+					let monitor_attempt_recorder = tracking.tracking.attempt_recorder.clone();
+					let provider_clone = provider.clone();
+					let tx_for_replay: SolverTransaction = tx_attempt.clone();
+					let from_for_replay: Option<SolverAddress> = Some(SolverAddress::from(from));
+					let chain_id_for_replay: u64 = chain_id;
+					tokio::spawn(async move {
+						let result = monitor_transaction(
+							provider_clone,
+							tx_hash_alloy,
+							tracking.min_confirmations,
+							Duration::from_secs(tracking.tx_confirmation_timeout_seconds),
+							tx_for_replay,
+							from_for_replay,
+							chain_id_for_replay,
+						)
+						.await;
+
+						match result {
+							PollOutcome::Confirmed(receipt) => {
+								if let Some(attempt_id) = monitor_attempt_id.clone() {
+									record_attempt_update_best_effort(
+										monitor_attempt_recorder.clone(),
+										Some(&tracking.tracking.callback),
+										&tracking.tracking.id,
+										attempt_id,
+										tracking.tracking.tx_type,
+										TransactionAttemptStatus::Confirmed,
+										Some(tx_hash_clone.clone()),
+										Some(receipt.clone()),
+										None,
+										"monitor_confirmed",
+									)
+									.await;
+								}
+								(tracking.tracking.callback)(
+									TransactionMonitoringEvent::Confirmed {
+										id: tracking.tracking.id,
+										tx_hash: tx_hash_clone,
+										tx_type: tracking.tracking.tx_type,
+										receipt,
+									},
+								);
+							},
+							PollOutcome::Reverted {
+								error,
+								classification,
+								..
+							} => {
+								if let Some(attempt_id) = monitor_attempt_id.clone() {
+									record_attempt_update_best_effort(
+										monitor_attempt_recorder.clone(),
+										Some(&tracking.tracking.callback),
+										&tracking.tracking.id,
+										attempt_id,
+										tracking.tracking.tx_type,
+										TransactionAttemptStatus::Reverted,
+										Some(tx_hash_clone.clone()),
+										None,
+										Some(error.clone()),
+										"monitor_reverted",
+									)
+									.await;
+								}
+								(tracking.tracking.callback)(TransactionMonitoringEvent::Failed {
+									id: tracking.tracking.id,
+									tx_hash: tx_hash_clone,
+									tx_type: tracking.tracking.tx_type,
+									error,
+									classification,
+								});
+							},
+							PollOutcome::Indeterminate(reason) => {
+								if let Some(attempt_id) = monitor_attempt_id.clone() {
+									record_attempt_update_best_effort(
+										monitor_attempt_recorder.clone(),
+										Some(&tracking.tracking.callback),
+										&tracking.tracking.id,
+										attempt_id,
+										tracking.tracking.tx_type,
+										TransactionAttemptStatus::Indeterminate,
+										Some(tx_hash_clone.clone()),
+										None,
+										Some(reason.clone()),
+										"monitor_indeterminate",
+									)
+									.await;
+								}
+								(tracking.tracking.callback)(
+									TransactionMonitoringEvent::Indeterminate {
+										id: tracking.tracking.id,
+										tx_hash: tx_hash_clone,
+										tx_type: tracking.tracking.tx_type,
+										reason,
+									},
+								);
+							},
+						}
+					});
+				}
+
+				Ok(tx_hash)
+			},
+			RawSendVerdict::ReplacementRejected { reason } => {
+				// ANOTHER tx already holds our nonce in the mempool
+				// ("replacement transaction underpriced"). Mark our attempt
+				// SubmitRejected but DO NOT roll back the nonce cache —
+				// rolling back would let us reuse a nonce that already has
+				// a tx, causing self-replacement loops. See
+				// classify_submission_outcome in nonce.rs:166-171.
+				if let (Some(tracking_ref), Some(planned_attempt)) =
+					(tracking.as_ref(), first_attempt.as_ref())
+				{
+					record_attempt_update_best_effort(
+						tracking_ref.tracking.attempt_recorder.clone(),
+						Some(&tracking_ref.tracking.callback),
+						&tracking_ref.tracking.id,
+						planned_attempt.id.clone(),
+						tracking_ref.tracking.tx_type,
+						TransactionAttemptStatus::SubmitRejected,
+						Some(tx_hash.clone()),
 						None,
-						Some(first_err_str.clone()),
-						"first_submit_error",
+						Some(reason.clone()),
+						"raw send rejected; another tx holds this nonce",
 					)
 					.await;
 				}
-				match nonce_action_for_outcome(outcome) {
-					NonceCacheAction::NonceTooLowRetry => {
-						// EXISTING path — resync local cache from chain
-						// pending and retry once with the resynced nonce.
-						tracing::warn!(
-							chain_id,
-							signer = %from,
-							nonce_used = ?tx_attempt.nonce,
-							error = %first_err,
-							"submission failed: nonce too low; resyncing and retrying"
-						);
+				tracing::warn!(
+					chain_id,
+					signer = %from,
+					nonce_used = ?tx_attempt.nonce,
+					error = %reason,
+					"raw send rejected with replacement-underpriced; nonce cache kept advanced (another tx holds the nonce)"
+				);
+				// NO nonce rollback here. Cache stays advanced.
+				Err(DeliveryError::ReplacementUnderpriced { hint: reason })
+			},
+			RawSendVerdict::DefinitelyRejected { reason } => {
+				// Mark the ledger row terminally rejected. The hash was
+				// already persisted before broadcast, so this is post-rejection
+				// cleanup — the best-effort helper is appropriate.
+				if let (Some(tracking_ref), Some(planned_attempt)) =
+					(tracking.as_ref(), first_attempt.as_ref())
+				{
+					record_attempt_update_best_effort(
+						tracking_ref.tracking.attempt_recorder.clone(),
+						Some(&tracking_ref.tracking.callback),
+						&tracking_ref.tracking.id,
+						planned_attempt.id.clone(),
+						tracking_ref.tracking.tx_type,
+						TransactionAttemptStatus::SubmitRejected,
+						Some(tx_hash.clone()),
+						None,
+						Some(reason.clone()),
+						"raw send definitely rejected",
+					)
+					.await;
+				}
 
-						let retry_nonce = self.resync_nonce_for(chain_id, from).await?;
-						let mut retry_tx = tx_attempt.clone();
-						retry_tx.nonce = Some(retry_nonce);
-						let retry_attempt = if let Some(tracking) = tracking.as_ref() {
-							Some(
-								record_planned_attempt(
-									tracking,
-									solver_address_from_alloy(from),
-									retry_tx.clone(),
-								)
-								.await?,
-							)
-						} else {
-							None
-						};
-						let retry_request: TransactionRequest = retry_tx.into();
+				// Roll back the nonce: fetch authoritative chain pending; on
+				// Some(pending) reset cache, on None keep it advanced (never
+				// roll back without authoritative state).
+				let mgr = self.get_nonce_manager(chain_id)?;
+				let cache_before = mgr.peek(from);
+				let pending_result = provider.get_transaction_count(from).pending().await;
+				let (pending_opt, fetch_err): (Option<u64>, Option<String>) = match pending_result {
+					Ok(p) => (Some(p), None),
+					Err(e) => (None, Some(e.to_string())),
+				};
+				let cache_after = apply_nonce_cache_action(
+					mgr,
+					from,
+					NonceCacheAction::AttemptRollback,
+					pending_opt,
+				);
+				if let Some(pending) = pending_opt {
+					tracing::warn!(
+						chain_id,
+						signer = %from,
+						nonce_used = ?tx_attempt.nonce,
+						chain_pending = pending,
+						cache_before = ?cache_before,
+						cache_after = ?cache_after,
+						error = %reason,
+						"raw send definitively rejected; nonce cache rolled back to chain pending"
+					);
+				} else {
+					tracing::warn!(
+						chain_id,
+						signer = %from,
+						nonce_used = ?tx_attempt.nonce,
+						cache_before = ?cache_before,
+						cache_after = ?cache_after,
+						error = %reason,
+						pending_fetch_error = ?fetch_err,
+						"raw send definitively rejected BUT chain-pending fetch failed; nonce cache kept advanced (no authoritative state)"
+					);
+				}
+				Err(DeliveryError::TransactionFailed(reason))
+			},
+			RawSendVerdict::NonceTooLow { reason } => {
+				// Branch on whether this submit is a same-nonce replacement
+				// (a bump dispatched by the sweeper) or an ordinary new-nonce
+				// submit:
+				//
+				// * Same-nonce replacement: MUST NOT retry with a fresh nonce
+				//   — that would violate the same-nonce invariant and create a
+				//   sibling on a different nonce slot, breaking the bump
+				//   lineage. Mark SubmitRejected and return Err WITHOUT
+				//   touching the nonce cache — no rollback, preserve
+				//   same-nonce invariant; another tx may hold this nonce
+				//   already; the bump sweeper will pick a fresh tip next
+				//   cycle.
+				//
+				// * Normal submit: do a bounded one-shot resync + rebuild +
+				//   re-sign + re-broadcast inline. Callers don't retry on
+				//   NonceTooLow, so without this they would fail the order.
+				let is_replacement = tracking
+					.as_ref()
+					.and_then(|t| t.tracking.replacement_of.as_ref())
+					.is_some();
 
-						match provider.send_transaction(retry_request).await {
-							Ok(p) => {
-								tracing::info!(
-									chain_id,
-									retry_nonce,
-									"Resynced nonce retry succeeded"
-								);
-								if let (Some(tracking), Some(attempt)) =
-									(tracking.as_ref(), retry_attempt.as_ref())
-								{
-									record_attempt_update_best_effort(
-										tracking.tracking.attempt_recorder.clone(),
-										attempt.id.clone(),
-										TransactionAttemptStatus::Broadcast,
-										Some(TransactionHash(p.tx_hash().0.to_vec())),
-										None,
-										None,
-										"retry_broadcast",
-									)
-									.await;
-									broadcast_attempt_id = Some(attempt.id.clone());
-								}
-								p
-							},
-							Err(retry_err) => {
-								let retry_err_str = retry_err.to_string();
-								let retry_outcome = classify_submission_outcome(&retry_err_str);
-								if let (Some(tracking), Some(attempt)) =
-									(tracking.as_ref(), retry_attempt.as_ref())
-								{
-									record_attempt_update_best_effort(
-										tracking.tracking.attempt_recorder.clone(),
-										attempt.id.clone(),
-										attempt_status_for_submission_outcome(retry_outcome),
-										None,
-										None,
-										Some(retry_err_str.clone()),
-										"retry_submit_error",
-									)
-									.await;
-								}
-								match nonce_action_for_outcome(retry_outcome) {
-									NonceCacheAction::NonceTooLowRetry => {
-										tracing::error!(
-											chain_id,
-											retry_nonce,
-											error = %retry_err,
-											"Resynced nonce retry still failed with nonce too low — surfacing structured error"
-										);
-										let message = format!(
-											"Chain {chain_id}: retry with resynced nonce {retry_nonce} still failed: {retry_err}"
-										);
-										return Err(DeliveryError::NonceTooLow(message));
-									},
-									action @ NonceCacheAction::AttemptRollback => {
-										let mgr = self.get_nonce_manager(chain_id)?;
-										let cache_before = mgr.peek(from);
-										let pending_result =
-											provider.get_transaction_count(from).pending().await;
-										let (pending_opt, fetch_err): (
-											Option<u64>,
-											Option<String>,
-										) = match pending_result {
-											Ok(p) => (Some(p), None),
-											Err(e) => (None, Some(e.to_string())),
-										};
-										let cache_after = apply_nonce_cache_action(
-											mgr,
-											from,
-											action,
-											pending_opt,
-										);
-										if let Some(pending) = pending_opt {
-											tracing::warn!(
-												chain_id,
-												signer = %from,
-												retry_nonce,
-												chain_pending = pending,
-												cache_before = ?cache_before,
-												cache_after = ?cache_after,
-												error = %retry_err_str,
-												"resynced retry rejected pre-pool; nonce cache rolled back to chain pending"
-											);
-										} else {
-											tracing::warn!(
-												chain_id,
-												signer = %from,
-												retry_nonce,
-												cache_before = ?cache_before,
-												cache_after = ?cache_after,
-												error = %retry_err_str,
-												pending_fetch_error = ?fetch_err,
-												"resynced retry rejected pre-pool BUT chain-pending fetch failed; nonce cache kept advanced"
-											);
-										}
-									},
-									action @ NonceCacheAction::Keep => {
-										let mgr = self.get_nonce_manager(chain_id)?;
-										let cache_after =
-											apply_nonce_cache_action(mgr, from, action, None);
-										tracing::warn!(
-											chain_id,
-											signer = %from,
-											retry_nonce,
-											cache_after = ?cache_after,
-											outcome = ?retry_outcome,
-											error = %retry_err_str,
-											"resynced retry failed; nonce cache kept advanced (replacement-class or ambiguous error)"
-										);
-									},
-								}
+				if is_replacement {
+					// SAME-NONCE INVARIANT: do not retry with a fresh nonce
+					// and do NOT roll back the nonce cache. A `nonce too low`
+					// on a replacement means our bid lost the slot — some
+					// OTHER tx is at or past this nonce. Rolling our cache back
+					// to a lagging chain-pending value could let us reuse a
+					// nonce that already has a tx, causing self-replacement
+					// loops (see classify_submission_outcome in nonce.rs:166-171
+					// for the Replacement-class invariant). The bump sweeper
+					// will pick a fresh tip on the next cycle.
+					if let (Some(tracking_ref), Some(planned_attempt)) =
+						(tracking.as_ref(), first_attempt.as_ref())
+					{
+						record_attempt_update_best_effort(
+							tracking_ref.tracking.attempt_recorder.clone(),
+							Some(&tracking_ref.tracking.callback),
+							&tracking_ref.tracking.id,
+							planned_attempt.id.clone(),
+							tracking_ref.tracking.tx_type,
+							TransactionAttemptStatus::SubmitRejected,
+							Some(tx_hash.clone()),
+							None,
+							Some(reason.clone()),
+							"raw send nonce too low on replacement (no fresh-nonce retry, no rollback)",
+						)
+						.await;
+					}
+					tracing::warn!(
+						chain_id,
+						signer = %from,
+						nonce_used = ?tx_attempt.nonce,
+						error = %reason,
+						"raw send rejected with nonce too low on replacement; nonce cache kept advanced (another tx may hold this nonce; sweeper will pick a fresh tip next cycle)"
+					);
+					// NO nonce rollback here. Cache stays advanced.
+					return Err(DeliveryError::NonceTooLow(reason));
+				}
+
+				// NORMAL submit: one-shot resync + rebuild + re-sign +
+				// re-broadcast. The retry is intentionally bounded — a second
+				// NonceTooLow is terminal (no loop, no recursion).
+				tracing::warn!(
+					chain_id,
+					signer = %from,
+					error = %reason,
+					original_nonce = ?tx_attempt.nonce,
+					"Raw send returned nonce too low on normal submit; resyncing and retrying once."
+				);
+
+				// Before the resync, mark the ORIGINAL planned attempt
+				// SubmitRejected. The retry will create a NEW attempt row
+				// carrying the fresh nonce; the original row stays terminal
+				// at the old nonce. One row per signed envelope keeps the
+				// audit trail honest and prevents the recovery / bump sweeper
+				// from reading a row whose `tx.nonce` is stale relative to
+				// its `tx_hash`.
+				if let (Some(tracking_ref), Some(planned_attempt)) =
+					(tracking.as_ref(), first_attempt.as_ref())
+				{
+					record_attempt_update_best_effort(
+						tracking_ref.tracking.attempt_recorder.clone(),
+						Some(&tracking_ref.tracking.callback),
+						&tracking_ref.tracking.id,
+						planned_attempt.id.clone(),
+						tracking_ref.tracking.tx_type,
+						TransactionAttemptStatus::SubmitRejected,
+						Some(tx_hash.clone()),
+						None,
+						Some(format!(
+							"superseded by nonce-too-low retry (will broadcast with fresh nonce): {reason}"
+						)),
+						"superseded by nonce-too-low retry",
+					)
+					.await;
+				}
+
+				// Resync the local nonce cache from chain pending.
+				// `reset_next_nonce` (not `set_next_nonce`) is used so a
+				// chain-pending value BELOW the local cache (the signature
+				// of a ghost broadcast we recovered from) can move the cache
+				// backward — the whole point of the resync.
+				let mgr = self.get_nonce_manager(chain_id)?;
+				let fresh_pending = provider
+					.get_transaction_count(from)
+					.pending()
+					.await
+					.map_err(|e| {
+						DeliveryError::Network(format!(
+							"Failed to resync nonce from chain for nonce-too-low retry: {e}"
+						))
+					})?;
+				let cache_before_resync = mgr.peek(from);
+				mgr.reset_next_nonce(from, fresh_pending);
+				tracing::debug!(
+					chain_id,
+					signer = %from,
+					chain_pending = fresh_pending,
+					cache_before = ?cache_before_resync,
+					cache_after = fresh_pending,
+					"Nonce-too-low retry: nonce cache resynced from chain pending"
+				);
+
+				// Allocate a fresh nonce.
+				let new_nonce = mgr.take_next(from).ok_or_else(|| {
+					DeliveryError::Network(
+						"Nonce cache empty immediately after resync; cannot allocate retry nonce"
+							.to_string(),
+					)
+				})?;
+				tx_attempt.nonce = Some(new_nonce);
+
+				// Record a NEW planned attempt row for the retry, carrying
+				// the FRESH nonce. `replacement_of` is None because this is
+				// a fresh-nonce retry, not a same-nonce replacement
+				// (different lineage class).
+				//
+				// If recording fails, ledger durability for the retry cannot
+				// be proven — refuse to broadcast and roll back the fresh
+				// nonce we just allocated (it was not yet broadcast).
+				let retry_planned_attempt = if let Some(tracking_ref) = tracking.as_ref() {
+					match record_planned_attempt(
+						tracking_ref,
+						solver_address_from_alloy(from),
+						tx_attempt.clone(),
+						None, // fresh attempt id (no override)
+						None, // not a same-nonce replacement
+					)
+					.await
+					{
+						Ok(attempt) => Some(attempt),
+						Err(record_err) => {
+							let record_err_msg = record_err.to_string();
+							let failed_nonce = new_nonce;
+							let mgr = self.get_nonce_manager(chain_id)?;
+							let cache_before = mgr.peek(from);
+							let pending_result =
+								provider.get_transaction_count(from).pending().await;
+							let (pending_opt, fetch_err): (Option<u64>, Option<String>) =
+								match pending_result {
+									Ok(p) => (Some(p), None),
+									Err(e) => (None, Some(e.to_string())),
+								};
+							let cache_after = apply_nonce_cache_action(
+								mgr,
+								from,
+								NonceCacheAction::AttemptRollback,
+								pending_opt,
+							);
+							if let Some(pending) = pending_opt {
 								tracing::error!(
-									"Resynced nonce retry failed on chain {}: {}",
 									chain_id,
-									retry_err
+									signer = %from,
+									failed_nonce,
+									chain_pending = pending,
+									cache_before = ?cache_before,
+									cache_after = ?cache_after,
+									error = %record_err_msg,
+									"nonce-too-low retry: failed to record retry planned attempt; refusing to broadcast; nonce cache rolled back to chain pending"
 								);
-								return Err(DeliveryError::Network(format!(
-									"Resynced nonce retry failed: {retry_err}"
-								)));
-							},
+							} else {
+								tracing::error!(
+									chain_id,
+									signer = %from,
+									failed_nonce,
+									cache_before = ?cache_before,
+									cache_after = ?cache_after,
+									error = %record_err_msg,
+									pending_fetch_error = ?fetch_err,
+									"nonce-too-low retry: failed to record retry planned attempt; refusing to broadcast; chain-pending fetch failed so nonce cache kept advanced"
+								);
+							}
+							return Err(record_err);
+						},
+					}
+				} else {
+					// No tracking — proceed without a ledger row. The retry's
+					// tracking-Some paths below are no-ops in this case.
+					None
+				};
+
+				// Rebuild the request from the updated tx_attempt.
+				let new_request: TransactionRequest = tx_attempt.clone().into();
+
+				// Re-sign locally — produces a NEW hash + NEW encoded bytes.
+				// On signing failure mark SubmitRejected (broadcast did not
+				// happen), roll back the nonce, and surface the signing error.
+				let (_new_envelope, new_tx_hash, new_encoded) = match self
+					.build_signed_envelope(chain_id, new_request)
+					.await
+				{
+					Ok(v) => v,
+					Err(sign_err) => {
+						let sign_err_msg = sign_err.to_string();
+						if let (Some(tracking_ref), Some(retry_planned)) =
+							(tracking.as_ref(), retry_planned_attempt.as_ref())
+						{
+							record_attempt_update_best_effort(
+								tracking_ref.tracking.attempt_recorder.clone(),
+								Some(&tracking_ref.tracking.callback),
+								&tracking_ref.tracking.id,
+								retry_planned.id.clone(),
+								tracking_ref.tracking.tx_type,
+								TransactionAttemptStatus::SubmitRejected,
+								None,
+								None,
+								Some(sign_err_msg.clone()),
+								"local signing failed on nonce-too-low retry",
+							)
+							.await;
 						}
-					},
-					action @ NonceCacheAction::AttemptRollback => {
-						// Try to fetch authoritative chain pending. The helper
-						// `apply_nonce_cache_action` enforces the invariant: on
-						// Some(pending) it resets, on None it KEEPS the cache —
-						// we never reset without authoritative chain state.
+
+						// Rollback: fetch authoritative chain pending; on
+						// Some(pending) reset cache, on None keep it advanced.
 						let mgr = self.get_nonce_manager(chain_id)?;
 						let cache_before = mgr.peek(from);
 						let pending_result = provider.get_transaction_count(from).pending().await;
@@ -1142,7 +1992,544 @@ impl DeliveryInterface for AlloyDelivery {
 								Ok(p) => (Some(p), None),
 								Err(e) => (None, Some(e.to_string())),
 							};
-						let cache_after = apply_nonce_cache_action(mgr, from, action, pending_opt);
+						let cache_after = apply_nonce_cache_action(
+							mgr,
+							from,
+							NonceCacheAction::AttemptRollback,
+							pending_opt,
+						);
+						if let Some(pending) = pending_opt {
+							tracing::error!(
+								chain_id,
+								signer = %from,
+								failed_nonce = new_nonce,
+								chain_pending = pending,
+								cache_before = ?cache_before,
+								cache_after = ?cache_after,
+								error = %sign_err_msg,
+								"local signing failed on nonce-too-low retry; nonce cache rolled back to chain pending"
+							);
+						} else {
+							tracing::error!(
+								chain_id,
+								signer = %from,
+								failed_nonce = new_nonce,
+								cache_before = ?cache_before,
+								cache_after = ?cache_after,
+								error = %sign_err_msg,
+								pending_fetch_error = ?fetch_err,
+								"local signing failed on nonce-too-low retry; chain-pending fetch failed so nonce cache kept advanced"
+							);
+						}
+						return Err(sign_err);
+					},
+				};
+
+				// Persist the new hash on the RETRY planned attempt row
+				// before broadcast — failure aborts the broadcast (same
+				// invariant as the primary submit path). The retry row was
+				// just recorded with the fresh nonce; transition it from
+				// Planned → Broadcast and attach the hash.
+				if let (Some(tracking_ref), Some(retry_planned)) =
+					(tracking.as_ref(), retry_planned_attempt.as_ref())
+				{
+					let persist_result = tracking_ref
+						.tracking
+						.attempt_recorder
+						.record_attempt_update(
+							&retry_planned.id,
+							TransactionAttemptStatus::Broadcast,
+							Some(new_tx_hash.clone()),
+							None,
+							None,
+						)
+						.await;
+					if let Err(persist_err) = persist_result {
+						// Cannot prove ledger durability for the retry hash
+						// — refuse to broadcast. Roll back the nonce, surface
+						// as Network.
+						let failed_nonce = new_nonce;
+						let mgr = self.get_nonce_manager(chain_id)?;
+						let cache_before = mgr.peek(from);
+						let pending_result = provider.get_transaction_count(from).pending().await;
+						let (pending_opt, fetch_err): (Option<u64>, Option<String>) =
+							match pending_result {
+								Ok(p) => (Some(p), None),
+								Err(e) => (None, Some(e.to_string())),
+							};
+						let cache_after = apply_nonce_cache_action(
+							mgr,
+							from,
+							NonceCacheAction::AttemptRollback,
+							pending_opt,
+						);
+						if let Some(pending) = pending_opt {
+							tracing::error!(
+								chain_id,
+								signer = %from,
+								failed_nonce,
+								chain_pending = pending,
+								cache_before = ?cache_before,
+								cache_after = ?cache_after,
+								error = %persist_err,
+								"nonce-too-low retry: pre-broadcast hash persist failed; refusing to broadcast; nonce cache rolled back to chain pending"
+							);
+						} else {
+							tracing::error!(
+								chain_id,
+								signer = %from,
+								failed_nonce,
+								cache_before = ?cache_before,
+								cache_after = ?cache_after,
+								error = %persist_err,
+								pending_fetch_error = ?fetch_err,
+								"nonce-too-low retry: pre-broadcast hash persist failed; refusing to broadcast; chain-pending fetch failed so nonce cache kept advanced"
+							);
+						}
+						return Err(DeliveryError::Network(format!(
+							"Failed to persist nonce-too-low retry hash to attempt ledger: {persist_err}"
+						)));
+					}
+				}
+
+				// Re-broadcast.
+				let retry_raw_result = provider.send_raw_transaction(&new_encoded).await;
+				let retry_error_message: Option<String> =
+					retry_raw_result.as_ref().err().map(|e| e.to_string());
+				let retry_verdict = classify_raw_send_outcome(retry_error_message.as_deref());
+
+				// Classify retry outcome. The retry is ONE-SHOT: a second
+				// NonceTooLow is treated as terminal (no loop, no recursion).
+				match retry_verdict {
+					RawSendVerdict::Accepted => {
+						tracing::debug!(
+							chain_id,
+							signer = %from,
+							nonce_used = ?tx_attempt.nonce,
+							tx_hash = ?new_tx_hash,
+							"Nonce-too-low retry submitted; nonce committed"
+						);
+
+						// Subsequent updates target the RETRY row, not the
+						// original — the original was already marked
+						// SubmitRejected above and carries the stale nonce.
+						if let (Some(tracking), Some(attempt)) =
+							(tracking.as_ref(), retry_planned_attempt.as_ref())
+						{
+							record_attempt_update_best_effort(
+								tracking.tracking.attempt_recorder.clone(),
+								Some(&tracking.tracking.callback),
+								&tracking.tracking.id,
+								attempt.id.clone(),
+								tracking.tracking.tx_type,
+								TransactionAttemptStatus::Broadcast,
+								Some(new_tx_hash.clone()),
+								None,
+								None,
+								"retry_broadcast",
+							)
+							.await;
+							broadcast_attempt_id = Some(attempt.id.clone());
+						}
+
+						// POST-SUBMIT diagnostic snapshot.
+						let post_submit_pending =
+							provider.get_transaction_count(from).pending().await.ok();
+						let to_hex = tx_attempt
+							.to
+							.as_ref()
+							.map(|addr| format!("0x{}", hex::encode(&addr.0)));
+						let new_tx_hash_alloy = FixedBytes::<32>::from_slice(&new_tx_hash.0);
+						tracing::debug!(
+							chain_id,
+							tx_hash = %new_tx_hash_alloy,
+							signer = %from,
+							to = ?to_hex,
+							value_wei = %tx_attempt.value,
+							data_len = tx_attempt.data.len(),
+							tx_nonce = ?tx_attempt.nonce,
+							gas_limit = ?tx_attempt.gas_limit,
+							gas_price = ?tx_attempt.gas_price,
+							max_fee_per_gas = ?tx_attempt.max_fee_per_gas,
+							max_priority_fee_per_gas = ?tx_attempt.max_priority_fee_per_gas,
+							pre_submit_pending_nonce = ?pre_submit_pending,
+							post_submit_pending_nonce = ?post_submit_pending,
+							pre_submit_balance_wei = ?pre_submit_balance.map(|b| b.to_string()),
+							gas_budget_wei = ?native_gas_budget.as_ref().map(|b| b.gas_budget_wei.to_string()),
+							required_wei = ?native_gas_budget.as_ref().map(|b| b.required_wei.to_string()),
+							retry_ambiguous = false,
+							"POST-SUBMIT diagnostic snapshot (nonce-too-low retry)"
+						);
+
+						// Spawn the monitor with the NEW hash.
+						if let Some(tracking) = tracking {
+							let tx_hash_clone = new_tx_hash.clone();
+							let monitor_attempt_id = broadcast_attempt_id.clone();
+							let monitor_attempt_recorder =
+								tracking.tracking.attempt_recorder.clone();
+							let provider_clone = provider.clone();
+							let tx_for_replay: SolverTransaction = tx_attempt.clone();
+							let from_for_replay: Option<SolverAddress> =
+								Some(SolverAddress::from(from));
+							let chain_id_for_replay: u64 = chain_id;
+							tokio::spawn(async move {
+								let result = monitor_transaction(
+									provider_clone,
+									new_tx_hash_alloy,
+									tracking.min_confirmations,
+									Duration::from_secs(tracking.tx_confirmation_timeout_seconds),
+									tx_for_replay,
+									from_for_replay,
+									chain_id_for_replay,
+								)
+								.await;
+
+								match result {
+									PollOutcome::Confirmed(receipt) => {
+										if let Some(attempt_id) = monitor_attempt_id.clone() {
+											record_attempt_update_best_effort(
+												monitor_attempt_recorder.clone(),
+												Some(&tracking.tracking.callback),
+												&tracking.tracking.id,
+												attempt_id,
+												tracking.tracking.tx_type,
+												TransactionAttemptStatus::Confirmed,
+												Some(tx_hash_clone.clone()),
+												Some(receipt.clone()),
+												None,
+												"monitor_confirmed",
+											)
+											.await;
+										}
+										(tracking.tracking.callback)(
+											TransactionMonitoringEvent::Confirmed {
+												id: tracking.tracking.id,
+												tx_hash: tx_hash_clone,
+												tx_type: tracking.tracking.tx_type,
+												receipt,
+											},
+										);
+									},
+									PollOutcome::Reverted {
+										error,
+										classification,
+										..
+									} => {
+										if let Some(attempt_id) = monitor_attempt_id.clone() {
+											record_attempt_update_best_effort(
+												monitor_attempt_recorder.clone(),
+												Some(&tracking.tracking.callback),
+												&tracking.tracking.id,
+												attempt_id,
+												tracking.tracking.tx_type,
+												TransactionAttemptStatus::Reverted,
+												Some(tx_hash_clone.clone()),
+												None,
+												Some(error.clone()),
+												"monitor_reverted",
+											)
+											.await;
+										}
+										(tracking.tracking.callback)(
+											TransactionMonitoringEvent::Failed {
+												id: tracking.tracking.id,
+												tx_hash: tx_hash_clone,
+												tx_type: tracking.tracking.tx_type,
+												error,
+												classification,
+											},
+										);
+									},
+									PollOutcome::Indeterminate(reason) => {
+										if let Some(attempt_id) = monitor_attempt_id.clone() {
+											record_attempt_update_best_effort(
+												monitor_attempt_recorder.clone(),
+												Some(&tracking.tracking.callback),
+												&tracking.tracking.id,
+												attempt_id,
+												tracking.tracking.tx_type,
+												TransactionAttemptStatus::Indeterminate,
+												Some(tx_hash_clone.clone()),
+												None,
+												Some(reason.clone()),
+												"monitor_indeterminate",
+											)
+											.await;
+										}
+										(tracking.tracking.callback)(
+											TransactionMonitoringEvent::Indeterminate {
+												id: tracking.tracking.id,
+												tx_hash: tx_hash_clone,
+												tx_type: tracking.tracking.tx_type,
+												reason,
+											},
+										);
+									},
+								}
+							});
+						}
+
+						Ok(new_tx_hash)
+					},
+					RawSendVerdict::Ambiguous => {
+						// Untracked ambiguous send: return Ok(hash) so the
+						// caller can poll. Returning Err would push the caller
+						// toward a fresh submit() that allocates a NEW nonce
+						// while the original tx may still execute —
+						// double-execution risk at two nonces.
+						//
+						// The nonce cache is intentionally NOT rolled back.
+						// An ambiguous outcome may mean the tx landed;
+						// reusing a held nonce is a worse failure mode than
+						// leaking one. The drift monitor catches leaked
+						// nonces.
+						if tracking.as_ref().is_none() {
+							tracing::warn!(
+								chain_id,
+								signer = %from,
+								tx_hash = ?new_tx_hash,
+								nonce_used = ?tx_attempt.nonce,
+								error = ?retry_error_message,
+								"Nonce-too-low retry: ambiguous outcome on untracked send; returning known hash so caller can poll. Nonce cache kept advanced."
+							);
+							return Ok(new_tx_hash);
+						}
+
+						tracing::warn!(
+							chain_id,
+							tx_hash = ?new_tx_hash,
+							error = ?retry_error_message,
+							"Nonce-too-low retry submission outcome ambiguous; hash already persisted, monitor will resolve."
+						);
+
+						if let (Some(tracking), Some(attempt)) =
+							(tracking.as_ref(), retry_planned_attempt.as_ref())
+						{
+							record_attempt_update_best_effort(
+								tracking.tracking.attempt_recorder.clone(),
+								Some(&tracking.tracking.callback),
+								&tracking.tracking.id,
+								attempt.id.clone(),
+								tracking.tracking.tx_type,
+								TransactionAttemptStatus::Indeterminate,
+								Some(new_tx_hash.clone()),
+								None,
+								retry_error_message.clone(),
+								"retry_submit_ambiguous",
+							)
+							.await;
+							broadcast_attempt_id = Some(attempt.id.clone());
+						}
+
+						// POST-SUBMIT diagnostic snapshot.
+						let post_submit_pending =
+							provider.get_transaction_count(from).pending().await.ok();
+						let to_hex = tx_attempt
+							.to
+							.as_ref()
+							.map(|addr| format!("0x{}", hex::encode(&addr.0)));
+						let new_tx_hash_alloy = FixedBytes::<32>::from_slice(&new_tx_hash.0);
+						tracing::debug!(
+							chain_id,
+							tx_hash = %new_tx_hash_alloy,
+							signer = %from,
+							to = ?to_hex,
+							value_wei = %tx_attempt.value,
+							data_len = tx_attempt.data.len(),
+							tx_nonce = ?tx_attempt.nonce,
+							gas_limit = ?tx_attempt.gas_limit,
+							gas_price = ?tx_attempt.gas_price,
+							max_fee_per_gas = ?tx_attempt.max_fee_per_gas,
+							max_priority_fee_per_gas = ?tx_attempt.max_priority_fee_per_gas,
+							pre_submit_pending_nonce = ?pre_submit_pending,
+							post_submit_pending_nonce = ?post_submit_pending,
+							pre_submit_balance_wei = ?pre_submit_balance.map(|b| b.to_string()),
+							gas_budget_wei = ?native_gas_budget.as_ref().map(|b| b.gas_budget_wei.to_string()),
+							required_wei = ?native_gas_budget.as_ref().map(|b| b.required_wei.to_string()),
+							retry_ambiguous = true,
+							"POST-SUBMIT diagnostic snapshot (nonce-too-low retry; ambiguous; monitor will resolve)"
+						);
+
+						// Spawn the monitor with the NEW hash.
+						if let Some(tracking) = tracking {
+							let tx_hash_clone = new_tx_hash.clone();
+							let monitor_attempt_id = broadcast_attempt_id.clone();
+							let monitor_attempt_recorder =
+								tracking.tracking.attempt_recorder.clone();
+							let provider_clone = provider.clone();
+							let tx_for_replay: SolverTransaction = tx_attempt.clone();
+							let from_for_replay: Option<SolverAddress> =
+								Some(SolverAddress::from(from));
+							let chain_id_for_replay: u64 = chain_id;
+							tokio::spawn(async move {
+								let result = monitor_transaction(
+									provider_clone,
+									new_tx_hash_alloy,
+									tracking.min_confirmations,
+									Duration::from_secs(tracking.tx_confirmation_timeout_seconds),
+									tx_for_replay,
+									from_for_replay,
+									chain_id_for_replay,
+								)
+								.await;
+
+								match result {
+									PollOutcome::Confirmed(receipt) => {
+										if let Some(attempt_id) = monitor_attempt_id.clone() {
+											record_attempt_update_best_effort(
+												monitor_attempt_recorder.clone(),
+												Some(&tracking.tracking.callback),
+												&tracking.tracking.id,
+												attempt_id,
+												tracking.tracking.tx_type,
+												TransactionAttemptStatus::Confirmed,
+												Some(tx_hash_clone.clone()),
+												Some(receipt.clone()),
+												None,
+												"monitor_confirmed",
+											)
+											.await;
+										}
+										(tracking.tracking.callback)(
+											TransactionMonitoringEvent::Confirmed {
+												id: tracking.tracking.id,
+												tx_hash: tx_hash_clone,
+												tx_type: tracking.tracking.tx_type,
+												receipt,
+											},
+										);
+									},
+									PollOutcome::Reverted {
+										error,
+										classification,
+										..
+									} => {
+										if let Some(attempt_id) = monitor_attempt_id.clone() {
+											record_attempt_update_best_effort(
+												monitor_attempt_recorder.clone(),
+												Some(&tracking.tracking.callback),
+												&tracking.tracking.id,
+												attempt_id,
+												tracking.tracking.tx_type,
+												TransactionAttemptStatus::Reverted,
+												Some(tx_hash_clone.clone()),
+												None,
+												Some(error.clone()),
+												"monitor_reverted",
+											)
+											.await;
+										}
+										(tracking.tracking.callback)(
+											TransactionMonitoringEvent::Failed {
+												id: tracking.tracking.id,
+												tx_hash: tx_hash_clone,
+												tx_type: tracking.tracking.tx_type,
+												error,
+												classification,
+											},
+										);
+									},
+									PollOutcome::Indeterminate(reason) => {
+										if let Some(attempt_id) = monitor_attempt_id.clone() {
+											record_attempt_update_best_effort(
+												monitor_attempt_recorder.clone(),
+												Some(&tracking.tracking.callback),
+												&tracking.tracking.id,
+												attempt_id,
+												tracking.tracking.tx_type,
+												TransactionAttemptStatus::Indeterminate,
+												Some(tx_hash_clone.clone()),
+												None,
+												Some(reason.clone()),
+												"monitor_indeterminate",
+											)
+											.await;
+										}
+										(tracking.tracking.callback)(
+											TransactionMonitoringEvent::Indeterminate {
+												id: tracking.tracking.id,
+												tx_hash: tx_hash_clone,
+												tx_type: tracking.tracking.tx_type,
+												reason,
+											},
+										);
+									},
+								}
+							});
+						}
+
+						Ok(new_tx_hash)
+					},
+					RawSendVerdict::ReplacementRejected {
+						reason: retry_reason,
+					} => {
+						// Another tx now holds the fresh nonce too. Mark
+						// SubmitRejected on the RETRY row but do NOT roll back
+						// the cache (someone else owns this nonce; rolling
+						// back would let us reuse a held nonce).
+						if let (Some(tracking_ref), Some(retry_planned)) =
+							(tracking.as_ref(), retry_planned_attempt.as_ref())
+						{
+							record_attempt_update_best_effort(
+								tracking_ref.tracking.attempt_recorder.clone(),
+								Some(&tracking_ref.tracking.callback),
+								&tracking_ref.tracking.id,
+								retry_planned.id.clone(),
+								tracking_ref.tracking.tx_type,
+								TransactionAttemptStatus::SubmitRejected,
+								Some(new_tx_hash.clone()),
+								None,
+								Some(retry_reason.clone()),
+								"nonce-too-low retry: another tx already holds the fresh nonce",
+							)
+							.await;
+						}
+						tracing::warn!(
+							chain_id,
+							signer = %from,
+							nonce_used = ?tx_attempt.nonce,
+							error = %retry_reason,
+							"nonce-too-low retry rejected with replacement-underpriced; nonce cache kept advanced (another tx holds the nonce)"
+						);
+						Err(DeliveryError::ReplacementUnderpriced { hint: retry_reason })
+					},
+					RawSendVerdict::DefinitelyRejected {
+						reason: retry_reason,
+					} => {
+						// Mark the RETRY row SubmitRejected and roll back the
+						// nonce.
+						if let (Some(tracking_ref), Some(retry_planned)) =
+							(tracking.as_ref(), retry_planned_attempt.as_ref())
+						{
+							record_attempt_update_best_effort(
+								tracking_ref.tracking.attempt_recorder.clone(),
+								Some(&tracking_ref.tracking.callback),
+								&tracking_ref.tracking.id,
+								retry_planned.id.clone(),
+								tracking_ref.tracking.tx_type,
+								TransactionAttemptStatus::SubmitRejected,
+								Some(new_tx_hash.clone()),
+								None,
+								Some(retry_reason.clone()),
+								"nonce-too-low retry rejected definitively",
+							)
+							.await;
+						}
+
+						let mgr = self.get_nonce_manager(chain_id)?;
+						let cache_before = mgr.peek(from);
+						let pending_result = provider.get_transaction_count(from).pending().await;
+						let (pending_opt, fetch_err): (Option<u64>, Option<String>) =
+							match pending_result {
+								Ok(p) => (Some(p), None),
+								Err(e) => (None, Some(e.to_string())),
+							};
+						let cache_after = apply_nonce_cache_action(
+							mgr,
+							from,
+							NonceCacheAction::AttemptRollback,
+							pending_opt,
+						);
 						if let Some(pending) = pending_opt {
 							tracing::warn!(
 								chain_id,
@@ -1151,8 +2538,8 @@ impl DeliveryInterface for AlloyDelivery {
 								chain_pending = pending,
 								cache_before = ?cache_before,
 								cache_after = ?cache_after,
-								error = %first_err_str,
-								"tx rejected pre-pool; nonce cache rolled back to chain pending"
+								error = %retry_reason,
+								"nonce-too-low retry definitively rejected; nonce cache rolled back to chain pending"
 							);
 						} else {
 							tracing::warn!(
@@ -1161,178 +2548,91 @@ impl DeliveryInterface for AlloyDelivery {
 								nonce_used = ?tx_attempt.nonce,
 								cache_before = ?cache_before,
 								cache_after = ?cache_after,
-								error = %first_err_str,
+								error = %retry_reason,
 								pending_fetch_error = ?fetch_err,
-								"tx rejected pre-pool BUT chain-pending fetch failed; nonce cache kept advanced (no authoritative state)"
+								"nonce-too-low retry definitively rejected BUT chain-pending fetch failed; nonce cache kept advanced"
 							);
 						}
-						return Err(DeliveryError::Network(format!(
-							"Failed to send transaction: {first_err}"
-						)));
+						Err(DeliveryError::TransactionFailed(retry_reason))
 					},
-					action @ NonceCacheAction::Keep => {
-						let mgr = self.get_nonce_manager(chain_id)?;
-						let cache_after = apply_nonce_cache_action(mgr, from, action, None);
-						tracing::warn!(
+					RawSendVerdict::NonceTooLow {
+						reason: second_reason,
+					} => {
+						// SECOND NonceTooLow within the same submit() call.
+						// Terminal — do not loop. Mark SubmitRejected and
+						// surface NonceTooLow. The engine handler will fail
+						// the order; the operator can investigate (signer
+						// being used by another process, or chain state
+						// shifting faster than we can sync).
+						tracing::error!(
 							chain_id,
 							signer = %from,
-							nonce_used = ?tx_attempt.nonce,
-							cache_after = ?cache_after,
-							outcome = ?outcome,
-							error = %first_err_str,
-							"tx submission did not accept; nonce cache kept advanced (replacement-class or ambiguous error)"
+							first_error = %reason,
+							second_error = %second_reason,
+							"Nonce too low twice within one submit; giving up."
 						);
-						return Err(DeliveryError::Network(format!(
-							"Failed to send transaction: {first_err}"
-						)));
+						if let (Some(tracking_ref), Some(retry_planned)) =
+							(tracking.as_ref(), retry_planned_attempt.as_ref())
+						{
+							record_attempt_update_best_effort(
+								tracking_ref.tracking.attempt_recorder.clone(),
+								Some(&tracking_ref.tracking.callback),
+								&tracking_ref.tracking.id,
+								retry_planned.id.clone(),
+								tracking_ref.tracking.tx_type,
+								TransactionAttemptStatus::SubmitRejected,
+								Some(new_tx_hash.clone()),
+								None,
+								Some(format!(
+									"nonce too low twice; first: {reason}; second: {second_reason}"
+								)),
+								"nonce-too-low retry also got nonce too low",
+							)
+							.await;
+						}
+
+						let mgr = self.get_nonce_manager(chain_id)?;
+						let cache_before = mgr.peek(from);
+						let pending_result = provider.get_transaction_count(from).pending().await;
+						let (pending_opt, fetch_err): (Option<u64>, Option<String>) =
+							match pending_result {
+								Ok(p) => (Some(p), None),
+								Err(e) => (None, Some(e.to_string())),
+							};
+						let cache_after = apply_nonce_cache_action(
+							mgr,
+							from,
+							NonceCacheAction::AttemptRollback,
+							pending_opt,
+						);
+						if let Some(pending) = pending_opt {
+							tracing::warn!(
+								chain_id,
+								signer = %from,
+								nonce_used = ?tx_attempt.nonce,
+								chain_pending = pending,
+								cache_before = ?cache_before,
+								cache_after = ?cache_after,
+								error = %second_reason,
+								"nonce-too-low retry also returned nonce too low; nonce cache rolled back to chain pending"
+							);
+						} else {
+							tracing::warn!(
+								chain_id,
+								signer = %from,
+								nonce_used = ?tx_attempt.nonce,
+								cache_before = ?cache_before,
+								cache_after = ?cache_after,
+								error = %second_reason,
+								pending_fetch_error = ?fetch_err,
+								"nonce-too-low retry also returned nonce too low BUT chain-pending fetch failed; nonce cache kept advanced"
+							);
+						}
+						Err(DeliveryError::NonceTooLow(second_reason))
 					},
 				}
 			},
-		};
-
-		// Get the transaction hash
-		let tx_hash = *pending_tx.tx_hash();
-		let tx_hash_obj = TransactionHash(tx_hash.0.to_vec());
-
-		// POST-SUBMIT DIAGNOSTIC. Logged at DEBUG so it's silent in normal ops
-		// but available via RUST_LOG=solver_delivery=debug for forensic runs.
-		// NOTE: load-balanced RPC providers (e.g. Alchemy) have eventual
-		// consistency between write and read endpoints — `pending_nonce` after
-		// a successful submit can report the pre-submit value for tens of
-		// seconds even though the tx has been accepted, propagated, and is on
-		// its way to mining. Do NOT use it to decide retry/failure.
-		let post_submit_pending = provider.get_transaction_count(from).pending().await.ok();
-		let to_hex = tx_attempt
-			.to
-			.as_ref()
-			.map(|addr| format!("0x{}", hex::encode(&addr.0)));
-		tracing::debug!(
-			chain_id,
-			%tx_hash,
-			signer = %from,
-			to = ?to_hex,
-			value_wei = %tx_attempt.value,
-			data_len = tx_attempt.data.len(),
-			tx_nonce = ?tx_attempt.nonce,
-			gas_limit = ?tx_attempt.gas_limit,
-			gas_price = ?tx_attempt.gas_price,
-			max_fee_per_gas = ?tx_attempt.max_fee_per_gas,
-			max_priority_fee_per_gas = ?tx_attempt.max_priority_fee_per_gas,
-			pre_submit_pending_nonce = ?pre_submit_pending,
-			post_submit_pending_nonce = ?post_submit_pending,
-			pre_submit_balance_wei = ?pre_submit_balance.map(|b| b.to_string()),
-			gas_budget_wei = ?native_gas_budget.as_ref().map(|b| b.gas_budget_wei.to_string()),
-			required_wei = ?native_gas_budget.as_ref().map(|b| b.required_wei.to_string()),
-			"POST-SUBMIT diagnostic snapshot (read-replica lag may make pending_nonce stale)"
-		);
-
-		// NOTE: a previous version of this code did a 3-attempt
-		// `get_transaction_by_hash` "visibility check" right after submit and
-		// returned an error + reset the nonce cache when the read came back
-		// null. That was a false-positive trap: Alchemy's read endpoints lag
-		// by tens of seconds (load-balanced read replicas), so a tx that has
-		// been accepted by the pool, propagated, and is on its way to mining
-		// can still return null for `get_transaction_by_hash`. Verified: a tx
-		// declared "ghost" by that check actually mined at the requested
-		// nonce. Removing the check; rely on `monitor_transaction` (when
-		// tracking is provided) to detect actual confirmation, and on the
-		// existing nonce-too-low retry path to handle stale local nonce.
-
-		// If tracking is provided, set up monitoring
-		if let Some(tracking) = tracking {
-			let tx_hash_clone = tx_hash_obj.clone();
-			let monitor_attempt_id = broadcast_attempt_id.clone();
-			let monitor_attempt_recorder = tracking.tracking.attempt_recorder.clone();
-			// Erase the root provider to a `DynProvider` so it matches
-			// `monitor_transaction`'s signature (and `ProviderProbe` inside it).
-			let provider_clone = pending_tx.provider().clone().erased();
-			// Capture replay parameters for revert-data classification on revert.
-			let tx_for_replay: SolverTransaction = tx_attempt.clone();
-			let from_for_replay: Option<SolverAddress> = Some(SolverAddress::from(from));
-			let chain_id_for_replay: u64 = chain_id;
-			tokio::spawn(async move {
-				let result = monitor_transaction(
-					provider_clone,
-					tx_hash,
-					tracking.min_confirmations,
-					Duration::from_secs(tracking.tx_confirmation_timeout_seconds),
-					tx_for_replay,
-					from_for_replay,
-					chain_id_for_replay,
-				)
-				.await;
-
-				match result {
-					PollOutcome::Confirmed(receipt) => {
-						if let Some(attempt_id) = monitor_attempt_id.clone() {
-							record_attempt_update_best_effort(
-								monitor_attempt_recorder.clone(),
-								attempt_id,
-								TransactionAttemptStatus::Confirmed,
-								Some(tx_hash_clone.clone()),
-								Some(receipt.clone()),
-								None,
-								"monitor_confirmed",
-							)
-							.await;
-						}
-						(tracking.tracking.callback)(TransactionMonitoringEvent::Confirmed {
-							id: tracking.tracking.id,
-							tx_hash: tx_hash_clone,
-							tx_type: tracking.tracking.tx_type,
-							receipt,
-						});
-					},
-					PollOutcome::Reverted {
-						error,
-						classification,
-						..
-					} => {
-						if let Some(attempt_id) = monitor_attempt_id.clone() {
-							record_attempt_update_best_effort(
-								monitor_attempt_recorder.clone(),
-								attempt_id,
-								TransactionAttemptStatus::Reverted,
-								Some(tx_hash_clone.clone()),
-								None,
-								Some(error.clone()),
-								"monitor_reverted",
-							)
-							.await;
-						}
-						(tracking.tracking.callback)(TransactionMonitoringEvent::Failed {
-							id: tracking.tracking.id,
-							tx_hash: tx_hash_clone,
-							tx_type: tracking.tracking.tx_type,
-							error,
-							classification,
-						});
-					},
-					PollOutcome::Indeterminate(reason) => {
-						if let Some(attempt_id) = monitor_attempt_id.clone() {
-							record_attempt_update_best_effort(
-								monitor_attempt_recorder.clone(),
-								attempt_id,
-								TransactionAttemptStatus::Indeterminate,
-								Some(tx_hash_clone.clone()),
-								None,
-								Some(reason.clone()),
-								"monitor_indeterminate",
-							)
-							.await;
-						}
-						(tracking.tracking.callback)(TransactionMonitoringEvent::Indeterminate {
-							id: tracking.tracking.id,
-							tx_hash: tx_hash_clone,
-							tx_type: tracking.tracking.tx_type,
-							reason,
-						});
-					},
-				}
-			});
 		}
-
-		Ok(tx_hash_obj)
 	}
 
 	async fn get_receipt(
@@ -1696,6 +2996,12 @@ impl DeliveryInterface for AlloyDelivery {
 	) -> Result<Option<Vec<u8>>, DeliveryError> {
 		let provider = self.get_provider(chain_id)?.clone();
 		get_revert_data_with_provider(provider, chain_id, tx, from, block).await
+	}
+
+	fn submission_signer(&self, chain_id: u64) -> Option<SolverAddress> {
+		self.signer_addresses
+			.get(&chain_id)
+			.map(|alloy_addr| SolverAddress::from(*alloy_addr))
 	}
 
 	async fn tx_exists(
@@ -2099,6 +3405,29 @@ impl solver_types::ImplementationRegistry for Registry {
 
 impl crate::DeliveryRegistry for Registry {}
 
+/// Build the `TransactionRequest` used for the pre-nonce gas estimate.
+///
+/// Mirrors the field-population the existing `submit()` already performs via
+/// `tx_attempt.clone().into()` (`From<Transaction> for TransactionRequest` in
+/// `solver_types::account`) — chain_id, to, value, data/input, gas_price,
+/// max_fee_per_gas, max_priority_fee_per_gas. Nonce and gas are explicitly
+/// cleared so `eth_estimateGas` decides them; the wallet filler attached to
+/// the provider supplies `from`, matching what the existing `estimate_gas`
+/// path on `DeliveryInterface` does today.
+///
+/// Keeping this as a thin wrapper around the existing `From` impl guarantees
+/// the estimate request is byte-for-byte the same as what `send_transaction`
+/// would have seen, modulo the two fields the estimate is meant to derive.
+fn build_estimate_request(tx: &SolverTransaction) -> TransactionRequest {
+	let mut request: TransactionRequest = tx.clone().into();
+	// Defensive: the caller only invokes this when `tx.gas_limit.is_none()`
+	// and the nonce has not yet been allocated, but clearing here keeps the
+	// helper safe to call from future paths that pre-fill either field.
+	request.gas = None;
+	request.nonce = None;
+	request
+}
+
 #[cfg(test)]
 mod fee_params_cache_tests {
 	//! Direct tests for the per-chain `FeeParamsCache`. These exercise the
@@ -2484,38 +3813,81 @@ mod tests {
 	// ========================================================================
 
 	#[test]
-	fn nonce_action_for_outcome_maps_correctly() {
-		use NonceCacheAction::*;
-		use SubmissionOutcome::*;
-		assert_eq!(
-			nonce_action_for_outcome(DefinitelyRejected),
-			AttemptRollback
-		);
-		assert_eq!(nonce_action_for_outcome(Replacement), Keep);
-		assert_eq!(nonce_action_for_outcome(Ambiguous), Keep);
-		assert_eq!(nonce_action_for_outcome(NonceTooLow), NonceTooLowRetry);
+	fn classify_raw_send_outcome_accepts_when_ok() {
+		assert_eq!(classify_raw_send_outcome(None), RawSendVerdict::Accepted);
 	}
 
 	#[test]
-	fn submission_outcome_maps_to_attempt_status() {
-		use SubmissionOutcome::*;
+	fn classify_raw_send_outcome_treats_already_known_as_accepted() {
+		assert_eq!(
+			classify_raw_send_outcome(Some("already known")),
+			RawSendVerdict::Accepted,
+		);
+		assert_eq!(
+			classify_raw_send_outcome(Some("ALREADY KNOWN: tx hash 0xabc")),
+			RawSendVerdict::Accepted,
+		);
+	}
 
+	#[test]
+	fn classify_raw_send_outcome_replacement_underpriced_is_replacement_rejected() {
+		let verdict = classify_raw_send_outcome(Some("replacement transaction underpriced"));
+		assert!(matches!(
+			verdict,
+			RawSendVerdict::ReplacementRejected { .. }
+		));
+	}
+
+	#[test]
+	fn classify_raw_send_outcome_replacement_fee_too_low_is_replacement_rejected() {
+		let verdict = classify_raw_send_outcome(Some("replacement fee too low"));
+		assert!(matches!(
+			verdict,
+			RawSendVerdict::ReplacementRejected { .. }
+		));
+	}
+
+	#[test]
+	fn classify_raw_send_outcome_transaction_already_exists_is_replacement_rejected() {
+		let verdict = classify_raw_send_outcome(Some("transaction already exists"));
+		assert!(matches!(
+			verdict,
+			RawSendVerdict::ReplacementRejected { .. }
+		));
+	}
+
+	#[test]
+	fn classify_raw_send_outcome_replacement_fee_too_low_case_insensitive() {
+		// Different nodes may emit different casing.
+		let verdict = classify_raw_send_outcome(Some("REPLACEMENT FEE TOO LOW for nonce 42"));
+		assert!(matches!(
+			verdict,
+			RawSendVerdict::ReplacementRejected { .. }
+		));
+	}
+
+	#[test]
+	fn classify_raw_send_outcome_insufficient_funds_is_definitely_rejected() {
+		let verdict = classify_raw_send_outcome(Some("insufficient funds for gas * price + value"));
+		assert!(matches!(verdict, RawSendVerdict::DefinitelyRejected { .. }));
+	}
+
+	#[test]
+	fn classify_raw_send_outcome_unknown_error_is_ambiguous() {
 		assert_eq!(
-			attempt_status_for_submission_outcome(NonceTooLow),
-			TransactionAttemptStatus::SubmitRejected
+			classify_raw_send_outcome(Some("internal error")),
+			RawSendVerdict::Ambiguous,
 		);
 		assert_eq!(
-			attempt_status_for_submission_outcome(DefinitelyRejected),
-			TransactionAttemptStatus::SubmitRejected
+			classify_raw_send_outcome(Some("connection reset")),
+			RawSendVerdict::Ambiguous,
 		);
-		assert_eq!(
-			attempt_status_for_submission_outcome(Replacement),
-			TransactionAttemptStatus::Indeterminate
-		);
-		assert_eq!(
-			attempt_status_for_submission_outcome(Ambiguous),
-			TransactionAttemptStatus::Indeterminate
-		);
+	}
+
+	#[test]
+	fn classify_raw_send_outcome_nonce_too_low_is_nonce_too_low() {
+		let verdict = classify_raw_send_outcome(Some("nonce too low"));
+		assert!(matches!(verdict, RawSendVerdict::NonceTooLow { .. }));
 	}
 
 	#[test]
@@ -2548,32 +3920,6 @@ mod tests {
 			Some(101),
 			"no authoritative chain state → cache must NOT be reset"
 		);
-		assert_eq!(mgr.peek(signer), Some(101));
-	}
-
-	#[test]
-	fn apply_nonce_cache_action_keep_does_not_mutate() {
-		use NonceCacheAction::*;
-		let mgr = ResettableNonceManager::new();
-		let signer = Address::ZERO;
-		mgr.reset_next_nonce(signer, 101);
-
-		let after = apply_nonce_cache_action(&mgr, signer, Keep, Some(95));
-		assert_eq!(after, Some(101));
-		assert_eq!(mgr.peek(signer), Some(101), "Keep must not touch the cache");
-	}
-
-	#[test]
-	fn apply_nonce_cache_action_nonce_too_low_is_noop() {
-		use NonceCacheAction::*;
-		let mgr = ResettableNonceManager::new();
-		let signer = Address::ZERO;
-		mgr.reset_next_nonce(signer, 101);
-
-		// The NonceTooLow path is handled by the existing retry branch; the
-		// helper must not double-handle it.
-		let after = apply_nonce_cache_action(&mgr, signer, NonceTooLowRetry, Some(50));
-		assert_eq!(after, Some(101));
 		assert_eq!(mgr.peek(signer), Some(101));
 	}
 
@@ -2744,6 +4090,37 @@ mod tests {
 			.await;
 
 			assert!(delivery.is_ok());
+		}
+
+		/// Task 6: `submission_signer` returns the configured signer address
+		/// for chains the backend manages, and `None` for chains it does not.
+		/// Both chains in this test share the same `AccountSigner`, so the
+		/// returned addresses must be equal.
+		#[tokio::test]
+		async fn submission_signer_returns_configured_address() {
+			let networks = NetworksConfigBuilder::new()
+				.add_network(1, NetworkConfigBuilder::new().build())
+				.add_network(137, NetworkConfigBuilder::new().build())
+				.build();
+			let signer = create_test_signer();
+			let delivery = AlloyDelivery::new(
+				vec![1, 137],
+				&networks,
+				HashMap::new(),
+				signer,
+				&test_fee_policy(),
+			)
+			.await
+			.unwrap();
+
+			let s1 = delivery.submission_signer(1);
+			let s137 = delivery.submission_signer(137);
+			let s99 = delivery.submission_signer(99); // not configured
+
+			assert!(s1.is_some());
+			assert!(s137.is_some());
+			assert_eq!(s1, s137);
+			assert!(s99.is_none());
 		}
 
 		// ====================================================================
@@ -2954,10 +4331,38 @@ mod tests {
 
 	mod callback_tests {
 		use super::*;
-		use crate::TransactionMonitoringEvent;
-		use solver_types::TransactionType;
+		use crate::{
+			PlannedAttemptInit, TransactionAttemptRecorder, TransactionAttemptRecorderError,
+			TransactionCallback, TransactionMonitoringEvent,
+		};
+		use solver_types::{TransactionAttempt, TransactionAttemptStatus, TransactionType};
 		use std::sync::atomic::{AtomicBool, Ordering};
 		use std::sync::Arc;
+
+		struct FailingRecorder;
+
+		#[async_trait::async_trait]
+		impl TransactionAttemptRecorder for FailingRecorder {
+			async fn record_planned_attempt(
+				&self,
+				_init: PlannedAttemptInit,
+			) -> Result<TransactionAttempt, TransactionAttemptRecorderError> {
+				unreachable!("not used by this test")
+			}
+
+			async fn record_attempt_update(
+				&self,
+				_attempt_id: &str,
+				_status: TransactionAttemptStatus,
+				_tx_hash: Option<TransactionHash>,
+				_receipt: Option<TransactionReceipt>,
+				_error: Option<String>,
+			) -> Result<(), TransactionAttemptRecorderError> {
+				Err(TransactionAttemptRecorderError::Storage(
+					"terminal attempt".to_string(),
+				))
+			}
+		}
 
 		/// Test that callback is invoked with Confirmed event
 		#[test]
@@ -3014,6 +4419,63 @@ mod tests {
 
 			assert!(called.load(Ordering::SeqCst));
 			assert_eq!(*error_msg.lock().unwrap(), "Transaction reverted");
+		}
+
+		#[tokio::test]
+		async fn monitor_emits_attempt_ledger_conflict_when_confirmed_update_hits_terminal_row() {
+			let observed = Arc::new(std::sync::Mutex::new(None));
+			let observed_for_callback = observed.clone();
+			let callback: TransactionCallback = Box::new(move |event| {
+				*observed_for_callback.lock().unwrap() = Some(event);
+			});
+			let tx_hash = TransactionHash(vec![0x55; 32]);
+			let receipt = TransactionReceipt {
+				hash: tx_hash.clone(),
+				block_number: 12345,
+				success: true,
+				block_timestamp: Some(1234567890),
+				logs: vec![],
+			};
+
+			record_attempt_update_best_effort(
+				Arc::new(FailingRecorder),
+				Some(&callback),
+				"order-1",
+				"attempt-1".to_string(),
+				TransactionType::Fill,
+				TransactionAttemptStatus::Confirmed,
+				Some(tx_hash.clone()),
+				Some(receipt),
+				None,
+				"monitor_confirmed",
+			)
+			.await;
+
+			let event = observed
+				.lock()
+				.unwrap()
+				.take()
+				.expect("expected conflict callback");
+			match event {
+				TransactionMonitoringEvent::AttemptLedgerConflict {
+					id,
+					attempt_id,
+					tx_type,
+					tx_hash: event_tx_hash,
+					attempted_status,
+					error,
+					context,
+				} => {
+					assert_eq!(id, "order-1");
+					assert_eq!(attempt_id, "attempt-1");
+					assert_eq!(tx_type, TransactionType::Fill);
+					assert_eq!(event_tx_hash, Some(tx_hash));
+					assert_eq!(attempted_status, TransactionAttemptStatus::Confirmed);
+					assert!(error.contains("terminal attempt"));
+					assert_eq!(context, "monitor_confirmed");
+				},
+				other => panic!("expected AttemptLedgerConflict, got {other:?}"),
+			}
 		}
 
 		/// Test TransactionType variants used in monitoring
@@ -3393,6 +4855,8 @@ mod tests {
 				tx_type: TransactionType::Fill,
 				attempt_recorder: Arc::new(NoopTransactionAttemptRecorder),
 				callback,
+				attempt_id: None,
+				replacement_of: None,
 			};
 
 			let config = TransactionTrackingWithConfig {
@@ -3425,11 +4889,138 @@ mod tests {
 					tx_type,
 					attempt_recorder: Arc::new(NoopTransactionAttemptRecorder),
 					callback,
+					attempt_id: None,
+					replacement_of: None,
 				};
 
 				// Verify each type can be used in tracking
 				assert!(!tracking.id.is_empty());
 			}
 		}
+
+		#[test]
+		fn transaction_tracking_default_lineage_fields_are_none() {
+			let tracking = TransactionTracking {
+				id: "order-1".into(),
+				tx_type: TransactionType::Fill,
+				attempt_recorder: Arc::new(NoopTransactionAttemptRecorder),
+				callback: Box::new(|_: crate::TransactionMonitoringEvent| {}),
+				attempt_id: None,
+				replacement_of: None,
+			};
+			assert!(tracking.attempt_id.is_none());
+			assert!(tracking.replacement_of.is_none());
+		}
+
+		#[test]
+		fn transaction_tracking_with_lineage_fields() {
+			let tracking = TransactionTracking {
+				id: "order-1".into(),
+				tx_type: TransactionType::Fill,
+				attempt_recorder: Arc::new(NoopTransactionAttemptRecorder),
+				callback: Box::new(|_: crate::TransactionMonitoringEvent| {}),
+				attempt_id: Some("forced-id".into()),
+				replacement_of: Some("parent-id".into()),
+			};
+			assert_eq!(tracking.attempt_id.as_deref(), Some("forced-id"));
+			assert_eq!(tracking.replacement_of.as_deref(), Some("parent-id"));
+		}
+	}
+
+	/// Smoke test for the Alloy 1.0.37 pre-sign + raw-send API surface:
+	///   TransactionRequest → build_typed_tx() → TxSigner::sign_transaction
+	///   → typed.into_signed(sig).into() → TxEnvelope::tx_hash / encoded_2718
+	/// Confirms the chain compiles against the pinned version and produces
+	/// non-zero outputs.
+	#[tokio::test]
+	async fn spike_pre_sign_envelope_produces_hash_and_encoded_bytes() {
+		use alloy_consensus::{SignableTransaction, TxEnvelope};
+		use alloy_network::{eip2718::Encodable2718, TransactionBuilder, TxSigner};
+		use alloy_primitives::{Address, B256, U256};
+		use alloy_rpc_types::TransactionRequest;
+		use alloy_signer_local::PrivateKeySigner;
+
+		let signer_pk = PrivateKeySigner::random();
+		let signer_addr = signer_pk.address();
+		let signer = AccountSigner::Local(signer_pk).with_chain_id(Some(1));
+
+		let request = TransactionRequest::default()
+			.with_from(signer_addr)
+			.with_to(Address::ZERO)
+			.with_value(U256::from(0u64))
+			.with_nonce(0u64)
+			.with_chain_id(1)
+			.with_gas_limit(21_000)
+			.with_max_fee_per_gas(20_000_000_000u128)
+			.with_max_priority_fee_per_gas(1_000_000_000u128);
+
+		let mut typed = request
+			.build_typed_tx()
+			.expect("request has all required fields");
+
+		let signature = TxSigner::sign_transaction(&signer, &mut typed)
+			.await
+			.expect("signer produces a signature");
+
+		let envelope: TxEnvelope = typed.into_signed(signature).into();
+
+		let tx_hash = *envelope.tx_hash();
+		let encoded = envelope.encoded_2718();
+		assert_ne!(tx_hash, B256::ZERO, "tx_hash must be derived");
+		assert!(!encoded.is_empty(), "encoded_2718 must produce bytes");
+	}
+
+	/// Exercise the `build_signed_envelope` helper end-to-end and confirm it
+	/// produces a non-empty hash + encoded payload. Goes through the
+	/// production helper so the hash-conversion (B256 → TransactionHash) and
+	/// signer-lookup path are covered.
+	#[tokio::test]
+	async fn build_signed_envelope_produces_hash_and_encoded_bytes() {
+		use alloy_network::TransactionBuilder;
+		use alloy_primitives::{Address, U256};
+		use alloy_rpc_types::TransactionRequest;
+
+		// Build a single-chain delivery inline. The `create_test_delivery`
+		// helper lives in `monitor_transaction_tests` (a child mod) and is not
+		// accessible from the outer `mod tests`.
+		let networks = NetworksConfigBuilder::new()
+			.add_network(1, NetworkConfigBuilder::new().build())
+			.build();
+		let signer = create_test_signer();
+		let delivery = AlloyDelivery::new(
+			vec![1],
+			&networks,
+			HashMap::new(),
+			signer,
+			&test_fee_policy(),
+		)
+		.await
+		.expect("test delivery builds");
+		let chain_id: u64 = 1;
+		let signer_addr = delivery.get_signer_address(chain_id).unwrap();
+
+		let request = TransactionRequest::default()
+			.with_from(signer_addr)
+			.with_to(Address::ZERO)
+			.with_value(U256::from(0u64))
+			.with_nonce(0u64)
+			.with_chain_id(chain_id)
+			.with_gas_limit(21_000)
+			.with_max_fee_per_gas(20_000_000_000u128)
+			.with_max_priority_fee_per_gas(1_000_000_000u128);
+
+		let (_envelope, tx_hash, encoded) = delivery
+			.build_signed_envelope(chain_id, request)
+			.await
+			.expect("envelope build succeeds");
+
+		// `TransactionHash` has no `Default`; instead assert the raw bytes are
+		// the expected length and not all zero.
+		assert_eq!(tx_hash.0.len(), 32, "tx_hash must be a 32-byte digest");
+		assert!(
+			tx_hash.0.iter().any(|b| *b != 0),
+			"tx_hash must not be all-zero",
+		);
+		assert!(!encoded.is_empty(), "encoded_2718 must produce bytes");
 	}
 }

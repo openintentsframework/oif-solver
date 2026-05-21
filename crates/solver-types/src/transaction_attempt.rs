@@ -12,13 +12,14 @@ pub enum TransactionAttemptStatus {
 	SubmitRejected,
 	Reverted,
 	Indeterminate,
+	Replaced,
 }
 
 impl TransactionAttemptStatus {
 	pub fn is_terminal(self) -> bool {
 		matches!(
 			self,
-			Self::Confirmed | Self::SubmitRejected | Self::Reverted
+			Self::Confirmed | Self::SubmitRejected | Self::Reverted | Self::Replaced
 		)
 	}
 }
@@ -38,6 +39,14 @@ pub struct TransactionAttempt {
 	pub error: Option<String>,
 	pub created_at: u64,
 	pub updated_at: u64,
+	/// Parent attempt id when this row is a same-nonce replacement.
+	/// Set at creation by the sweeper; never mutated afterwards.
+	#[serde(default)]
+	pub replacement_of: Option<String>,
+	/// Child attempt id when this row has been superseded by a bump.
+	/// Best-effort hint; lineage traversal MUST NOT depend on this field.
+	#[serde(default)]
+	pub replaced_by: Option<String>,
 }
 
 impl TransactionAttempt {
@@ -63,6 +72,8 @@ impl TransactionAttempt {
 			error: None,
 			created_at: now,
 			updated_at: now,
+			replacement_of: None,
+			replaced_by: None,
 		}
 	}
 
@@ -124,6 +135,7 @@ mod tests {
 		assert!(TransactionAttemptStatus::Confirmed.is_terminal());
 		assert!(TransactionAttemptStatus::SubmitRejected.is_terminal());
 		assert!(TransactionAttemptStatus::Reverted.is_terminal());
+		assert!(TransactionAttemptStatus::Replaced.is_terminal());
 	}
 
 	#[test]
@@ -173,5 +185,66 @@ mod tests {
 		assert_eq!(decoded.error, attempt.error);
 		assert_eq!(decoded.tx.data, attempt.tx.data);
 		assert_eq!(decoded.tx.chain_id, attempt.tx.chain_id);
+	}
+
+	#[test]
+	fn replaced_status_is_terminal() {
+		assert!(TransactionAttemptStatus::Replaced.is_terminal());
+	}
+
+	#[test]
+	fn replaced_attempt_is_terminal() {
+		let mut a = TransactionAttempt::planned(
+			"x".into(),
+			"order-1".into(),
+			Some(Address(vec![9; 20])),
+			TransactionType::Fill,
+			sample_tx(),
+		);
+		a.status = TransactionAttemptStatus::Replaced;
+		assert!(a.is_terminal());
+	}
+
+	#[test]
+	fn lineage_fields_default_to_none_on_planned() {
+		let a = TransactionAttempt::planned(
+			"x".into(),
+			"order-1".into(),
+			Some(Address(vec![9; 20])),
+			TransactionType::Fill,
+			sample_tx(),
+		);
+		assert!(a.replacement_of.is_none());
+		assert!(a.replaced_by.is_none());
+	}
+
+	#[test]
+	fn old_serialized_row_without_lineage_fields_deserializes() {
+		// Pre-PR-06 row JSON: no replacement_of, no replaced_by.
+		// tx_type uses PascalCase (no rename_all on TransactionType).
+		// status uses camelCase (rename_all = "camelCase" on TransactionAttemptStatus).
+		let json = r#"{
+			"id": "x",
+			"order_id": "o",
+			"signer": null,
+			"tx_type": "Fill",
+			"chain_id": 1,
+			"nonce": null,
+			"tx_hash": null,
+			"receipt": null,
+			"tx": {
+				"to": null, "data": [], "value": "0",
+				"chain_id": 1, "nonce": null, "gas_limit": null,
+				"gas_price": null, "max_fee_per_gas": null,
+				"max_priority_fee_per_gas": null
+			},
+			"status": "planned",
+			"error": null,
+			"created_at": 0,
+			"updated_at": 0
+		}"#;
+		let a: TransactionAttempt = serde_json::from_str(json).unwrap();
+		assert!(a.replacement_of.is_none());
+		assert!(a.replaced_by.is_none());
 	}
 }

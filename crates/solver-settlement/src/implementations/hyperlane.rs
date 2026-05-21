@@ -916,6 +916,23 @@ impl HyperlaneSettlement {
 		// Return quote without buffer for now - the quote already includes IGP overhead
 		Ok(quote)
 	}
+
+	/// Returns true when this order's route actually uses Hyperlane PostFill.
+	/// Mirrors the early-return logic in `generate_post_fill_transaction`:
+	/// when EITHER side has no configured oracles, the orchestrator skips
+	/// PostFill, and a claim never needs a Hyperlane message to prove fill.
+	fn post_fill_required(&self, order: &Order) -> bool {
+		let dest_chain = match order.output_chains.first() {
+			Some(c) => c.chain_id,
+			None => return false,
+		};
+		let origin_chain = match order.input_chains.first() {
+			Some(c) => c.chain_id,
+			None => return false,
+		};
+		!self.get_output_oracles(dest_chain).is_empty()
+			&& !self.get_input_oracles(origin_chain).is_empty()
+	}
 }
 
 /// Configuration schema for HyperlaneSettlement
@@ -1085,11 +1102,20 @@ impl SettlementInterface for HyperlaneSettlement {
 			_ => None,
 		};
 
-		// No message = can claim immediately
 		if message_id.is_none() {
+			if self.post_fill_required(order) {
+				tracing::warn!(
+					order_id = %solver_types::utils::formatting::truncate_id(&order.id),
+					attestation_data = ?fill_proof.attestation_data,
+					"Hyperlane message_id missing from attestation; deferring claim readiness"
+				);
+				return false;
+			}
+			// Route does not use Hyperlane PostFill: no message is expected,
+			// so missing message_id means claim is ready.
 			tracing::debug!(
 				order_id = %solver_types::utils::formatting::truncate_id(&order.id),
-				"No Hyperlane message, claim ready"
+				"No Hyperlane PostFill required for this route, claim ready"
 			);
 			return true;
 		}
@@ -1261,10 +1287,15 @@ impl SettlementInterface for HyperlaneSettlement {
 				SettlementError::ValidationFailed(format!("No provider for chain {dest_chain}"))
 			})?;
 
+			let fill_tx_hash = order.fill_tx_hash.as_ref().ok_or_else(|| {
+				SettlementError::ValidationFailed(
+					"Missing fill transaction hash: required for Hyperlane post-fill processing"
+						.to_string(),
+				)
+			})?;
+
 			let fill_receipt = dest_provider
-				.get_transaction_receipt(FixedBytes::<32>::from_slice(
-					&order.fill_tx_hash.as_ref().unwrap().0,
-				))
+				.get_transaction_receipt(FixedBytes::<32>::from_slice(&fill_tx_hash.0))
 				.await
 				.map_err(|e| {
 					SettlementError::ValidationFailed(format!("Failed to get fill receipt: {e}"))
@@ -1803,6 +1834,133 @@ mod tests {
 			.expect("matching log should be accepted");
 		assert_eq!(solver, expected_solver);
 		assert_eq!(ts, expected_timestamp);
+	}
+
+	// ── can_claim route-awareness helpers ─────────────────────────────────────
+
+	/// Build a settlement with oracles configured for both origin and dest chains
+	/// so that `post_fill_required` returns true.
+	fn test_hyperlane_settlement_with_oracles(origin: u64, dest: u64) -> HyperlaneSettlement {
+		let oracle_config = OracleConfig {
+			input_oracles: HashMap::from([(origin, vec![solver_types::Address(vec![0x11; 20])])]),
+			output_oracles: HashMap::from([(dest, vec![solver_types::Address(vec![0x22; 20])])]),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		};
+		test_hyperlane_settlement(oracle_config)
+	}
+
+	/// Build a settlement with NO oracles configured so that `post_fill_required`
+	/// returns false (PostFill is skipped for every route).
+	fn test_hyperlane_settlement_no_oracles() -> HyperlaneSettlement {
+		let oracle_config = OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		};
+		test_hyperlane_settlement(oracle_config)
+	}
+
+	/// Minimal order with `input_chains` on `origin` and `output_chains` on `dest`.
+	fn test_order_with_chains(origin: u64, dest: u64) -> solver_types::Order {
+		solver_types::Order {
+			id: "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20".to_string(),
+			standard: "eip7683".to_string(),
+			created_at: 0,
+			updated_at: 0,
+			status: solver_types::OrderStatus::Pending,
+			data: serde_json::Value::Null,
+			solver_address: solver_types::Address(vec![0x99; 20]),
+			quote_id: None,
+			input_chains: vec![solver_types::order::ChainSettlerInfo {
+				chain_id: origin,
+				settler_address: solver_types::Address(vec![0xCC; 20]),
+			}],
+			output_chains: vec![solver_types::order::ChainSettlerInfo {
+				chain_id: dest,
+				settler_address: solver_types::Address(vec![0xDD; 20]),
+			}],
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			claim_tx_hash: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
+			fill_proof: None,
+			settlement_name: None,
+		}
+	}
+
+	/// Minimal FillProof skeleton with no attestation data.
+	fn fill_proof_skeleton() -> FillProof {
+		FillProof {
+			tx_hash: solver_types::TransactionHash(vec![0u8; 32]),
+			block_number: 0,
+			attestation_data: None,
+			filled_timestamp: 0,
+			oracle_address: "0x0000000000000000000000000000000000000000".to_string(),
+		}
+	}
+
+	#[tokio::test]
+	async fn can_claim_returns_false_when_message_id_missing_and_post_fill_required() {
+		let settlement = test_hyperlane_settlement_with_oracles(1, 137);
+		let order = test_order_with_chains(1, 137);
+		let fill_proof = FillProof {
+			attestation_data: None,
+			..fill_proof_skeleton()
+		};
+		let ready = settlement.can_claim(&order, &fill_proof).await;
+		assert!(
+			!ready,
+			"can_claim must return false when PostFill is required and message_id is missing"
+		);
+	}
+
+	#[tokio::test]
+	async fn can_claim_returns_true_when_message_id_missing_but_post_fill_skipped() {
+		let settlement = test_hyperlane_settlement_no_oracles();
+		let order = test_order_with_chains(1, 137);
+		let fill_proof = FillProof {
+			attestation_data: None,
+			..fill_proof_skeleton()
+		};
+		let ready = settlement.can_claim(&order, &fill_proof).await;
+		assert!(
+			ready,
+			"can_claim must return true when PostFill is not required and message_id is missing"
+		);
+	}
+
+	#[tokio::test]
+	async fn can_claim_returns_false_when_attestation_invalid_hex_and_post_fill_required() {
+		let settlement = test_hyperlane_settlement_with_oracles(1, 137);
+		let order = test_order_with_chains(1, 137);
+		let fill_proof = FillProof {
+			attestation_data: Some("zz".repeat(32).into_bytes()), // 64 bytes, not valid hex
+			..fill_proof_skeleton()
+		};
+		let ready = settlement.can_claim(&order, &fill_proof).await;
+		assert!(
+			!ready,
+			"invalid hex must defer claim when PostFill required"
+		);
+	}
+
+	#[tokio::test]
+	async fn can_claim_returns_false_when_attestation_wrong_length_and_post_fill_required() {
+		let settlement = test_hyperlane_settlement_with_oracles(1, 137);
+		let order = test_order_with_chains(1, 137);
+		let fill_proof = FillProof {
+			attestation_data: Some("aa".repeat(16).into_bytes()), // 32 bytes, not 64
+			..fill_proof_skeleton()
+		};
+		let ready = settlement.can_claim(&order, &fill_proof).await;
+		assert!(
+			!ready,
+			"wrong-length attestation must defer claim when PostFill required"
+		);
 	}
 
 	#[test]

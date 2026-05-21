@@ -8,7 +8,7 @@
 use alloy_sol_types::SolEvent;
 use solver_delivery::DeliveryService;
 use solver_types::standards::eip7683::interfaces::{
-	Finalised, OrderPurchased, OutputFilled, Refunded,
+	Finalised, Open, OrderPurchased, OutputFilled, Refunded,
 };
 use solver_types::{Address, LogFilter, TransactionHash, H256};
 
@@ -137,6 +137,45 @@ async fn probe_event<E: SolEvent>(
 			block_number,
 		}),
 		_ => Ok(ProbeResult::MatchedButUnusable),
+	}
+}
+
+/// Origin-chain probe for `Open`, emitted by InputSettlerEscrow.openFor.
+pub(crate) async fn chain_evidence_for_prepare_open(
+	delivery: &DeliveryService,
+	chain_id: u64,
+	input_settler: &Address,
+	order_id_bytes: &[u8; 32],
+	window_blocks: u64,
+) -> ChainEvidence {
+	let (from_block, to_block) =
+		match anchor_block_for_same_chain(delivery, chain_id, None, window_blocks).await {
+			Ok(pair) => pair,
+			Err(error) => return ChainEvidence::Unknown { error },
+		};
+
+	match probe_event::<Open>(
+		delivery,
+		chain_id,
+		input_settler,
+		order_id_bytes,
+		from_block,
+		to_block,
+	)
+	.await
+	{
+		Ok(ProbeResult::Found {
+			tx_hash,
+			block_number,
+		}) => ChainEvidence::Proven {
+			tx_hash,
+			block_number,
+		},
+		Ok(ProbeResult::NoMatch) => ChainEvidence::NotFound,
+		Ok(ProbeResult::MatchedButUnusable) => ChainEvidence::Unknown {
+			error: "Open log matched but lacked tx_hash or block_number".to_string(),
+		},
+		Err(error) => ChainEvidence::Unknown { error },
 	}
 }
 

@@ -271,6 +271,14 @@ impl OrderParsable for Eip7683OrderData {
 			.map(|output| output.chain_id.try_into().unwrap_or(1))
 			.collect()
 	}
+
+	fn fill_deadline_secs(&self) -> Option<u64> {
+		Some(self.fill_deadline as u64)
+	}
+
+	fn expires_secs(&self) -> Option<u64> {
+		Some(self.expires as u64)
+	}
 }
 
 /// Hex string serialization helper

@@ -17,6 +17,7 @@ A high-performance cross-chain solver implementation for the Open Intents Framew
 - [Quick Start](#quick-start)
 - [Docker](#docker)
 - [Configuration](#configuration)
+  - [Transaction Bumping](#transaction-bumping-tx_bump)
   - [AWS KMS Signing](#aws-kms-signing)
 - [API Reference](#api-reference)
 - [Cross-Chain Rebalancing](#cross-chain-rebalancing)
@@ -492,6 +493,47 @@ Token arrays may be empty at boot and can be populated later via admin APIs.
 Optional fee overrides can be set at the top level: `min_profitability_pct` (decimal string), `gas_buffer_bps`, `commission_bps`, and `rate_buffer_bps` (basis points).
 
 For per-chain EIP-1559 fee tuning (priority floor, fallback, percentile speed, gas-price cap), see [docs/fee-policy.md](docs/fee-policy.md). The solver auto-generates sensible defaults — you only need a `fee_policy` block in your bootstrap config if you want to override them.
+
+### Transaction Bumping (`tx_bump`)
+
+The solver can run a background same-nonce transaction bump sweeper for stale in-flight attempts. It is disabled by default and should only be enabled with per-chain fee caps, signer-balance monitoring, and alerts for the bump/conflict events listed in [docs/tx-bump-operations.md](docs/tx-bump-operations.md).
+
+The sweeper:
+- Finds non-terminal attempts that have been pending longer than the configured threshold.
+- Checks whether the lineage tip already mined before submitting a replacement.
+- Submits a same-nonce replacement with bumped fees when the attempt is still pending.
+- Reconciles confirmed attempts through the attempt ledger so restart recovery and bumping agree on chain truth.
+
+Example bootstrap config:
+
+```json
+{
+  "tx_bump": {
+    "enabled": false,
+    "sweep_interval_secs": 15,
+    "default_pending_threshold_secs": 60,
+    "default_bump_percent": 15,
+    "default_max_replacements_per_stage": 3,
+    "default_max_fee_per_gas_cap_wei": "150000000000",
+    "default_max_priority_fee_per_gas_cap_wei": "5000000000",
+    "default_profitability_gate_fail_closed": false,
+    "default_receipt_preflight_fail_closed": true,
+    "chains": {
+      "8453": {
+        "pending_threshold_secs": 60,
+        "bump_percent": 15,
+        "max_replacements_per_stage": 3,
+        "max_fee_per_gas_cap_wei": "50000000000",
+        "max_priority_fee_per_gas_cap_wei": "2000000000",
+        "profitability_gate_fail_closed": true,
+        "receipt_preflight_fail_closed": true
+      }
+    }
+  }
+}
+```
+
+Chains not present in `tx_bump.chains` are not bumped.
 
 Optional network types are: `parent`, `hub`, and `new`.
 
