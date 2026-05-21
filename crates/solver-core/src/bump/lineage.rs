@@ -52,6 +52,13 @@ pub fn lineage_tip<'a>(component: &'a [&'a TransactionAttempt]) -> Option<&'a Tr
 		if a.is_terminal() {
 			continue;
 		}
+		// Pre-broadcast replacement children — a row persisted to the ledger
+		// before its raw transaction was broadcast — are not eligible to be
+		// the lineage tip. They block neither their parent nor the bump
+		// sweeper.
+		if a.status == TransactionAttemptStatus::Planned && a.tx_hash.is_none() {
+			continue;
+		}
 		// Walk up via replacement_of, marking ancestors as having a
 		// non-terminal descendant.
 		let mut cursor = a.replacement_of.as_deref();
@@ -196,6 +203,21 @@ mod tests {
 		assert_eq!(
 			tip.id, "a",
 			"rejected child does not block parent from being tip"
+		);
+	}
+
+	#[test]
+	fn lineage_tip_ignores_pre_broadcast_planned_replacement_without_hash() {
+		let parent = attempt("a", None, TransactionAttemptStatus::Broadcast, 10);
+		let child = attempt("b", Some("a"), TransactionAttemptStatus::Planned, 12);
+		assert!(child.tx_hash.is_none());
+
+		let attempts = vec![parent, child];
+		let refs: Vec<&TransactionAttempt> = attempts.iter().collect();
+		let tip = lineage_tip(&refs).unwrap();
+		assert_eq!(
+			tip.id, "a",
+			"pre-broadcast planned replacement without a hash must not block the parent"
 		);
 	}
 
