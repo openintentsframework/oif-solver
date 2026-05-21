@@ -9,7 +9,21 @@ use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_client::RpcClient;
 use alloy_transport::layers::{RateLimitRetryPolicy, RetryBackoffLayer};
 use alloy_transport::TransportError;
-use std::fmt;
+use std::{fmt, sync::Once};
+
+static RUSTLS_PROVIDER: Once = Once::new();
+
+/// Installs a process-level rustls crypto provider.
+///
+/// rustls 0.23 requires an explicit provider when multiple crypto backends are
+/// present in the dependency graph. This can happen in workspace tests even when
+/// the solver binary installs a provider in `main`, because each test binary is
+/// a separate process.
+pub fn ensure_rustls_crypto_provider() {
+	RUSTLS_PROVIDER.call_once(|| {
+		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+	});
+}
 
 /// Errors that can occur during provider creation.
 #[derive(Debug, Clone)]
@@ -141,6 +155,8 @@ pub async fn create_ws_provider(
 	network_id: u64,
 	networks: &NetworksConfig,
 ) -> Result<DynProvider, ProviderError> {
+	ensure_rustls_crypto_provider();
+
 	let network = get_network_config(network_id, networks)?;
 	let ws_url = get_ws_url(network_id, network)?;
 
@@ -276,6 +292,12 @@ mod tests {
 			.add_network(1, NetworkConfigBuilder::new().build())
 			.add_network(137, NetworkConfigBuilder::new().build())
 			.build()
+	}
+
+	#[test]
+	fn ensure_rustls_crypto_provider_is_idempotent() {
+		ensure_rustls_crypto_provider();
+		ensure_rustls_crypto_provider();
 	}
 
 	#[test]

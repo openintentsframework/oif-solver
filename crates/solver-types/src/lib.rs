@@ -78,7 +78,7 @@ pub use order::*;
 pub use pricing::*;
 pub use provider::{
 	create_http_provider, create_http_providers, create_ws_provider, create_ws_providers,
-	ProviderError,
+	ensure_rustls_crypto_provider, ProviderError,
 };
 pub use registry::ImplementationRegistry;
 pub use secret_string::SecretString;
