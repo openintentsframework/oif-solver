@@ -111,20 +111,31 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:
-        test:
-          - happy_e2e_open_fill_settle
-          - submit_e2e_hyperlane
-          - permit2_e2e
-          - eip3009_e2e
-          - deny_list_e2e
-          - failure_e2e_onchain
-          - failure_e2e_settlement
-          - api_e2e_orders
-          - admin_api_e2e
+        include:
+          - test: happy_e2e_open_fill_settle
+            timeout_minutes: 10
+          - test: submit_e2e_hyperlane
+            timeout_minutes: 10
+          - test: permit2_e2e
+            timeout_minutes: 10
+          - test: eip3009_e2e
+            timeout_minutes: 10
+          - test: deny_list_e2e
+            timeout_minutes: 10
+          - test: failure_e2e_onchain
+            timeout_minutes: 10
+          - test: failure_e2e_settlement
+            timeout_minutes: 10
+          - test: api_e2e_orders
+            timeout_minutes: 10
+          - test: admin_api_e2e
+            timeout_minutes: 10
+          - test: tx_bump_resilience_e2e
+            timeout_minutes: 40
     services:
       # Only admin_api_e2e uses Redis; others ignore REDIS_URL via
       # `redis_url_or_skip`. Cheaper to start it in every shard than to fork

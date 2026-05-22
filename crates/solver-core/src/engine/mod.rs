@@ -569,6 +569,11 @@ impl SolverEngine {
 							.await;
 						}
 						SolverEvent::Order(OrderEvent::Executing { order, params }) => {
+							tracing::info!(
+								event = "OrderExecuting",
+								order_id = %order.id,
+								"Handling order execution event"
+							);
 							// Executing sends a fill transaction - use transaction semaphore
 							self.spawn_handler(&transaction_semaphore, move |engine| async move {
 								let order_id = order.id.clone();
@@ -644,6 +649,11 @@ impl SolverEngine {
 
 						// Handle PostFillReady - use settlement handler
 						SolverEvent::Settlement(SettlementEvent::PostFillReady { order_id }) => {
+							tracing::info!(
+								event = "PostFillReady",
+								order_id = %order_id,
+								"Handling post-fill readiness event"
+							);
 							self.spawn_handler(&transaction_semaphore, move |engine| async move {
 								let order_id_clone = order_id.clone();
 								if let Err(e) = engine.settlement_handler.handle_post_fill_ready(order_id).await {

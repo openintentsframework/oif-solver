@@ -84,6 +84,9 @@ struct Args {
 /// 5. Runs the solver until interrupted
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+	// Install the rustls crypto provider before any TLS connections are made.
+	solver_types::ensure_rustls_crypto_provider();
+
 	let args = Args::parse();
 
 	// Initialize tracing with env filter

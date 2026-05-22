@@ -11,6 +11,7 @@ tests=(
   failure_e2e_settlement
   api_e2e_orders
   admin_api_e2e
+  tx_bump_resilience_e2e
 )
 
 for test_name in "${tests[@]}"; do

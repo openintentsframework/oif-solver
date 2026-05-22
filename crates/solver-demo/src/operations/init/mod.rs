@@ -1210,6 +1210,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		}
 	}
 

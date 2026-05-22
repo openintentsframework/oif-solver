@@ -142,6 +142,11 @@ pub struct SeedOverrides {
 	/// Chains you don't mention keep their generated defaults.
 	#[serde(default)]
 	pub fee_policy: Option<FeePolicyOverride>,
+
+	/// Optional same-nonce transaction bumping configuration.
+	/// If omitted, transaction bumping remains disabled by default.
+	#[serde(default)]
+	pub tx_bump: Option<crate::OperatorTxBumpConfig>,
 }
 
 /// Top-level fee-policy override block.
@@ -728,6 +733,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let chain_ids = config.chain_ids();
@@ -766,6 +772,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		assert!(config.has_chain(10));
@@ -809,6 +816,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let network = config.get_network(10);
@@ -892,6 +900,7 @@ mod tests {
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
+			tx_bump: None,
 		};
 
 		let json = serde_json::to_string(&config).unwrap();

@@ -5877,7 +5877,7 @@ mod tests {
 		}
 
 		fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn ::std::fmt::Debug) {
-			let formatted = format!("{:?}", value);
+			let formatted = format!("{value:?}");
 			// `tracing` formats string literals via `record_debug` with
 			// surrounding quotes — strip them so equality with `"success"`
 			// works without callers having to know the encoding.
@@ -5914,7 +5914,7 @@ mod tests {
 		/// sink at known points. Per-thread isolation means parallel
 		/// `cargo test` runners don't see each other's events.
 		static CAPTURED_EVENTS: ::std::cell::RefCell<Vec<CapturedEvent>> =
-			::std::cell::RefCell::new(Vec::new());
+			const { ::std::cell::RefCell::new(Vec::new()) };
 	}
 
 	/// Process-wide subscriber that funnels every `tracing::Event` into
@@ -6421,8 +6421,7 @@ mod tests {
 			.await;
 		assert!(
 			result.is_ok(),
-			"validator must use stored cost; got {:?}",
-			result
+			"validator must use stored cost; got {result:?}"
 		);
 	}
 
@@ -6608,8 +6607,7 @@ mod tests {
 		//    catastrophic ($100 - $75) / $4000 = 0.625% the fresh costs imply.
 		assert!(
 			margin > Decimal::from_str("2.0").unwrap(),
-			"margin {} must reflect stored cost, not the inflated fresh cost",
-			margin,
+			"margin {margin} must reflect stored cost, not the inflated fresh cost",
 		);
 	}
 }
@@ -6621,9 +6619,9 @@ mod gas_leg_proptests {
 	//! Encodes the OIF contract-derived chain-boundary invariant:
 	//!   - `Settler.open*`, pre-claim, and `finalise*` are origin-chain costs.
 	//!   - `BaseFiller.fill*` and post-fill oracle work are destination-chain costs.
-	//! Changing destination fee params must never move origin legs (and vice
-	//! versa). These tests run without any mock infrastructure because the
-	//! helper is pure.
+	//!     Changing destination fee params must never move origin legs (and vice
+	//!     versa). These tests run without any mock infrastructure because the
+	//!     helper is pure.
 	use super::*;
 	use proptest::prelude::*;
 
