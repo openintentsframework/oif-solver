@@ -34,7 +34,7 @@ pub trait SignatureValidator {
 	) -> Result<bool, APIError>;
 
 	/// Extract signature from encoded signature data
-	fn extract_signature(&self, signature: &Bytes) -> Bytes;
+	fn extract_signature(&self, signature: &Bytes) -> Result<Bytes, APIError>;
 }
 
 // Generic domain separator functionality
