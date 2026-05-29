@@ -63,31 +63,31 @@ pub fn create_signature_validator() -> impl SignatureValidator {
 	CompactSignatureValidator
 }
 
-/// Extract sponsor signature from ABI-encoded signature bytes
-/// This handles ABI-encoded signatures: abi.encode(sponsorSig, allocatorSig)
+/// Extract the sponsor signature from ABI-encoded signature bytes.
+///
+/// TheCompact passes signatures as `abi.encode(bytes sponsorSig, bytes allocatorData)`.
+/// The sponsor signature is the first dynamic element of that tuple.
+///
+/// Security (C-04): we must locate the sponsor signature by *decoding the ABI tuple*
+/// (i.e. by following the head offsets), not by reading a hardcoded byte offset. The
+/// same blob is forwarded verbatim to `IInputSettlerCompact::finalise`, which decodes
+/// it with the Solidity ABI decoder. If we extracted the sponsor signature from a fixed
+/// offset, an attacker could craft a non-canonical-but-valid encoding whose first
+/// element resolves to different bytes than what we validate — making intake signature
+/// validation check a signature the contract never uses. Decoding the tuple keeps the
+/// solver's view and the contract's view in lockstep.
 pub fn extract_sponsor_signature(signature: &Bytes) -> Bytes {
-	// Handle ABI-encoded signatures: abi.encode(sponsorSig, allocatorSig)
-	if signature.len() > 65 && signature.len() >= 96 {
-		let sponsor_sig_length_offset = 64;
-		if signature.len() > sponsor_sig_length_offset + 32 {
-			let sponsor_sig_length = u32::from_be_bytes([
-				signature[sponsor_sig_length_offset + 28],
-				signature[sponsor_sig_length_offset + 29],
-				signature[sponsor_sig_length_offset + 30],
-				signature[sponsor_sig_length_offset + 31],
-			]) as usize;
-
-			let sponsor_sig_start = sponsor_sig_length_offset + 32;
-			if signature.len() >= sponsor_sig_start + sponsor_sig_length {
-				return Bytes::from(
-					signature[sponsor_sig_start..sponsor_sig_start + sponsor_sig_length].to_vec(),
-				);
-			}
-		}
+	// Try to decode as the ABI tuple (bytes sponsorSig, bytes allocatorData). On any
+	// decode failure (e.g. a raw 65-byte ECDSA signature, or malformed input) fall back
+	// to treating the input as a raw signature.
+	type SponsorAllocatorSig = (
+		alloy_sol_types::sol_data::Bytes,
+		alloy_sol_types::sol_data::Bytes,
+	);
+	match <SponsorAllocatorSig as SolType>::abi_decode(signature) {
+		Ok((sponsor_sig, _allocator_data)) => sponsor_sig,
+		Err(_) => signature.clone(),
 	}
-
-	// If not ABI-encoded or extraction failed, use raw signature
-	signature.clone()
 }
 
 /// Compute BatchCompact struct hash for TheCompact protocol
@@ -262,58 +262,81 @@ mod tests {
 	use super::*;
 	use alloy_primitives::Bytes;
 
+	/// 32-byte big-endian ABI word holding a u32 value.
+	fn word_u32(v: u32) -> [u8; 32] {
+		let mut w = [0u8; 32];
+		w[28..32].copy_from_slice(&v.to_be_bytes());
+		w
+	}
+
+	/// Right-pad `data` to a 32-byte boundary, as ABI dynamic-byte tails are encoded.
+	fn padded(data: &[u8]) -> Vec<u8> {
+		let mut out = data.to_vec();
+		let rem = out.len() % 32;
+		if rem != 0 {
+			out.extend(std::iter::repeat_n(0u8, 32 - rem));
+		}
+		out
+	}
+
 	#[test]
 	fn test_extract_sponsor_signature() {
-		// Test case: ABI-encoded signature with sponsor and allocator signatures
-		// Structure: abi.encode(sponsorSig, allocatorSig)
-		// - First 32 bytes: offset to sponsorSig (0x40 = 64)
-		// - Next 32 bytes: offset to allocatorSig (0x80 = 128)
-		// - Next 32 bytes: length of sponsorSig (65 bytes)
-		// - Next 65 bytes: actual sponsorSig data
-		// - Next 32 bytes: length of allocatorSig (65 bytes)
-		// - Last 65 bytes: actual allocatorSig data
+		// Canonical abi.encode(bytes sponsorSig, bytes allocatorData) — what wallets
+		// (viem/ethers) and Solidity actually produce. Tails are 32-byte padded.
+		use alloy_sol_types::{sol_data, SolType};
+		type SigTuple = (sol_data::Bytes, sol_data::Bytes);
 
-		let mut abi_encoded_sig = Vec::new();
-
-		// Offset to sponsorSig (64 bytes from start)
-		abi_encoded_sig.extend_from_slice(&[0u8; 28]);
-		abi_encoded_sig.extend_from_slice(&64u32.to_be_bytes());
-
-		// Offset to allocatorSig (128 bytes from start)
-		abi_encoded_sig.extend_from_slice(&[0u8; 28]);
-		abi_encoded_sig.extend_from_slice(&128u32.to_be_bytes());
-
-		// Length of sponsorSig (65 bytes)
-		abi_encoded_sig.extend_from_slice(&[0u8; 28]);
-		abi_encoded_sig.extend_from_slice(&65u32.to_be_bytes());
-
-		// Sponsor signature data (65 bytes)
 		let sponsor_sig_data = vec![0x11u8; 65];
-		abi_encoded_sig.extend_from_slice(&sponsor_sig_data);
+		let allocator_data = vec![0x22u8; 65];
+		let signature = Bytes::from(SigTuple::abi_encode(&(
+			Bytes::from(sponsor_sig_data.clone()),
+			Bytes::from(allocator_data.clone()),
+		)));
 
-		// Length of allocatorSig (65 bytes)
-		abi_encoded_sig.extend_from_slice(&[0u8; 28]);
-		abi_encoded_sig.extend_from_slice(&65u32.to_be_bytes());
-
-		// Allocator signature data (65 bytes)
-		abi_encoded_sig.extend_from_slice(&[0x22u8; 65]);
-
-		let signature = Bytes::from(abi_encoded_sig);
 		let extracted = extract_sponsor_signature(&signature);
-
-		// Should extract the sponsor signature (65 bytes of 0x11)
 		assert_eq!(extracted.len(), 65);
 		assert_eq!(extracted.to_vec(), sponsor_sig_data);
 
-		// Test case: Raw signature (not ABI-encoded, should return as-is)
+		// Raw 65-byte ECDSA signature (not ABI-encoded) — returned as-is.
 		let raw_sig = Bytes::from(vec![0x33u8; 65]);
-		let extracted_raw = extract_sponsor_signature(&raw_sig);
-		assert_eq!(extracted_raw, raw_sig);
+		assert_eq!(extract_sponsor_signature(&raw_sig), raw_sig);
 
-		// Test case: Short signature (should return as-is)
+		// Short signature — returned as-is.
 		let short_sig = Bytes::from(vec![0x44u8; 32]);
-		let extracted_short = extract_sponsor_signature(&short_sig);
-		assert_eq!(extracted_short, short_sig);
+		assert_eq!(extract_sponsor_signature(&short_sig), short_sig);
+	}
+
+	#[test]
+	fn test_extract_sponsor_signature_follows_abi_head_offset() {
+		// Regression test for C-04: extraction must locate the sponsor signature by
+		// decoding the ABI tuple (following head offsets), not by reading a hardcoded
+		// byte offset of 64.
+		//
+		// An attacker supplies a tuple whose tail elements are placed in REVERSED order:
+		// allocatorData first (at offset 64) and the real sponsorSig later (at offset
+		// 192). The old fixed-offset (== 64) logic returns the attacker-controlled
+		// allocatorData as if it were the sponsor signature, while `finalise` (a proper
+		// ABI decoder) consumes a different blob — desyncing solver validation from the
+		// contract. The corrected decoder never hands back the allocator bytes: it
+		// either decodes correctly or rejects the malformed input (falling back to the
+		// raw blob, which then fails downstream signature recovery and is rejected).
+		let real_sponsor_sig = vec![0x11u8; 65];
+		let allocator_data = vec![0x22u8; 65];
+
+		let mut blob = Vec::new();
+		blob.extend_from_slice(&word_u32(192)); // head[0] -> sponsorSig
+		blob.extend_from_slice(&word_u32(64)); // head[1] -> allocatorData
+		blob.extend_from_slice(&word_u32(allocator_data.len() as u32)); // @64 len
+		blob.extend_from_slice(&padded(&allocator_data)); // @96 data (96 bytes)
+		blob.extend_from_slice(&word_u32(real_sponsor_sig.len() as u32)); // @192 len
+		blob.extend_from_slice(&padded(&real_sponsor_sig)); // @224 data
+
+		let extracted = extract_sponsor_signature(&Bytes::from(blob));
+		assert_ne!(
+			extracted.to_vec(),
+			allocator_data,
+			"must not return the attacker-controlled allocator data as the sponsor signature"
+		);
 	}
 
 	#[test]
