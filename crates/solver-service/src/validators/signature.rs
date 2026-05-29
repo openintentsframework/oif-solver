@@ -122,6 +122,17 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 				details: None,
 			});
 		}
+
+		// 5. Validate the allocator portion of the Compact signature blob.
+		//
+		// The sponsor sub-signature is verified above, but the untouched
+		// abi.encode(sponsorSig, allocatorData) blob is later forwarded verbatim as the
+		// `signatures` argument of IInputSettlerCompact::finalise. A request with a valid
+		// sponsorSig but malformed/empty allocatorData would pass intake, get filled on the
+		// destination (fronting solver capital), then deterministically revert at finalise —
+		// stranding the fill. Reject malformed allocatorData here, before any fill.
+		compact::validate_allocator_data(&intent.signature)?;
+
 		tracing::debug!("EIP-712 signature validated");
 		Ok(())
 	}
@@ -222,6 +233,20 @@ mod tests {
 		Address(bytes)
 	}
 
+	/// Encode `abi.encode(bytes sponsorSig, bytes allocatorData)` the way TheCompact expects.
+	///
+	/// Uses `abi_encode_params` (not `abi_encode`) so the two `bytes` arguments are laid out
+	/// as a head/tail pair without the extra outer offset word that alloy prepends for a
+	/// standalone dynamic tuple — matching Solidity's `abi.encode(a, b)` exactly.
+	fn encode_compact_signature(sponsor_sig: &[u8], allocator_data: &[u8]) -> Vec<u8> {
+		use alloy_sol_types::sol_data;
+		type CompactSignatureTuple = (sol_data::Bytes, sol_data::Bytes);
+		<CompactSignatureTuple as SolType>::abi_encode_params(&(
+			sponsor_sig.to_vec(),
+			allocator_data.to_vec(),
+		))
+	}
+
 	fn build_signature_fixture() -> SignatureFixture {
 		let chain_id = 1u64;
 		let nonce = 1u64;
@@ -309,9 +334,15 @@ mod tests {
 		let message = Message::from_digest(*digest);
 		let signature = secp.sign_ecdsa_recoverable(message, &secret_key);
 		let (recovery_id, sig_bytes) = signature.serialize_compact();
-		let mut signature_bytes = sig_bytes.to_vec();
+		let mut sponsor_sig = sig_bytes.to_vec();
 		let rec_id: i32 = recovery_id.into();
-		signature_bytes.push((rec_id as u8) + 27);
+		sponsor_sig.push((rec_id as u8) + 27);
+
+		// TheCompact's finalise consumes signatures as abi.encode(sponsorSig, allocatorData).
+		// Wrap the sponsor signature with a non-empty, well-formed allocatorData blob so the
+		// happy-path fixture mirrors the on-chain expectation.
+		let allocator_data = vec![0xABu8; 65];
+		let signature_bytes = encode_compact_signature(&sponsor_sig, &allocator_data);
 
 		let lock_tag_hex = format!("0x{}", hex::encode(lock_tag));
 		let token_hex = format!("0x{}", hex::encode(token_address_bytes));
@@ -513,5 +544,63 @@ mod tests {
 			},
 			Err(other) => panic!("unexpected error: {other:?}"),
 		}
+	}
+
+	/// C-02: a valid sponsorSig paired with EMPTY allocatorData must be rejected at intake,
+	/// before any destination fill is generated. Otherwise finalise reverts and the fronted
+	/// fill is stranded.
+	#[tokio::test]
+	async fn validate_signature_rejects_empty_allocator_data() {
+		let mut fixture = build_signature_fixture();
+		// Re-wrap the same valid sponsor signature with an EMPTY allocatorData.
+		let sponsor_sig = compact::extract_sponsor_signature(&fixture.intent.signature);
+		fixture.intent.signature = Bytes::from(encode_compact_signature(&sponsor_sig, &[]));
+
+		let service = SignatureValidationService::new();
+		let result = service
+			.validate_signature(
+				"eip7683",
+				&fixture.intent,
+				&fixture.networks,
+				&fixture.delivery,
+			)
+			.await;
+
+		assert!(
+			matches!(
+				result,
+				Err(APIError::BadRequest { ref message, .. }) if message.contains("allocatorData")
+			),
+			"expected empty allocatorData rejection, got: {result:?}"
+		);
+	}
+
+	/// C-02: a valid sponsorSig that is NOT wrapped as abi.encode(sponsorSig, allocatorData)
+	/// (a bare 65-byte signature) must be rejected for ResourceLock intake.
+	#[tokio::test]
+	async fn validate_signature_rejects_non_tuple_allocator_blob() {
+		let mut fixture = build_signature_fixture();
+		let sponsor_sig = compact::extract_sponsor_signature(&fixture.intent.signature);
+		// Bare signature, not the ABI tuple form.
+		fixture.intent.signature = sponsor_sig;
+
+		let service = SignatureValidationService::new();
+		let result = service
+			.validate_signature(
+				"eip7683",
+				&fixture.intent,
+				&fixture.networks,
+				&fixture.delivery,
+			)
+			.await;
+
+		assert!(
+			matches!(
+				result,
+				Err(APIError::BadRequest { ref message, .. })
+					if message.contains("well-formed") || message.contains("tuple")
+			),
+			"expected non-tuple allocator blob rejection, got: {result:?}"
+		);
 	}
 }

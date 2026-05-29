@@ -63,6 +63,78 @@ pub fn create_signature_validator() -> impl SignatureValidator {
 	CompactSignatureValidator
 }
 
+/// Extract the allocator portion from an ABI-encoded `(sponsorSig, allocatorData)` blob.
+///
+/// TheCompact's `IInputSettlerCompact::finalise` consumes a `signatures` argument
+/// shaped as `abi.encode(bytes sponsorSig, bytes allocatorData)`. The solver forwards
+/// this blob verbatim, so a malformed/empty `allocatorData` is only discovered when
+/// `finalise` reverts on-chain — after the destination fill has already been fronted.
+///
+/// This mirrors the byte layout that [`extract_sponsor_signature`] relies on (two head
+/// offsets followed by length-prefixed `bytes` bodies) so the two extractors stay
+/// consistent with the on-chain encoding. Returns `Some(allocatorData)` when the second
+/// tuple element can be located, or `None` when the blob is not a well-formed
+/// two-element tuple (e.g. a raw 65-byte signature).
+pub fn extract_allocator_data(signature: &Bytes) -> Option<Bytes> {
+	// Need at least: two 32-byte head offsets + sponsorSig length word.
+	if signature.len() < 96 {
+		return None;
+	}
+
+	// Head slot 1 (bytes 32..64): offset to the second element (allocatorData).
+	let read_u256_as_usize = |start: usize| -> Option<usize> {
+		let slot = signature.get(start..start + 32)?;
+		// Reject offsets that don't fit in the lower 8 bytes (defensive; real offsets
+		// are small) so we never index with a truncated value.
+		if slot[..24].iter().any(|b| *b != 0) {
+			return None;
+		}
+		Some(u64::from_be_bytes(slot[24..32].try_into().ok()?) as usize)
+	};
+
+	let allocator_offset = read_u256_as_usize(32)?;
+	let allocator_len = read_u256_as_usize(allocator_offset)?;
+	let allocator_start = allocator_offset.checked_add(32)?;
+	let allocator_end = allocator_start.checked_add(allocator_len)?;
+
+	let allocator = signature.get(allocator_start..allocator_end)?;
+	Some(Bytes::from(allocator.to_vec()))
+}
+
+/// Validate the allocator portion of a Compact `(sponsorSig, allocatorData)` blob.
+///
+/// For ResourceLock (Compact) intents the solver fronts its own capital on the
+/// destination before any origin-chain authorization is checked. The sponsor
+/// sub-signature is validated elsewhere, but `allocatorData` is forwarded untouched
+/// into `finalise`. An empty or non-tuple-encoded `allocatorData` deterministically
+/// reverts at `finalise`, stranding the fill. Reject such payloads at intake.
+///
+/// Returns an error when the signature blob is not a well-formed `(bytes, bytes)`
+/// tuple or when `allocatorData` is empty.
+pub fn validate_allocator_data(signature: &Bytes) -> Result<(), APIError> {
+	match extract_allocator_data(signature) {
+		Some(allocator_data) => {
+			if allocator_data.is_empty() {
+				return Err(APIError::BadRequest {
+					error_type: ApiErrorType::OrderValidationFailed,
+					message: "ResourceLock allocatorData is empty; \
+						finalise would revert and strand the fill"
+						.to_string(),
+					details: None,
+				});
+			}
+			Ok(())
+		},
+		None => Err(APIError::BadRequest {
+			error_type: ApiErrorType::OrderValidationFailed,
+			message: "ResourceLock signature is not a well-formed \
+				abi.encode(sponsorSig, allocatorData) tuple"
+				.to_string(),
+			details: None,
+		}),
+	}
+}
+
 /// Extract sponsor signature from ABI-encoded signature bytes
 /// This handles ABI-encoded signatures: abi.encode(sponsorSig, allocatorSig)
 pub fn extract_sponsor_signature(signature: &Bytes) -> Bytes {
@@ -314,6 +386,70 @@ mod tests {
 		let short_sig = Bytes::from(vec![0x44u8; 32]);
 		let extracted_short = extract_sponsor_signature(&short_sig);
 		assert_eq!(extracted_short, short_sig);
+	}
+
+	/// Build the same non-padded `abi.encode(sponsorSig, allocatorData)` layout the manual
+	/// `extract_sponsor_signature` parser (and TheCompact) use: head offsets at bytes 0/32,
+	/// then length-prefixed bodies with the sponsor body NOT word-padded.
+	fn build_compact_blob(sponsor: &[u8], allocator: &[u8]) -> Bytes {
+		let mut blob = Vec::new();
+		// Offset to sponsorSig body length word (0x40).
+		blob.extend_from_slice(&[0u8; 28]);
+		blob.extend_from_slice(&64u32.to_be_bytes());
+		// Offset to allocatorData body length word: 64 + 32 + sponsor.len().
+		let allocator_offset = 64 + 32 + sponsor.len() as u32;
+		blob.extend_from_slice(&[0u8; 28]);
+		blob.extend_from_slice(&allocator_offset.to_be_bytes());
+		// sponsorSig length + body (no padding).
+		blob.extend_from_slice(&[0u8; 28]);
+		blob.extend_from_slice(&(sponsor.len() as u32).to_be_bytes());
+		blob.extend_from_slice(sponsor);
+		// allocatorData length + body.
+		blob.extend_from_slice(&[0u8; 28]);
+		blob.extend_from_slice(&(allocator.len() as u32).to_be_bytes());
+		blob.extend_from_slice(allocator);
+		Bytes::from(blob)
+	}
+
+	#[test]
+	fn test_extract_allocator_data_roundtrip() {
+		let sponsor = vec![0x11u8; 65];
+		let allocator = vec![0x22u8; 80];
+		let blob = build_compact_blob(&sponsor, &allocator);
+
+		// Sponsor extraction must still match.
+		assert_eq!(extract_sponsor_signature(&blob).to_vec(), sponsor);
+		// Allocator extraction returns the exact allocator bytes.
+		assert_eq!(extract_allocator_data(&blob).unwrap().to_vec(), allocator);
+	}
+
+	#[test]
+	fn test_validate_allocator_data_accepts_non_empty() {
+		let blob = build_compact_blob(&[0x11u8; 65], &[0x22u8; 65]);
+		assert!(validate_allocator_data(&blob).is_ok());
+	}
+
+	#[test]
+	fn test_validate_allocator_data_rejects_empty() {
+		let blob = build_compact_blob(&[0x11u8; 65], &[]);
+		let err = validate_allocator_data(&blob).unwrap_err();
+		match err {
+			APIError::BadRequest { message, .. } => assert!(message.contains("allocatorData")),
+			other => panic!("unexpected error: {other:?}"),
+		}
+	}
+
+	#[test]
+	fn test_validate_allocator_data_rejects_non_tuple() {
+		// A bare 65-byte signature is not a well-formed two-element tuple.
+		let raw = Bytes::from(vec![0x33u8; 65]);
+		let err = validate_allocator_data(&raw).unwrap_err();
+		match err {
+			APIError::BadRequest { message, .. } => {
+				assert!(message.contains("well-formed") || message.contains("tuple"))
+			},
+			other => panic!("unexpected error: {other:?}"),
+		}
 	}
 
 	#[test]
