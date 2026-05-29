@@ -184,6 +184,7 @@ impl SolverEngine {
 			delivery.clone(),
 			token_manager.clone(),
 			storage.clone(),
+			settlement.clone(),
 		));
 
 		let intent_handler = Arc::new(IntentHandler::new(

@@ -1772,6 +1772,7 @@ fn build_seed_overrides(
 		orders_auth_enabled: Some(options.enable_admin_api),
 		min_profitability_pct: None,
 		gas_buffer_bps: None,
+		settlement_fee_buffer_bps: None,
 		commission_bps: None,
 		rate_buffer_bps: None,
 		monitoring_timeout_seconds: None,

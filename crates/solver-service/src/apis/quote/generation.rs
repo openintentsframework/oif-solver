@@ -2156,6 +2156,8 @@ mod tests {
 				gas_pre_claim: Decimal::ZERO,
 				gas_claim: Decimal::from_str("0.001").unwrap(),
 				gas_buffer: Decimal::from_str("0.0005").unwrap(),
+				settlement_fee: Decimal::ZERO,
+				settlement_fee_buffer: Decimal::ZERO,
 				rate_buffer: Decimal::from_str("0.01").unwrap(),
 				base_price: Decimal::from_str("1.0").unwrap(),
 				min_profit: Decimal::from_str("0.005").unwrap(),
