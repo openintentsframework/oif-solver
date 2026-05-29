@@ -61,8 +61,12 @@ use solver_types::{
 	api::PostOrderRequest,
 	bytes32_to_address, create_http_provider, current_timestamp, normalize_bytes32_address,
 	standards::eip7683::{
+		compact_claims::compute_batch_compact_claim_hash,
 		compact_signatures::decode_compact_signatures,
-		interfaces::{IInputSettlerCompact, IInputSettlerEscrow, SolMandateOutput, StandardOrder},
+		interfaces::{
+			IAllocator, IInputSettlerCompact, IInputSettlerEscrow, ITheCompact, SolMandateOutput,
+			StandardOrder,
+		},
 		GasLimitOverrides, LockType, MandateOutput,
 	},
 	with_0x_prefix, ConfigSchema, Eip7683OrderData, Field, FieldType, ImplementationRegistry,
@@ -633,6 +637,128 @@ impl Eip7683OffchainDiscovery {
 		Ok(())
 	}
 }
+
+async fn validate_resource_lock_allocator_authorization(
+	order: &StandardOrder,
+	allocator_data: &Bytes,
+	providers: &HashMap<u64, DynProvider>,
+	networks: &NetworksConfig,
+) -> Result<(), DiscoveryError> {
+	let origin_chain_id = order.originChainId.to::<u64>();
+	let network = networks.get(&origin_chain_id).ok_or_else(|| {
+		DiscoveryError::ValidationError(format!(
+			"Chain ID {} not found in networks configuration",
+			order.originChainId
+		))
+	})?;
+	let provider = providers.get(&origin_chain_id).ok_or_else(|| {
+		DiscoveryError::ValidationError(format!(
+			"No RPC provider configured for chain ID {origin_chain_id}"
+		))
+	})?;
+
+	let the_compact_address = network
+		.the_compact_address
+		.as_ref()
+		.ok_or_else(|| {
+			DiscoveryError::ValidationError(format!(
+				"No TheCompact address found for chain ID {origin_chain_id}"
+			))
+		})
+		.and_then(|addr| {
+			if addr.0.len() == 20 {
+				Ok(AlloyAddress::from_slice(&addr.0))
+			} else {
+				Err(DiscoveryError::ValidationError(
+					"Invalid TheCompact address length".to_string(),
+				))
+			}
+		})?;
+	let arbiter = network
+		.input_settler_compact_address
+		.as_ref()
+		.ok_or_else(|| {
+			DiscoveryError::ValidationError(format!(
+				"No input settler compact address found for chain ID {origin_chain_id}"
+			))
+		})
+		.and_then(|addr| {
+			if addr.0.len() == 20 {
+				Ok(AlloyAddress::from_slice(&addr.0))
+			} else {
+				Err(DiscoveryError::ValidationError(
+					"Invalid input settler compact address length".to_string(),
+				))
+			}
+		})?;
+
+	if order.inputs.is_empty() {
+		return Err(DiscoveryError::ValidationError(
+			"ResourceLock order has no inputs to authorize against an allocator".to_string(),
+		));
+	}
+
+	let compact = ITheCompact::new(the_compact_address, provider);
+	let mut resolved_allocator: Option<AlloyAddress> = None;
+	for input in &order.inputs {
+		let details = compact.getLockDetails(input[0]).call().await.map_err(|e| {
+			DiscoveryError::Connection(format!("Failed to query TheCompact.getLockDetails: {e}"))
+		})?;
+		match resolved_allocator {
+			None => resolved_allocator = Some(details.allocator),
+			Some(existing) if existing != details.allocator => {
+				return Err(DiscoveryError::ValidationError(
+					"ResourceLock inputs resolve to multiple allocators".to_string(),
+				));
+			},
+			Some(_) => {},
+		}
+	}
+	let allocator = resolved_allocator.expect("inputs is non-empty");
+
+	if let Some(expected) = network.allocator_address.as_ref() {
+		if expected.0.len() != 20 {
+			return Err(DiscoveryError::ValidationError(
+				"Invalid configured allocator address length".to_string(),
+			));
+		}
+		let expected = AlloyAddress::from_slice(&expected.0);
+		if allocator != expected {
+			return Err(DiscoveryError::ValidationError(
+				"ResourceLock inputs use an allocator that differs from the configured allocator_address"
+					.to_string(),
+			));
+		}
+	}
+
+	let claim_hash = compute_batch_compact_claim_hash(order, arbiter).map_err(|e| {
+		DiscoveryError::ValidationError(format!("Failed to compute Compact claim hash: {e}"))
+	})?;
+	let allocator_contract = IAllocator::new(allocator, provider);
+	let authorized = allocator_contract
+		.isClaimAuthorized(
+			claim_hash,
+			arbiter,
+			order.user,
+			order.nonce,
+			U256::from(order.expires),
+			order.inputs.clone(),
+			allocator_data.clone(),
+		)
+		.call()
+		.await
+		.map_err(|e| {
+			DiscoveryError::Connection(format!("Allocator isClaimAuthorized call failed: {e}"))
+		})?;
+
+	if !authorized {
+		return Err(DiscoveryError::ValidationError(
+			"Allocator did not authorize the provided allocatorData".to_string(),
+		));
+	}
+
+	Ok(())
+}
 /// Handles intent submission requests.
 ///
 /// This is the main request handler for the POST /intent endpoint.
@@ -715,15 +841,38 @@ async fn handle_intent_submission(
 	let lock_type = LockType::from(&request.order);
 
 	if matches!(lock_type, LockType::ResourceLock) {
-		if let Err(e) = decode_compact_signatures(&signature) {
-			tracing::warn!(error = %e, "Failed to decode Compact signature payload");
+		let decoded = match decode_compact_signatures(&signature) {
+			Ok(decoded) => decoded,
+			Err(e) => {
+				tracing::warn!(error = %e, "Failed to decode Compact signature payload");
+				return (
+					StatusCode::BAD_REQUEST,
+					Json(IntentResponse {
+						order_id: None,
+						status: IntentResponseStatus::Rejected,
+						message: Some(e.to_string()),
+						order: order_json.clone(),
+					}),
+				)
+					.into_response();
+			},
+		};
+		if let Err(e) = validate_resource_lock_allocator_authorization(
+			&order,
+			&decoded.allocator_data,
+			&state.providers,
+			&state.networks,
+		)
+		.await
+		{
+			tracing::warn!(error = %e, "Failed to validate Compact allocator authorization");
 			return (
 				StatusCode::BAD_REQUEST,
 				Json(IntentResponse {
 					order_id: None,
 					status: IntentResponseStatus::Rejected,
 					message: Some(e.to_string()),
-					order: order_json,
+					order: order_json.clone(),
 				}),
 			)
 				.into_response();
@@ -979,6 +1128,7 @@ impl crate::DiscoveryRegistry for Registry {}
 mod tests {
 	use super::*;
 	use alloy_primitives::{Address as AlloyAddress, Bytes, U256};
+	use alloy_provider::{mock::Asserter, Provider, ProviderBuilder};
 	use axum::body;
 	use serde_json::json;
 	use solver_types::api::{OifOrder, OrderPayload, PostOrderRequest, SignatureType};
@@ -1052,7 +1202,19 @@ mod tests {
 		Bytes::from(shifted_payload)
 	}
 
-	fn resource_lock_request_with_shifted_signature() -> PostOrderRequest {
+	fn compact_signature(sponsor_sig: &[u8], allocator_data: &[u8]) -> Bytes {
+		let sponsor_tail = padded_bytes(sponsor_sig);
+		let allocator_offset = 64 + sponsor_tail.len();
+
+		let mut signature = Vec::new();
+		signature.extend_from_slice(&abi_word(64));
+		signature.extend_from_slice(&abi_word(allocator_offset));
+		signature.extend_from_slice(&sponsor_tail);
+		signature.extend_from_slice(&padded_bytes(allocator_data));
+		Bytes::from(signature)
+	}
+
+	fn resource_lock_request(signature: Bytes) -> PostOrderRequest {
 		let payload = OrderPayload {
 			signature_type: SignatureType::Eip712,
 			domain: json!({
@@ -1091,10 +1253,43 @@ mod tests {
 
 		PostOrderRequest {
 			order: OifOrder::OifResourceLockV0 { payload },
-			signature: shifted_compact_signature(&[0x11u8; 65]),
+			signature,
 			quote_id: None,
 			origin_submission: None,
 		}
+	}
+
+	fn resource_lock_request_with_shifted_signature() -> PostOrderRequest {
+		resource_lock_request(shifted_compact_signature(&[0x11u8; 65]))
+	}
+
+	fn resource_lock_request_with_allocator_data(
+		allocator_data: &'static [u8],
+	) -> PostOrderRequest {
+		resource_lock_request(compact_signature(&[0x11u8; 65], allocator_data))
+	}
+
+	fn encode_lock_details(allocator: AlloyAddress) -> Bytes {
+		let mut out = vec![0u8; 160];
+		out[44..64].copy_from_slice(allocator.as_slice());
+		Bytes::from(out)
+	}
+
+	fn encode_bool(value: bool) -> Bytes {
+		let mut out = vec![0u8; 32];
+		if value {
+			out[31] = 1;
+		}
+		Bytes::from(out)
+	}
+
+	fn mocked_provider_with_allocator_authorized(authorized: bool) -> DynProvider {
+		let asserter = Asserter::new();
+		asserter.push_success(&encode_lock_details(AlloyAddress::from([0xA1u8; 20])));
+		asserter.push_success(&encode_bool(authorized));
+		ProviderBuilder::new()
+			.connect_mocked_client(asserter)
+			.erased()
 	}
 
 	#[test]
@@ -1399,6 +1594,45 @@ mod tests {
 			.and_then(|v| v.as_str())
 			.unwrap_or_default()
 			.contains("Compact"));
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_submission_rejects_unauthorized_compact_allocator_data() {
+		use axum::extract::State;
+		use axum::Json;
+
+		let (tx, _rx) = mpsc::unbounded_channel();
+		let mut providers = HashMap::new();
+		providers.insert(1, mocked_provider_with_allocator_authorized(false));
+		let state = ApiState {
+			intent_sender: tx,
+			providers,
+			networks: create_test_networks_config(),
+		};
+
+		let response = handle_intent_submission(
+			State(state),
+			Json(resource_lock_request_with_allocator_data(
+				b"garbage allocator data",
+			)),
+		)
+		.await
+		.into_response();
+
+		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+		let body_bytes = body::to_bytes(response.into_body(), usize::MAX)
+			.await
+			.expect("body");
+		let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).expect("parse body");
+		assert_eq!(
+			parsed.get("status").and_then(|v| v.as_str()),
+			Some("rejected")
+		);
+		assert!(parsed
+			.get("message")
+			.and_then(|v| v.as_str())
+			.unwrap_or_default()
+			.contains("allocator"));
 	}
 
 	#[tokio::test]
