@@ -18,9 +18,8 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use solver_storage::StorageService;
 use solver_types::{
-	order_id_to_bytes32, with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, InteropAddress,
-	NetworksConfig, Order, OrderOutput, Schema, Transaction, TransactionHash, TransactionReceipt,
-	TransactionType,
+	order_id_to_bytes32, with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, NetworksConfig,
+	Order, Schema, Transaction, TransactionHash, TransactionReceipt, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -64,62 +63,51 @@ struct HyperlaneOutput {
 	context: Vec<u8>,
 }
 
-/// Convert InteropAddress to bytes32 for Hyperlane
-fn interop_address_to_bytes32(addr: &InteropAddress) -> [u8; 32] {
-	let mut bytes32 = [0u8; 32];
+/// Resolve the exact `MandateOutput` that was filled on `dest_chain` and convert it
+/// to Hyperlane format.
+///
+/// The FillDescription payload (and therefore the payload hash checked with `isProven`)
+/// MUST be built from the specific output that the OutputSettler attested on the
+/// destination chain — including its full `call`/`context` bytes. Building it from
+/// `outputs.first()` with an empty context (the previous behaviour) produced a payload
+/// hash that diverged from the attestation for any multi-output order, or any order
+/// whose filled output carried non-empty context/callbackData, leaving the order
+/// unprovable and solver funds stranded.
+fn resolve_filled_output(
+	order: &Order,
+	dest_chain: u64,
+) -> Result<HyperlaneOutput, SettlementError> {
+	let order_data: solver_types::standards::eip7683::Eip7683OrderData =
+		serde_json::from_value(order.data.clone()).map_err(|e| {
+			SettlementError::ValidationFailed(format!("Failed to parse order_data: {e}"))
+		})?;
 
-	// Get the raw bytes from the InteropAddress
-	let raw_bytes = addr.to_bytes();
-
-	// For Ethereum addresses (20 bytes), right-align in 32 bytes
-	if let Ok(eth_addr) = addr.ethereum_address() {
-		// Put the 20-byte Ethereum address in the last 20 bytes of the 32-byte array
-		bytes32[12..].copy_from_slice(eth_addr.as_slice());
-	} else {
-		// For other address formats, use the raw bytes right-aligned
-		let len = raw_bytes.len().min(32);
-		bytes32[32 - len..].copy_from_slice(&raw_bytes[..len]);
+	let matched: Vec<&_> = order_data
+		.outputs
+		.iter()
+		.filter(|o| o.chain_id == U256::from(dest_chain))
+		.collect();
+	if matched.is_empty() {
+		return Err(SettlementError::ValidationFailed(format!(
+			"Order has no output on destination chain {dest_chain}"
+		)));
 	}
-
-	bytes32
-}
-
-/// Convert an OrderOutput to Hyperlane-compatible format
-fn order_output_to_hyperlane(output: &OrderOutput) -> HyperlaneOutput {
-	let asset = &output.asset;
-	let receiver = &output.receiver;
-	let amount = output.amount;
-
-	HyperlaneOutput {
-		token: interop_address_to_bytes32(asset),
-		amount,
-		recipient: interop_address_to_bytes32(receiver),
-		call: output
-			.calldata
-			.as_ref()
-			.and_then(|s| hex::decode(s.trim_start_matches("0x")).ok())
-			.unwrap_or_default(),
-		context: vec![], // Empty context for generic orders
+	if matched.len() > 1 {
+		return Err(SettlementError::ValidationFailed(format!(
+			"Order has multiple outputs on destination chain {dest_chain}; unsupported"
+		)));
 	}
-}
+	let output = matched[0];
 
-/// Extract output details from order data using OrderParsable
-fn extract_output_details(order: &Order) -> Result<HyperlaneOutput, SettlementError> {
-	// Parse order data using the OrderParsable trait
-	let parsed_order = order.parse_order_data().map_err(|e| {
-		SettlementError::ValidationFailed(format!("Failed to parse order data: {e}"))
-	})?;
-
-	// Get requested outputs
-	let outputs = parsed_order.parse_requested_outputs();
-
-	// Get the first output
-	let first_output = outputs
-		.first()
-		.ok_or_else(|| SettlementError::ValidationFailed("No outputs found in order".into()))?;
-
-	// Convert to Hyperlane format
-	Ok(order_output_to_hyperlane(first_output))
+	// Use the on-chain bytes32 token/recipient and the exact call/context bytes
+	// directly — these are what the OutputSettler attested.
+	Ok(HyperlaneOutput {
+		token: output.token,
+		amount: output.amount,
+		recipient: output.recipient,
+		call: output.call.clone(),
+		context: output.context.clone(),
+	})
 }
 
 /// Extract (solver, timestamp) from OutputFilled logs.
@@ -609,9 +597,11 @@ impl HyperlaneSettlement {
 		order: &Order,
 		solver_identifier: [u8; 32],
 		timestamp: u32,
+		dest_chain: u64,
 	) -> Result<[u8; 32], SettlementError> {
-		// Extract output details from order
-		let output = extract_output_details(order)?;
+		// Resolve the exact MandateOutput that was filled on `dest_chain` so the
+		// payload hash matches the attestation the OutputSettler recorded.
+		let output = resolve_filled_output(order, dest_chain)?;
 		let order_id_bytes =
 			order_id_to_bytes32(&order.id).map_err(SettlementError::ValidationFailed)?;
 
@@ -1173,8 +1163,9 @@ impl SettlementInterface for HyperlaneSettlement {
 		let oracle_address = self.validate_bound_output_oracle(order, dest_chain)?;
 		let recipient_oracle = self.validate_bound_input_oracle(order, origin_chain)?;
 
-		// Extract fill details from order
-		let output = extract_output_details(order)?;
+		// Resolve the exact MandateOutput filled on the destination chain so the
+		// FillDescription payload matches the OutputSettler attestation.
+		let output = resolve_filled_output(order, dest_chain)?;
 
 		// Convert order ID to bytes32
 		let order_id_bytes =
@@ -1330,7 +1321,8 @@ impl SettlementInterface for HyperlaneSettlement {
 				extract_fill_details_from_logs(&logs, order, &order_id_bytes, dest_chain)?;
 
 			// Compute payload hash once and store it
-			let payload_hash = self.compute_payload_hash(order, solver_id, timestamp)?;
+			let payload_hash =
+				self.compute_payload_hash(order, solver_id, timestamp, dest_chain)?;
 
 			// Store in message tracker with all details for later use
 			// PostFill happens on dest_chain, message goes from dest_chain to origin_chain
@@ -1834,6 +1826,160 @@ mod tests {
 			.expect("matching log should be accepted");
 		assert_eq!(solver, expected_solver);
 		assert_eq!(ts, expected_timestamp);
+	}
+
+	/// Build an Order carrying multiple MandateOutputs (H-21 regression).
+	fn build_test_order_with_outputs(
+		order_id: [u8; 32],
+		origin_chain: u64,
+		dest_chain: u64,
+		outputs: Vec<MandateOutput>,
+	) -> solver_types::Order {
+		use solver_types::standards::eip7683::{Eip7683OrderData, GasLimitOverrides};
+
+		let order_data = Eip7683OrderData {
+			user: format!("0x{}", alloy_primitives::hex::encode([0x22u8; 20])),
+			nonce: alloy_primitives::U256::from(1u64),
+			origin_chain_id: alloy_primitives::U256::from(origin_chain),
+			expires: (solver_types::current_timestamp() as u32) + 3600,
+			fill_deadline: (solver_types::current_timestamp() as u32) + 1800,
+			input_oracle: format!("0x{}", alloy_primitives::hex::encode([0x11u8; 20])),
+			inputs: vec![],
+			order_id,
+			gas_limit_overrides: GasLimitOverrides::default(),
+			outputs,
+			raw_order_data: None,
+			signature: None,
+			sponsor: None,
+			lock_type: None,
+		};
+
+		solver_types::Order {
+			id: format!("0x{}", alloy_primitives::hex::encode(order_id)),
+			standard: "eip7683".to_string(),
+			created_at: 0,
+			updated_at: 0,
+			status: solver_types::OrderStatus::Pending,
+			data: serde_json::to_value(&order_data).unwrap(),
+			solver_address: solver_types::Address(vec![0x99; 20]),
+			quote_id: None,
+			input_chains: vec![solver_types::order::ChainSettlerInfo {
+				chain_id: origin_chain,
+				settler_address: solver_types::Address(vec![0xCC; 20]),
+			}],
+			output_chains: vec![solver_types::order::ChainSettlerInfo {
+				chain_id: dest_chain,
+				settler_address: solver_types::Address(vec![0xAA; 20]),
+			}],
+			execution_params: None,
+			prepare_tx_hash: None,
+			fill_tx_hash: None,
+			claim_tx_hash: None,
+			post_fill_tx_hash: None,
+			pre_claim_tx_hash: None,
+			fill_proof: None,
+			settlement_name: None,
+		}
+	}
+
+	/// H-21: the FillDescription payload hash must be built from the exact filled
+	/// output on the destination chain (with its full context/call), not from
+	/// `outputs.first()` with an empty context. For a multi-output order whose
+	/// destination output is `outputs[1]`, the previous code hashed `outputs[0]`
+	/// with `context = []`, producing a hash that never matched the attestation.
+	#[test]
+	fn test_compute_payload_hash_uses_filled_output_with_context() {
+		let order_id: [u8; 32] = [0x42; 32];
+		let origin_chain = 1u64;
+		let dest_chain = 137u64;
+
+		// outputs[0]: a same-chain/origin output that must NOT drive the payload.
+		let origin_output = MandateOutputBuilder::new()
+			.chain_id(U256::from(origin_chain))
+			.token([0x01; 32])
+			.amount(U256::from(111u64))
+			.recipient([0x02; 32])
+			.build();
+
+		// outputs[1]: the cross-chain filled output, carrying non-empty
+		// callbackData and context.
+		let filled_output = MandateOutputBuilder::new()
+			.oracle([0x11; 32])
+			.settler([0xAA; 32])
+			.chain_id(U256::from(dest_chain))
+			.token([0x22; 32])
+			.amount(U256::from(1000u64))
+			.recipient([0x33; 32])
+			.call(vec![0xca, 0xfe])
+			.context(vec![0xde, 0xad])
+			.build();
+
+		let order = build_test_order_with_outputs(
+			order_id,
+			origin_chain,
+			dest_chain,
+			vec![origin_output, filled_output.clone()],
+		);
+
+		let settlement = test_hyperlane_settlement(OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+
+		let solver_id = [0x77u8; 32];
+		let timestamp = 1_700_000_000u32;
+
+		let actual = settlement
+			.compute_payload_hash(&order, solver_id, timestamp, dest_chain)
+			.expect("payload hash should compute");
+
+		// Expected: hash of the payload built from the FILLED output's exact
+		// token/amount/recipient/call/context.
+		let order_id_bytes = order_id_to_bytes32(&order.id).unwrap();
+		let expected_payload = encode_fill_description(
+			solver_id,
+			order_id_bytes,
+			timestamp,
+			filled_output.token,
+			filled_output.amount,
+			filled_output.recipient,
+			filled_output.call.clone(),
+			filled_output.context.clone(),
+		)
+		.unwrap();
+		let mut hasher = Keccak256::new();
+		hasher.update(&expected_payload);
+		let mut expected = [0u8; 32];
+		expected.copy_from_slice(&hasher.finalize());
+
+		assert_eq!(
+			actual, expected,
+			"payload hash must be built from the filled destination output incl. context"
+		);
+
+		// And it must NOT equal the (buggy) hash built from outputs[0] with empty
+		// context, to guard against regressing to the first-output path.
+		let buggy_payload = encode_fill_description(
+			solver_id,
+			order_id_bytes,
+			timestamp,
+			[0x01; 32],
+			U256::from(111u64),
+			[0x02; 32],
+			vec![],
+			vec![],
+		)
+		.unwrap();
+		let mut hasher2 = Keccak256::new();
+		hasher2.update(&buggy_payload);
+		let mut buggy = [0u8; 32];
+		buggy.copy_from_slice(&hasher2.finalize());
+		assert_ne!(
+			actual, buggy,
+			"payload hash must not use outputs[0]/empty context"
+		);
 	}
 
 	// ── can_claim route-awareness helpers ─────────────────────────────────────
