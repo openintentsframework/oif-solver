@@ -7,11 +7,21 @@ use alloy_primitives::{hex, Address as AlloyAddress, U256};
 use alloy_sol_types::SolCall;
 use solver_config::Config;
 use solver_core::SolverEngine;
+use solver_storage::reservation_store::{ReservationError, ReservationStore};
 use solver_types::{
 	standards::eip7683::{interfaces::StandardOrder, LockType},
 	APIError, ApiErrorType,
 };
 use std::convert::TryFrom;
+
+/// TTL (seconds) for a Compact-input reservation.
+///
+/// Reservations are released when an order reaches a terminal state, but until
+/// that lifecycle wiring lands (see PR follow-up) the TTL provides a safety net
+/// so a crashed solver cannot strand a deposit's capacity forever. It is set
+/// comfortably longer than the worst-case order lifetime to avoid prematurely
+/// freeing capacity for a legitimately in-flight order.
+const COMPACT_RESERVATION_TTL_SECONDS: u64 = 3600;
 
 mod interfaces {
 	use alloy_sol_types::sol;
@@ -204,15 +214,33 @@ async fn validate_compact_deposit_for_order(
 	balance_buf.copy_from_slice(response.as_ref());
 	let balance = U256::from_be_bytes(balance_buf);
 
-	if balance < required_amount {
-		return Err(APIError::BadRequest {
-			error_type: ApiErrorType::OrderValidationFailed,
-			message: format!(
-				"Compact deposit for user {user:#x} is insufficient on chain {chain_id} (required {required_amount}, available {balance})",
-			),
-			details: None,
-		});
-	}
+	// Atomically reserve `required_amount` against this deposit. This closes the
+	// concurrency window where N orders backed by the same Compact deposit all
+	// pass a stateless balanceOf check, get filled on the destination, but only
+	// one origin claim can succeed (C-03). The ledger guarantees the total
+	// reserved across in-flight orders never exceeds the on-chain balance.
+	let reservation_store =
+		ReservationStore::new(solver.storage().clone(), COMPACT_RESERVATION_TTL_SECONDS);
+
+	reservation_store
+		.reserve(chain_id, user, token_id, required_amount, balance)
+		.await
+		.map_err(|e| match e {
+			ReservationError::InsufficientCapacity { .. } => APIError::BadRequest {
+				error_type: ApiErrorType::OrderValidationFailed,
+				message: e.to_string(),
+				details: None,
+			},
+			ReservationError::Contended => APIError::BadRequest {
+				error_type: ApiErrorType::OrderValidationFailed,
+				message: "Compact reservation ledger is contended; please retry".to_string(),
+				details: None,
+			},
+			ReservationError::Storage(msg) => APIError::InternalServerError {
+				error_type: ApiErrorType::OrderValidationFailed,
+				message: format!("Failed to reserve Compact deposit: {msg}"),
+			},
+		})?;
 
 	Ok(())
 }
@@ -579,7 +607,7 @@ mod tests {
 
 		match result {
 			Err(APIError::BadRequest { message, .. }) => {
-				assert!(message.contains("Compact deposit"));
+				assert!(message.contains("Insufficient Compact capacity"));
 			},
 			_ => panic!("expected compact deposit failure"),
 		}
@@ -887,6 +915,55 @@ mod tests {
 		)
 		.await
 		.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_resource_lock_concurrent_reserves_admit_only_one() {
+		// Two ResourceLock orders for the SAME (user, token_id) where the
+		// Compact balance backs only ONE of them. A stateless balanceOf check
+		// admits both (the C-03 bug); with the atomic reservation ledger wired
+		// in, exactly one must be admitted and the other rejected.
+		let token_id = U256::from(123u64);
+		let amount = U256::from(600u64); // two would need 1200
+		let balance = U256::from(1000u64); // backs only one
+
+		let standard_order = build_standard_order(TEST_CHAIN_ID, token_id, amount);
+
+		let mut contract_responses = HashMap::new();
+		contract_responses.insert(TEST_CHAIN_ID, balance.to_be_bytes::<32>().to_vec());
+
+		let delivery = Arc::new(TestDelivery::new(HashMap::new(), contract_responses))
+			as Arc<dyn DeliveryInterface>;
+		let mut delivery_map = HashMap::new();
+		delivery_map.insert(TEST_CHAIN_ID, delivery);
+
+		let config = build_config(TEST_CHAIN_ID, TEST_COMPACT);
+		let solver = Arc::new(build_solver_engine(config.clone(), delivery_map));
+		let config = Arc::new(config);
+
+		let s1 = Arc::clone(&solver);
+		let c1 = Arc::clone(&config);
+		let o1 = standard_order.clone();
+		let s2 = Arc::clone(&solver);
+		let c2 = Arc::clone(&config);
+		let o2 = standard_order.clone();
+
+		let h1 = tokio::spawn(async move {
+			super::ensure_user_capacity_for_order(&s1, &c1, LockType::ResourceLock, &o1).await
+		});
+		let h2 = tokio::spawn(async move {
+			super::ensure_user_capacity_for_order(&s2, &c2, LockType::ResourceLock, &o2).await
+		});
+
+		let r1 = h1.await.unwrap();
+		let r2 = h2.await.unwrap();
+
+		let successes = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+		assert_eq!(
+			successes, 1,
+			"exactly one ResourceLock order may be admitted against a single-backing deposit: \
+			 r1={r1:?} r2={r2:?}"
+		);
 	}
 
 	#[tokio::test]

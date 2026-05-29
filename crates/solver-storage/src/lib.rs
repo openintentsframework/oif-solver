@@ -18,6 +18,7 @@ pub mod config_store;
 pub mod nonce_store;
 pub mod readiness;
 pub mod redis_health;
+pub mod reservation_store;
 
 // Re-export redis_health types for convenience
 pub use redis_health::{
@@ -569,6 +570,23 @@ impl StorageService {
 		let bytes =
 			serde_json::to_vec(data).map_err(|e| StorageError::Serialization(e.to_string()))?;
 		self.backend.set_bytes(&key, bytes, indexes, None).await
+	}
+
+	/// Stores raw bytes only if the key does not already exist.
+	///
+	/// Returns `Ok(true)` when the value was set, `Ok(false)` when the key
+	/// already held a (non-expired) value. This exposes the backend's atomic
+	/// set-if-not-exists primitive (Redis `SET NX`, in-memory lock) for callers
+	/// that need to initialize a key exactly once under concurrency.
+	pub async fn set_nx_bytes(
+		&self,
+		namespace: &str,
+		id: &str,
+		value: Vec<u8>,
+		ttl: Option<Duration>,
+	) -> Result<bool, StorageError> {
+		let key = format!("{namespace}:{id}");
+		self.backend.set_nx(&key, value, ttl).await
 	}
 
 	/// Atomically replaces raw bytes if the current bytes still match `expected`.

@@ -12,6 +12,7 @@ testing = ["mockall"]
 cluster-tests = []
 
 [dependencies]
+alloy-primitives = { workspace = true }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 fs2 = "0.4"

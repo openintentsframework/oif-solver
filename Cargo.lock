@@ -5333,6 +5333,7 @@ dependencies = [
 name = "solver-storage"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "async-trait",
  "chrono",
  "fs2",
