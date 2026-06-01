@@ -45,6 +45,9 @@ use std::time::{Duration, Instant};
 /// 2 seconds matches typical Ethereum mainnet block time and is short enough
 /// not to materially delay confirmation reporting on faster chains.
 const TX_CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Best-effort startup nonce reads must not block solver startup indefinitely
+/// when an RPC endpoint accepts connections but does not respond.
+const INITIAL_NONCE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Drift-monitor parameters. The monitor periodically compares local nonce
 /// cache against chain pending. Some lead is normal during in-flight
@@ -629,14 +632,18 @@ impl AlloyDelivery {
 
 			// Use type erasure to simplify the provider type
 			let dyn_provider = provider.erased();
-			match (
-				dyn_provider.get_transaction_count(signer_address).await,
-				dyn_provider
-					.get_transaction_count(signer_address)
-					.pending()
-					.await,
-			) {
-				(Ok(latest), Ok(pending)) => {
+			let nonce_probe = tokio::time::timeout(INITIAL_NONCE_PROBE_TIMEOUT, async {
+				(
+					dyn_provider.get_transaction_count(signer_address).await,
+					dyn_provider
+						.get_transaction_count(signer_address)
+						.pending()
+						.await,
+				)
+			})
+			.await;
+			match nonce_probe {
+				Ok((Ok(latest), Ok(pending))) => {
 					tracing::info!(
 						chain_id = *network_id,
 						signer = %signer_address,
@@ -645,13 +652,21 @@ impl AlloyDelivery {
 						"Initialized EVM delivery nonce state"
 					);
 				},
-				(latest_result, pending_result) => {
+				Ok((latest_result, pending_result)) => {
 					tracing::warn!(
 						chain_id = *network_id,
 						signer = %signer_address,
 						latest_error = ?latest_result.err(),
 						pending_error = ?pending_result.err(),
 						"Could not read initial EVM delivery nonce state"
+					);
+				},
+				Err(_) => {
+					tracing::warn!(
+						chain_id = *network_id,
+						signer = %signer_address,
+						timeout_ms = INITIAL_NONCE_PROBE_TIMEOUT.as_millis(),
+						"Timed out reading initial EVM delivery nonce state"
 					);
 				},
 			}
@@ -3502,8 +3517,12 @@ mod tests {
 	// available here.
 	use super::*;
 	use alloy_signer_local::PrivateKeySigner;
-	use solver_types::utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder};
+	use solver_types::{
+		networks::RpcEndpoint,
+		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
+	};
 	use std::collections::HashMap;
+	use tokio::net::TcpListener;
 
 	mod revert_data_extractor_tests {
 		use super::super::extract_revert_bytes_from_transport_err;
@@ -3563,10 +3582,37 @@ mod tests {
 	);
 
 	fn create_test_networks() -> NetworksConfig {
+		let mut chain_1 = NetworkConfigBuilder::new().build();
+		chain_1.rpc_urls = vec![RpcEndpoint::http_only("http://127.0.0.1:1".to_string())];
+
+		let mut chain_137 = NetworkConfigBuilder::new().build();
+		chain_137.rpc_urls = vec![RpcEndpoint::http_only("http://127.0.0.1:1".to_string())];
+
 		NetworksConfigBuilder::new()
-			.add_network(1, NetworkConfigBuilder::new().build())
-			.add_network(137, NetworkConfigBuilder::new().build())
+			.add_network(1, chain_1)
+			.add_network(137, chain_137)
 			.build()
+	}
+
+	async fn start_unresponsive_rpc() -> String {
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let address = listener.local_addr().unwrap();
+		tokio::spawn(async move {
+			while let Ok((socket, _)) = listener.accept().await {
+				tokio::spawn(async move {
+					let _socket = socket;
+					tokio::time::sleep(Duration::from_secs(60)).await;
+				});
+			}
+		});
+		format!("http://{address}")
+	}
+
+	fn create_test_networks_with_rpc_url(rpc_url: String) -> NetworksConfig {
+		let mut chain_1 = NetworkConfigBuilder::new().build();
+		chain_1.rpc_urls = vec![RpcEndpoint::http_only(rpc_url)];
+
+		NetworksConfigBuilder::new().add_network(1, chain_1).build()
 	}
 
 	fn create_test_signer() -> AccountSigner {
@@ -3609,6 +3655,30 @@ mod tests {
 			&test_fee_policy(),
 		)
 		.await;
+
+		assert!(result.is_ok());
+		let delivery = result.unwrap();
+		assert!(delivery.providers.contains_key(&1));
+	}
+
+	#[tokio::test]
+	async fn test_alloy_delivery_new_times_out_unresponsive_nonce_probe() {
+		let rpc_url = start_unresponsive_rpc().await;
+		let networks = create_test_networks_with_rpc_url(rpc_url);
+		let signer = create_test_signer();
+
+		let result = tokio::time::timeout(
+			Duration::from_secs(3),
+			AlloyDelivery::new(
+				vec![1],
+				&networks,
+				HashMap::new(),
+				signer,
+				&test_fee_policy(),
+			),
+		)
+		.await
+		.expect("constructor should not hang on unresponsive nonce probe");
 
 		assert!(result.is_ok());
 		let delivery = result.unwrap();
