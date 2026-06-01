@@ -41,6 +41,8 @@ use thiserror::Error;
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::instrument;
 
+const INTENT_QUEUE_CAPACITY: usize = 1024;
+
 /// Errors that can occur during engine operations.
 ///
 /// These errors represent various failure modes that can occur while
@@ -328,12 +330,14 @@ impl SolverEngine {
 		// Perform recovery and get orphaned intents
 		let orphaned_intents = self.initialize_with_recovery().await?;
 
-		// Start discovery monitoring
-		let (intent_tx, mut intent_rx) = mpsc::unbounded_channel();
+		// Start discovery monitoring with bounded intake so external discovery
+		// sources cannot accumulate unbounded in-memory intent backlog.
+		let intent_queue_capacity = INTENT_QUEUE_CAPACITY.max(orphaned_intents.len());
+		let (intent_tx, mut intent_rx) = mpsc::channel(intent_queue_capacity);
 
 		// Re-inject orphaned intents if any
 		for intent in orphaned_intents {
-			if let Err(e) = intent_tx.send(intent) {
+			if let Err(e) = intent_tx.try_send(intent) {
 				tracing::warn!("Failed to re-inject orphaned intent: {}", e);
 			}
 		}

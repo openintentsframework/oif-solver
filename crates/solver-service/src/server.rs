@@ -19,15 +19,17 @@ use crate::{
 };
 use alloy_primitives::U256;
 use axum::{
+	body::Body,
+	extract::DefaultBodyLimit,
 	extract::{Extension, Path, State},
-	http::StatusCode,
-	middleware,
-	response::{IntoResponse, Json},
+	http::{Request, StatusCode},
+	middleware::{self, Next},
+	response::{IntoResponse, Json, Response},
 	routing::{delete, get, post, put},
 	Router, ServiceExt,
 };
 use serde_json::Value;
-use solver_config::{ApiConfig, Config};
+use solver_config::{ApiConfig, Config, RateLimitConfig};
 use solver_core::SolverEngine;
 use solver_storage::{
 	config_store::create_config_store,
@@ -40,7 +42,13 @@ use solver_types::{
 	ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse, OperatorConfig, Order,
 	OrderIdCallback, Transaction,
 };
-use std::{convert::TryInto, net::SocketAddr, sync::Arc};
+use std::{
+	collections::{HashMap, VecDeque},
+	convert::TryInto,
+	net::{IpAddr, Ipv4Addr, SocketAddr},
+	sync::{Arc, Mutex},
+	time::{Duration, Instant},
+};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tower::ServiceBuilder;
@@ -65,6 +73,58 @@ pub struct AppState {
 	pub siwe_nonce_store: Option<Arc<NonceStore>>,
 	/// Signature validation service for different order standards.
 	pub signature_validation: Arc<SignatureValidationService>,
+}
+
+#[derive(Clone)]
+struct ApiRateLimiter {
+	max_requests: usize,
+	window: Duration,
+	clients: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
+}
+
+impl ApiRateLimiter {
+	fn new(config: &RateLimitConfig) -> Self {
+		Self {
+			max_requests: config.requests_per_minute.max(config.burst_size).max(1) as usize,
+			window: Duration::from_secs(60),
+			clients: Arc::new(Mutex::new(HashMap::new())),
+		}
+	}
+
+	fn allows(&self, ip: IpAddr) -> bool {
+		let now = Instant::now();
+		let mut clients = self.clients.lock().expect("rate limiter lock poisoned");
+		let entries = clients.entry(ip).or_default();
+		while entries
+			.front()
+			.is_some_and(|instant| now.duration_since(*instant) >= self.window)
+		{
+			entries.pop_front();
+		}
+		if entries.len() >= self.max_requests {
+			return false;
+		}
+		entries.push_back(now);
+		true
+	}
+}
+
+async fn api_rate_limit_middleware(
+	State(limiter): State<ApiRateLimiter>,
+	request: Request<Body>,
+	next: Next,
+) -> Response {
+	let ip = request
+		.extensions()
+		.get::<axum::extract::ConnectInfo<SocketAddr>>()
+		.map(|connect_info| connect_info.0.ip())
+		.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+
+	if !limiter.allows(ip) {
+		return StatusCode::TOO_MANY_REQUESTS.into_response();
+	}
+
+	next.run(request).await
 }
 
 fn create_admin_storage_backend(
@@ -187,14 +247,6 @@ pub async fn start_server(
 			None
 		},
 	};
-
-	// Track whether the public Orders API should require a JWT.
-	// Independent of admin SIWE — see `AuthConfig::orders_auth_enabled`.
-	let orders_require_auth = api_config
-		.auth
-		.as_ref()
-		.map(|a| a.orders_auth_enabled)
-		.unwrap_or(false);
 
 	// Initialize signature validation service
 	let signature_validation = Arc::new(SignatureValidationService::new());
@@ -338,20 +390,8 @@ pub async fn start_server(
 		signature_validation,
 	};
 
-	// Build the router with /api/v1 base path and quote endpoint
-	let mut api_routes = Router::new()
-		.route("/quotes", post(handle_quote))
-		.route("/assets", get(handle_get_assets))
-		.route("/assets/{chain_id}", get(handle_get_assets_for_chain));
-
-	// Add auth subroutes
-	let auth_routes = Router::new()
-		.route("/register", post(handle_auth_register))
-		.route("/refresh", post(handle_auth_refresh))
-		.route("/siwe/nonce", post(handle_auth_siwe_nonce))
-		.route("/siwe/verify", post(handle_auth_siwe_verify));
-
-	api_routes = api_routes.nest("/auth", auth_routes);
+	// Build the router with /api/v1 base path and public API hardening.
+	let mut api_routes = build_public_api_routes(&api_config, jwt_service.as_ref());
 
 	// Add admin routes if enabled
 	if let Some(admin_state) = admin_state {
@@ -438,43 +478,6 @@ pub async fn start_server(
 		tracing::info!("Admin routes registered at /api/v1/admin/*");
 	}
 
-	// Create order routes with optional auth
-	let mut order_routes = Router::new()
-		.route("/orders", post(handle_order))
-		.route("/orders/{id}", get(handle_get_order_by_id));
-
-	// Apply auth middleware to order routes only if orders_require_auth is true
-	if orders_require_auth {
-		if let Some(jwt) = &jwt_service {
-			// POST /orders requires CreateOrders scope
-			let order_post_route = Router::new().route("/orders", post(handle_order)).layer(
-				middleware::from_fn_with_state(
-					AuthState {
-						jwt_service: jwt.clone(),
-						required_scope: solver_types::AuthScope::CreateOrders,
-					},
-					auth_middleware,
-				),
-			);
-
-			// GET /orders/{id} requires ReadOrders scope
-			let order_get_route = Router::new()
-				.route("/orders/{id}", get(handle_get_order_by_id))
-				.layer(middleware::from_fn_with_state(
-					AuthState {
-						jwt_service: jwt.clone(),
-						required_scope: solver_types::AuthScope::ReadOrders,
-					},
-					auth_middleware,
-				));
-
-			order_routes = order_post_route.merge(order_get_route);
-		}
-	}
-
-	// Combine all routes
-	api_routes = api_routes.merge(order_routes);
-
 	// Health check route at root level (no auth required)
 	let health_routes = Router::new()
 		.route("/health", get(handle_health))
@@ -501,6 +504,83 @@ pub async fn start_server(
 	axum::serve(listener, service).await?;
 
 	Ok(())
+}
+
+fn build_public_api_routes(
+	api_config: &ApiConfig,
+	jwt_service: Option<&Arc<JwtService>>,
+) -> Router<AppState> {
+	let mut quote_routes = Router::new().route("/quotes", post(handle_quote));
+	let require_auth = api_config
+		.auth
+		.as_ref()
+		.map(|auth| auth.orders_auth_enabled)
+		.unwrap_or(false);
+
+	if require_auth {
+		if let Some(jwt) = jwt_service {
+			quote_routes = quote_routes.layer(middleware::from_fn_with_state(
+				AuthState {
+					jwt_service: jwt.clone(),
+					required_scope: solver_types::AuthScope::CreateQuotes,
+				},
+				auth_middleware,
+			));
+		}
+	}
+
+	let auth_routes = Router::new()
+		.route("/register", post(handle_auth_register))
+		.route("/refresh", post(handle_auth_refresh))
+		.route("/siwe/nonce", post(handle_auth_siwe_nonce))
+		.route("/siwe/verify", post(handle_auth_siwe_verify));
+
+	let mut order_routes = Router::new()
+		.route("/orders", post(handle_order))
+		.route("/orders/{id}", get(handle_get_order_by_id));
+
+	if require_auth {
+		if let Some(jwt) = jwt_service {
+			let order_post_route = Router::new().route("/orders", post(handle_order)).layer(
+				middleware::from_fn_with_state(
+					AuthState {
+						jwt_service: jwt.clone(),
+						required_scope: solver_types::AuthScope::CreateOrders,
+					},
+					auth_middleware,
+				),
+			);
+
+			let order_get_route = Router::new()
+				.route("/orders/{id}", get(handle_get_order_by_id))
+				.layer(middleware::from_fn_with_state(
+					AuthState {
+						jwt_service: jwt.clone(),
+						required_scope: solver_types::AuthScope::ReadOrders,
+					},
+					auth_middleware,
+				));
+
+			order_routes = order_post_route.merge(order_get_route);
+		}
+	}
+
+	let mut routes = Router::new()
+		.merge(quote_routes)
+		.route("/assets", get(handle_get_assets))
+		.route("/assets/{chain_id}", get(handle_get_assets_for_chain))
+		.nest("/auth", auth_routes)
+		.merge(order_routes)
+		.layer(DefaultBodyLimit::max(api_config.max_request_size));
+
+	if let Some(rate_limiting) = &api_config.rate_limiting {
+		routes = routes.layer(middleware::from_fn_with_state(
+			ApiRateLimiter::new(rate_limiting),
+			api_rate_limit_middleware,
+		));
+	}
+
+	routes
 }
 
 /// Handles POST /api/v1/quotes requests.
@@ -964,13 +1044,13 @@ async fn forward_to_discovery_service(
 mod tests {
 	use super::*;
 	use alloy_primitives::hex;
-	use axum::body;
-	use axum::http::StatusCode;
+	use axum::body::{self, Body};
+	use axum::http::{Request, StatusCode};
 	use reqwest::Client;
 	use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 	use serde_json::{json, to_value};
 	use solver_account::AccountService;
-	use solver_config::Config;
+	use solver_config::{Config, RateLimitConfig};
 	use solver_core::engine::event_bus::EventBus;
 	use solver_core::engine::token_manager::TokenManager;
 	use solver_delivery::DeliveryService;
@@ -986,10 +1066,13 @@ mod tests {
 		SignatureType,
 	};
 	use solver_types::standards::eip7683::interfaces::StandardOrder as OifStandardOrder;
-	use solver_types::{APIError, Address, ApiErrorType, ErrorResponse};
+	use solver_types::{
+		APIError, Address, ApiErrorType, AuthConfig, AuthScope, ErrorResponse, SecretString,
+	};
 	use std::collections::HashMap;
 	use std::convert::TryFrom;
 	use std::sync::Arc;
+	use tower::ServiceExt;
 	use wiremock::matchers::{method, path};
 	use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1128,6 +1211,23 @@ mod tests {
 			siwe_nonce_store: None,
 			signature_validation: Arc::new(SignatureValidationService::new()),
 		}
+	}
+
+	fn test_auth_config() -> AuthConfig {
+		AuthConfig {
+			orders_auth_enabled: true,
+			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars"),
+			access_token_expiry_hours: 1,
+			refresh_token_expiry_hours: 720,
+			issuer: "test".to_string(),
+			public_register_enabled: false,
+			admin: None,
+		}
+	}
+
+	async fn test_quote_app(api_config: ApiConfig, jwt_service: Option<Arc<JwtService>>) -> Router {
+		let state = build_test_app_state(None).await;
+		build_public_api_routes(&api_config, jwt_service.as_ref()).with_state(state)
 	}
 
 	async fn build_intake_disabled_test_app_state(discovery_url: Option<String>) -> AppState {
@@ -1381,6 +1481,120 @@ mod tests {
 		.into_response();
 
 		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn quotes_route_requires_create_quotes_scope_when_order_auth_enabled() {
+		let api_config = ApiConfig {
+			enabled: true,
+			host: "127.0.0.1".to_string(),
+			port: 0,
+			timeout_seconds: 30,
+			max_request_size: 1024 * 1024,
+			implementations: Default::default(),
+			rate_limiting: None,
+			cors: None,
+			auth: Some(test_auth_config()),
+			quote: None,
+		};
+		let jwt = Arc::new(JwtService::new(test_auth_config()).unwrap());
+		let app = test_quote_app(api_config, Some(jwt.clone())).await;
+
+		let missing = app
+			.clone()
+			.oneshot(
+				Request::builder()
+					.method("POST")
+					.uri("/quotes")
+					.header("content-type", "application/json")
+					.body(Body::from("{}"))
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+		let wrong_scope = jwt
+			.generate_access_token("orders-client", vec![AuthScope::CreateOrders])
+			.unwrap();
+		let response = app
+			.oneshot(
+				Request::builder()
+					.method("POST")
+					.uri("/quotes")
+					.header("content-type", "application/json")
+					.header("authorization", format!("Bearer {wrong_scope}"))
+					.body(Body::from("{}"))
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::FORBIDDEN);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn quotes_route_enforces_configured_request_body_limit() {
+		let api_config = ApiConfig {
+			enabled: true,
+			host: "127.0.0.1".to_string(),
+			port: 0,
+			timeout_seconds: 30,
+			max_request_size: 8,
+			implementations: Default::default(),
+			rate_limiting: None,
+			cors: None,
+			auth: None,
+			quote: None,
+		};
+		let app = test_quote_app(api_config, None).await;
+
+		let response = app
+			.oneshot(
+				Request::builder()
+					.method("POST")
+					.uri("/quotes")
+					.header("content-type", "application/json")
+					.body(Body::from("{\"intent\":{}}"))
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn quotes_route_enforces_configured_rate_limit() {
+		let api_config = ApiConfig {
+			enabled: true,
+			host: "127.0.0.1".to_string(),
+			port: 0,
+			timeout_seconds: 30,
+			max_request_size: 1024 * 1024,
+			implementations: Default::default(),
+			rate_limiting: Some(RateLimitConfig {
+				requests_per_minute: 1,
+				burst_size: 1,
+			}),
+			cors: None,
+			auth: None,
+			quote: None,
+		};
+		let app = test_quote_app(api_config, None).await;
+
+		let request = || {
+			Request::builder()
+				.method("POST")
+				.uri("/quotes")
+				.header("content-type", "application/json")
+				.body(Body::from("{}"))
+				.unwrap()
+		};
+
+		let first = app.clone().oneshot(request()).await.unwrap();
+		assert_ne!(first.status(), StatusCode::TOO_MANY_REQUESTS);
+
+		let second = app.oneshot(request()).await.unwrap();
+		assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
