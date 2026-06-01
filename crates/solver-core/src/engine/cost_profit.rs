@@ -487,6 +487,14 @@ impl CostProfitService {
 						.map_err(|e| CostProfitError::Calculation(e.to_string()))?;
 
 						output_usd_values.push(usd_value);
+						calculated_amounts.insert(
+							output.asset.clone(),
+							TokenAmountInfo {
+								token: output.asset.clone(),
+								amount: *output_amount,
+								decimals: output_token.decimals,
+							},
+						);
 					}
 
 					// Match outputs with inputs
@@ -3473,6 +3481,74 @@ mod tests {
 				}
 			}
 		}
+	}
+
+	#[tokio::test]
+	async fn exact_output_swap_amounts_include_known_output_amounts() {
+		let mut mock_pricing = MockPricingInterface::new();
+		mock_pricing
+			.expect_convert_asset()
+			.returning(|from, to, amount| {
+				let from = from.to_string();
+				let to = to.to_string();
+				let amount_f64: f64 = amount.parse().unwrap_or(0.0);
+				Box::pin(async move {
+					match (from.as_str(), to.as_str()) {
+						("USDC", "USD") => Ok(amount_f64.to_string()),
+						("USD", "ETH") => Ok((amount_f64 / ETH_USD_PRICE).to_string()),
+						_ => Ok(amount_f64.to_string()),
+					}
+				})
+			});
+
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
+		let delivery = create_mock_delivery_service();
+		let mut networks = create_test_networks_config();
+		networks.get_mut(&1).expect("chain 1 test network").tokens[0].address =
+			solver_types::Address(
+				address!("A0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C")
+					.0
+					.to_vec(),
+			);
+		let dest_token = &mut networks
+			.get_mut(&137)
+			.expect("chain 137 test network")
+			.tokens[0];
+		dest_token.address = solver_types::Address(
+			address!("B0b86a33E6441b8C6A7f4C5C1C5C5C5C5C5C5C5C")
+				.0
+				.to_vec(),
+		);
+		dest_token.symbol = "USDC".to_string();
+		dest_token.decimals = 6;
+		let token_manager = Arc::new(TokenManager::new(
+			networks,
+			delivery.clone(),
+			create_mock_account_service(),
+		));
+		let storage = Arc::new(StorageService::new(Box::new(MockStorageInterface::new())));
+		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let request = create_test_request(false);
+		let context = create_test_validated_context(false);
+		let decimals = service.get_all_token_decimals(&request).await;
+		let output_asset = request.intent.outputs[0].asset.clone();
+		let input_asset = request.intent.inputs[0].asset.clone();
+		let expected_output_amount = U256::from_str("2000000000").unwrap();
+
+		let amounts = service
+			.calculate_swap_amounts(&request, &context, &decimals, 0)
+			.await
+			.expect("ExactOutput amounts should calculate");
+
+		assert_eq!(
+			amounts.get(&output_asset).map(|info| info.amount),
+			Some(expected_output_amount),
+			"ExactOutput resolved amounts must include the known output amount"
+		);
+		assert!(
+			amounts.contains_key(&input_asset),
+			"ExactOutput should still include the calculated input amount"
+		);
 	}
 
 	#[test]
