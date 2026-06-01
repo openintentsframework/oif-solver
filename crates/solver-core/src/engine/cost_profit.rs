@@ -1122,6 +1122,128 @@ impl CostProfitService {
 			.await
 	}
 
+	/// Performs cheap local validation that must happen before fill simulation.
+	///
+	/// This avoids spending RPC capacity on `eth_estimateGas` for orders whose
+	/// assets or callback payloads are known locally to be unsupported.
+	pub async fn validate_before_fill_simulation(
+		&self,
+		order: &Order,
+		config: &Config,
+	) -> Result<(), CostProfitError> {
+		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
+			error_type: ApiErrorType::InvalidRequest,
+			message: format!("Failed to parse order data: {e}"),
+			details: None,
+		})?;
+
+		let available_inputs = order_parsed.parse_available_inputs();
+		let requested_outputs = order_parsed.parse_requested_outputs();
+
+		for input in &available_inputs {
+			let chain_id = input.asset.ethereum_chain_id().map_err(|e| {
+				CostProfitError::Calculation(format!("Failed to get input chain ID: {e}"))
+			})?;
+			let ethereum_addr = input.asset.ethereum_address().map_err(|e| {
+				CostProfitError::Calculation(format!("Failed to get input token address: {e}"))
+			})?;
+			let token_address = Address(ethereum_addr.0.to_vec());
+			self.token_manager
+				.get_token_info(chain_id, &token_address)
+				.await?;
+		}
+
+		for output in &requested_outputs {
+			let chain_id = output.asset.ethereum_chain_id().map_err(|e| {
+				CostProfitError::Calculation(format!("Failed to get output chain ID: {e}"))
+			})?;
+			let ethereum_addr = output.asset.ethereum_address().map_err(|e| {
+				CostProfitError::Calculation(format!("Failed to get output token address: {e}"))
+			})?;
+			let token_address = Address(ethereum_addr.0.to_vec());
+			self.token_manager
+				.get_token_info(chain_id, &token_address)
+				.await?;
+
+			Self::validate_callback_calldata(output.calldata.as_deref())?;
+		}
+
+		Self::validate_callback_policy_before_simulation(&requested_outputs, config)
+	}
+
+	fn validate_callback_calldata(calldata: Option<&str>) -> Result<(), CostProfitError> {
+		let Some(calldata) = calldata else {
+			return Ok(());
+		};
+		let hex_payload = calldata.strip_prefix("0x").unwrap_or(calldata);
+		if hex_payload.is_empty() {
+			return Ok(());
+		}
+		if hex_payload.len() % 2 != 0 {
+			return Err(CostProfitError::Calculation(
+				"Output callbackData must be valid hex".to_string(),
+			));
+		}
+		let byte_len = hex_payload.len() / 2;
+		if byte_len > u16::MAX as usize {
+			return Err(CostProfitError::Calculation(format!(
+				"Output callbackData is too large: {byte_len} bytes exceeds {} byte limit",
+				u16::MAX
+			)));
+		}
+		alloy_primitives::hex::decode(hex_payload).map_err(|e| {
+			CostProfitError::Calculation(format!("Output callbackData must be valid hex: {e}"))
+		})?;
+		Ok(())
+	}
+
+	fn validate_callback_policy_before_simulation(
+		outputs: &[OrderOutput],
+		config: &Config,
+	) -> Result<(), CostProfitError> {
+		for output in outputs {
+			let has_callback = output
+				.calldata
+				.as_ref()
+				.is_some_and(|c| !c.is_empty() && c != "0x");
+			if !has_callback {
+				continue;
+			}
+
+			if !config.order.simulate_callbacks {
+				return Err(CostProfitError::Config(
+					"Order has callback data but callback simulation is disabled. \
+					Callbacks are not supported when simulate_callbacks = false in config."
+						.to_string(),
+				));
+			}
+
+			let recipient_interop_hex = output.receiver.to_hex().to_lowercase();
+			let output_chain_id = output.receiver.ethereum_chain_id().map_err(|e| {
+				CostProfitError::Config(format!("Failed to extract chain ID from recipient: {e}"))
+			})?;
+			let recipient_eth_address = output
+				.receiver
+				.ethereum_address()
+				.map(|addr| format!("0x{}", alloy_primitives::hex::encode(addr)))
+				.unwrap_or_else(|_| "unknown".to_string());
+
+			let is_whitelisted = config
+				.order
+				.callback_whitelist
+				.iter()
+				.any(|entry| entry.to_lowercase() == recipient_interop_hex);
+
+			if !is_whitelisted {
+				return Err(CostProfitError::Config(format!(
+					"Callback recipient {recipient_eth_address} on chain {output_chain_id} not in whitelist. Add '{recipient_interop_hex}' to order.callback_whitelist in config (EIP-7930 format)"
+				)));
+			}
+		}
+
+		Ok(())
+	}
+
 	/// Estimates the cost for an order with an optional simulated fill gas override.
 	///
 	/// When `simulated_fill_gas` is provided (from `eth_estimateGas`), it will be used
