@@ -17,9 +17,11 @@ use alloy_primitives::{Address as AlloyAddress, U256};
 use futures::future::try_join_all;
 use solver_core::SolverEngine;
 use solver_types::{
+	standards::eip7683::{MAX_STANDARD_ORDER_INPUTS, MAX_STANDARD_ORDER_OUTPUTS},
 	AuthScheme, CostContext, GetQuoteRequest, IntentRequest, IntentType, InteropAddress,
 	NetworksConfig, QuoteError, SwapType, ValidatedQuoteContext,
 };
+use std::collections::HashSet;
 
 /// Main validator for quote requests.
 ///
@@ -71,6 +73,16 @@ impl QuoteValidator {
 			return Err(QuoteError::InvalidRequest(
 				"inputs and outputs are required".to_string(),
 			));
+		}
+		if intent.inputs.len() > MAX_STANDARD_ORDER_INPUTS {
+			return Err(QuoteError::InvalidRequest(format!(
+				"Too many inputs: maximum supported is {MAX_STANDARD_ORDER_INPUTS}"
+			)));
+		}
+		if intent.outputs.len() > MAX_STANDARD_ORDER_OUTPUTS {
+			return Err(QuoteError::InvalidRequest(format!(
+				"Too many outputs: maximum supported is {MAX_STANDARD_ORDER_OUTPUTS}"
+			)));
 		}
 
 		for input in &intent.inputs {
@@ -290,9 +302,28 @@ impl QuoteValidator {
 			));
 		}
 
+		let origin_chains: HashSet<u64> = request
+			.intent
+			.inputs
+			.iter()
+			.map(|input| Self::chain_id_from_interop(&input.asset))
+			.collect::<Result<_, _>>()?;
+		let mut seen_output_chains = HashSet::new();
+
 		// Validate all outputs are on supported destination chains
 		for output in &request.intent.outputs {
 			let chain_id = Self::chain_id_from_interop(&output.asset)?;
+			if origin_chains.contains(&chain_id) {
+				return Err(QuoteError::UnsupportedAsset(format!(
+					"Chain {chain_id} targets an origin chain; same-chain outputs are unsupported"
+				)));
+			}
+			if !seen_output_chains.insert(chain_id) {
+				return Err(QuoteError::UnsupportedAsset(format!(
+					"duplicate output chain {chain_id}; multi-output to the same chain is unsupported"
+				)));
+			}
+
 			let is_dest = networks
 				.get(&chain_id)
 				.is_some_and(|net| !net.output_settler_address.0.is_empty());
@@ -1465,7 +1496,7 @@ mod tests {
 	}
 
 	#[test]
-	fn test_validate_supported_networks_success_same_chain_input_output() {
+	fn test_validate_supported_networks_fails_same_chain_input_output() {
 		// Test: Input and output on same chain with both settlers configured
 		let mut networks = HashMap::new();
 		networks.insert(1u64, create_network_config(false, false)); // Chain 1: both settlers
@@ -1474,14 +1505,77 @@ mod tests {
 
 		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
-			result.is_ok(),
-			"Should accept same-chain swaps when both settlers configured: {result:?}"
+			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("same-chain outputs are unsupported")),
+			"Should reject same-chain swaps even when both settlers are configured: {result:?}"
+		);
+	}
+
+	#[test]
+	fn test_validate_intent_structure_rejects_too_many_inputs() {
+		let mut intent = create_exact_input_request(Some("1000000000000000000"), None);
+		let input = intent.inputs[0].clone();
+		intent.inputs = vec![input; 17];
+
+		let result = QuoteValidator::validate_intent_structure(&intent);
+
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("Too many inputs")),
+			"expected input cap error, got {result:?}"
+		);
+	}
+
+	#[test]
+	fn test_validate_intent_structure_rejects_too_many_outputs() {
+		let mut intent = create_exact_input_request(Some("1000000000000000000"), None);
+		let output = intent.outputs[0].clone();
+		intent.outputs = vec![output; 17];
+
+		let result = QuoteValidator::validate_intent_structure(&intent);
+
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("Too many outputs")),
+			"expected output cap error, got {result:?}"
+		);
+	}
+
+	#[test]
+	fn test_validate_supported_networks_rejects_same_chain_output() {
+		let mut networks = HashMap::new();
+		networks.insert(1u64, create_network_config(false, false));
+
+		let request = create_request_with_chains(1, 1);
+
+		let result = QuoteValidator::validate_supported_networks(&request, &networks);
+
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("same-chain outputs are unsupported")),
+			"expected same-chain rejection, got {result:?}"
+		);
+	}
+
+	#[test]
+	fn test_validate_supported_networks_rejects_duplicate_output_chain() {
+		let mut networks = HashMap::new();
+		networks.insert(1u64, create_network_config(false, false));
+		networks.insert(137u64, create_network_config(false, false));
+
+		let mut request = create_request_with_chains(1, 137);
+		request
+			.intent
+			.outputs
+			.push(request.intent.outputs[0].clone());
+
+		let result = QuoteValidator::validate_supported_networks(&request, &networks);
+
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("duplicate output chain")),
+			"expected duplicate output-chain rejection, got {result:?}"
 		);
 	}
 
 	#[test]
 	fn test_validate_supported_networks_fails_same_chain_missing_settlers() {
-		// Test: Input and output on same chain but missing required settlers
+		// Test: Input and output on same chain are rejected before settler checks
 		let mut networks = HashMap::new();
 		networks.insert(1u64, create_network_config(false, true)); // Chain 1: no output settler
 
@@ -1489,8 +1583,8 @@ mod tests {
 
 		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
-			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Chain 1 not supported as destination")),
-			"Should reject same-chain swaps when output settler missing: {result:?}"
+			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("same-chain outputs are unsupported")),
+			"Should reject same-chain swaps before output settler checks: {result:?}"
 		);
 	}
 
@@ -1506,7 +1600,11 @@ mod tests {
 
 		let result = QuoteValidator::validate_supported_networks(&request, &networks);
 		assert!(
-			result.is_ok() || matches!(result, Err(QuoteError::InvalidRequest(_))),
+			result.is_ok()
+				|| matches!(
+					result,
+					Err(QuoteError::InvalidRequest(_) | QuoteError::UnsupportedAsset(_))
+				),
 			"Should handle address parsing appropriately: {result:?}"
 		);
 	}

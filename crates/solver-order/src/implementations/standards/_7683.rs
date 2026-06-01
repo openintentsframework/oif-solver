@@ -16,7 +16,7 @@ use solver_types::{
 			IInputSettlerCompact, IInputSettlerEscrow, IOutputSettlerSimple, SolMandateOutput,
 			SolveParams, StandardOrder,
 		},
-		GasLimitOverrides, LockType,
+		GasLimitOverrides, LockType, MAX_STANDARD_ORDER_INPUTS, MAX_STANDARD_ORDER_OUTPUTS,
 	},
 	utils::conversion::hex_to_alloy_address,
 	Address, ConfigSchema, Eip7683OrderData, ExecutionParams, FillProof, NetworksConfig, Order,
@@ -601,6 +601,16 @@ impl OrderInterface for Eip7683OrderImpl {
 			return Err(OrderError::ValidationFailed(
 				"order has no outputs".to_string(),
 			));
+		}
+		if standard_order.inputs.len() > MAX_STANDARD_ORDER_INPUTS {
+			return Err(OrderError::ValidationFailed(format!(
+				"too many inputs: maximum supported is {MAX_STANDARD_ORDER_INPUTS}"
+			)));
+		}
+		if standard_order.outputs.len() > MAX_STANDARD_ORDER_OUTPUTS {
+			return Err(OrderError::ValidationFailed(format!(
+				"too many outputs: maximum supported is {MAX_STANDARD_ORDER_OUTPUTS}"
+			)));
 		}
 
 		// Per-output shape and settler validation.
@@ -1586,6 +1596,45 @@ mod tests {
 		let err = result.unwrap_err().to_string();
 		assert!(
 			err.contains("order has no outputs"),
+			"unexpected error message: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_rejects_too_many_inputs() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		standard_order.inputs = vec![[U256::from(100), U256::from(200)]; 17];
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(result.is_err(), "expected input count cap to reject");
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("too many inputs"),
+			"unexpected error message: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_rejects_too_many_outputs_before_duplicate_check() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		let output = standard_order.outputs[0].clone();
+		standard_order.outputs = vec![output; 17];
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(result.is_err(), "expected output count cap to reject");
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("too many outputs"),
 			"unexpected error message: {err}"
 		);
 	}
