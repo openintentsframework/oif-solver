@@ -736,6 +736,7 @@ impl CostProfitService {
 
 		let settlement_fee_wei = match self.build_post_fill_fee_params_for_quote(
 			request,
+			context,
 			&swap_amounts_with_info,
 			config,
 		)? {
@@ -759,6 +760,7 @@ impl CostProfitService {
 			match self
 				.build_post_fill_tx_for_quote(
 					request,
+					context,
 					&swap_amounts_with_info,
 					config,
 					solver_address,
@@ -1713,6 +1715,46 @@ impl CostProfitService {
 		}
 	}
 
+	fn resolve_quote_output_amount(
+		request: &GetQuoteRequest,
+		context: &ValidatedQuoteContext,
+		resolved_amounts: &std::collections::HashMap<InteropAddress, TokenAmountInfo>,
+		output: &solver_types::QuoteOutput,
+		dest_chain_id: u64,
+		caller: &str,
+	) -> Result<U256, APIError> {
+		if let Some(info) = resolved_amounts.get(&output.asset) {
+			return Ok(info.amount);
+		}
+
+		if let Some(known_outputs) = &context.known_outputs {
+			if let Some((_, amount)) = known_outputs.iter().find(|(known_output, _)| {
+				known_output.asset == output.asset && known_output.receiver == output.receiver
+			}) {
+				return Ok(*amount);
+			}
+
+			if request.intent.outputs.len() == 1 && known_outputs.len() == 1 {
+				return Ok(known_outputs[0].1);
+			}
+		}
+
+		if let Some(amount) = output.amount.as_deref() {
+			return U256::from_str(amount).map_err(|e| APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: format!("Output amount is not a valid integer: {e}"),
+				details: None,
+			});
+		}
+
+		Err(APIError::InternalServerError {
+			error_type: ApiErrorType::InternalError,
+			message: format!(
+				"Missing output amount for asset on chain {dest_chain_id}; {caller} must run after calculate_swap_amounts or receive exact-output context"
+			),
+		})
+	}
+
 	/// Build a synthetic fill `Transaction` from a resolved quote request, suitable
 	/// for `eth_estimateGas` against the destination chain's OutputSettler.
 	///
@@ -1739,7 +1781,7 @@ impl CostProfitService {
 	async fn build_fill_tx_for_quote(
 		&self,
 		request: &GetQuoteRequest,
-		_context: &ValidatedQuoteContext,
+		context: &ValidatedQuoteContext,
 		resolved_amounts: &std::collections::HashMap<InteropAddress, TokenAmountInfo>,
 		config: &Config,
 		solver_address: &Address,
@@ -1781,16 +1823,14 @@ impl CostProfitService {
 		// errors. Do NOT silently encode a zero amount; that would make
 		// estimateGas return a misleadingly low value and reintroduce the
 		// quote/validator divergence we're trying to eliminate.
-		let amount: U256 = resolved_amounts
-			.get(&output.asset)
-			.map(|info| info.amount)
-			.ok_or_else(|| APIError::InternalServerError {
-				error_type: ApiErrorType::InternalError,
-				message: format!(
-					"Missing resolved swap amount for output asset on chain {chain_id}; \
-					build_fill_tx_for_quote must run after calculate_swap_amounts"
-				),
-			})?;
+		let amount = Self::resolve_quote_output_amount(
+			request,
+			context,
+			resolved_amounts,
+			output,
+			chain_id,
+			"build_fill_tx_for_quote",
+		)?;
 
 		// Left-pad / right-align: 20-byte address occupies bytes32[12..32], the
 		// leading 12 bytes are zero. Mirrors the convention used in
@@ -1891,6 +1931,7 @@ impl CostProfitService {
 	fn build_post_fill_fee_params_for_quote(
 		&self,
 		request: &GetQuoteRequest,
+		context: &ValidatedQuoteContext,
 		resolved_amounts: &std::collections::HashMap<InteropAddress, TokenAmountInfo>,
 		config: &Config,
 	) -> Result<Option<solver_settlement::PostFillFeeParams>, APIError> {
@@ -1918,16 +1959,14 @@ impl CostProfitService {
 				message: format!("Failed to derive destination chain id: {e}"),
 				details: None,
 			})?;
-		let amount = resolved_amounts
-			.get(&output.asset)
-			.map(|info| info.amount)
-			.ok_or_else(|| APIError::InternalServerError {
-				error_type: ApiErrorType::InternalError,
-				message: format!(
-					"Missing resolved swap amount for output asset on chain {dest_chain_id}; \
-					settlement fee quote must run after calculate_swap_amounts"
-				),
-			})?;
+		let amount = Self::resolve_quote_output_amount(
+			request,
+			context,
+			resolved_amounts,
+			output,
+			dest_chain_id,
+			"settlement fee quote",
+		)?;
 		let source_settler = config
 			.networks
 			.get(&dest_chain_id)
@@ -2076,6 +2115,7 @@ impl CostProfitService {
 	async fn build_post_fill_tx_for_quote(
 		&self,
 		request: &GetQuoteRequest,
+		context: &ValidatedQuoteContext,
 		resolved_amounts: &std::collections::HashMap<InteropAddress, TokenAmountInfo>,
 		config: &Config,
 		solver_address: &Address,
@@ -2145,16 +2185,14 @@ impl CostProfitService {
 			})?;
 		let output_settler = network.output_settler_address.clone();
 
-		let amount: U256 = resolved_amounts
-			.get(&output.asset)
-			.map(|info| info.amount)
-			.ok_or_else(|| APIError::InternalServerError {
-				error_type: ApiErrorType::InternalError,
-				message: format!(
-					"Missing resolved swap amount for output asset on chain {dest_chain_id}; \
-					build_post_fill_tx_for_quote must run after calculate_swap_amounts"
-				),
-			})?;
+		let amount = Self::resolve_quote_output_amount(
+			request,
+			context,
+			resolved_amounts,
+			output,
+			dest_chain_id,
+			"build_post_fill_tx_for_quote",
+		)?;
 
 		let token_addr = output
 			.asset
@@ -6482,18 +6520,31 @@ mod tests {
 		config
 	}
 
-	/// Like `config_for_live_estimate(false)` but with chain 137 dropped
-	/// from `config.networks`. `build_post_fill_tx_for_quote` then errors
-	/// at the `Network <id> not configured` branch and the call site
-	/// emits `outcome=skipped_build_tx`.
+	/// Like `config_for_live_estimate(false)` but with a malformed Hyperlane
+	/// output oracle on chain 137. Fee-param construction still succeeds because
+	/// the destination network remains configured; only `build_post_fill_tx_for_quote`
+	/// errors, and the call site emits `outcome=skipped_build_tx`.
 	///
 	/// The upstream cost calc still resolves because `calculate_swap_amounts`
 	/// reads token info via the `TokenManager`, which carries its own
-	/// per-test networks — `config.networks` is only consulted by the
-	/// post-fill builder.
-	fn config_missing_dest_network_for_post_fill() -> Config {
+	/// per-test networks.
+	fn config_malformed_output_oracle_for_post_fill() -> Config {
 		let mut config = config_for_live_estimate(false);
-		config.networks.remove(&137);
+		config.settlement.implementations.insert(
+			"hyperlane".to_string(),
+			serde_json::json!({
+				"oracles": {
+					"input": {
+						"1": ["0x1111111111111111111111111111111111111111"],
+						"137": ["0x2222222222222222222222222222222222222222"]
+					},
+					"output": {
+						"1": ["0x1111111111111111111111111111111111111111"],
+						"137": ["not-an-address"]
+					}
+				}
+			}),
+		);
 		config.gas = Some(solver_config::GasConfig {
 			flows: HashMap::from([(
 				"permit2_escrow".to_string(),
@@ -6613,8 +6664,8 @@ mod tests {
 			"outcome field mismatch: {captured:#?}",
 		);
 
-		// Case 3: SKIPPED_BUILD_TX — chain enabled, but dest network missing
-		// from `config.networks` so `build_post_fill_tx_for_quote` errors.
+		// Case 3: SKIPPED_BUILD_TX — chain enabled, but Hyperlane output oracle
+		// malformed so `build_post_fill_tx_for_quote` errors.
 		let captured = capture_post_fill_events(|| {
 			let request = request.clone();
 			let context = context.clone();
@@ -6622,7 +6673,7 @@ mod tests {
 			async move {
 				let (service, _, _) =
 					cost_profit_service_for_post_fill_override(None, Some(5_000_000));
-				let config = config_missing_dest_network_for_post_fill();
+				let config = config_malformed_output_oracle_for_post_fill();
 				let _ = service
 					.calculate_cost_context_for_flow_keys(
 						&request,
@@ -6783,6 +6834,31 @@ mod tests {
 			U256::from(1_000_000u64),
 			"builder must use resolved amount, not the stale request value"
 		);
+	}
+
+	#[test]
+	fn exact_output_post_fill_fee_params_use_known_output_amount() {
+		let config = config_with_output_settler_on_dest(QUOTE_OUTPUT_SETTLER);
+		let request = create_test_request(false);
+		let context = create_test_validated_context(false);
+		let input_asset = request.intent.inputs[0].asset.clone();
+		let mut resolved = HashMap::new();
+		resolved.insert(
+			input_asset.clone(),
+			TokenAmountInfo {
+				token: input_asset,
+				amount: U256::from(1_000_000_000_000_000_000u128),
+				decimals: 18,
+			},
+		);
+		let service = cost_profit_service_no_delivery_chains();
+
+		let params = service
+			.build_post_fill_fee_params_for_quote(&request, &context, &resolved, &config)
+			.expect("exact-output fee params should use known output amount")
+			.expect("quote has a post-fill output");
+
+		assert_eq!(params.output_amount, U256::from_str("2000000000").unwrap());
 	}
 
 	// ----- Task 5: validator honors stored cost_breakdown for quoted orders ---

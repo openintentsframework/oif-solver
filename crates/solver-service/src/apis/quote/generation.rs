@@ -2021,6 +2021,9 @@ mod tests {
 				.expect_select_oracle()
 				.returning(|oracles, _context| oracles.first().cloned());
 		}
+		mock_settlement
+			.expect_quote_post_fill_fee()
+			.returning(|_| Box::pin(async { Ok(None) }));
 
 		let mut implementations: HashMap<String, Box<dyn SettlementInterface>> = HashMap::new();
 		implementations.insert("test".to_string(), Box::new(mock_settlement));
