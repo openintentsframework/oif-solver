@@ -56,14 +56,18 @@ impl ResettableNonceManager {
 		*entry
 	}
 
-	/// Replace the next-to-hand-out nonce for `address` exactly.
-	/// Use only after reading authoritative chain state; unlike
-	/// `set_next_nonce`, this may move the local cache backward to recover
-	/// from ghost broadcasts that advanced only the in-process counter.
+	/// Replace the next-to-hand-out nonce for `address` using authoritative
+	/// chain state, clamped by the local high-water mark. This avoids
+	/// reissuing a nonce already handed out by this process when multiple
+	/// same-signer submissions are in flight.
 	pub fn reset_next_nonce(&self, address: Address, next: u64) -> u64 {
 		let mut cache = self.cache.lock().expect("nonce cache mutex poisoned");
-		cache.insert(address, next);
-		next
+		let reset = cache
+			.get(&address)
+			.copied()
+			.map_or(next, |local| local.max(next));
+		cache.insert(address, reset);
+		reset
 	}
 
 	/// Reconcile the local next nonce with chain `pending`.
@@ -171,11 +175,16 @@ pub fn classify_submission_outcome(message: &str) -> SubmissionOutcome {
 	}
 
 	// 3. Definitely rejected pre-pool. Safe to roll back the cache.
+	let fee_cap_below_base_fee = lower.contains("max fee per gas less than block base fee")
+		|| lower.contains("fee cap less than block base fee")
+		|| lower.contains("max fee per gas below block base fee");
+
 	if lower.contains("insufficient funds")
 		|| lower.contains("transaction underpriced")
 		|| lower.contains("intrinsic gas too low")
 		|| lower.contains("exceeds block gas limit")
 		|| lower.contains("gas required exceeds")
+		|| fee_cap_below_base_fee
 		// Nonce upper-bound (the lower-bound `nonce too low` was handled above)
 		|| lower.contains("nonce too high")
 		// Signature / sender / chain pre-validation
@@ -287,19 +296,33 @@ mod tests {
 	}
 
 	#[test]
-	fn reset_next_nonce_can_recover_from_local_cache_ahead_of_chain() {
+	fn reset_next_nonce_does_not_reissue_locally_allocated_nonces() {
 		let mgr = ResettableNonceManager::new();
 		mgr.set_next_nonce(ADDR, 139);
 		assert_eq!(mgr.take_next(ADDR), Some(139));
 		assert_eq!(mgr.take_next(ADDR), Some(140));
 		assert_eq!(mgr.peek(ADDR), Some(141));
 
-		// Chain pending is still 139 because the locally handed-out txs were
-		// ghost broadcasts. A real resync must be allowed to move backward.
-		assert_eq!(mgr.reset_next_nonce(ADDR, 139), 139);
+		// Chain pending is still 139, but the local cache has already handed
+		// out nonces through 140. Rollback must not move below that local
+		// high-water mark or concurrent submitters can reissue an in-flight
+		// nonce.
+		assert_eq!(mgr.reset_next_nonce(ADDR, 139), 141);
 
-		assert_eq!(mgr.take_next(ADDR), Some(139));
-		assert_eq!(mgr.peek(ADDR), Some(140));
+		assert_eq!(mgr.take_next(ADDR), Some(141));
+		assert_eq!(mgr.peek(ADDR), Some(142));
+	}
+
+	#[test]
+	fn reset_next_nonce_preserves_local_high_water_when_chain_pending_lags() {
+		let mgr = ResettableNonceManager::new();
+		mgr.set_next_nonce(ADDR, 10);
+		assert_eq!(mgr.take_next(ADDR), Some(10));
+		assert_eq!(mgr.take_next(ADDR), Some(11));
+		assert_eq!(mgr.peek(ADDR), Some(12));
+
+		assert_eq!(mgr.reset_next_nonce(ADDR, 9), 12);
+		assert_eq!(mgr.peek(ADDR), Some(12));
 	}
 
 	#[test]
@@ -415,6 +438,18 @@ mod tests {
 		// Mixed case
 		assert_eq!(
 			classify_submission_outcome("ERROR: Insufficient Funds"),
+			DefinitelyRejected
+		);
+		assert_eq!(
+			classify_submission_outcome("max fee per gas less than block base fee"),
+			DefinitelyRejected
+		);
+		assert_eq!(
+			classify_submission_outcome("fee cap less than block base fee"),
+			DefinitelyRejected
+		);
+		assert_eq!(
+			classify_submission_outcome("max fee per gas below block base fee"),
 			DefinitelyRejected
 		);
 	}

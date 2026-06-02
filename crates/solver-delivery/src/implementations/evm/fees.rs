@@ -266,6 +266,12 @@ impl SolverEip1559Estimator {
 	}
 }
 
+pub(crate) fn clamp_legacy_gas_price_to_cap(gas_price: u128, policy: &ChainFeePolicy) -> u128 {
+	policy
+		.gas_price_cap
+		.map_or(gas_price, |cap| gas_price.min(cap))
+}
+
 /// Trait impl so `SolverEip1559Estimator` can be passed to alloy's
 /// `Eip1559Estimator::Custom(...)` if a future caller wants to use
 /// alloy's `estimate_eip1559_fees_with(...)` wrapper. Today our
@@ -571,6 +577,22 @@ mod tests {
 		// significantly exceed 2.5 gwei.
 		let est = estimator.estimate(10_000_000_000, &[vec![100_000_000u128]]);
 		assert!(est.max_fee_per_gas <= 2_500_000_000.max(est.max_priority_fee_per_gas));
+	}
+
+	#[test]
+	fn gas_price_cap_clamps_legacy_fallback_price() {
+		let policy = ChainFeePolicy {
+			speed: FeeSpeed::Fast,
+			min_priority_fee_per_gas: Some(100_000_000),
+			priority_fee_fallback: 100_000_000,
+			quote_cost_strategy: FeeCostStrategy::BufferedEffective125,
+			gas_price_cap: Some(2_500_000_000),
+		};
+
+		assert_eq!(
+			super::clamp_legacy_gas_price_to_cap(10_000_000_000, &policy),
+			2_500_000_000
+		);
 	}
 
 	#[test]

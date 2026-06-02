@@ -4,7 +4,7 @@
 //! supporting blockchain transaction submission and monitoring using the Alloy library.
 
 use crate::implementations::evm::fees::{
-	FeePolicyConfig, FeePolicyRegistry, SolverEip1559Estimator,
+	clamp_legacy_gas_price_to_cap, FeePolicyConfig, FeePolicyRegistry, SolverEip1559Estimator,
 };
 // Re-import directly because the schema validator below builds a transient
 // `FeePolicyRegistry` purely to surface field-level wei-parse errors. Going
@@ -2712,13 +2712,15 @@ impl DeliveryInterface for AlloyDelivery {
 						"Failed to get fee history ({e}) and legacy gas price fallback ({gas_err})"
 					))
 				})?;
+				let capped_gp = clamp_legacy_gas_price_to_cap(gp, &policy);
 				tracing::warn!(
 					chain_id,
 					error = %e,
 					gas_price = gp,
+					capped_gas_price = capped_gp,
 					"Falling back to legacy gas price after feeHistory failure"
 				);
-				return Ok(FeeParams::legacy(chain_id, gp));
+				return Ok(FeeParams::legacy(chain_id, capped_gp));
 			},
 		};
 
@@ -2750,8 +2752,14 @@ impl DeliveryInterface for AlloyDelivery {
 						let gp = provider.get_gas_price().await.map_err(|e| {
 							DeliveryError::Network(format!("Failed to get legacy gas price: {e}"))
 						})?;
-						let params = FeeParams::legacy(chain_id, gp);
-						tracing::debug!(chain_id, gas_price = gp, "Resolved legacy fee params");
+						let capped_gp = clamp_legacy_gas_price_to_cap(gp, &policy);
+						let params = FeeParams::legacy(chain_id, capped_gp);
+						tracing::debug!(
+							chain_id,
+							gas_price = gp,
+							capped_gas_price = capped_gp,
+							"Resolved legacy fee params"
+						);
 						self.fee_params_cache
 							.insert(chain_id, params.clone(), now)
 							.await;
@@ -3891,7 +3899,7 @@ mod tests {
 	}
 
 	#[test]
-	fn apply_nonce_cache_action_rollback_with_pending_resets_cache() {
+	fn apply_nonce_cache_action_rollback_with_pending_preserves_high_water_cache() {
 		use NonceCacheAction::*;
 		let mgr = ResettableNonceManager::new();
 		let signer = Address::ZERO;
@@ -3901,10 +3909,10 @@ mod tests {
 		let after = apply_nonce_cache_action(&mgr, signer, AttemptRollback, Some(100));
 		assert_eq!(
 			after,
-			Some(100),
-			"cache must reset to authoritative pending"
+			Some(101),
+			"cache must not move below locally allocated high-water nonce"
 		);
-		assert_eq!(mgr.peek(signer), Some(100));
+		assert_eq!(mgr.peek(signer), Some(101));
 	}
 
 	#[test]
