@@ -61,6 +61,7 @@ use solver_types::{
 	api::PostOrderRequest,
 	bytes32_to_address, create_http_provider, current_timestamp, normalize_bytes32_address,
 	standards::eip7683::{
+		compact_signatures::decode_compact_signatures,
 		interfaces::{IInputSettlerCompact, IInputSettlerEscrow, SolMandateOutput, StandardOrder},
 		GasLimitOverrides, LockType, MandateOutput,
 	},
@@ -713,6 +714,22 @@ async fn handle_intent_submission(
 	// Derive lock type from the order
 	let lock_type = LockType::from(&request.order);
 
+	if matches!(lock_type, LockType::ResourceLock) {
+		if let Err(e) = decode_compact_signatures(&signature) {
+			tracing::warn!(error = %e, "Failed to decode Compact signature payload");
+			return (
+				StatusCode::BAD_REQUEST,
+				Json(IntentResponse {
+					order_id: None,
+					status: IntentResponseStatus::Rejected,
+					message: Some(e.to_string()),
+					order: order_json,
+				}),
+			)
+				.into_response();
+		}
+	}
+
 	// Convert to intent
 	match Eip7683OffchainDiscovery::order_to_intent(
 		&order,
@@ -962,7 +979,9 @@ impl crate::DiscoveryRegistry for Registry {}
 mod tests {
 	use super::*;
 	use alloy_primitives::{Address as AlloyAddress, Bytes, U256};
+	use axum::body;
 	use serde_json::json;
+	use solver_types::api::{OifOrder, OrderPayload, PostOrderRequest, SignatureType};
 	use solver_types::{
 		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
 		NetworksConfig,
@@ -999,6 +1018,82 @@ mod tests {
 			recipient: alloy_primitives::FixedBytes::from([0xbcu8; 32]),
 			callbackData: Bytes::new(),
 			context: Bytes::new(),
+		}
+	}
+
+	fn abi_word(value: usize) -> [u8; 32] {
+		let mut word = [0u8; 32];
+		word[24..32].copy_from_slice(&(value as u64).to_be_bytes());
+		word
+	}
+
+	fn padded_bytes(bytes: &[u8]) -> Vec<u8> {
+		let mut encoded = Vec::new();
+		encoded.extend_from_slice(&abi_word(bytes.len()));
+		encoded.extend_from_slice(bytes);
+		let padding = (32 - (bytes.len() % 32)) % 32;
+		encoded.extend(std::iter::repeat_n(0u8, padding));
+		encoded
+	}
+
+	fn shifted_compact_signature(valid_sponsor_sig: &[u8]) -> Bytes {
+		let fake_fixed_offset_tail = padded_bytes(valid_sponsor_sig);
+		let actual_sponsor_sig = vec![0x44u8; valid_sponsor_sig.len()];
+		let actual_sponsor_offset = 64 + fake_fixed_offset_tail.len();
+		let actual_sponsor_tail = padded_bytes(&actual_sponsor_sig);
+		let allocator_offset = actual_sponsor_offset + actual_sponsor_tail.len();
+
+		let mut shifted_payload = Vec::new();
+		shifted_payload.extend_from_slice(&abi_word(actual_sponsor_offset));
+		shifted_payload.extend_from_slice(&abi_word(allocator_offset));
+		shifted_payload.extend_from_slice(&fake_fixed_offset_tail);
+		shifted_payload.extend_from_slice(&actual_sponsor_tail);
+		shifted_payload.extend_from_slice(&padded_bytes(&[]));
+		Bytes::from(shifted_payload)
+	}
+
+	fn resource_lock_request_with_shifted_signature() -> PostOrderRequest {
+		let payload = OrderPayload {
+			signature_type: SignatureType::Eip712,
+			domain: json!({
+				"name": "BatchCompact",
+				"version": "1",
+				"chainId": "1",
+				"verifyingContract": "0x8888888888888888888888888888888888888888",
+			}),
+			primary_type: "BatchCompact".to_string(),
+			message: json!({
+				"sponsor": "0x1111111111111111111111111111111111111111",
+				"nonce": "1",
+				"expires": "1700000000",
+				"mandate": {
+					"fillDeadline": "1700000100",
+					"inputOracle": "0x2222222222222222222222222222222222222222",
+					"outputs": [{
+						"oracle": "0x6666666666666666666666666666666666666666666666666666666666666666",
+						"settler": "0x7777777777777777777777777777777777777777777777777777777777777777",
+						"chainId": "137",
+						"token": "0x4444444444444444444444444444444444444444444444444444444444444444",
+						"amount": "500",
+						"recipient": "0x5555555555555555555555555555555555555555555555555555555555555555",
+						"callbackData": "0x",
+						"context": "0x"
+					}]
+				},
+				"commitments": [{
+					"lockTag": "0xaaaaaaaaaaaaaaaaaaaaaaaa",
+					"token": "0x3333333333333333333333333333333333333333",
+					"amount": "1000"
+				}]
+			}),
+			types: None,
+		};
+
+		PostOrderRequest {
+			order: OifOrder::OifResourceLockV0 { payload },
+			signature: shifted_compact_signature(&[0x11u8; 65]),
+			quote_id: None,
+			origin_submission: None,
 		}
 	}
 
@@ -1272,10 +1367,44 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn test_handle_intent_submission_rejects_shifted_compact_signature() {
+		use axum::extract::State;
+		use axum::Json;
+
+		let (tx, _rx) = mpsc::unbounded_channel();
+		let state = ApiState {
+			intent_sender: tx,
+			providers: HashMap::new(),
+			networks: create_test_networks_config(),
+		};
+
+		let response = handle_intent_submission(
+			State(state),
+			Json(resource_lock_request_with_shifted_signature()),
+		)
+		.await
+		.into_response();
+
+		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+		let body_bytes = body::to_bytes(response.into_body(), usize::MAX)
+			.await
+			.expect("body");
+		let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).expect("parse body");
+		assert_eq!(
+			parsed.get("status").and_then(|v| v.as_str()),
+			Some("rejected")
+		);
+		assert!(parsed
+			.get("message")
+			.and_then(|v| v.as_str())
+			.unwrap_or_default()
+			.contains("Compact"));
+	}
+
+	#[tokio::test]
 	async fn test_handle_intent_submission_invalid_order() {
 		use axum::extract::State;
 		use axum::Json;
-		use solver_types::api::OifOrder;
 
 		let (tx, _rx) = mpsc::unbounded_channel();
 		let state = ApiState {

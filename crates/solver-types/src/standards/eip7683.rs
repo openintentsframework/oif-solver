@@ -4,6 +4,8 @@
 //! that are shared across the solver system. Updated to match the OIF
 //! contracts structure with StandardOrder and MandateOutput types.
 
+pub mod compact_signatures;
+
 use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
