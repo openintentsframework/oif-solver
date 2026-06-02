@@ -303,6 +303,7 @@ pub async fn handle_get_config(
 		solver: AdminSolverResponse {
 			min_profitability_pct: operator_config.solver.min_profitability_pct.to_string(),
 			gas_buffer_bps: operator_config.solver.gas_buffer_bps,
+			settlement_fee_buffer_bps: operator_config.solver.settlement_fee_buffer_bps,
 			commission_bps: operator_config.solver.commission_bps,
 			rate_buffer_bps: operator_config.solver.rate_buffer_bps,
 		},
@@ -934,6 +935,7 @@ async fn ensure_new_token_approvals(
 /// ```
 ///
 /// - `gasBufferBps`: Gas buffer in basis points (e.g., 1500 = 15%)
+/// - `settlementFeeBufferBps`: Native settlement fee buffer in basis points (e.g., 1000 = 10%)
 /// - `minProfitabilityPct`: Minimum profitability as decimal string (e.g., "2.5" for 2.5%)
 /// - `commissionBps`: Commission in basis points (e.g., 20 = 0.20%)
 /// - `rateBufferBps`: Rate buffer in basis points (e.g., 14 = 0.14%)
@@ -963,7 +965,15 @@ pub async fn handle_update_fees(
 		)));
 	}
 
-	// 2b. Validate commission_bps is reasonable (0-10000 = 0-100%)
+	// 2b. Validate settlement_fee_buffer_bps is reasonable (0-10000 = 0-100%)
+	if request.settlement_fee_buffer_bps > 10000 {
+		return Err(AdminAuthError::InvalidMessage(format!(
+			"Invalid settlementFeeBufferBps: {} exceeds maximum of 10000 (100%)",
+			request.settlement_fee_buffer_bps
+		)));
+	}
+
+	// 2c. Validate commission_bps is reasonable (0-10000 = 0-100%)
 	if request.commission_bps > 10000 {
 		return Err(AdminAuthError::InvalidMessage(format!(
 			"Invalid commissionBps: {} exceeds maximum of 10000 (100%)",
@@ -971,7 +981,7 @@ pub async fn handle_update_fees(
 		)));
 	}
 
-	// 2c. Validate rate_buffer_bps is reasonable (<10000 to avoid zero rate)
+	// 2d. Validate rate_buffer_bps is reasonable (<10000 to avoid zero rate)
 	if request.rate_buffer_bps >= 10000 {
 		return Err(AdminAuthError::InvalidMessage(format!(
 			"Invalid rateBufferBps: {} must be less than 10000",
@@ -985,6 +995,7 @@ pub async fn handle_update_fees(
 	// 4. Update fee configuration
 	let mut operator_config = versioned.data;
 	operator_config.solver.gas_buffer_bps = request.gas_buffer_bps;
+	operator_config.solver.settlement_fee_buffer_bps = request.settlement_fee_buffer_bps;
 	operator_config.solver.min_profitability_pct = min_profitability;
 	operator_config.solver.commission_bps = request.commission_bps;
 	operator_config.solver.rate_buffer_bps = request.rate_buffer_bps;
@@ -1009,6 +1020,7 @@ pub async fn handle_update_fees(
 	tracing::info!(
 		version = new_versioned.version,
 		gas_buffer_bps = request.gas_buffer_bps,
+		settlement_fee_buffer_bps = request.settlement_fee_buffer_bps,
 		commission_bps = request.commission_bps,
 		rate_buffer_bps = request.rate_buffer_bps,
 		min_profitability_pct = %request.min_profitability_pct,
@@ -1018,8 +1030,9 @@ pub async fn handle_update_fees(
 	Ok(Json(AdminActionResponse {
 		success: true,
 		message: format!(
-			"Fee configuration updated: gasBufferBps={}, minProfitabilityPct={}, commissionBps={}, rateBufferBps={}",
+			"Fee configuration updated: gasBufferBps={}, settlementFeeBufferBps={}, minProfitabilityPct={}, commissionBps={}, rateBufferBps={}",
 			request.gas_buffer_bps,
+			request.settlement_fee_buffer_bps,
 			request.min_profitability_pct,
 			request.commission_bps,
 			request.rate_buffer_bps
@@ -1037,6 +1050,7 @@ pub async fn handle_get_fees(State(state): State<AdminApiState>) -> Json<FeeConf
 	Json(FeeConfigResponse {
 		min_profitability_pct: config.solver.min_profitability_pct.to_string(),
 		gas_buffer_bps: config.solver.gas_buffer_bps,
+		settlement_fee_buffer_bps: config.solver.settlement_fee_buffer_bps,
 		commission_bps: config.solver.commission_bps,
 		rate_buffer_bps: config.solver.rate_buffer_bps,
 		monitoring_timeout_seconds: config.solver.monitoring_timeout_seconds,
@@ -1737,6 +1751,7 @@ mod tests {
 			solver: OperatorSolverConfig {
 				min_profitability_pct: rust_decimal::Decimal::ZERO,
 				gas_buffer_bps: 1000,
+				settlement_fee_buffer_bps: 1000,
 				commission_bps: 20,
 				rate_buffer_bps: 14,
 				monitoring_timeout_seconds: 60,
@@ -2752,8 +2767,97 @@ mod tests {
 		// ConfigBuilder default values
 		assert_eq!(response.min_profitability_pct, "0");
 		assert_eq!(response.gas_buffer_bps, 1000);
+		assert_eq!(response.settlement_fee_buffer_bps, 1000);
 		assert_eq!(response.commission_bps, 0); // Disabled by default for backward compatibility
 		assert_eq!(response.rate_buffer_bps, 14);
+	}
+
+	#[tokio::test]
+	#[serial]
+	async fn test_handle_update_fees_updates_settlement_fee_buffer() {
+		let _jwt_secret = strong_jwt_secret_guard();
+		let admin = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: false,
+			recipient_allowlist: vec![],
+		};
+		let mut operator_config = build_operator_config(admin, withdrawals);
+		operator_config.networks.insert(
+			1,
+			OperatorNetworkConfig {
+				chain_id: 1,
+				name: "chain-1".to_string(),
+				network_type: NetworkType::Parent,
+				tokens: vec![],
+				rpc_urls: vec![OperatorRpcEndpoint {
+					http: "http://localhost:8545".to_string(),
+					ws: None,
+				}],
+				input_settler_address: alloy_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: alloy_address("0x2222222222222222222222222222222222222222"),
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		operator_config.networks.insert(
+			137,
+			OperatorNetworkConfig {
+				chain_id: 137,
+				name: "chain-137".to_string(),
+				network_type: NetworkType::Hub,
+				tokens: vec![],
+				rpc_urls: vec![OperatorRpcEndpoint {
+					http: "http://localhost:8546".to_string(),
+					ws: None,
+				}],
+				input_settler_address: alloy_address("0x3333333333333333333333333333333333333333"),
+				output_settler_address: alloy_address("0x4444444444444444444444444444444444444444"),
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		let state = create_admin_state_with_operator_config(
+			operator_config,
+			create_delivery_service(None, false),
+		)
+		.await;
+		let state_for_assert = state.clone();
+
+		let response = handle_update_fees(
+			State(state),
+			VerifiedAdmin {
+				admin: solver_types::Address::from(admin),
+				contents: UpdateFeeConfigContents {
+					gas_buffer_bps: 1500,
+					settlement_fee_buffer_bps: 2500,
+					min_profitability_pct: "2.5".to_string(),
+					commission_bps: 20,
+					rate_buffer_bps: 14,
+					nonce: 1,
+					deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+				},
+			},
+		)
+		.await
+		.unwrap()
+		.0;
+
+		assert!(response.success);
+		assert!(response.message.contains("settlementFeeBufferBps=2500"));
+
+		let versioned = state_for_assert.config_store.get().await.unwrap();
+		assert_eq!(versioned.data.solver.settlement_fee_buffer_bps, 2500);
+		assert_eq!(
+			state_for_assert
+				.dynamic_config
+				.read()
+				.await
+				.solver
+				.settlement_fee_buffer_bps,
+			2500
+		);
 	}
 
 	#[tokio::test]
@@ -3039,6 +3143,7 @@ mod tests {
 		let response = FeeConfigResponse {
 			min_profitability_pct: "2.5".to_string(),
 			gas_buffer_bps: 1500,
+			settlement_fee_buffer_bps: 2500,
 			commission_bps: 20,
 			rate_buffer_bps: 14,
 			monitoring_timeout_seconds: 60,
@@ -3047,6 +3152,7 @@ mod tests {
 		let json = serde_json::to_string(&response).unwrap();
 		assert!(json.contains("\"minProfitabilityPct\":\"2.5\""));
 		assert!(json.contains("\"gasBufferBps\":1500"));
+		assert!(json.contains("\"settlementFeeBufferBps\":2500"));
 		assert!(json.contains("\"commissionBps\":20"));
 		assert!(json.contains("\"rateBufferBps\":14"));
 		assert!(json.contains("\"monitoringTimeoutSeconds\":60"));

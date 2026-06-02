@@ -70,15 +70,6 @@ sol! {
 			address source,
 			bytes[] calldata payloads
 		) external payable;
-
-		function quoteGasPayment(
-			uint32 destinationDomain,
-			address recipientOracle,
-			uint256 gasLimit,
-			bytes calldata customMetadata,
-			address source,
-			bytes[] calldata payloads
-		) external view returns (uint256);
 	}
 }
 
@@ -274,6 +265,8 @@ pub struct CostProfitService {
 	token_manager: Arc<TokenManager>,
 	/// Storage service for reading quotes
 	storage_service: Arc<StorageService>,
+	/// Settlement service for backend-owned native settlement fee quotes
+	settlement_service: Arc<solver_settlement::SettlementService>,
 }
 
 impl CostProfitService {
@@ -283,12 +276,14 @@ impl CostProfitService {
 		delivery_service: Arc<DeliveryService>,
 		token_manager: Arc<TokenManager>,
 		storage_service: Arc<StorageService>,
+		settlement_service: Arc<solver_settlement::SettlementService>,
 	) -> Self {
 		Self {
 			pricing_service,
 			delivery_service,
 			token_manager,
 			storage_service,
+			settlement_service,
 		}
 	}
 
@@ -739,6 +734,25 @@ impl CostProfitService {
 			}
 		}
 
+		let settlement_fee_wei = match self.build_post_fill_fee_params_for_quote(
+			request,
+			context,
+			&swap_amounts_with_info,
+			config,
+		)? {
+			Some(params) => self
+				.settlement_service
+				.quote_post_fill_fee_primary(&params)
+				.await
+				.map_err(|e| APIError::InternalServerError {
+					error_type: ApiErrorType::ServiceError,
+					message: format!("Failed to quote settlement fee: {e}"),
+				})?
+				.map(|quote| quote.fee_wei)
+				.unwrap_or(U256::ZERO),
+			None => U256::ZERO,
+		};
+
 		// Build the synthetic post-fill tx + override, then estimate.
 		// All branches log exactly ONE outcome event and yield Option<u64>.
 		// We never `return` — the rest of cost calc must run regardless.
@@ -746,9 +760,11 @@ impl CostProfitService {
 			match self
 				.build_post_fill_tx_for_quote(
 					request,
+					context,
 					&swap_amounts_with_info,
 					config,
 					solver_address,
+					settlement_fee_wei,
 				)
 				.await
 			{
@@ -876,6 +892,7 @@ impl CostProfitService {
 				origin_chain_id,
 				dest_chain_id,
 				&gas_units,
+				settlement_fee_wei,
 			)
 			.await?;
 
@@ -936,7 +953,10 @@ impl CostProfitService {
 		);
 		execution_costs_by_chain.insert(
 			dest_chain_id,
-			cost_breakdown.gas_fill + cost_breakdown.gas_post_fill,
+			cost_breakdown.gas_fill
+				+ cost_breakdown.gas_post_fill
+				+ cost_breakdown.settlement_fee
+				+ cost_breakdown.settlement_fee_buffer,
 		);
 
 		// Calculate adjusted amounts (swap amounts +/- costs based on swap type)
@@ -988,6 +1008,7 @@ impl CostProfitService {
 		})
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	pub async fn calculate_total_cost(
 		&self,
 		inputs: &[OrderInput],
@@ -996,6 +1017,7 @@ impl CostProfitService {
 		origin_chain_id: u64,
 		dest_chain_id: u64,
 		gas_units: &GasUnits,
+		settlement_fee_wei: U256,
 	) -> Result<CostBreakdown, CostProfitError> {
 		// Read gas_buffer_bps from solver config (hot-reloadable)
 		let gas_buffer_bps_value = config.solver.gas_buffer_bps;
@@ -1059,6 +1081,12 @@ impl CostProfitService {
 		// so keep this component at zero to avoid double-charging.
 		let rate_buffer = Decimal::ZERO;
 
+		let settlement_fee = self.wei_to_usd(&settlement_fee_wei).await?;
+		let settlement_fee_buffer_bps =
+			Decimal::new(config.solver.settlement_fee_buffer_bps as i64, 0);
+		let settlement_fee_buffer =
+			(settlement_fee * settlement_fee_buffer_bps) / Decimal::from(10000);
+
 		// Input and output valuations do not depend on each other.
 		let (total_input_value_usd, total_output_value_usd) = tokio::try_join!(
 			self.calculate_inputs_usd_value(inputs),
@@ -1087,6 +1115,8 @@ impl CostProfitService {
 				+ gas_fill + gas_post_fill
 				+ gas_pre_claim
 				+ gas_claim + gas_buffer
+				+ settlement_fee
+				+ settlement_fee_buffer
 				+ rate_buffer;
 
 		// Calculate subtotal (actual costs only, excluding profit)
@@ -1102,6 +1132,8 @@ impl CostProfitService {
 			gas_pre_claim,
 			gas_claim,
 			gas_buffer,
+			settlement_fee,
+			settlement_fee_buffer,
 			rate_buffer,
 			base_price,
 			min_profit,
@@ -1183,6 +1215,25 @@ impl CostProfitService {
 		let available_inputs = order_parsed.parse_available_inputs();
 		let requested_outputs = order_parsed.parse_requested_outputs();
 
+		let settlement_fee_wei = match self.build_post_fill_fee_params_for_order(
+			order,
+			&requested_outputs,
+			origin_chain_id,
+			dest_chain_id,
+		)? {
+			Some(params) => self
+				.settlement_service
+				.quote_post_fill_fee_for_order(order, &params)
+				.await
+				.map_err(|e| APIError::InternalServerError {
+					error_type: ApiErrorType::ServiceError,
+					message: format!("Failed to quote settlement fee: {e}"),
+				})?
+				.map(|quote| quote.fee_wei)
+				.unwrap_or(U256::ZERO),
+			None => U256::ZERO,
+		};
+
 		// Use the unified cost calculation method
 		let cost_breakdown = self
 			.calculate_total_cost(
@@ -1192,6 +1243,7 @@ impl CostProfitService {
 				origin_chain_id,
 				dest_chain_id,
 				&gas_units,
+				settlement_fee_wei,
 			)
 			.await?;
 
@@ -1663,6 +1715,46 @@ impl CostProfitService {
 		}
 	}
 
+	fn resolve_quote_output_amount(
+		request: &GetQuoteRequest,
+		context: &ValidatedQuoteContext,
+		resolved_amounts: &std::collections::HashMap<InteropAddress, TokenAmountInfo>,
+		output: &solver_types::QuoteOutput,
+		dest_chain_id: u64,
+		caller: &str,
+	) -> Result<U256, APIError> {
+		if let Some(info) = resolved_amounts.get(&output.asset) {
+			return Ok(info.amount);
+		}
+
+		if let Some(known_outputs) = &context.known_outputs {
+			if let Some((_, amount)) = known_outputs.iter().find(|(known_output, _)| {
+				known_output.asset == output.asset && known_output.receiver == output.receiver
+			}) {
+				return Ok(*amount);
+			}
+
+			if request.intent.outputs.len() == 1 && known_outputs.len() == 1 {
+				return Ok(known_outputs[0].1);
+			}
+		}
+
+		if let Some(amount) = output.amount.as_deref() {
+			return U256::from_str(amount).map_err(|e| APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: format!("Output amount is not a valid integer: {e}"),
+				details: None,
+			});
+		}
+
+		Err(APIError::InternalServerError {
+			error_type: ApiErrorType::InternalError,
+			message: format!(
+				"Missing output amount for asset on chain {dest_chain_id}; {caller} must run after calculate_swap_amounts or receive exact-output context"
+			),
+		})
+	}
+
 	/// Build a synthetic fill `Transaction` from a resolved quote request, suitable
 	/// for `eth_estimateGas` against the destination chain's OutputSettler.
 	///
@@ -1689,7 +1781,7 @@ impl CostProfitService {
 	async fn build_fill_tx_for_quote(
 		&self,
 		request: &GetQuoteRequest,
-		_context: &ValidatedQuoteContext,
+		context: &ValidatedQuoteContext,
 		resolved_amounts: &std::collections::HashMap<InteropAddress, TokenAmountInfo>,
 		config: &Config,
 		solver_address: &Address,
@@ -1731,16 +1823,14 @@ impl CostProfitService {
 		// errors. Do NOT silently encode a zero amount; that would make
 		// estimateGas return a misleadingly low value and reintroduce the
 		// quote/validator divergence we're trying to eliminate.
-		let amount: U256 = resolved_amounts
-			.get(&output.asset)
-			.map(|info| info.amount)
-			.ok_or_else(|| APIError::InternalServerError {
-				error_type: ApiErrorType::InternalError,
-				message: format!(
-					"Missing resolved swap amount for output asset on chain {chain_id}; \
-					build_fill_tx_for_quote must run after calculate_swap_amounts"
-				),
-			})?;
+		let amount = Self::resolve_quote_output_amount(
+			request,
+			context,
+			resolved_amounts,
+			output,
+			chain_id,
+			"build_fill_tx_for_quote",
+		)?;
 
 		// Left-pad / right-align: 20-byte address occupies bytes32[12..32], the
 		// leading 12 bytes are zero. Mirrors the convention used in
@@ -1838,21 +1928,198 @@ impl CostProfitService {
 		})
 	}
 
+	fn build_post_fill_fee_params_for_quote(
+		&self,
+		request: &GetQuoteRequest,
+		context: &ValidatedQuoteContext,
+		resolved_amounts: &std::collections::HashMap<InteropAddress, TokenAmountInfo>,
+		config: &Config,
+	) -> Result<Option<solver_settlement::PostFillFeeParams>, APIError> {
+		let Some(input) = request.intent.inputs.first() else {
+			return Ok(None);
+		};
+		let Some(output) = request.intent.outputs.first() else {
+			return Ok(None);
+		};
+
+		let origin_chain_id =
+			input
+				.asset
+				.ethereum_chain_id()
+				.map_err(|e| APIError::BadRequest {
+					error_type: ApiErrorType::MissingChainId,
+					message: format!("Failed to derive origin chain id: {e}"),
+					details: None,
+				})?;
+		let dest_chain_id = output
+			.asset
+			.ethereum_chain_id()
+			.map_err(|e| APIError::BadRequest {
+				error_type: ApiErrorType::MissingChainId,
+				message: format!("Failed to derive destination chain id: {e}"),
+				details: None,
+			})?;
+		let amount = Self::resolve_quote_output_amount(
+			request,
+			context,
+			resolved_amounts,
+			output,
+			dest_chain_id,
+			"settlement fee quote",
+		)?;
+		let source_settler = config
+			.networks
+			.get(&dest_chain_id)
+			.ok_or_else(|| APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: format!(
+					"Network {dest_chain_id} not configured; cannot quote settlement fee"
+				),
+				details: None,
+			})?
+			.output_settler_address
+			.clone();
+
+		let token_addr = output
+			.asset
+			.ethereum_address()
+			.map_err(|e| APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: format!("Output asset is not an EVM address: {e}"),
+				details: None,
+			})?;
+		let recipient_addr =
+			output
+				.receiver
+				.ethereum_address()
+				.map_err(|e| APIError::BadRequest {
+					error_type: ApiErrorType::InvalidRequest,
+					message: format!("Output receiver is not an EVM address: {e}"),
+					details: None,
+				})?;
+		let mut output_token = [0u8; 32];
+		output_token.copy_from_slice(
+			AlloyAddress::from_slice(token_addr.as_slice())
+				.into_word()
+				.as_slice(),
+		);
+		let mut output_recipient = [0u8; 32];
+		output_recipient.copy_from_slice(
+			AlloyAddress::from_slice(recipient_addr.as_slice())
+				.into_word()
+				.as_slice(),
+		);
+		let output_call = match output.calldata.as_deref() {
+			None => Vec::new(),
+			Some(s) if s.is_empty() || s == "0x" => Vec::new(),
+			Some(s) => alloy_primitives::hex::decode(s.trim_start_matches("0x")).map_err(|e| {
+				APIError::BadRequest {
+					error_type: ApiErrorType::InvalidRequest,
+					message: format!("Output calldata is not valid hex: {e}"),
+					details: None,
+				}
+			})?,
+		};
+
+		Ok(Some(solver_settlement::PostFillFeeParams {
+			origin_chain_id,
+			dest_chain_id,
+			output_token,
+			output_amount: amount,
+			output_recipient,
+			output_call,
+			source_settler,
+		}))
+	}
+
+	fn build_post_fill_fee_params_for_order(
+		&self,
+		order: &Order,
+		outputs: &[OrderOutput],
+		origin_chain_id: u64,
+		dest_chain_id: u64,
+	) -> Result<Option<solver_settlement::PostFillFeeParams>, APIError> {
+		let Some(output) = outputs.first() else {
+			return Ok(None);
+		};
+		let source_settler = order
+			.output_chains
+			.first()
+			.map(|chain| chain.settler_address.clone())
+			.ok_or_else(|| APIError::BadRequest {
+				error_type: ApiErrorType::MissingChainId,
+				message: "No output chain found".to_string(),
+				details: None,
+			})?;
+		let token_addr = output
+			.asset
+			.ethereum_address()
+			.map_err(|e| APIError::BadRequest {
+				error_type: ApiErrorType::InvalidRequest,
+				message: format!("Output asset is not an EVM address: {e}"),
+				details: None,
+			})?;
+		let recipient_addr =
+			output
+				.receiver
+				.ethereum_address()
+				.map_err(|e| APIError::BadRequest {
+					error_type: ApiErrorType::InvalidRequest,
+					message: format!("Output receiver is not an EVM address: {e}"),
+					details: None,
+				})?;
+		let mut output_token = [0u8; 32];
+		output_token.copy_from_slice(
+			AlloyAddress::from_slice(token_addr.as_slice())
+				.into_word()
+				.as_slice(),
+		);
+		let mut output_recipient = [0u8; 32];
+		output_recipient.copy_from_slice(
+			AlloyAddress::from_slice(recipient_addr.as_slice())
+				.into_word()
+				.as_slice(),
+		);
+		let output_call = match output.calldata.as_deref() {
+			None => Vec::new(),
+			Some(s) if s.is_empty() || s == "0x" => Vec::new(),
+			Some(s) => alloy_primitives::hex::decode(s.trim_start_matches("0x")).map_err(|e| {
+				APIError::BadRequest {
+					error_type: ApiErrorType::InvalidRequest,
+					message: format!("Output calldata is not valid hex: {e}"),
+					details: None,
+				}
+			})?,
+		};
+
+		Ok(Some(solver_settlement::PostFillFeeParams {
+			origin_chain_id,
+			dest_chain_id,
+			output_token,
+			output_amount: output.amount,
+			output_recipient,
+			output_call,
+			source_settler,
+		}))
+	}
+
 	/// Build a synthetic Hyperlane post-fill `submit(...)` transaction for
 	/// quote-time `eth_estimateGas`.
 	///
 	/// This mirrors `HyperlaneSettlement::generate_post_fill_transaction` for the
 	/// parts that determine gas units: selected output oracle, recipient input
 	/// oracle, source output settler, message gas limit, and fill-description
-	/// payload shape. It also performs the same `quoteGasPayment(...)` call and
-	/// attaches the resulting `value`, because some oracle deployments require
-	/// the payment even during `eth_estimateGas`.
+	/// payload shape. The caller supplies the settlement-owned fee quote as
+	/// transaction value, because some oracle deployments require the payment even
+	/// during `eth_estimateGas`.
 	async fn build_post_fill_tx_for_quote(
 		&self,
 		request: &GetQuoteRequest,
+		context: &ValidatedQuoteContext,
 		resolved_amounts: &std::collections::HashMap<InteropAddress, TokenAmountInfo>,
 		config: &Config,
 		solver_address: &Address,
+		settlement_fee_wei: U256,
 	) -> Result<Option<PostFillQuoteTx>, APIError> {
 		let Some(hyperlane_config) = hyperlane_config_for_quote(config) else {
 			return Ok(None);
@@ -1918,16 +2185,14 @@ impl CostProfitService {
 			})?;
 		let output_settler = network.output_settler_address.clone();
 
-		let amount: U256 = resolved_amounts
-			.get(&output.asset)
-			.map(|info| info.amount)
-			.ok_or_else(|| APIError::InternalServerError {
-				error_type: ApiErrorType::InternalError,
-				message: format!(
-					"Missing resolved swap amount for output asset on chain {dest_chain_id}; \
-					build_post_fill_tx_for_quote must run after calculate_swap_amounts"
-				),
-			})?;
+		let amount = Self::resolve_quote_output_amount(
+			request,
+			context,
+			resolved_amounts,
+			output,
+			dest_chain_id,
+			"build_post_fill_tx_for_quote",
+		)?;
 
 		let token_addr = output
 			.asset
@@ -2016,37 +2281,6 @@ impl CostProfitService {
 		let total_payload_size: usize = payloads.iter().map(|p| p.len()).sum();
 		let message_gas_limit = quote_hyperlane_message_gas_limit(total_payload_size);
 
-		let quote_call_data = IHyperlaneOracleForQuote::quoteGasPaymentCall {
-			destinationDomain: origin_chain_id as u32,
-			recipientOracle: alloy_primitives::Address::from_slice(&recipient_oracle.0),
-			gasLimit: message_gas_limit,
-			customMetadata: vec![].into(),
-			source: alloy_primitives::Address::from_slice(&output_settler.0),
-			payloads: payloads.clone().into_iter().map(Into::into).collect(),
-		};
-		let gas_payment = self
-			.delivery_service
-			.contract_call(
-				dest_chain_id,
-				Transaction {
-					to: Some(oracle_address.clone()),
-					data: quote_call_data.abi_encode(),
-					value: U256::ZERO,
-					chain_id: dest_chain_id,
-					nonce: None,
-					gas_limit: None,
-					gas_price: None,
-					max_fee_per_gas: None,
-					max_priority_fee_per_gas: None,
-				},
-			)
-			.await
-			.map_err(|e| APIError::InternalServerError {
-				error_type: ApiErrorType::ServiceError,
-				message: format!("Failed to quote Hyperlane post-fill gas payment: {e}"),
-			})?;
-		let gas_payment = U256::from_be_slice(gas_payment.as_ref());
-
 		let call_data = IHyperlaneOracleForQuote::submitCall {
 			destinationDomain: origin_chain_id as u32,
 			recipientOracle: alloy_primitives::Address::from_slice(&recipient_oracle.0),
@@ -2059,7 +2293,7 @@ impl CostProfitService {
 		let tx = Transaction {
 			to: Some(oracle_address),
 			data: call_data.abi_encode(),
-			value: gas_payment,
+			value: settlement_fee_wei,
 			chain_id: dest_chain_id,
 			nonce: None,
 			gas_limit: None,
@@ -2667,6 +2901,39 @@ mod tests {
 	const ETH_USD_PRICE: f64 = 4000.0;
 	const USDC_USD_PRICE: f64 = 1.0;
 
+	fn no_fee_settlement_service() -> Arc<solver_settlement::SettlementService> {
+		let mut mock = solver_settlement::MockSettlementInterface::new();
+		mock.expect_quote_post_fill_fee()
+			.returning(|_| Box::pin(async { Ok(None) }));
+		let mut implementations: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::new();
+		implementations.insert("mock".to_string(), Box::new(mock));
+		Arc::new(solver_settlement::SettlementService::new(
+			implementations,
+			"mock".to_string(),
+			1,
+		))
+	}
+
+	fn settlement_service_with_fee(
+		fee_wei: U256,
+		chain_id: u64,
+	) -> Arc<solver_settlement::SettlementService> {
+		let mut mock = solver_settlement::MockSettlementInterface::new();
+		mock.expect_quote_post_fill_fee().returning(move |_| {
+			let quote = solver_settlement::SettlementFeeQuote { fee_wei, chain_id };
+			Box::pin(async move { Ok(Some(quote)) })
+		});
+		let mut implementations: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::new();
+		implementations.insert("mock".to_string(), Box::new(mock));
+		Arc::new(solver_settlement::SettlementService::new(
+			implementations,
+			"mock".to_string(),
+			1,
+		))
+	}
+
 	fn create_test_networks_config() -> NetworksConfig {
 		let input_token = solver_types::utils::tests::builders::TokenConfigBuilder::new()
 			.address({
@@ -2702,10 +2969,15 @@ mod tests {
 
 	// Helper functions for creating test data
 	fn create_test_config() -> Config {
-		ConfigBuilder::new()
+		let mut config = ConfigBuilder::new()
 			.with_min_profitability_pct(Decimal::from_str("5.0").unwrap())
 			.rate_buffer_bps(0) // Disable rate buffer for tests with specific mock expectations
-			.build()
+			.networks(create_test_networks_config())
+			.build();
+		if let Some(gas) = config.gas.as_mut() {
+			gas.live_fill_estimate_enabled = false;
+		}
+		config
 	}
 	fn create_test_request(is_exact_input: bool) -> GetQuoteRequest {
 		GetQuoteRequest {
@@ -2818,6 +3090,8 @@ mod tests {
 			gas_pre_claim: Decimal::ZERO,
 			gas_claim: Decimal::from_str("0.01").unwrap(),
 			gas_buffer: Decimal::from_str("0.004").unwrap(),
+			settlement_fee: Decimal::ZERO,
+			settlement_fee_buffer: Decimal::ZERO,
 			rate_buffer: Decimal::ZERO,
 			base_price: Decimal::ZERO,
 			min_profit: Decimal::from_str("5.00").unwrap(),
@@ -2921,7 +3195,13 @@ mod tests {
 		let delivery = create_mock_delivery_service();
 		let token_manager = create_mock_token_manager();
 
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			settlement_service_with_fee(U256::from(1u64), 137),
+		);
 
 		// Act
 		let result = service.get_cost_context_by_quote_id("test_quote_123").await;
@@ -2954,7 +3234,13 @@ mod tests {
 		let delivery = create_mock_delivery_service();
 		let token_manager = create_mock_token_manager();
 
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		// Act
 		let result = service
@@ -3107,7 +3393,13 @@ mod tests {
 		// Create services
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let request = create_test_request(true); // true for ExactInput
 		let context = create_test_validated_context(true); // true for ExactInput
@@ -3119,7 +3411,7 @@ mod tests {
 			.await;
 
 		// Assert
-		assert!(result.is_ok());
+		assert!(result.is_ok(), "result: {result:?}");
 		let cost_context = result.unwrap();
 
 		// Verify swap type
@@ -3128,9 +3420,20 @@ mod tests {
 		// Verify cost breakdown exists and has reasonable values
 		assert!(cost_context.cost_breakdown.total >= Decimal::ZERO);
 		assert!(cost_context.cost_breakdown.operational_cost >= Decimal::ZERO);
+		assert!(cost_context.cost_breakdown.settlement_fee > Decimal::ZERO);
+		assert!(cost_context.cost_breakdown.settlement_fee_buffer > Decimal::ZERO);
 
 		// Verify execution costs by chain
 		assert!(!cost_context.execution_costs_by_chain.is_empty());
+		assert!(
+			cost_context
+				.execution_costs_by_chain
+				.get(&137)
+				.copied()
+				.unwrap_or_default()
+				>= cost_context.cost_breakdown.settlement_fee
+					+ cost_context.cost_breakdown.settlement_fee_buffer
+		);
 
 		// Verify swap amounts were calculated
 		assert!(!cost_context.swap_amounts.is_empty());
@@ -3262,7 +3565,13 @@ mod tests {
 			create_mock_account_service(),
 		));
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let request = create_test_request(true);
 		let context = create_test_validated_context(true);
@@ -3431,7 +3740,13 @@ mod tests {
 		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		// Create test request for ExactOutput
 		let request = create_test_request(false); // false for ExactOutput
@@ -3548,7 +3863,7 @@ mod tests {
 		let mut mock_pricing = MockPricingInterface::new();
 		mock_pricing
 			.expect_wei_to_currency()
-			.times(5)
+			.times(6)
 			.returning(|wei, _| {
 				let wei = wei.to_string();
 				Box::pin(async move { Ok(wei) })
@@ -3597,6 +3912,7 @@ mod tests {
 			delivery,
 			token_manager,
 			Arc::new(StorageService::new(Box::new(MockStorageInterface::new()))),
+			no_fee_settlement_service(),
 		);
 
 		let config = create_test_config();
@@ -3614,6 +3930,7 @@ mod tests {
 					pre_claim_units: 4,
 					claim_units: 5,
 				},
+				U256::from(10u64),
 			)
 			.await
 			.unwrap();
@@ -3624,7 +3941,9 @@ mod tests {
 		assert_eq!(breakdown.gas_pre_claim, Decimal::from(40));
 		assert_eq!(breakdown.gas_claim, Decimal::from(50));
 		assert_eq!(breakdown.gas_buffer, Decimal::from(60));
-		assert_eq!(breakdown.operational_cost, Decimal::from(660));
+		assert_eq!(breakdown.settlement_fee, Decimal::from(10));
+		assert_eq!(breakdown.settlement_fee_buffer, Decimal::from(1));
+		assert_eq!(breakdown.operational_cost, Decimal::from(671));
 	}
 
 	// ============================================================================
@@ -3723,6 +4042,8 @@ mod tests {
 			gas_pre_claim: Decimal::ZERO,
 			gas_claim: Decimal::from_str("0.01").unwrap(),
 			gas_buffer: Decimal::from_str("0.004").unwrap(),
+			settlement_fee: Decimal::ZERO,
+			settlement_fee_buffer: Decimal::ZERO,
 			rate_buffer: Decimal::ZERO,
 			base_price: Decimal::ZERO,
 			min_profit,
@@ -3814,7 +4135,13 @@ mod tests {
 	async fn test_validate_profitability_profitable_order() {
 		// Arrange
 		let (pricing, delivery, token_manager, storage) = setup_profitable_mocks().await;
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let order = create_profitable_order();
 		let cost_breakdown =
@@ -3846,7 +4173,13 @@ mod tests {
 	#[tokio::test]
 	async fn test_validate_profitability_unprofitable_order() {
 		let (pricing, delivery, token_manager, storage) = setup_unprofitable_mocks().await;
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let order = create_unprofitable_order();
 		let cost_breakdown =
@@ -3873,6 +4206,54 @@ mod tests {
 			} => {
 				assert_eq!(error_type, ApiErrorType::InsufficientProfitability);
 				assert!(message.contains("Insufficient profit margin"));
+			},
+			other => panic!("Expected UnprocessableEntity error, got: {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_validate_profitability_rejects_when_settlement_fee_erases_margin() {
+		let (pricing, delivery, token_manager, storage) = setup_profitable_mocks().await;
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
+
+		let order = create_profitable_order();
+		let mut cost_breakdown =
+			create_test_cost_breakdown_with_profit(Decimal::from_str("200.0").unwrap());
+		cost_breakdown.settlement_fee = Decimal::from_str("120.0").unwrap();
+		cost_breakdown.operational_cost += cost_breakdown.settlement_fee;
+		cost_breakdown.subtotal = cost_breakdown.operational_cost;
+		cost_breakdown.total = cost_breakdown.operational_cost;
+
+		// The order spread is $100. With the gas-only helper cost ($0.044), the
+		// order clears a 2% floor. Adding the settlement fee makes realized profit
+		// negative, so the gate must reject.
+		let result = service
+			.validate_profitability(
+				&order,
+				&cost_breakdown,
+				Decimal::from_str("2.0").unwrap(),
+				None,
+				"off-chain",
+			)
+			.await;
+
+		match result.unwrap_err() {
+			APIError::UnprocessableEntity {
+				error_type,
+				message,
+				details,
+			} => {
+				assert_eq!(error_type, ApiErrorType::InsufficientProfitability);
+				assert!(message.contains("Insufficient profit margin"));
+				let details = details.expect("profitability error should include details");
+				assert_eq!(details["operational_cost"], "$120.04");
+				assert_eq!(details["actual_profit"], "$-20.04");
 			},
 			other => panic!("Expected UnprocessableEntity error, got: {other:?}"),
 		}
@@ -3922,7 +4303,13 @@ mod tests {
 
 		let (pricing, delivery, token_manager, _) = setup_profitable_mocks().await;
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let order = create_profitable_order();
 		let cost_breakdown =
@@ -3986,7 +4373,13 @@ mod tests {
 
 		let (pricing, delivery, token_manager, _) = setup_profitable_mocks().await;
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let order = create_profitable_order();
 		let cost_breakdown =
@@ -4018,7 +4411,13 @@ mod tests {
 	async fn test_validate_profitability_onchain_intent() {
 		// Arrange
 		let (pricing, delivery, token_manager, storage) = setup_profitable_mocks().await;
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let order = create_profitable_order();
 		let cost_breakdown =
@@ -4047,7 +4446,13 @@ mod tests {
 	async fn test_validate_profitability_offchain_intent() {
 		// Arrange
 		let (pricing, delivery, token_manager, storage) = setup_profitable_mocks().await;
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let order = create_profitable_order();
 		let cost_breakdown =
@@ -4091,7 +4496,13 @@ mod tests {
 		let token_manager = create_mock_token_manager();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let order = create_zero_value_order();
 		let cost_breakdown =
@@ -4128,7 +4539,13 @@ mod tests {
 	async fn test_validate_profitability_order_parsing_failure() {
 		// Arrange
 		let (pricing, delivery, token_manager, storage) = setup_profitable_mocks().await;
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		// Create invalid order with malformed JSON
 		let mut invalid_order = create_profitable_order();
@@ -4188,7 +4605,13 @@ mod tests {
 		let token_manager = create_mock_token_manager();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let order = create_profitable_order();
 		let cost_breakdown =
@@ -4244,7 +4667,13 @@ mod tests {
 
 		let (pricing, delivery, token_manager, _) = setup_profitable_mocks().await;
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let order = create_profitable_order();
 		let cost_breakdown =
@@ -4271,7 +4700,13 @@ mod tests {
 	async fn test_validate_profitability_without_quote_context() {
 		// Arrange
 		let (pricing, delivery, token_manager, storage) = setup_profitable_mocks().await;
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let order = create_profitable_order();
 		let cost_breakdown =
@@ -4317,7 +4752,13 @@ mod tests {
 		let token_manager = create_mock_token_manager();
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let order = create_test_order_with_amounts(
 			U256::from_str("1000000000000000000").unwrap(), // 1 INPUT
@@ -4533,7 +4974,13 @@ mod tests {
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let token_manager = create_mock_token_manager();
 
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let order = create_order_with_callback(vec![]); // Empty callback
 		let fill_tx = create_test_fill_transaction();
@@ -4581,7 +5028,13 @@ mod tests {
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let token_manager = create_mock_token_manager();
 
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		// Callback data: some arbitrary bytes
 		let callback_data = vec![0xde, 0xad, 0xbe, 0xef];
@@ -4630,7 +5083,13 @@ mod tests {
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let token_manager = create_mock_token_manager();
 
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let callback_data = vec![0xde, 0xad, 0xbe, 0xef];
 		let order = create_order_with_callback(callback_data);
@@ -4677,7 +5136,13 @@ mod tests {
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let token_manager = create_mock_token_manager();
 
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let order = create_order_with_multiple_outputs();
 		let fill_tx = create_test_fill_transaction();
@@ -4733,7 +5198,13 @@ mod tests {
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let token_manager = create_mock_token_manager();
 
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let callback_data = vec![0xde, 0xad, 0xbe, 0xef];
 		let order = create_order_with_callback(callback_data);
@@ -4783,7 +5254,13 @@ mod tests {
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
 		let token_manager = create_mock_token_manager();
 
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		// Order with callback data
 		let callback_data = vec![0xde, 0xad, 0xbe, 0xef];
@@ -4836,7 +5313,13 @@ mod tests {
 		let storage = Arc::new(StorageService::new(Box::new(MockStorageInterface::new())));
 		let token_manager = create_mock_token_manager();
 
-		CostProfitService::new(pricing, delivery, token_manager, storage)
+		CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		)
 	}
 
 	#[tokio::test]
@@ -4952,7 +5435,13 @@ mod tests {
 		let delivery = create_mock_delivery_service();
 		let storage = Arc::new(StorageService::new(Box::new(MockStorageInterface::new())));
 		let token_manager = create_mock_token_manager();
-		CostProfitService::new(pricing, delivery, token_manager, storage)
+		CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		)
 	}
 
 	#[tokio::test]
@@ -5178,7 +5667,13 @@ mod tests {
 		));
 
 		let storage = Arc::new(StorageService::new(Box::new(MockStorageInterface::new())));
-		CostProfitService::new(pricing, delivery, token_manager, storage)
+		CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		)
 	}
 
 	/// Build a Config that has `networks` populated to match the live-estimate
@@ -5629,7 +6124,13 @@ mod tests {
 		));
 
 		let storage = Arc::new(StorageService::new(Box::new(MockStorageInterface::new())));
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 		(service, override_calls, bare_calls)
 	}
 
@@ -6019,18 +6520,31 @@ mod tests {
 		config
 	}
 
-	/// Like `config_for_live_estimate(false)` but with chain 137 dropped
-	/// from `config.networks`. `build_post_fill_tx_for_quote` then errors
-	/// at the `Network <id> not configured` branch and the call site
-	/// emits `outcome=skipped_build_tx`.
+	/// Like `config_for_live_estimate(false)` but with a malformed Hyperlane
+	/// output oracle on chain 137. Fee-param construction still succeeds because
+	/// the destination network remains configured; only `build_post_fill_tx_for_quote`
+	/// errors, and the call site emits `outcome=skipped_build_tx`.
 	///
 	/// The upstream cost calc still resolves because `calculate_swap_amounts`
 	/// reads token info via the `TokenManager`, which carries its own
-	/// per-test networks — `config.networks` is only consulted by the
-	/// post-fill builder.
-	fn config_missing_dest_network_for_post_fill() -> Config {
+	/// per-test networks.
+	fn config_malformed_output_oracle_for_post_fill() -> Config {
 		let mut config = config_for_live_estimate(false);
-		config.networks.remove(&137);
+		config.settlement.implementations.insert(
+			"hyperlane".to_string(),
+			serde_json::json!({
+				"oracles": {
+					"input": {
+						"1": ["0x1111111111111111111111111111111111111111"],
+						"137": ["0x2222222222222222222222222222222222222222"]
+					},
+					"output": {
+						"1": ["0x1111111111111111111111111111111111111111"],
+						"137": ["not-an-address"]
+					}
+				}
+			}),
+		);
 		config.gas = Some(solver_config::GasConfig {
 			flows: HashMap::from([(
 				"permit2_escrow".to_string(),
@@ -6150,8 +6664,8 @@ mod tests {
 			"outcome field mismatch: {captured:#?}",
 		);
 
-		// Case 3: SKIPPED_BUILD_TX — chain enabled, but dest network missing
-		// from `config.networks` so `build_post_fill_tx_for_quote` errors.
+		// Case 3: SKIPPED_BUILD_TX — chain enabled, but Hyperlane output oracle
+		// malformed so `build_post_fill_tx_for_quote` errors.
 		let captured = capture_post_fill_events(|| {
 			let request = request.clone();
 			let context = context.clone();
@@ -6159,7 +6673,7 @@ mod tests {
 			async move {
 				let (service, _, _) =
 					cost_profit_service_for_post_fill_override(None, Some(5_000_000));
-				let config = config_missing_dest_network_for_post_fill();
+				let config = config_malformed_output_oracle_for_post_fill();
 				let _ = service
 					.calculate_cost_context_for_flow_keys(
 						&request,
@@ -6322,6 +6836,31 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn exact_output_post_fill_fee_params_use_known_output_amount() {
+		let config = config_with_output_settler_on_dest(QUOTE_OUTPUT_SETTLER);
+		let request = create_test_request(false);
+		let context = create_test_validated_context(false);
+		let input_asset = request.intent.inputs[0].asset.clone();
+		let mut resolved = HashMap::new();
+		resolved.insert(
+			input_asset.clone(),
+			TokenAmountInfo {
+				token: input_asset,
+				amount: U256::from(1_000_000_000_000_000_000u128),
+				decimals: 18,
+			},
+		);
+		let service = cost_profit_service_no_delivery_chains();
+
+		let params = service
+			.build_post_fill_fee_params_for_quote(&request, &context, &resolved, &config)
+			.expect("exact-output fee params should use known output amount")
+			.expect("quote has a post-fill output");
+
+		assert_eq!(params.output_amount, U256::from_str("2000000000").unwrap());
+	}
+
 	// ----- Task 5: validator honors stored cost_breakdown for quoted orders ---
 
 	/// Helper that builds a `StoredQuote` whose embedded `cost_context` carries
@@ -6400,7 +6939,13 @@ mod tests {
 
 		let (pricing, delivery, token_manager, _) = setup_profitable_mocks().await;
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let order = create_profitable_order();
 		// Fresh breakdown intentionally has a high operational cost that would
@@ -6431,7 +6976,13 @@ mod tests {
 		// breakdown and reject for insufficient margin.
 		let (pricing, delivery, token_manager, _) = setup_profitable_mocks().await;
 		let storage = Arc::new(StorageService::new(Box::new(MockStorageInterface::new())));
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let order = create_profitable_order();
 		let mut fresh_breakdown =
@@ -6472,7 +7023,13 @@ mod tests {
 
 		let (pricing, delivery, token_manager, _) = setup_profitable_mocks().await;
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		let order = create_profitable_order();
 		let mut fresh_breakdown =
@@ -6577,7 +7134,13 @@ mod tests {
 
 		let (pricing, delivery, token_manager, _) = setup_profitable_mocks().await;
 		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
-		let validator_service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let validator_service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 
 		// 4. Order whose spread comfortably exceeds the stored operational cost.
 		let order = create_profitable_order();

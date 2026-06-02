@@ -32,6 +32,10 @@ pub struct CostBreakdown {
 	pub gas_claim: Decimal,
 	#[serde(with = "rust_decimal::serde::str")]
 	pub gas_buffer: Decimal,
+	#[serde(default, with = "rust_decimal::serde::str")]
+	pub settlement_fee: Decimal,
+	#[serde(default, with = "rust_decimal::serde::str")]
+	pub settlement_fee_buffer: Decimal,
 
 	// Market components
 	#[serde(with = "rust_decimal::serde::str")]
@@ -75,4 +79,33 @@ pub struct CostContext {
 	/// For ExactInput: inputs unchanged, outputs = swap_amounts - cost_amounts
 	/// For ExactOutput: outputs unchanged, inputs = swap_amounts + cost_amounts
 	pub adjusted_amounts: HashMap<InteropAddress, TokenAmountInfo>,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn cost_breakdown_deserializes_legacy_json_without_settlement_fee() {
+		let legacy = r#"{
+			"gas_open":"1",
+			"gas_fill":"2",
+			"gas_post_fill":"0",
+			"gas_pre_claim":"0",
+			"gas_claim":"1",
+			"gas_buffer":"0",
+			"rate_buffer":"0",
+			"base_price":"0",
+			"min_profit":"0",
+			"operational_cost":"4",
+			"subtotal":"4",
+			"total":"4",
+			"currency":"USD"
+		}"#;
+
+		let breakdown: CostBreakdown = serde_json::from_str(legacy).unwrap();
+
+		assert_eq!(breakdown.settlement_fee, Decimal::ZERO);
+		assert_eq!(breakdown.settlement_fee_buffer, Decimal::ZERO);
+	}
 }
