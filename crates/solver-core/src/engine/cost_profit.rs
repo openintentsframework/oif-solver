@@ -3842,7 +3842,13 @@ mod tests {
 			create_mock_account_service(),
 		));
 		let storage = Arc::new(StorageService::new(Box::new(MockStorageInterface::new())));
-		let service = CostProfitService::new(pricing, delivery, token_manager, storage);
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
 		let request = create_test_request(false);
 		let context = create_test_validated_context(false);
 		let decimals = service.get_all_token_decimals(&request).await;
