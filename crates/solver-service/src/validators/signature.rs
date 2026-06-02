@@ -103,7 +103,7 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 		let struct_hash = message_hasher.compute_message_hash(&order_bytes, contract_address)?;
 
 		// 3. Extract signature using interface
-		let signature = signature_validator.extract_signature(&intent.signature);
+		let signature = signature_validator.extract_signature(&intent.signature)?;
 
 		// 4. Validate EIP-712 signature using interface
 		let expected_signer = standard_order.user;
@@ -193,6 +193,7 @@ mod tests {
 	};
 	use solver_types::api::{OrderPayload, PostOrderRequest, SignatureType};
 	use solver_types::networks::RpcEndpoint;
+	use solver_types::standards::eip7683::compact_signatures::decode_compact_signatures;
 	use solver_types::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
 	use solver_types::standards::eip7683::LockType;
 	use solver_types::{Address, NetworkConfig, NetworksConfig};
@@ -220,6 +221,49 @@ mod tests {
 		let bytes = hex::decode(hex_str.trim_start_matches("0x")).expect("valid hex address");
 		assert_eq!(bytes.len(), 20);
 		Address(bytes)
+	}
+
+	fn abi_word(value: usize) -> [u8; 32] {
+		let mut word = [0u8; 32];
+		word[24..32].copy_from_slice(&(value as u64).to_be_bytes());
+		word
+	}
+
+	fn padded_bytes(bytes: &[u8]) -> Vec<u8> {
+		let mut encoded = Vec::new();
+		encoded.extend_from_slice(&abi_word(bytes.len()));
+		encoded.extend_from_slice(bytes);
+		let padding = (32 - (bytes.len() % 32)) % 32;
+		encoded.extend(std::iter::repeat_n(0u8, padding));
+		encoded
+	}
+
+	fn compact_signature(sponsor_sig: &[u8], allocator_data: &[u8]) -> Bytes {
+		let sponsor_tail = padded_bytes(sponsor_sig);
+		let allocator_offset = 64 + sponsor_tail.len();
+
+		let mut signature = Vec::new();
+		signature.extend_from_slice(&abi_word(64));
+		signature.extend_from_slice(&abi_word(allocator_offset));
+		signature.extend_from_slice(&sponsor_tail);
+		signature.extend_from_slice(&padded_bytes(allocator_data));
+		Bytes::from(signature)
+	}
+
+	fn shifted_compact_signature(valid_sponsor_sig: &[u8]) -> Bytes {
+		let fake_fixed_offset_tail = padded_bytes(valid_sponsor_sig);
+		let actual_sponsor_sig = vec![0x44u8; valid_sponsor_sig.len()];
+		let actual_sponsor_offset = 64 + fake_fixed_offset_tail.len();
+		let actual_sponsor_tail = padded_bytes(&actual_sponsor_sig);
+		let allocator_offset = actual_sponsor_offset + actual_sponsor_tail.len();
+
+		let mut shifted_payload = Vec::new();
+		shifted_payload.extend_from_slice(&abi_word(actual_sponsor_offset));
+		shifted_payload.extend_from_slice(&abi_word(allocator_offset));
+		shifted_payload.extend_from_slice(&fake_fixed_offset_tail);
+		shifted_payload.extend_from_slice(&actual_sponsor_tail);
+		shifted_payload.extend_from_slice(&padded_bytes(&[]));
+		Bytes::from(shifted_payload)
 	}
 
 	fn build_signature_fixture() -> SignatureFixture {
@@ -353,7 +397,7 @@ mod tests {
 			order: solver_types::OifOrder::OifResourceLockV0 {
 				payload: order_payload,
 			},
-			signature: Bytes::from(signature_bytes),
+			signature: compact_signature(&signature_bytes, &[]),
 			quote_id: None,
 			origin_submission: None,
 		};
@@ -410,6 +454,31 @@ mod tests {
 			)
 			.await
 			.expect("signature should validate");
+	}
+
+	#[tokio::test]
+	async fn validate_signature_rejects_shifted_compact_signature_offsets() {
+		let mut fixture = build_signature_fixture();
+		let valid_sponsor_sig = decode_compact_signatures(&fixture.intent.signature)
+			.expect("canonical compact signature")
+			.sponsor
+			.to_vec();
+		fixture.intent.signature = shifted_compact_signature(&valid_sponsor_sig);
+
+		let service = SignatureValidationService::new();
+		let result = service
+			.validate_signature(
+				"eip7683",
+				&fixture.intent,
+				&fixture.networks,
+				&fixture.delivery,
+			)
+			.await;
+
+		assert!(matches!(
+			result,
+			Err(APIError::BadRequest { message, .. }) if message.contains("Compact")
+		));
 	}
 
 	#[tokio::test]
@@ -507,6 +576,7 @@ mod tests {
 			Err(APIError::BadRequest { message, .. }) => {
 				assert!(
 					(message.contains("Invalid") && message.contains("signature"))
+						|| message.contains("Compact")
 						|| message.contains("Failed to recover public key"),
 					"unexpected error message: {message}"
 				);

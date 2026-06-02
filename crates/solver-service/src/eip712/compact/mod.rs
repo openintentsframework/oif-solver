@@ -7,6 +7,7 @@ use crate::eip712::{MessageHashComputer, SignatureValidator};
 use alloy_primitives::{keccak256, Address as AlloyAddress, Bytes, FixedBytes, Uint};
 use alloy_sol_types::SolType;
 use solver_types::{
+	standards::eip7683::compact_signatures::decode_compact_signatures,
 	standards::eip7683::interfaces::{
 		SolMandateOutput as MandateOutput, StandardOrder as OifStandardOrder,
 	},
@@ -48,7 +49,7 @@ impl SignatureValidator for CompactSignatureValidator {
 	}
 
 	/// Extract sponsor signature from ABI-encoded signature bytes
-	fn extract_signature(&self, signature: &Bytes) -> Bytes {
+	fn extract_signature(&self, signature: &Bytes) -> Result<Bytes, APIError> {
 		extract_sponsor_signature(signature)
 	}
 }
@@ -65,29 +66,8 @@ pub fn create_signature_validator() -> impl SignatureValidator {
 
 /// Extract sponsor signature from ABI-encoded signature bytes
 /// This handles ABI-encoded signatures: abi.encode(sponsorSig, allocatorSig)
-pub fn extract_sponsor_signature(signature: &Bytes) -> Bytes {
-	// Handle ABI-encoded signatures: abi.encode(sponsorSig, allocatorSig)
-	if signature.len() > 65 && signature.len() >= 96 {
-		let sponsor_sig_length_offset = 64;
-		if signature.len() > sponsor_sig_length_offset + 32 {
-			let sponsor_sig_length = u32::from_be_bytes([
-				signature[sponsor_sig_length_offset + 28],
-				signature[sponsor_sig_length_offset + 29],
-				signature[sponsor_sig_length_offset + 30],
-				signature[sponsor_sig_length_offset + 31],
-			]) as usize;
-
-			let sponsor_sig_start = sponsor_sig_length_offset + 32;
-			if signature.len() >= sponsor_sig_start + sponsor_sig_length {
-				return Bytes::from(
-					signature[sponsor_sig_start..sponsor_sig_start + sponsor_sig_length].to_vec(),
-				);
-			}
-		}
-	}
-
-	// If not ABI-encoded or extraction failed, use raw signature
-	signature.clone()
+pub fn extract_sponsor_signature(signature: &Bytes) -> Result<Bytes, APIError> {
+	Ok(decode_compact_signatures(signature)?.sponsor)
 }
 
 /// Compute BatchCompact struct hash for TheCompact protocol
@@ -261,17 +241,33 @@ pub fn compute_batch_compact_struct_hash(
 mod tests {
 	use super::*;
 	use alloy_primitives::Bytes;
+	use solver_types::standards::eip7683::compact_signatures::decode_compact_signatures;
+
+	fn abi_word(value: usize) -> [u8; 32] {
+		let mut word = [0u8; 32];
+		word[24..32].copy_from_slice(&(value as u64).to_be_bytes());
+		word
+	}
+
+	fn padded_bytes(bytes: &[u8]) -> Vec<u8> {
+		let mut encoded = Vec::new();
+		encoded.extend_from_slice(&abi_word(bytes.len()));
+		encoded.extend_from_slice(bytes);
+		let padding = (32 - (bytes.len() % 32)) % 32;
+		encoded.extend(std::iter::repeat_n(0u8, padding));
+		encoded
+	}
 
 	#[test]
 	fn test_extract_sponsor_signature() {
 		// Test case: ABI-encoded signature with sponsor and allocator signatures
 		// Structure: abi.encode(sponsorSig, allocatorSig)
 		// - First 32 bytes: offset to sponsorSig (0x40 = 64)
-		// - Next 32 bytes: offset to allocatorSig (0x80 = 128)
+		// - Next 32 bytes: offset to allocatorSig (0xC0 = 192)
 		// - Next 32 bytes: length of sponsorSig (65 bytes)
-		// - Next 65 bytes: actual sponsorSig data
+		// - Next 65 bytes: actual sponsorSig data plus ABI padding
 		// - Next 32 bytes: length of allocatorSig (65 bytes)
-		// - Last 65 bytes: actual allocatorSig data
+		// - Last 65 bytes: actual allocatorSig data plus ABI padding
 
 		let mut abi_encoded_sig = Vec::new();
 
@@ -279,41 +275,53 @@ mod tests {
 		abi_encoded_sig.extend_from_slice(&[0u8; 28]);
 		abi_encoded_sig.extend_from_slice(&64u32.to_be_bytes());
 
-		// Offset to allocatorSig (128 bytes from start)
-		abi_encoded_sig.extend_from_slice(&[0u8; 28]);
-		abi_encoded_sig.extend_from_slice(&128u32.to_be_bytes());
-
-		// Length of sponsorSig (65 bytes)
-		abi_encoded_sig.extend_from_slice(&[0u8; 28]);
-		abi_encoded_sig.extend_from_slice(&65u32.to_be_bytes());
-
 		// Sponsor signature data (65 bytes)
 		let sponsor_sig_data = vec![0x11u8; 65];
-		abi_encoded_sig.extend_from_slice(&sponsor_sig_data);
+		let sponsor_tail = padded_bytes(&sponsor_sig_data);
 
-		// Length of allocatorSig (65 bytes)
-		abi_encoded_sig.extend_from_slice(&[0u8; 28]);
-		abi_encoded_sig.extend_from_slice(&65u32.to_be_bytes());
+		// Offset to allocatorSig (192 bytes from start)
+		abi_encoded_sig.extend_from_slice(&abi_word(64 + sponsor_tail.len()));
+		abi_encoded_sig.extend_from_slice(&sponsor_tail);
 
 		// Allocator signature data (65 bytes)
-		abi_encoded_sig.extend_from_slice(&[0x22u8; 65]);
+		abi_encoded_sig.extend_from_slice(&padded_bytes(&[0x22u8; 65]));
 
 		let signature = Bytes::from(abi_encoded_sig);
-		let extracted = extract_sponsor_signature(&signature);
+		let extracted = extract_sponsor_signature(&signature).unwrap();
 
 		// Should extract the sponsor signature (65 bytes of 0x11)
 		assert_eq!(extracted.len(), 65);
 		assert_eq!(extracted.to_vec(), sponsor_sig_data);
+	}
 
-		// Test case: Raw signature (not ABI-encoded, should return as-is)
+	#[test]
+	fn compact_signature_decoder_must_not_accept_shifted_sponsor_offset_payload() {
+		let valid_sponsor_sig = vec![0x11u8; 65];
+		let bad_sponsor_sig = vec![0x44u8; 65];
+
+		let fake_fixed_offset_tail = padded_bytes(&valid_sponsor_sig);
+		let actual_sponsor_offset = 64 + fake_fixed_offset_tail.len();
+		let actual_sponsor_tail = padded_bytes(&bad_sponsor_sig);
+		let allocator_offset = actual_sponsor_offset + actual_sponsor_tail.len();
+		let allocator_tail = padded_bytes(&[]);
+
+		let mut shifted_payload = Vec::new();
+		shifted_payload.extend_from_slice(&abi_word(actual_sponsor_offset));
+		shifted_payload.extend_from_slice(&abi_word(allocator_offset));
+		shifted_payload.extend_from_slice(&fake_fixed_offset_tail);
+		shifted_payload.extend_from_slice(&actual_sponsor_tail);
+		shifted_payload.extend_from_slice(&allocator_tail);
+
+		assert!(decode_compact_signatures(&Bytes::from(shifted_payload)).is_err());
+	}
+
+	#[test]
+	fn compact_signature_decoder_must_not_accept_raw_or_short_payloads() {
 		let raw_sig = Bytes::from(vec![0x33u8; 65]);
-		let extracted_raw = extract_sponsor_signature(&raw_sig);
-		assert_eq!(extracted_raw, raw_sig);
-
-		// Test case: Short signature (should return as-is)
 		let short_sig = Bytes::from(vec![0x44u8; 32]);
-		let extracted_short = extract_sponsor_signature(&short_sig);
-		assert_eq!(extracted_short, short_sig);
+
+		assert!(decode_compact_signatures(&raw_sig).is_err());
+		assert!(decode_compact_signatures(&short_sig).is_err());
 	}
 
 	#[test]
