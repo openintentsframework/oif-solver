@@ -426,6 +426,7 @@ pub fn merge_to_operator_config(
 		.unwrap_or(seed.defaults.min_profitability_pct);
 
 	let gas_buffer_bps = initializer.gas_buffer_bps.unwrap_or(1000);
+	let settlement_fee_buffer_bps = initializer.settlement_fee_buffer_bps.unwrap_or(1000);
 	let commission_bps = initializer
 		.commission_bps
 		.unwrap_or(seed.defaults.commission_bps);
@@ -496,6 +497,7 @@ pub fn merge_to_operator_config(
 		solver: OperatorSolverConfig {
 			min_profitability_pct,
 			gas_buffer_bps,
+			settlement_fee_buffer_bps,
 			commission_bps,
 			rate_buffer_bps,
 			monitoring_timeout_seconds,
@@ -1205,6 +1207,7 @@ fn build_solver_config_from_operator(
 		id: operator_config.solver_id.clone(),
 		min_profitability_pct: operator_config.solver.min_profitability_pct,
 		gas_buffer_bps: operator_config.solver.gas_buffer_bps,
+		settlement_fee_buffer_bps: operator_config.solver.settlement_fee_buffer_bps,
 		commission_bps: operator_config.solver.commission_bps,
 		rate_buffer_bps: operator_config.solver.rate_buffer_bps,
 		monitoring_timeout_seconds: operator_config.solver.monitoring_timeout_seconds,
@@ -2541,6 +2544,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		solver: OperatorSolverConfig {
 			min_profitability_pct: config.solver.min_profitability_pct,
 			gas_buffer_bps: config.solver.gas_buffer_bps,
+			settlement_fee_buffer_bps: config.solver.settlement_fee_buffer_bps,
 			commission_bps: config.solver.commission_bps,
 			rate_buffer_bps: config.solver.rate_buffer_bps,
 			monitoring_timeout_seconds: config.solver.monitoring_timeout_seconds,
@@ -3507,6 +3511,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -3828,6 +3833,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -3889,6 +3895,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -3944,6 +3951,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -3990,6 +3998,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -4082,6 +4091,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: Some(Decimal::from_str("2.5").unwrap()), // Override: 2.5%
 			gas_buffer_bps: Some(1500),                                     // Override: 15%
+			settlement_fee_buffer_bps: Some(2000),                          // Override: 20%
 			commission_bps: Some(25),                                       // Override: 0.25%
 			rate_buffer_bps: Some(30),                                      // Override: 0.30%
 			monitoring_timeout_seconds: None,
@@ -4104,6 +4114,9 @@ mod tests {
 
 		// Verify gas_buffer_bps is applied
 		assert_eq!(config.solver.gas_buffer_bps, 1500);
+
+		// Verify settlement_fee_buffer_bps is applied
+		assert_eq!(config.solver.settlement_fee_buffer_bps, 2000);
 
 		// Verify commission_bps is applied
 		assert_eq!(config.solver.commission_bps, 25);
@@ -4148,6 +4161,9 @@ mod tests {
 
 		// Should use default gas_buffer_bps (1000 = 10%)
 		assert_eq!(config.solver.gas_buffer_bps, 1000);
+
+		// Should use default settlement_fee_buffer_bps (1000 = 10%)
+		assert_eq!(config.solver.settlement_fee_buffer_bps, 1000);
 
 		// Should use seed default commission_bps
 		assert_eq!(
@@ -4305,6 +4321,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -4372,6 +4389,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -4464,6 +4482,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -4531,6 +4550,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -4604,6 +4624,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -4729,6 +4750,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -4862,6 +4884,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -4933,6 +4956,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -4998,6 +5022,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -5098,6 +5123,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -5207,6 +5233,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -5375,6 +5402,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -5515,6 +5543,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -5619,6 +5648,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -5745,6 +5775,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -5900,6 +5931,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -5948,6 +5980,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -6010,6 +6043,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -6065,6 +6099,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -6138,6 +6173,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -6325,6 +6361,7 @@ mod tests {
 			solver: OperatorSolverConfig {
 				min_profitability_pct: Decimal::from_str("0.0").unwrap(),
 				gas_buffer_bps: 1000,
+				settlement_fee_buffer_bps: 1000,
 				commission_bps: 20,
 				rate_buffer_bps: 14,
 				monitoring_timeout_seconds: 30,
@@ -6417,6 +6454,10 @@ mod tests {
 		assert_eq!(
 			op_config.solver.gas_buffer_bps,
 			config.solver.gas_buffer_bps
+		);
+		assert_eq!(
+			op_config.solver.settlement_fee_buffer_bps,
+			config.solver.settlement_fee_buffer_bps
 		);
 		assert_eq!(
 			op_config.solver.commission_bps,
@@ -7350,6 +7391,7 @@ mod tests {
 			deny_list: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,

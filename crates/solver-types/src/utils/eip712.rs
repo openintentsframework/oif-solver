@@ -808,6 +808,7 @@ pub fn admin_eip712_types() -> serde_json::Value {
 		],
 		"UpdateFeeConfig": [
 			{"name": "gasBufferBps", "type": "uint32"},
+			{"name": "settlementFeeBufferBps", "type": "uint32"},
 			{"name": "minProfitabilityPct", "type": "string"},
 			{"name": "commissionBps", "type": "uint32"},
 			{"name": "rateBufferBps", "type": "uint32"},
@@ -1984,14 +1985,16 @@ mod tests {
 			.as_array()
 			.expect("should be an array");
 
-		// UpdateFeeConfig should have: gasBufferBps, minProfitabilityPct, commissionBps, rateBufferBps, nonce, deadline
-		assert_eq!(fee_config.len(), 6);
+		// UpdateFeeConfig should have: gasBufferBps, settlementFeeBufferBps, minProfitabilityPct,
+		// commissionBps, rateBufferBps, nonce, deadline.
+		assert_eq!(fee_config.len(), 7);
 
 		let names: Vec<&str> = fee_config
 			.iter()
 			.map(|f| f["name"].as_str().unwrap())
 			.collect();
 		assert!(names.contains(&"gasBufferBps"));
+		assert!(names.contains(&"settlementFeeBufferBps"));
 		assert!(names.contains(&"minProfitabilityPct"));
 		assert!(names.contains(&"commissionBps"));
 		assert!(names.contains(&"rateBufferBps"));

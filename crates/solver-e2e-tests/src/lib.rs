@@ -8,7 +8,7 @@
 //! Design choices are documented in `crates/solver-e2e-tests/README.md`.
 
 use alloy_network::{EthereumWallet, TransactionBuilder};
-use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy_primitives::{keccak256, Address, Bytes, FixedBytes, B256, U256};
 use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_rpc_types::{BlockNumberOrTag, Filter, Log, TransactionReceipt, TransactionRequest};
 use alloy_signer_local::PrivateKeySigner;
@@ -65,6 +65,13 @@ sol! {
 	#[sol(rpc)]
 	contract IMailboxMock {
 		function dispatchCounter() external view returns (uint256);
+	}
+
+	#[sol(rpc)]
+	contract ITheCompactE2e {
+		function DOMAIN_SEPARATOR() external view returns (bytes32);
+		function __registerAllocator(address allocator, bytes calldata proof) external;
+		function depositERC20(address token, bytes12 lockTag, uint256 amount, address recipient) external returns (uint256);
 	}
 }
 
@@ -198,6 +205,9 @@ pub struct ChainDeployment {
 	pub output_oracle: Address,
 	pub input_settler: Address,
 	pub output_settler: Address,
+	pub input_settler_compact: Option<Address>,
+	pub the_compact: Option<Address>,
+	pub allocator: Option<Address>,
 	/// `MockMailboxV2` address when `HarnessOptions::use_hyperlane_settlement`
 	/// is set. `None` for the default `Direct`-settlement layout.
 	/// Tests can read its `dispatchCounter` to assert the solver actually
@@ -247,6 +257,10 @@ pub struct HarnessOptions {
 	/// TOKA spending. Required for any test that submits Permit2-signed
 	/// orders through the off-chain HTTP API (`OifOrder::OifEscrowV0`).
 	pub enable_permit2: bool,
+	/// Deploy TheCompact, InputSettlerCompact, and SimpleAllocator on the origin
+	/// chain, register the allocator, and write those addresses into the solver
+	/// bootstrap config. Used by ResourceLock/Compact e2e scenarios.
+	pub enable_compact_simple_allocator: bool,
 	/// Addresses (`"0x..."` strings, any case) to write into a deny list
 	/// JSON file in the harness's tempdir. The harness sets
 	/// `SeedOverrides.deny_list` to that file's path so the solver loads it
@@ -367,6 +381,7 @@ impl Default for HarnessOptions {
 			admin_redis_url: None,
 			use_hyperlane_settlement: false,
 			enable_permit2: false,
+			enable_compact_simple_allocator: false,
 			deny_list_addresses: None,
 			run_solver: true,
 			tx_bump: None,
@@ -465,6 +480,16 @@ impl Harness {
 			install_permit2_at_canonical(&origin_provider)
 				.await
 				.context("install Permit2 (origin)")?;
+		}
+
+		if options.enable_compact_simple_allocator {
+			let (the_compact, input_settler_compact, allocator) =
+				deploy_compact_stack(&origin_provider, parse_address(SOLVER_ADDRESS)?)
+					.await
+					.context("deploy Compact stack (origin)")?;
+			origin.the_compact = Some(the_compact);
+			origin.input_settler_compact = Some(input_settler_compact);
+			origin.allocator = Some(allocator);
 		}
 
 		// Mint TOKA to user on origin (for the input leg) and TOKB to solver
@@ -674,6 +699,71 @@ impl Harness {
 				body.len()
 			)
 		})
+	}
+
+	pub fn compact_lock_tag(&self) -> Result<FixedBytes<12>> {
+		let allocator = self
+			.origin
+			.allocator
+			.ok_or_else(|| anyhow!("Compact allocator not deployed"))?;
+		let mut lock_tag = [0u8; 12];
+		lock_tag[1..].copy_from_slice(&allocator.as_slice()[9..]);
+		Ok(FixedBytes::from(lock_tag))
+	}
+
+	pub fn compact_token_id(&self) -> Result<U256> {
+		let lock_tag = self.compact_lock_tag()?;
+		let mut bytes = [0u8; 32];
+		bytes[..12].copy_from_slice(lock_tag.as_slice());
+		bytes[12..].copy_from_slice(self.origin.token_a.as_slice());
+		Ok(U256::from_be_bytes(bytes))
+	}
+
+	pub async fn compact_deposit_user_token_a(&self, amount: U256) -> Result<U256> {
+		let the_compact = self
+			.origin
+			.the_compact
+			.ok_or_else(|| anyhow!("TheCompact not deployed"))?;
+		let lock_tag = self.compact_lock_tag()?;
+		user_approve_max(
+			&self.origin.rpc_http,
+			&self.user_signer,
+			self.origin.token_a,
+			the_compact,
+		)
+		.await
+		.context("user approve(TheCompact, MAX) on TOKA")?;
+
+		let user_provider = build_provider(&self.origin.rpc_http, self.user_signer.clone()).await?;
+		let pending = ITheCompactE2e::new(the_compact, user_provider)
+			.depositERC20(self.origin.token_a, lock_tag, amount, self.user_address())
+			.send()
+			.await
+			.context("send TheCompact.depositERC20")?;
+		let receipt = pending
+			.get_receipt()
+			.await
+			.context("depositERC20 receipt")?;
+		if !receipt.status() {
+			return Err(anyhow!(
+				"depositERC20 reverted (tx {:?})",
+				receipt.transaction_hash
+			));
+		}
+
+		self.compact_token_id()
+	}
+
+	pub async fn compact_domain_separator(&self) -> Result<B256> {
+		let the_compact = self
+			.origin
+			.the_compact
+			.ok_or_else(|| anyhow!("TheCompact not deployed"))?;
+		ITheCompactE2e::new(the_compact, &self.origin_provider)
+			.DOMAIN_SEPARATOR()
+			.call()
+			.await
+			.context("TheCompact.DOMAIN_SEPARATOR")
 	}
 
 	/// Read the destination chain's `MockMailboxV2.dispatchCounter`. Returns
@@ -1481,6 +1571,59 @@ async fn deploy_no_args(provider: &DynProvider, name: &str) -> Result<Address> {
 	deploy_raw(provider, bytecode, Bytes::new()).await
 }
 
+async fn deploy_with_args(provider: &DynProvider, name: &str, ctor_args: Bytes) -> Result<Address> {
+	let bytecode = load_bytecode(name)?;
+	deploy_raw(provider, bytecode, ctor_args).await
+}
+
+async fn deploy_compact_stack(
+	provider: &DynProvider,
+	allocator_signer: Address,
+) -> Result<(Address, Address, Address)> {
+	let the_compact = deploy_no_args(provider, "TheCompact")
+		.await
+		.context("deploy TheCompact")?;
+	let input_settler_compact = deploy_with_args(
+		provider,
+		"InputSettlerCompact",
+		Bytes::from((the_compact,).abi_encode_params()),
+	)
+	.await
+	.context("deploy InputSettlerCompact")?;
+	let allocator = deploy_with_args(
+		provider,
+		"SimpleAllocator",
+		Bytes::from((allocator_signer, the_compact).abi_encode_params()),
+	)
+	.await
+	.context("deploy SimpleAllocator")?;
+
+	let pending = ITheCompactE2e::new(the_compact, provider)
+		.__registerAllocator(allocator, Bytes::new())
+		.send()
+		.await
+		.context("send TheCompact.__registerAllocator")?;
+	let receipt = pending
+		.get_receipt()
+		.await
+		.context("register allocator receipt")?;
+	if !receipt.status() {
+		return Err(anyhow!(
+			"register allocator reverted (tx {:?})",
+			receipt.transaction_hash
+		));
+	}
+
+	tracing::info!(
+		the_compact = %the_compact,
+		input_settler_compact = %input_settler_compact,
+		allocator = %allocator,
+		"Deployed Compact stack"
+	);
+
+	Ok((the_compact, input_settler_compact, allocator))
+}
+
 async fn deploy_chain(
 	provider: &DynProvider,
 	chain_id: u64,
@@ -1521,6 +1664,9 @@ async fn deploy_chain(
 		output_oracle: always_yes,
 		input_settler,
 		output_settler,
+		input_settler_compact: None,
+		the_compact: None,
+		allocator: None,
 		mock_mailbox: None,
 	})
 }
@@ -1667,9 +1813,9 @@ fn build_seed_overrides(
 			rpc_urls: Some(vec![d.rpc_http.clone()]),
 			input_settler_address: Some(d.input_settler),
 			output_settler_address: Some(d.output_settler),
-			input_settler_compact_address: None,
-			the_compact_address: None,
-			allocator_address: None,
+			input_settler_compact_address: d.input_settler_compact,
+			the_compact_address: d.the_compact,
+			allocator_address: d.allocator,
 		}
 	}
 
@@ -1772,6 +1918,7 @@ fn build_seed_overrides(
 		orders_auth_enabled: Some(options.enable_admin_api),
 		min_profitability_pct: None,
 		gas_buffer_bps: None,
+		settlement_fee_buffer_bps: None,
 		commission_bps: None,
 		rate_buffer_bps: None,
 		monitoring_timeout_seconds: None,

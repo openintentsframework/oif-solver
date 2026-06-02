@@ -544,6 +544,11 @@ pub struct OperatorSolverConfig {
 	#[serde(default = "default_gas_buffer_bps")]
 	pub gas_buffer_bps: u32,
 
+	/// Settlement native fee buffer in basis points (e.g., 1000 = 10%).
+	/// Applied as safety margin on native settlement message fee quotes.
+	#[serde(default = "default_settlement_fee_buffer_bps")]
+	pub settlement_fee_buffer_bps: u32,
+
 	/// Commission in basis points (e.g., 20 = 0.20%).
 	/// Added to solver profit requirement.
 	#[serde(default = "default_commission_bps")]
@@ -565,6 +570,10 @@ pub struct OperatorSolverConfig {
 }
 
 fn default_gas_buffer_bps() -> u32 {
+	1000 // 10%
+}
+
+fn default_settlement_fee_buffer_bps() -> u32 {
 	1000 // 10%
 }
 
@@ -1134,6 +1143,7 @@ mod tests {
 			solver: OperatorSolverConfig {
 				min_profitability_pct: Decimal::ONE,
 				gas_buffer_bps: 1000,
+				settlement_fee_buffer_bps: 1000,
 				commission_bps: 20,
 				rate_buffer_bps: 14,
 				monitoring_timeout_seconds: 28800,
@@ -1248,5 +1258,17 @@ mod tests {
 			OperatorSettlementType::Hyperlane
 		);
 		assert!(parsed.settlement.hyperlane.is_some());
+	}
+
+	#[test]
+	fn test_operator_solver_config_defaults_settlement_fee_buffer_bps() {
+		let json = serde_json::json!({
+			"min_profitability_pct": "1",
+			"monitoring_timeout_seconds": 28800
+		});
+
+		let parsed: OperatorSolverConfig = serde_json::from_value(json).unwrap();
+
+		assert_eq!(parsed.settlement_fee_buffer_bps, 1000);
 	}
 }

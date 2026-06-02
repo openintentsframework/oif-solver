@@ -23,6 +23,36 @@ use solver_types::{
 	OrderStatus, Schema, Transaction,
 };
 
+const LIMIT_ORDER_CONTEXT_TYPE: u8 = 0x00;
+const DUTCH_AUCTION_CONTEXT_TYPE: u8 = 0x01;
+const EXCLUSIVE_LIMIT_ORDER_CONTEXT_TYPE: u8 = 0xe0;
+const EXCLUSIVE_DUTCH_AUCTION_CONTEXT_TYPE: u8 = 0xe1;
+
+fn validate_supported_output_context(index: usize, context: &[u8]) -> Result<(), OrderError> {
+	if context.is_empty() {
+		return Ok(());
+	}
+
+	let order_type = context[0];
+	match order_type {
+		LIMIT_ORDER_CONTEXT_TYPE if context.len() == 1 => Ok(()),
+		LIMIT_ORDER_CONTEXT_TYPE => Err(OrderError::ValidationFailed(format!(
+			"unsupported output context: output[{index}] limit-order context must be exactly 1 byte"
+		))),
+		DUTCH_AUCTION_CONTEXT_TYPE => Err(OrderError::ValidationFailed(format!(
+			"Dutch auction output contexts are unsupported: output[{index}]"
+		))),
+		EXCLUSIVE_LIMIT_ORDER_CONTEXT_TYPE | EXCLUSIVE_DUTCH_AUCTION_CONTEXT_TYPE => {
+			Err(OrderError::ValidationFailed(format!(
+				"exclusive output contexts are unsupported: output[{index}]"
+			)))
+		},
+		_ => Err(OrderError::ValidationFailed(format!(
+			"unsupported output context: output[{index}] has unsupported context type 0x{order_type:02x}"
+		))),
+	}
+}
+
 /// EIP-7683 order implementation.
 ///
 /// This struct implements the `OrderInterface` trait for EIP-7683 cross-chain orders.
@@ -612,6 +642,8 @@ impl OrderInterface for Eip7683OrderImpl {
 				OrderError::ValidationFailed(format!("output[{i}] chainId out of range"))
 			})?;
 
+			validate_supported_output_context(i, output.context.as_ref())?;
+
 			// 1. Reject same-chain outputs (unsupported by current fill/claim builders).
 			if output_chain_id == origin_chain_id {
 				return Err(OrderError::ValidationFailed(format!(
@@ -640,6 +672,14 @@ impl OrderInterface for Eip7683OrderImpl {
 					alloy_primitives::hex::encode(output.settler.0),
 					alloy_primitives::hex::encode(&network.output_settler_address.0),
 				)));
+			}
+
+			// 4. Reject multiple valid cross-chain outputs. Current fill generation
+			// only fills one output, while claim calldata includes all outputs.
+			if seen_chains.len() > 1 {
+				return Err(OrderError::ValidationFailed(
+					"multiple cross-chain outputs are unsupported".to_string(),
+				));
 			}
 		}
 
@@ -990,6 +1030,14 @@ mod tests {
 	fn encode_standard_order(order: &interfaces::StandardOrder) -> Bytes {
 		use alloy_sol_types::SolValue;
 		Bytes::from(order.abi_encode())
+	}
+
+	fn dutch_auction_context() -> Vec<u8> {
+		let mut context = vec![0x01];
+		context.extend_from_slice(&1_700_000_000u32.to_be_bytes());
+		context.extend_from_slice(&1_700_001_800u32.to_be_bytes());
+		context.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>());
+		context
 	}
 
 	#[test]
@@ -1344,6 +1392,110 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn test_validate_order_allows_limit_order_context() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		standard_order.outputs[0].context = vec![0x00].into();
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(
+			result.is_ok(),
+			"expected fixed-price limit context to be accepted"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_rejects_malformed_limit_order_context() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		standard_order.outputs[0].context = vec![0x00, 0x99].into();
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(
+			result.is_err(),
+			"expected malformed limit context to be rejected"
+		);
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("unsupported output context"),
+			"unexpected error message: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_rejects_dutch_auction_context() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		standard_order.outputs[0].context = dutch_auction_context().into();
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(
+			result.is_err(),
+			"expected Dutch auction context to be rejected"
+		);
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("Dutch auction output contexts are unsupported"),
+			"unexpected error message: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_rejects_exclusive_contexts() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		for order_type in [0xe0, 0xe1] {
+			let mut standard_order = create_valid_standard_order();
+			standard_order.outputs[0].context = vec![order_type].into();
+			let order_bytes = encode_standard_order(&standard_order);
+
+			let result = order_impl.validate_order(&order_bytes).await;
+			assert!(
+				result.is_err(),
+				"expected exclusive context 0x{order_type:02x} to be rejected"
+			);
+			let err = result.unwrap_err().to_string();
+			assert!(
+				err.contains("exclusive output contexts are unsupported"),
+				"unexpected error message for 0x{order_type:02x}: {err}"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_rejects_unknown_non_empty_context() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		standard_order.outputs[0].context = vec![0x7f].into();
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(result.is_err(), "expected unknown context to be rejected");
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("unsupported output context"),
+			"unexpected error message: {err}"
+		);
+	}
+
+	#[tokio::test]
 	async fn test_validate_order_invalid_bytes() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
@@ -1546,6 +1698,61 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn test_validate_order_rejects_multiple_cross_chain_outputs() {
+		let networks = NetworksConfigBuilder::new()
+			.add_network(1, NetworkConfigBuilder::new().build())
+			.add_network(137, NetworkConfigBuilder::new().build())
+			.add_network(42161, NetworkConfigBuilder::new().build())
+			.build();
+
+		let mut supported_routes = HashMap::new();
+		let input_oracle = OracleInfo {
+			chain_id: 1,
+			oracle: Address(vec![10u8; 20]),
+		};
+		supported_routes.insert(
+			input_oracle,
+			vec![
+				OracleInfo {
+					chain_id: 137,
+					oracle: Address(vec![11u8; 20]),
+				},
+				OracleInfo {
+					chain_id: 42161,
+					oracle: Address(vec![12u8; 20]),
+				},
+			],
+		);
+		let order_impl =
+			Eip7683OrderImpl::new(networks, OracleRoutes { supported_routes }).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		standard_order.outputs.push(interfaces::SolMandateOutput {
+			oracle: alloy_primitives::B256::from([12u8; 32]),
+			settler: default_output_settler_bytes32(),
+			chainId: U256::from(42161),
+			token: alloy_primitives::B256::from([0x77; 32]),
+			amount: U256::from(500),
+			recipient: alloy_primitives::B256::from([0x88; 32]),
+			callbackData: vec![].into(),
+			context: vec![].into(),
+		});
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+
+		assert!(
+			result.is_err(),
+			"expected multiple cross-chain outputs to be rejected"
+		);
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("multiple cross-chain outputs are unsupported"),
+			"unexpected error message: {err}"
+		);
+	}
+
+	#[tokio::test]
 	async fn test_validate_order_rejects_mismatched_output_settler() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
@@ -1695,6 +1902,36 @@ mod tests {
 		assert_eq!(order_data.lock_type, Some(LockType::Permit2Escrow));
 		assert!(order_data.raw_order_data.is_some());
 		assert_eq!(order_data.order_id, [0x42; 32]);
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_rejects_dutch_auction_context() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		standard_order.outputs[0].context = dutch_auction_context().into();
+		let order_bytes = encode_standard_order(&standard_order);
+		let solver_address = Address(vec![0x99; 20]);
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&None,
+				"permit2_escrow",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await;
+
+		assert!(result.is_err(), "expected Dutch context to be rejected");
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("Dutch auction output contexts are unsupported"),
+			"unexpected error message: {err}"
+		);
 	}
 
 	#[tokio::test]
@@ -1989,13 +2226,13 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_validate_and_create_order_multiple_outputs() {
+	async fn test_validate_and_create_order_rejects_multiple_outputs() {
 		// Create networks with an additional chain (42161 for Arbitrum)
 		let networks = NetworksConfigBuilder::new()
-        .add_network(1, NetworkConfigBuilder::new().build())
-        .add_network(137, NetworkConfigBuilder::new().build())
-        .add_network(42161, NetworkConfigBuilder::new().build()) // Add Arbitrum
-        .build();
+			.add_network(1, NetworkConfigBuilder::new().build())
+			.add_network(137, NetworkConfigBuilder::new().build())
+			.add_network(42161, NetworkConfigBuilder::new().build()) // Add Arbitrum
+			.build();
 
 		// Create oracle routes that support the additional chain
 		let mut supported_routes = HashMap::new();
@@ -2046,17 +2283,15 @@ mod tests {
 			)
 			.await;
 
-		assert!(result.is_ok());
-		let order = result.unwrap();
-
-		// Should have two output chains (137 and 42161) with multiple outputs
-		assert_eq!(order.output_chains.len(), 2);
-		let chain_ids: Vec<u64> = order.output_chains.iter().map(|oc| oc.chain_id).collect();
-		assert!(chain_ids.contains(&137));
-		assert!(chain_ids.contains(&42161));
-
-		let order_data: Eip7683OrderData = serde_json::from_value(order.data).unwrap();
-		assert_eq!(order_data.outputs.len(), 2);
+		assert!(
+			result.is_err(),
+			"expected multi-output order creation to be rejected"
+		);
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("multiple cross-chain outputs are unsupported"),
+			"unexpected error message: {err}"
+		);
 	}
 
 	#[tokio::test]
