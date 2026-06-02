@@ -963,7 +963,9 @@ async fn forward_to_discovery_service(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use alloy_primitives::hex;
+	use crate::eip712::MessageHashComputer;
+	use alloy_primitives::{hex, keccak256, Address as AlloyAddress, Bytes, FixedBytes, U256};
+	use alloy_sol_types::{SolCall, SolType};
 	use axum::body;
 	use axum::http::StatusCode;
 	use reqwest::Client;
@@ -973,7 +975,7 @@ mod tests {
 	use solver_config::Config;
 	use solver_core::engine::event_bus::EventBus;
 	use solver_core::engine::token_manager::TokenManager;
-	use solver_delivery::DeliveryService;
+	use solver_delivery::{DeliveryInterface, DeliveryService, MockDeliveryInterface};
 	use solver_discovery::DiscoveryService;
 	use solver_order::OrderService;
 	use solver_pricing::implementations::mock::create_mock_pricing;
@@ -985,7 +987,9 @@ mod tests {
 		OifOrder, OrderPayload, PostOrderRequest, PostOrderResponse, PostOrderResponseStatus,
 		SignatureType,
 	};
-	use solver_types::standards::eip7683::interfaces::StandardOrder as OifStandardOrder;
+	use solver_types::standards::eip7683::interfaces::{
+		IAllocator, ITheCompact, SolMandateOutput, StandardOrder as OifStandardOrder,
+	};
 	use solver_types::{APIError, Address, ApiErrorType, ErrorResponse};
 	use std::collections::HashMap;
 	use std::convert::TryFrom;
@@ -994,6 +998,12 @@ mod tests {
 	use wiremock::{Mock, MockServer, ResponseTemplate};
 
 	async fn build_test_solver_engine() -> Arc<SolverEngine> {
+		build_test_solver_engine_with_allocator_authorized(true).await
+	}
+
+	async fn build_test_solver_engine_with_allocator_authorized(
+		allocator_authorized: bool,
+	) -> Arc<SolverEngine> {
 		let config: Config = serde_json::from_value(json!({
 			"solver": {
 				"id": "test-solver",
@@ -1038,7 +1048,9 @@ mod tests {
 				"1": {
 					"chain_id": 1,
 					"input_settler_address": "0x0000000000000000000000000000000000000011",
+					"input_settler_compact_address": "0x9999999999999999999999999999999999999999",
 					"output_settler_address": "0x0000000000000000000000000000000000000022",
+					"the_compact_address": "0x8888888888888888888888888888888888888888",
 					"rpc_urls": [
 						{ "http": "http://localhost:8545" }
 					],
@@ -1066,7 +1078,23 @@ mod tests {
 
 		let solver_address = Address(vec![0x11; 20]);
 
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 10, 60));
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_eth_call().returning(move |tx| {
+			let selector = tx.data.get(0..4).map(|s| [s[0], s[1], s[2], s[3]]);
+			let response = match selector {
+				Some(s) if s == ITheCompact::getLockDetailsCall::SELECTOR => {
+					encode_lock_details(AlloyAddress::from([0xA1u8; 20]))
+				},
+				Some(s) if s == IAllocator::isClaimAuthorizedCall::SELECTOR => {
+					encode_bool(allocator_authorized)
+				},
+				_ => Bytes::from(FixedBytes::from([0x99u8; 32]).to_vec()),
+			};
+			Box::pin(async move { Ok(response) })
+		});
+		let mut delivery_implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+		delivery_implementations.insert(1, Arc::new(mock_delivery) as Arc<dyn DeliveryInterface>);
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 1, 10, 60));
 		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
 
 		let strategy_config = serde_json::Value::Object(serde_json::Map::new());
@@ -1109,8 +1137,37 @@ mod tests {
 		Arc::new(engine)
 	}
 
+	fn encode_lock_details(allocator: AlloyAddress) -> Bytes {
+		let mut out = vec![0u8; 160];
+		out[44..64].copy_from_slice(allocator.as_slice());
+		Bytes::from(out)
+	}
+
+	fn encode_bool(value: bool) -> Bytes {
+		let mut out = vec![0u8; 32];
+		if value {
+			out[31] = 1;
+		}
+		Bytes::from(out)
+	}
+
 	async fn build_test_app_state(discovery_url: Option<String>) -> AppState {
 		let solver = build_test_solver_engine().await;
+		build_test_app_state_with_solver(discovery_url, solver).await
+	}
+
+	async fn build_test_app_state_with_allocator_authorized(
+		discovery_url: Option<String>,
+		allocator_authorized: bool,
+	) -> AppState {
+		let solver = build_test_solver_engine_with_allocator_authorized(allocator_authorized).await;
+		build_test_app_state_with_solver(discovery_url, solver).await
+	}
+
+	async fn build_test_app_state_with_solver(
+		discovery_url: Option<String>,
+		solver: Arc<SolverEngine>,
+	) -> AppState {
 		let config = solver.config().clone();
 		let dynamic_config = Arc::new(RwLock::new(config));
 
@@ -1187,6 +1244,194 @@ mod tests {
 		bytes.extend_from_slice(&sig_bytes);
 		bytes.push(i32::from(recovery_id) as u8);
 		alloy_primitives::Bytes::from(bytes)
+	}
+
+	fn abi_word(value: usize) -> [u8; 32] {
+		let mut word = [0u8; 32];
+		word[24..32].copy_from_slice(&(value as u64).to_be_bytes());
+		word
+	}
+
+	fn padded_bytes(bytes: &[u8]) -> Vec<u8> {
+		let mut encoded = Vec::new();
+		encoded.extend_from_slice(&abi_word(bytes.len()));
+		encoded.extend_from_slice(bytes);
+		let padding = (32 - (bytes.len() % 32)) % 32;
+		encoded.extend(std::iter::repeat_n(0u8, padding));
+		encoded
+	}
+
+	fn compact_signature(sponsor_sig: &[u8], allocator_data: &[u8]) -> Bytes {
+		let sponsor_tail = padded_bytes(sponsor_sig);
+		let allocator_offset = 64 + sponsor_tail.len();
+
+		let mut signature = Vec::new();
+		signature.extend_from_slice(&abi_word(64));
+		signature.extend_from_slice(&abi_word(allocator_offset));
+		signature.extend_from_slice(&sponsor_tail);
+		signature.extend_from_slice(&padded_bytes(allocator_data));
+		Bytes::from(signature)
+	}
+
+	fn shifted_compact_signature(valid_sponsor_sig: &[u8]) -> Bytes {
+		let fake_fixed_offset_tail = padded_bytes(valid_sponsor_sig);
+		let actual_sponsor_sig = vec![0x44u8; valid_sponsor_sig.len()];
+		let actual_sponsor_offset = 64 + fake_fixed_offset_tail.len();
+		let actual_sponsor_tail = padded_bytes(&actual_sponsor_sig);
+		let allocator_offset = actual_sponsor_offset + actual_sponsor_tail.len();
+
+		let mut shifted_payload = Vec::new();
+		shifted_payload.extend_from_slice(&abi_word(actual_sponsor_offset));
+		shifted_payload.extend_from_slice(&abi_word(allocator_offset));
+		shifted_payload.extend_from_slice(&fake_fixed_offset_tail);
+		shifted_payload.extend_from_slice(&actual_sponsor_tail);
+		shifted_payload.extend_from_slice(&padded_bytes(&[]));
+		Bytes::from(shifted_payload)
+	}
+
+	fn sample_resource_lock_request(
+		signature_from_sponsor: impl FnOnce(&[u8]) -> Bytes,
+	) -> PostOrderRequest {
+		let chain_id = 1u64;
+		let nonce = 1u64;
+		let expires = 1_700_000_000u32;
+		let fill_deadline = 1_700_000_100u32;
+		let input_oracle_hex = "0x2222222222222222222222222222222222222222";
+		let lock_tag = [0xAAu8; 12];
+		let token_address_bytes = [0x33u8; 20];
+		let output_chain_id = 137u64;
+		let output_amount = U256::from(500u64);
+		let output_token_bytes32 = [0x44u8; 32];
+		let output_recipient = [0x55u8; 32];
+		let output_oracle = [0x66u8; 32];
+		let output_settler = [0x77u8; 32];
+		let compact_settler_hex = "0x9999999999999999999999999999999999999999";
+
+		let token_id = {
+			let mut bytes = [0u8; 32];
+			bytes[..12].copy_from_slice(&lock_tag);
+			bytes[12..].copy_from_slice(&token_address_bytes);
+			U256::from_be_bytes(bytes)
+		};
+		let input_amount = U256::from(1_000u64);
+
+		let secret_key = SecretKey::from_byte_array([0x11u8; 32]).expect("valid secret key");
+		let user_address = address_from_secret(&secret_key);
+		let input_oracle_bytes = hex::decode(input_oracle_hex.trim_start_matches("0x")).unwrap();
+		let input_oracle = AlloyAddress::from_slice(&input_oracle_bytes);
+
+		let outputs = vec![SolMandateOutput {
+			oracle: output_oracle.into(),
+			settler: output_settler.into(),
+			chainId: U256::from(output_chain_id),
+			token: output_token_bytes32.into(),
+			amount: output_amount,
+			recipient: output_recipient.into(),
+			callbackData: Vec::new().into(),
+			context: Vec::new().into(),
+		}];
+
+		let standard_order = OifStandardOrder {
+			user: user_address,
+			nonce: U256::from(nonce),
+			originChainId: U256::from(chain_id),
+			expires,
+			fillDeadline: fill_deadline,
+			inputOracle: input_oracle,
+			inputs: vec![[token_id, input_amount]],
+			outputs,
+		};
+
+		let contract_address = AlloyAddress::from_slice(
+			&hex::decode(compact_settler_hex.trim_start_matches("0x")).unwrap(),
+		);
+		let struct_hash = crate::eip712::compact::create_message_hasher()
+			.compute_message_hash(
+				&OifStandardOrder::abi_encode(&standard_order),
+				contract_address,
+			)
+			.expect("struct hash");
+		let domain_separator = FixedBytes::from([0x99u8; 32]);
+		let digest = keccak256(
+			[
+				&[0x19, 0x01][..],
+				domain_separator.as_slice(),
+				struct_hash.as_slice(),
+			]
+			.concat(),
+		);
+
+		let secp = Secp256k1::new();
+		let message = Message::from_digest(*digest);
+		let signature = secp.sign_ecdsa_recoverable(message, &secret_key);
+		let (recovery_id, sig_bytes) = signature.serialize_compact();
+		let mut sponsor_sig = sig_bytes.to_vec();
+		let rec_id: i32 = recovery_id.into();
+		sponsor_sig.push((rec_id as u8) + 27);
+		let signature = signature_from_sponsor(&sponsor_sig);
+
+		let lock_tag_hex = format!("0x{}", hex::encode(lock_tag));
+		let token_hex = format!("0x{}", hex::encode(token_address_bytes));
+		let payload = OrderPayload {
+			signature_type: SignatureType::Eip712,
+			domain: json!({
+				"name": "BatchCompact",
+				"version": "1",
+				"chainId": chain_id.to_string(),
+				"verifyingContract": "0x8888888888888888888888888888888888888888",
+			}),
+			primary_type: "BatchCompact".to_string(),
+			message: json!({
+				"sponsor": format!("{user_address:#x}"),
+				"nonce": nonce.to_string(),
+				"expires": expires.to_string(),
+				"mandate": {
+					"fillDeadline": fill_deadline.to_string(),
+					"inputOracle": input_oracle_hex,
+					"outputs": [{
+						"oracle": format!("0x{}", hex::encode(output_oracle)),
+						"settler": format!("0x{}", hex::encode(output_settler)),
+						"chainId": output_chain_id.to_string(),
+						"token": format!("0x{}", hex::encode(output_token_bytes32)),
+						"amount": output_amount.to_string(),
+						"recipient": format!("0x{}", hex::encode(output_recipient)),
+						"callbackData": "0x",
+						"context": "0x"
+					}]
+				},
+				"commitments": [{
+					"lockTag": lock_tag_hex,
+					"token": token_hex,
+					"amount": input_amount.to_string()
+				}]
+			}),
+			types: None,
+		};
+
+		let canonical_signature = compact_signature(&sponsor_sig, &[]);
+		assert!(
+			solver_types::standards::eip7683::compact_signatures::decode_compact_signatures(
+				&canonical_signature
+			)
+			.is_ok()
+		);
+
+		PostOrderRequest {
+			order: OifOrder::OifResourceLockV0 { payload },
+			signature,
+			quote_id: None,
+			origin_submission: None,
+		}
+	}
+
+	fn sample_resource_lock_request_with_shifted_signature() -> PostOrderRequest {
+		sample_resource_lock_request(shifted_compact_signature)
+	}
+
+	fn sample_resource_lock_request_with_allocator_data(
+		allocator_data: &'static [u8],
+	) -> PostOrderRequest {
+		sample_resource_lock_request(|sponsor_sig| compact_signature(sponsor_sig, allocator_data))
 	}
 
 	fn sample_permit2_request_with_witness_user(
@@ -1435,6 +1680,61 @@ mod tests {
 		let parsed: ErrorResponse = serde_json::from_slice(&body_bytes).expect("parse body");
 		assert_eq!(parsed.error, "SOLVER_INTAKE_DISABLED");
 		assert!(parsed.message.contains("intake"));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn handle_order_rejects_shifted_compact_signature_before_discovery_forwarding() {
+		let mock_server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(path("/intent"))
+			.respond_with(ResponseTemplate::new(200))
+			.expect(0)
+			.mount(&mock_server)
+			.await;
+
+		let discovery_url = format!("{}/intent", mock_server.uri());
+		let state = build_test_app_state(Some(discovery_url)).await;
+		let payload = to_value(sample_resource_lock_request_with_shifted_signature())
+			.expect("serialize request");
+
+		let response = super::handle_order(State(state), None, Json(payload)).await;
+
+		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+		let body_bytes = body::to_bytes(response.into_body(), usize::MAX)
+			.await
+			.expect("body");
+		let parsed: ErrorResponse = serde_json::from_slice(&body_bytes).expect("parse body");
+		assert_eq!(parsed.error, "ORDER_VALIDATION_FAILED");
+		assert!(parsed.message.contains("Compact"));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn handle_order_rejects_unauthorized_compact_allocator_data_before_forwarding() {
+		let mock_server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(path("/intent"))
+			.respond_with(ResponseTemplate::new(200))
+			.expect(0)
+			.mount(&mock_server)
+			.await;
+
+		let discovery_url = format!("{}/intent", mock_server.uri());
+		let state =
+			build_test_app_state_with_allocator_authorized(Some(discovery_url), false).await;
+		let payload = to_value(sample_resource_lock_request_with_allocator_data(
+			b"garbage allocator data",
+		))
+		.expect("serialize request");
+
+		let response = super::handle_order(State(state), None, Json(payload)).await;
+
+		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+		let body_bytes = body::to_bytes(response.into_body(), usize::MAX)
+			.await
+			.expect("body");
+		let parsed: ErrorResponse = serde_json::from_slice(&body_bytes).expect("parse body");
+		assert_eq!(parsed.error, "ORDER_VALIDATION_FAILED");
+		assert!(parsed.message.contains("allocator"));
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
