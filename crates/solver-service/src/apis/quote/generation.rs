@@ -2022,6 +2022,9 @@ mod tests {
 				.expect_select_oracle()
 				.returning(|oracles, _context| oracles.first().cloned());
 		}
+		mock_settlement
+			.expect_quote_post_fill_fee()
+			.returning(|_| Box::pin(async { Ok(None) }));
 
 		let mut implementations: HashMap<String, Box<dyn SettlementInterface>> = HashMap::new();
 		implementations.insert("test".to_string(), Box::new(mock_settlement));
@@ -2157,6 +2160,8 @@ mod tests {
 				gas_pre_claim: Decimal::ZERO,
 				gas_claim: Decimal::from_str("0.001").unwrap(),
 				gas_buffer: Decimal::from_str("0.0005").unwrap(),
+				settlement_fee: Decimal::ZERO,
+				settlement_fee_buffer: Decimal::ZERO,
 				rate_buffer: Decimal::from_str("0.01").unwrap(),
 				base_price: Decimal::from_str("1.0").unwrap(),
 				min_profit: Decimal::from_str("0.005").unwrap(),

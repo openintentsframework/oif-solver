@@ -89,6 +89,10 @@ pub struct SolverConfig {
 	/// Applied as safety margin on gas cost estimates.
 	#[serde(default = "default_gas_buffer_bps")]
 	pub gas_buffer_bps: u32,
+	/// Settlement native fee buffer in basis points (e.g., 1000 = 10%).
+	/// Applied as safety margin on native settlement message fee quotes.
+	#[serde(default = "default_settlement_fee_buffer_bps")]
+	pub settlement_fee_buffer_bps: u32,
 	/// Commission in basis points (e.g., 20 = 0.20%).
 	/// Added to solver profit requirement.
 	#[serde(default = "default_commission_bps")]
@@ -360,6 +364,10 @@ pub struct PricingConfig {
 }
 
 fn default_gas_buffer_bps() -> u32 {
+	1000 // 10%
+}
+
+fn default_settlement_fee_buffer_bps() -> u32 {
 	1000 // 10%
 }
 
@@ -1257,6 +1265,13 @@ mod tests {
 
 		assert_eq!(config.solver.ingress_mode, SolverIngressMode::Active);
 		assert!(!config.solver.is_intake_disabled());
+	}
+
+	#[test]
+	fn test_settlement_fee_buffer_bps_defaults_to_1000() {
+		let config = ConfigBuilder::new().build();
+
+		assert_eq!(config.solver.settlement_fee_buffer_bps, 1000);
 	}
 
 	#[test]
