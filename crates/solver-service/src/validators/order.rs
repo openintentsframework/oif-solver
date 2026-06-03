@@ -8,7 +8,9 @@ use alloy_sol_types::SolCall;
 use solver_config::Config;
 use solver_core::SolverEngine;
 use solver_types::{
-	standards::eip7683::{interfaces::StandardOrder, LockType},
+	standards::eip7683::{
+		interfaces::StandardOrder, LockType, MAX_STANDARD_ORDER_INPUTS, MAX_STANDARD_ORDER_OUTPUTS,
+	},
 	APIError, ApiErrorType,
 };
 use std::convert::TryFrom;
@@ -35,6 +37,21 @@ pub async fn ensure_user_capacity_for_order(
 		})?;
 
 	let user = &standard_order.user;
+
+	if standard_order.inputs.len() > MAX_STANDARD_ORDER_INPUTS {
+		return Err(APIError::BadRequest {
+			error_type: ApiErrorType::OrderValidationFailed,
+			message: format!("Too many inputs: maximum supported is {MAX_STANDARD_ORDER_INPUTS}"),
+			details: None,
+		});
+	}
+	if standard_order.outputs.len() > MAX_STANDARD_ORDER_OUTPUTS {
+		return Err(APIError::BadRequest {
+			error_type: ApiErrorType::OrderValidationFailed,
+			message: format!("Too many outputs: maximum supported is {MAX_STANDARD_ORDER_OUTPUTS}"),
+			details: None,
+		});
+	}
 
 	match lock_type {
 		LockType::ResourceLock => {
@@ -482,6 +499,37 @@ mod tests {
 		)
 		.await
 		.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_ensure_user_capacity_rejects_too_many_inputs_before_balance_rpc() {
+		let amount = U256::from(500u64);
+		let token_u256 = token_to_u256(parse_alloy_address(TEST_TOKEN));
+		let mut standard_order = build_standard_order(TEST_CHAIN_ID, token_u256, amount);
+		standard_order.inputs = vec![[token_u256, amount]; 17];
+
+		let delivery = Arc::new(TestDelivery::new(HashMap::new(), HashMap::new()))
+			as Arc<dyn DeliveryInterface>;
+		let mut delivery_map = HashMap::new();
+		delivery_map.insert(TEST_CHAIN_ID, delivery);
+
+		let config = build_config(TEST_CHAIN_ID, TEST_COMPACT);
+		let solver = build_solver_engine(config.clone(), delivery_map);
+
+		let result = super::ensure_user_capacity_for_order(
+			&solver,
+			&config,
+			LockType::Permit2Escrow,
+			&standard_order,
+		)
+		.await;
+
+		match result {
+			Err(APIError::BadRequest { message, .. }) => {
+				assert!(message.contains("Too many inputs"));
+			},
+			_ => panic!("expected too many inputs error"),
+		}
 	}
 
 	#[tokio::test]

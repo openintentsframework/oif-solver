@@ -1588,7 +1588,7 @@ mod tests {
 		use axum::extract::State;
 		use axum::Json;
 
-		let (tx, _rx) = mpsc::unbounded_channel();
+		let (tx, _rx) = mpsc::channel(16);
 		let state = ApiState {
 			intent_sender: tx,
 			providers: HashMap::new(),
@@ -1623,7 +1623,7 @@ mod tests {
 		use axum::extract::State;
 		use axum::Json;
 
-		let (tx, _rx) = mpsc::unbounded_channel();
+		let (tx, _rx) = mpsc::channel(16);
 		let mut providers = HashMap::new();
 		providers.insert(1, mocked_provider_with_allocator_authorized(false));
 		let state = ApiState {
