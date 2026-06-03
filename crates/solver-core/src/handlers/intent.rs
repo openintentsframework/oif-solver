@@ -359,6 +359,21 @@ impl IntentHandler {
 					}
 				}
 
+				if let Err(e) = self
+					.cost_profit_service
+					.validate_before_fill_simulation(&order, &config)
+					.await
+				{
+					tracing::warn!("Order failed pre-simulation validation: {}", e);
+					self.event_bus
+						.publish(SolverEvent::Order(OrderEvent::Skipped {
+							order_id: order.id.clone(),
+							reason: format!("Pre-simulation validation failed: {e}"),
+						}))
+						.ok();
+					return Ok(());
+				}
+
 				// Step 1: Generate fill transaction and simulate to get accurate gas estimate
 				// This also validates callbacks won't revert
 				let default_params = ExecutionParams {
@@ -570,7 +585,7 @@ mod tests {
 	use solver_pricing::{MockPricingInterface, PricingService};
 	use solver_storage::{MockStorageInterface, StorageError};
 	use solver_types::utils::tests::builders::{
-		Eip7683OrderDataBuilder, IntentBuilder, OrderBuilder,
+		Eip7683OrderDataBuilder, IntentBuilder, MandateOutputBuilder, OrderBuilder,
 	};
 	use solver_types::{Address, DiscoveryEvent, ExecutionParams, Intent, Order, SolverEvent};
 	use std::collections::HashMap;
@@ -599,6 +614,37 @@ mod tests {
 			.with_id("test_intent_123".to_string())
 			.with_data(serde_json::to_value(&order_data).unwrap())
 			.build()
+	}
+
+	fn create_test_order_from_data(order_data: Eip7683OrderData) -> Order {
+		OrderBuilder::new()
+			.with_id("test_intent_123".to_string())
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.build()
+	}
+
+	fn address20_to_bytes32(address: [u8; 20]) -> [u8; 32] {
+		let mut bytes = [0u8; 32];
+		bytes[12..].copy_from_slice(&address);
+		bytes
+	}
+
+	fn create_test_order_with_unsupported_output_token() -> Order {
+		let mut order_data = Eip7683OrderDataBuilder::new().build();
+		order_data.outputs[0].token = address20_to_bytes32([0x44; 20]);
+		create_test_order_from_data(order_data)
+	}
+
+	fn create_test_order_with_oversized_callback_data() -> Order {
+		let output = MandateOutputBuilder::new()
+			.chain_id(U256::from(137))
+			.token([0u8; 32])
+			.amount(U256::from(95u64))
+			.recipient([0u8; 32])
+			.call(vec![0xab; u16::MAX as usize + 1])
+			.build();
+		let order_data = Eip7683OrderDataBuilder::new().outputs(vec![output]).build();
+		create_test_order_from_data(order_data)
 	}
 
 	fn create_test_address() -> Address {
@@ -1000,6 +1046,162 @@ mod tests {
 
 		let result = handler.handle(intent).await;
 		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_rejects_unsupported_output_token_before_fill_simulation() {
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_order_interface = MockOrderInterface::new();
+		let mut mock_strategy = MockExecutionStrategy::new();
+
+		let intent = create_test_intent();
+		let solver_address = create_test_address();
+
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:0xtest_intent_123"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+		mock_storage
+			.expect_set_bytes()
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		mock_order_interface
+			.expect_validate_and_create_order()
+			.times(1)
+			.returning(move |_, _, _, _, _, _| {
+				Box::pin(async move { Ok(create_test_order_with_unsupported_output_token()) })
+			});
+		mock_order_interface
+			.expect_generate_fill_transaction()
+			.times(0);
+		mock_strategy.expect_should_execute().times(0);
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order_interface) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(mock_strategy),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let cost_profit_service = create_mock_cost_profit_service();
+		let (config, static_config) = create_test_config();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+			&static_config,
+		);
+
+		handler
+			.handle(intent)
+			.await
+			.expect("handler should skip unsupported token intent without error");
+
+		match receiver.recv().await.unwrap() {
+			SolverEvent::Order(OrderEvent::Skipped { reason, .. }) => {
+				assert!(reason.contains("Token not supported"));
+			},
+			other => panic!("Expected OrderEvent::Skipped, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_rejects_oversized_callback_before_fill_simulation() {
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_order_interface = MockOrderInterface::new();
+		let mut mock_strategy = MockExecutionStrategy::new();
+
+		let intent = create_test_intent();
+		let solver_address = create_test_address();
+
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:0xtest_intent_123"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+		mock_storage
+			.expect_set_bytes()
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		mock_order_interface
+			.expect_validate_and_create_order()
+			.times(1)
+			.returning(move |_, _, _, _, _, _| {
+				Box::pin(async move { Ok(create_test_order_with_oversized_callback_data()) })
+			});
+		mock_order_interface
+			.expect_generate_fill_transaction()
+			.times(0);
+		mock_strategy.expect_should_execute().times(0);
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order_interface) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(mock_strategy),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let cost_profit_service = create_mock_cost_profit_service();
+		let (config, static_config) = create_test_config();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+			&static_config,
+		);
+
+		handler
+			.handle(intent)
+			.await
+			.expect("handler should skip oversized callback intent without error");
+
+		match receiver.recv().await.unwrap() {
+			SolverEvent::Order(OrderEvent::Skipped { reason, .. }) => {
+				assert!(reason.contains("callbackData is too large"));
+			},
+			other => panic!("Expected OrderEvent::Skipped, got {other:?}"),
+		}
 	}
 
 	#[tokio::test]
