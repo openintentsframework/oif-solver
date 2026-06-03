@@ -8,6 +8,7 @@ pub mod context;
 pub mod cost_profit;
 pub mod event_bus;
 pub mod lifecycle;
+pub mod live_estimate;
 pub mod post_fill_overrides;
 pub mod startup_readiness;
 pub mod token_manager;

@@ -26,9 +26,9 @@
 use crate::seeds::types::{NetworkSeed, SeedConfig, COMMON_DEFAULTS};
 use solver_config::{
 	AccountConfig, ApiConfig, ApiImplementations, Config, DeliveryConfig, DiscoveryConfig,
-	GasConfig, GasFlowUnits, OrderConfig, PricingConfig, RebalanceConfig, RebalancePairConfig,
-	RebalancePairSideConfig, SettlementConfig, SolverConfig, SolverIngressMode, StorageConfig,
-	StrategyConfig,
+	GasConfig, GasFlowUnits, OrderConfig, PricingConfig, QuoteConfig, RateLimitConfig,
+	RebalanceConfig, RebalancePairConfig, RebalancePairSideConfig, SettlementConfig, SolverConfig,
+	SolverIngressMode, StorageConfig, StrategyConfig,
 };
 use solver_types::seed_overrides::OracleSelectionStrategyOverride;
 use solver_types::{
@@ -2137,6 +2137,8 @@ fn build_gas_config_from_operator(gas: &OperatorGasConfig) -> GasConfig {
 		flows,
 		live_fill_estimate_enabled: gas.live_fill_estimate_enabled,
 		live_post_fill_estimate_chain_ids: gas.live_post_fill_estimate_chain_ids.clone(),
+		max_concurrent_live_fill_estimates_per_chain:
+			solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
 	}
 }
 
@@ -2223,10 +2225,10 @@ fn build_api_config_from_operator(
 		implementations: ApiImplementations {
 			discovery: Some("offchain_eip7683".to_string()),
 		},
-		rate_limiting: None,
+		rate_limiting: Some(RateLimitConfig::default()),
 		cors: None,
 		auth,
-		quote: None,
+		quote: Some(QuoteConfig::default()),
 	})
 }
 

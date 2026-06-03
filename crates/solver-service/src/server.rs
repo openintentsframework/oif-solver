@@ -19,17 +19,16 @@ use crate::{
 };
 use alloy_primitives::U256;
 use axum::{
-	body::Body,
 	extract::DefaultBodyLimit,
 	extract::{Extension, Path, State},
-	http::{Request, StatusCode},
-	middleware::{self, Next},
-	response::{IntoResponse, Json, Response},
+	http::StatusCode,
+	middleware,
+	response::{IntoResponse, Json},
 	routing::{delete, get, post, put},
 	Router, ServiceExt,
 };
 use serde_json::Value;
-use solver_config::{ApiConfig, Config, RateLimitConfig};
+use solver_config::{ApiConfig, Config};
 use solver_core::SolverEngine;
 use solver_storage::{
 	config_store::create_config_store,
@@ -42,13 +41,7 @@ use solver_types::{
 	ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse, OperatorConfig, Order,
 	OrderIdCallback, Transaction,
 };
-use std::{
-	collections::{HashMap, VecDeque},
-	convert::TryInto,
-	net::{IpAddr, Ipv4Addr, SocketAddr},
-	sync::{Arc, Mutex},
-	time::{Duration, Instant},
-};
+use std::{convert::TryInto, net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tower::ServiceBuilder;
@@ -73,58 +66,6 @@ pub struct AppState {
 	pub siwe_nonce_store: Option<Arc<NonceStore>>,
 	/// Signature validation service for different order standards.
 	pub signature_validation: Arc<SignatureValidationService>,
-}
-
-#[derive(Clone)]
-struct ApiRateLimiter {
-	max_requests: usize,
-	window: Duration,
-	clients: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
-}
-
-impl ApiRateLimiter {
-	fn new(config: &RateLimitConfig) -> Self {
-		Self {
-			max_requests: config.requests_per_minute.max(config.burst_size).max(1) as usize,
-			window: Duration::from_secs(60),
-			clients: Arc::new(Mutex::new(HashMap::new())),
-		}
-	}
-
-	fn allows(&self, ip: IpAddr) -> bool {
-		let now = Instant::now();
-		let mut clients = self.clients.lock().expect("rate limiter lock poisoned");
-		let entries = clients.entry(ip).or_default();
-		while entries
-			.front()
-			.is_some_and(|instant| now.duration_since(*instant) >= self.window)
-		{
-			entries.pop_front();
-		}
-		if entries.len() >= self.max_requests {
-			return false;
-		}
-		entries.push_back(now);
-		true
-	}
-}
-
-async fn api_rate_limit_middleware(
-	State(limiter): State<ApiRateLimiter>,
-	request: Request<Body>,
-	next: Next,
-) -> Response {
-	let ip = request
-		.extensions()
-		.get::<axum::extract::ConnectInfo<SocketAddr>>()
-		.map(|connect_info| connect_info.0.ip())
-		.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-
-	if !limiter.allows(ip) {
-		return StatusCode::TOO_MANY_REQUESTS.into_response();
-	}
-
-	next.run(request).await
 }
 
 fn create_admin_storage_backend(
@@ -511,6 +452,7 @@ fn build_public_api_routes(
 	jwt_service: Option<&Arc<JwtService>>,
 ) -> Router<AppState> {
 	let mut quote_routes = Router::new().route("/quotes", post(handle_quote));
+	quote_routes = crate::api_hardening::apply_quote_concurrency(quote_routes, api_config);
 	let require_auth = api_config
 		.auth
 		.as_ref()
@@ -565,7 +507,7 @@ fn build_public_api_routes(
 		}
 	}
 
-	let mut routes = Router::new()
+	let routes = Router::new()
 		.merge(quote_routes)
 		.route("/assets", get(handle_get_assets))
 		.route("/assets/{chain_id}", get(handle_get_assets_for_chain))
@@ -573,14 +515,7 @@ fn build_public_api_routes(
 		.merge(order_routes)
 		.layer(DefaultBodyLimit::max(api_config.max_request_size));
 
-	if let Some(rate_limiting) = &api_config.rate_limiting {
-		routes = routes.layer(middleware::from_fn_with_state(
-			ApiRateLimiter::new(rate_limiting),
-			api_rate_limit_middleware,
-		));
-	}
-
-	routes
+	crate::api_hardening::apply_rate_limit(routes, api_config)
 }
 
 /// Handles POST /api/v1/quotes requests.
@@ -1071,7 +1006,9 @@ mod tests {
 	};
 	use std::collections::HashMap;
 	use std::convert::TryFrom;
+	use std::net::{IpAddr, Ipv4Addr};
 	use std::sync::Arc;
+	use std::time::Duration;
 	use tower::ServiceExt;
 	use wiremock::matchers::{method, path};
 	use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1222,6 +1159,21 @@ mod tests {
 			issuer: "test".to_string(),
 			public_register_enabled: false,
 			admin: None,
+		}
+	}
+
+	fn test_api_config() -> ApiConfig {
+		ApiConfig {
+			enabled: true,
+			host: "127.0.0.1".to_string(),
+			port: 0,
+			timeout_seconds: 30,
+			max_request_size: 1024 * 1024,
+			implementations: Default::default(),
+			rate_limiting: None,
+			cors: None,
+			auth: None,
+			quote: None,
 		}
 	}
 
@@ -1572,6 +1524,7 @@ mod tests {
 			max_request_size: 1024 * 1024,
 			implementations: Default::default(),
 			rate_limiting: Some(RateLimitConfig {
+				enabled: true,
 				requests_per_minute: 1,
 				burst_size: 1,
 			}),
@@ -1595,6 +1548,75 @@ mod tests {
 
 		let second = app.oneshot(request()).await.unwrap();
 		assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn quotes_route_applies_default_rate_limit_when_config_omits_it() {
+		let mut api_config = test_api_config();
+		api_config.rate_limiting = None;
+		let app = test_quote_app(api_config, None).await;
+
+		for _ in 0..solver_config::DEFAULT_API_RATE_LIMIT_REQUESTS_PER_MINUTE {
+			let response = app
+				.clone()
+				.oneshot(
+					Request::builder()
+						.method("POST")
+						.uri("/quotes")
+						.header("content-type", "application/json")
+						.body(Body::from("{}"))
+						.unwrap(),
+				)
+				.await
+				.unwrap();
+			assert_ne!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+		}
+
+		let limited = app
+			.oneshot(
+				Request::builder()
+					.method("POST")
+					.uri("/quotes")
+					.header("content-type", "application/json")
+					.body(Body::from("{}"))
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+	}
+
+	#[test]
+	fn api_rate_limiter_evicts_expired_client_entries() {
+		let limiter =
+			crate::api_hardening::ApiRateLimiter::new_for_test(1, Duration::from_millis(10));
+		let first_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+		let second_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+
+		assert!(limiter.allows(first_ip));
+		assert!(limiter.allows(second_ip));
+		assert_eq!(limiter.tracked_clients_for_test(), 2);
+
+		std::thread::sleep(Duration::from_millis(15));
+		assert!(limiter.allows(first_ip));
+		assert_eq!(
+			limiter.tracked_clients_for_test(),
+			1,
+			"expired clients should be removed opportunistically"
+		);
+	}
+
+	#[test]
+	fn quote_concurrency_limiter_rejects_when_saturated() {
+		let limiter = crate::api_hardening::QuoteConcurrencyLimiter::new(1);
+		let _held = limiter
+			.try_acquire()
+			.expect("first quote request should acquire the only permit");
+
+		assert!(
+			limiter.try_acquire().is_none(),
+			"saturated quote limiter should reject immediately"
+		);
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

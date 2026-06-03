@@ -5,6 +5,7 @@
 //! - Calculating profit margins for orders and validating profitability thresholds
 //! - Unified service combining cost estimation and profitability validation
 
+use crate::engine::live_estimate::LiveEstimateController;
 use crate::engine::token_manager::{TokenManager, TokenManagerError};
 use alloy_primitives::{keccak256, Address as AlloyAddress, B256, U256};
 use alloy_sol_types::{sol, SolCall};
@@ -274,6 +275,8 @@ pub struct CostProfitService {
 	token_manager: Arc<TokenManager>,
 	/// Storage service for reading quotes
 	storage_service: Arc<StorageService>,
+	/// Bounds quote-time live fill gas estimation per destination chain.
+	live_estimate_controller: Arc<LiveEstimateController>,
 }
 
 impl CostProfitService {
@@ -289,6 +292,7 @@ impl CostProfitService {
 			delivery_service,
 			token_manager,
 			storage_service,
+			live_estimate_controller: Arc::new(LiveEstimateController::new()),
 		}
 	}
 
@@ -705,6 +709,11 @@ impl CostProfitService {
 			.unwrap_or(false);
 
 		if fill_enabled {
+			let max_live_fill_estimates = config
+				.gas
+				.as_ref()
+				.map(|g| g.max_concurrent_live_fill_estimates_per_chain)
+				.unwrap_or(solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN);
 			match self
 				.build_fill_tx_for_quote(
 					request,
@@ -716,8 +725,9 @@ impl CostProfitService {
 				.await
 			{
 				Ok(fill_tx) => {
-					if let Some(live_units) =
-						self.try_live_fill_estimate(dest_chain_id, &fill_tx).await
+					if let Some(live_units) = self
+						.try_live_fill_estimate(dest_chain_id, &fill_tx, max_live_fill_estimates)
+						.await
 					{
 						tracing::info!(
 							chain_id = dest_chain_id,
@@ -1565,7 +1575,20 @@ impl CostProfitService {
 		&self,
 		dest_chain_id: u64,
 		fill_tx: &Transaction,
+		max_concurrent: usize,
 	) -> Option<u64> {
+		let Some(_permit) = self
+			.live_estimate_controller
+			.try_acquire(dest_chain_id, max_concurrent)
+		else {
+			tracing::warn!(
+				chain_id = dest_chain_id,
+				max_concurrent,
+				"Live fill-gas estimation saturated; falling back to static default"
+			);
+			return None;
+		};
+
 		match self
 			.delivery_service
 			.estimate_gas(dest_chain_id, fill_tx.clone())
@@ -3491,6 +3514,8 @@ mod tests {
 			)]),
 			live_fill_estimate_enabled: true,
 			live_post_fill_estimate_chain_ids: std::collections::HashSet::new(),
+			max_concurrent_live_fill_estimates_per_chain:
+				solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
 		});
 
 		let (open, fill, post_fill, pre_claim, claim) = estimate_gas_units_from_flow_keys(
@@ -3525,6 +3550,8 @@ mod tests {
 			)]),
 			live_fill_estimate_enabled: true,
 			live_post_fill_estimate_chain_ids: std::collections::HashSet::new(),
+			max_concurrent_live_fill_estimates_per_chain:
+				solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
 		});
 
 		let (open, fill, post_fill, pre_claim, claim) = estimate_gas_units_from_flow_keys(
@@ -4852,7 +4879,13 @@ mod tests {
 		let service = cost_profit_service_with_delivery_mock(1, mock_delivery);
 		let fill_tx = create_test_fill_transaction();
 
-		let result = service.try_live_fill_estimate(1, &fill_tx).await;
+		let result = service
+			.try_live_fill_estimate(
+				1,
+				&fill_tx,
+				solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
+			)
+			.await;
 		assert_eq!(result, Some(123_456));
 	}
 
@@ -4869,7 +4902,13 @@ mod tests {
 		let service = cost_profit_service_with_delivery_mock(1, mock_delivery);
 		let fill_tx = create_test_fill_transaction();
 
-		let result = service.try_live_fill_estimate(1, &fill_tx).await;
+		let result = service
+			.try_live_fill_estimate(
+				1,
+				&fill_tx,
+				solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
+			)
+			.await;
 		assert_eq!(result, None);
 	}
 
@@ -4886,7 +4925,13 @@ mod tests {
 		let service = cost_profit_service_with_delivery_mock(1, mock_delivery);
 		let fill_tx = create_test_fill_transaction();
 
-		let result = service.try_live_fill_estimate(1, &fill_tx).await;
+		let result = service
+			.try_live_fill_estimate(
+				1,
+				&fill_tx,
+				solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
+			)
+			.await;
 		assert_eq!(result, None);
 	}
 
@@ -5260,6 +5305,8 @@ mod tests {
 			)]),
 			live_fill_estimate_enabled: false,
 			live_post_fill_estimate_chain_ids: std::collections::HashSet::new(),
+			max_concurrent_live_fill_estimates_per_chain:
+				solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
 		});
 
 		let request = create_test_request(true);
@@ -5304,6 +5351,8 @@ mod tests {
 			)]),
 			live_fill_estimate_enabled: true,
 			live_post_fill_estimate_chain_ids: std::collections::HashSet::new(),
+			max_concurrent_live_fill_estimates_per_chain:
+				solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
 		});
 
 		let request = create_test_request(true);
@@ -5348,6 +5397,53 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn cost_context_uses_static_fill_when_live_estimate_limiter_is_saturated() {
+		use std::sync::atomic::Ordering;
+
+		let live_units: u64 = 5_000_000;
+		let (service, _override_calls, bare_calls) =
+			cost_profit_service_for_post_fill_override(Some(live_units), None);
+		let mut config = config_for_live_estimate(true);
+		config.gas = Some(solver_config::GasConfig {
+			flows: HashMap::from([(
+				"permit2_escrow".to_string(),
+				solver_config::GasFlowUnits {
+					open: Some(0),
+					fill: Some(50_000),
+					post_fill: Some(0),
+					pre_claim: Some(0),
+					claim: Some(0),
+				},
+			)]),
+			live_fill_estimate_enabled: true,
+			live_post_fill_estimate_chain_ids: std::collections::HashSet::new(),
+			max_concurrent_live_fill_estimates_per_chain: 0,
+		});
+
+		let request = create_test_request(true);
+		let context = create_test_validated_context(true);
+		let solver = Address([0xAB; 20].to_vec());
+
+		let ctx = service
+			.calculate_cost_context_for_flow_keys(
+				&request,
+				&context,
+				&config,
+				&["permit2_escrow".to_string()],
+				&solver,
+			)
+			.await
+			.expect("saturated live-estimate limiter should fall back to static gas");
+
+		assert!(ctx.cost_breakdown.gas_fill > Decimal::ZERO);
+		assert_eq!(
+			bare_calls.load(Ordering::SeqCst),
+			0,
+			"saturated limiter must not call eth_estimateGas"
+		);
+	}
+
+	#[tokio::test]
 	async fn cost_context_uses_live_post_fill_units_when_enabled() {
 		// Updated for Task 4: post-fill now flows through the override path
 		// (`estimate_gas_with_overrides`) and is gated by
@@ -5371,6 +5467,8 @@ mod tests {
 			)]),
 			live_fill_estimate_enabled: false,
 			live_post_fill_estimate_chain_ids: std::collections::HashSet::from([137u64]),
+			max_concurrent_live_fill_estimates_per_chain:
+				solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
 		});
 
 		let request = create_test_request(true);
@@ -5432,6 +5530,8 @@ mod tests {
 			)]),
 			live_fill_estimate_enabled: true,
 			live_post_fill_estimate_chain_ids: std::collections::HashSet::new(),
+			max_concurrent_live_fill_estimates_per_chain:
+				solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
 		});
 
 		let request = create_test_request(true);
@@ -5656,6 +5756,8 @@ mod tests {
 			)]),
 			live_fill_estimate_enabled: false,
 			live_post_fill_estimate_chain_ids: std::collections::HashSet::from([137u64]),
+			max_concurrent_live_fill_estimates_per_chain:
+				solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
 		});
 
 		let request = create_test_request(true);
@@ -5730,6 +5832,8 @@ mod tests {
 			)]),
 			live_fill_estimate_enabled: false,
 			live_post_fill_estimate_chain_ids: std::collections::HashSet::new(),
+			max_concurrent_live_fill_estimates_per_chain:
+				solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
 		});
 
 		let request = create_test_request(true);
@@ -5775,6 +5879,8 @@ mod tests {
 			)]),
 			live_fill_estimate_enabled: false,
 			live_post_fill_estimate_chain_ids: std::collections::HashSet::from([137u64]),
+			max_concurrent_live_fill_estimates_per_chain:
+				solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
 		});
 
 		let request = create_test_request(true);
@@ -5821,6 +5927,8 @@ mod tests {
 			)]),
 			live_fill_estimate_enabled: false,
 			live_post_fill_estimate_chain_ids: std::collections::HashSet::from([137u64]),
+			max_concurrent_live_fill_estimates_per_chain:
+				solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
 		});
 
 		let request = create_test_request(true);
@@ -6015,6 +6123,8 @@ mod tests {
 			} else {
 				std::collections::HashSet::new()
 			},
+			max_concurrent_live_fill_estimates_per_chain:
+				solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
 		});
 		config
 	}
@@ -6044,6 +6154,8 @@ mod tests {
 			)]),
 			live_fill_estimate_enabled: false,
 			live_post_fill_estimate_chain_ids: std::collections::HashSet::from([137u64]),
+			max_concurrent_live_fill_estimates_per_chain:
+				solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
 		});
 		config
 	}
@@ -6066,6 +6178,8 @@ mod tests {
 			} else {
 				std::collections::HashSet::new()
 			},
+			max_concurrent_live_fill_estimates_per_chain:
+				solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
 		}
 	}
 
@@ -6516,6 +6630,8 @@ mod tests {
 			)]),
 			live_fill_estimate_enabled: true,
 			live_post_fill_estimate_chain_ids: std::collections::HashSet::new(),
+			max_concurrent_live_fill_estimates_per_chain:
+				solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
 		});
 
 		let request = create_test_request(true);

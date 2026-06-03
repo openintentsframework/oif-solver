@@ -772,11 +772,29 @@ async fn handle_intent_submission(
 	}
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnqueueIntentError {
+	Full,
+	Closed,
+}
+
+impl std::fmt::Display for EnqueueIntentError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Full => write!(f, "intent queue is full"),
+			Self::Closed => write!(f, "intent queue is closed"),
+		}
+	}
+}
+
 fn enqueue_intent(
 	intent_sender: &mpsc::Sender<Intent>,
 	intent: Intent,
-) -> Result<(), mpsc::error::TrySendError<Intent>> {
-	intent_sender.try_send(intent)
+) -> Result<(), EnqueueIntentError> {
+	intent_sender.try_send(intent).map_err(|e| match e {
+		mpsc::error::TrySendError::Full(_) => EnqueueIntentError::Full,
+		mpsc::error::TrySendError::Closed(_) => EnqueueIntentError::Closed,
+	})
 }
 
 /// Configuration schema for EIP-7683 off-chain discovery service.
@@ -1345,6 +1363,6 @@ mod tests {
 		)
 		.expect_err("full queue should reject the intent immediately");
 
-		assert!(matches!(error, mpsc::error::TrySendError::Full(_)));
+		assert_eq!(error, EnqueueIntentError::Full);
 	}
 }

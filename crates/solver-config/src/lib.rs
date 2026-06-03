@@ -299,10 +299,25 @@ pub struct ApiConfig {
 /// Rate limiting configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RateLimitConfig {
+	/// Whether public API rate limiting is enabled.
+	#[serde(default = "default_rate_limiting_enabled")]
+	pub enabled: bool,
 	/// Maximum requests per minute per IP.
+	#[serde(default = "default_api_rate_limit_requests_per_minute")]
 	pub requests_per_minute: u32,
 	/// Burst allowance for requests.
+	#[serde(default = "default_api_rate_limit_burst")]
 	pub burst_size: u32,
+}
+
+impl Default for RateLimitConfig {
+	fn default() -> Self {
+		Self {
+			enabled: default_rate_limiting_enabled(),
+			requests_per_minute: default_api_rate_limit_requests_per_minute(),
+			burst_size: default_api_rate_limit_burst(),
+		}
+	}
 }
 
 /// CORS configuration.
@@ -360,6 +375,12 @@ fn default_live_post_fill_estimate_chain_ids() -> HashSet<u64> {
 	HashSet::new() // empty = disabled everywhere; opt-in per-chain
 }
 
+pub const DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN: usize = 8;
+
+fn default_max_concurrent_live_fill_estimates_per_chain() -> usize {
+	DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN
+}
+
 /// Gas configuration mapping flow identifiers to gas unit overrides.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GasConfig {
@@ -378,6 +399,10 @@ pub struct GasConfig {
 	/// OutputSettler's storage layout via the integration test.
 	#[serde(default = "default_live_post_fill_estimate_chain_ids")]
 	pub live_post_fill_estimate_chain_ids: HashSet<u64>,
+	/// Maximum concurrent quote-time live fill gas estimates per destination chain.
+	/// Saturation falls back to static configured gas units rather than refusing a quote.
+	#[serde(default = "default_max_concurrent_live_fill_estimates_per_chain")]
+	pub max_concurrent_live_fill_estimates_per_chain: usize,
 }
 
 /// Runtime rebalancing configuration.
@@ -693,6 +718,9 @@ pub struct QuoteConfig {
 	/// Defaults to 600 seconds (10 minutes) if not specified.
 	#[serde(default = "default_expires_seconds")]
 	pub expires_seconds: u64,
+	/// Maximum concurrent public quote requests.
+	#[serde(default = "default_quote_max_concurrent_requests")]
+	pub max_concurrent_requests: usize,
 }
 
 impl Default for QuoteConfig {
@@ -701,8 +729,29 @@ impl Default for QuoteConfig {
 			validity_seconds: default_quote_validity_seconds(),
 			fill_deadline_seconds: default_fill_deadline_seconds(),
 			expires_seconds: default_expires_seconds(),
+			max_concurrent_requests: default_quote_max_concurrent_requests(),
 		}
 	}
+}
+
+pub const DEFAULT_API_RATE_LIMIT_REQUESTS_PER_MINUTE: u32 = 600;
+pub const DEFAULT_API_RATE_LIMIT_BURST: u32 = 100;
+pub const DEFAULT_QUOTE_MAX_CONCURRENT_REQUESTS: usize = 32;
+
+fn default_rate_limiting_enabled() -> bool {
+	true
+}
+
+fn default_api_rate_limit_requests_per_minute() -> u32 {
+	DEFAULT_API_RATE_LIMIT_REQUESTS_PER_MINUTE
+}
+
+fn default_api_rate_limit_burst() -> u32 {
+	DEFAULT_API_RATE_LIMIT_BURST
+}
+
+fn default_quote_max_concurrent_requests() -> usize {
+	DEFAULT_QUOTE_MAX_CONCURRENT_REQUESTS
 }
 
 /// Returns the default quote validity duration in seconds.
