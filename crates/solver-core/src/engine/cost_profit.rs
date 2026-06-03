@@ -1237,6 +1237,18 @@ impl CostProfitService {
 		Ok(())
 	}
 
+	/// Returns true if `recipient_interop_hex` is permitted by the configured
+	/// callback whitelist. An empty whitelist means "allow all callbacks",
+	/// matching the quote-time contract in solver-service's
+	/// `validate_callback_whitelist`.
+	fn callback_recipient_whitelisted(config: &Config, recipient_interop_hex: &str) -> bool {
+		let whitelist = &config.order.callback_whitelist;
+		whitelist.is_empty()
+			|| whitelist
+				.iter()
+				.any(|entry| entry.to_lowercase() == recipient_interop_hex)
+	}
+
 	fn validate_callback_policy_before_simulation(
 		outputs: &[OrderOutput],
 		config: &Config,
@@ -1268,11 +1280,8 @@ impl CostProfitService {
 				.map(|addr| format!("0x{}", alloy_primitives::hex::encode(addr)))
 				.unwrap_or_else(|_| "unknown".to_string());
 
-			let is_whitelisted = config
-				.order
-				.callback_whitelist
-				.iter()
-				.any(|entry| entry.to_lowercase() == recipient_interop_hex);
+			let is_whitelisted =
+				Self::callback_recipient_whitelisted(config, &recipient_interop_hex);
 
 			if !is_whitelisted {
 				return Err(CostProfitError::Config(format!(
@@ -2618,11 +2627,7 @@ impl CostProfitService {
 
 		// Check whitelist using EIP-7930 InteropAddress format
 		// Whitelist entries should be in EIP-7930 hex format (e.g., "0x0001000002210514...")
-		let is_whitelisted = config
-			.order
-			.callback_whitelist
-			.iter()
-			.any(|entry| entry.to_lowercase() == recipient_interop_hex);
+		let is_whitelisted = Self::callback_recipient_whitelisted(config, &recipient_interop_hex);
 
 		if !is_whitelisted {
 			tracing::warn!(
@@ -5299,8 +5304,12 @@ mod tests {
 		let order = create_order_with_callback(callback_data);
 		let fill_tx = create_test_fill_transaction();
 
-		// Empty whitelist - recipient not whitelisted
-		let config = create_config_with_callback_whitelist(vec![]);
+		// Non-empty whitelist that does NOT contain the recipient (0x2222..).
+		// An empty whitelist would mean allow-all, so a different address is
+		// used here to exercise the genuine "not whitelisted" rejection path.
+		let config = create_config_with_callback_whitelist(vec![
+			"0x000100000189149999999999999999999999999999999999999999".to_string(),
+		]);
 
 		// Act
 		let result = service
@@ -5316,6 +5325,97 @@ mod tests {
 			},
 			other => panic!("Expected Config error, got: {other:?}"),
 		}
+	}
+
+	#[tokio::test]
+	async fn test_simulate_callback_empty_whitelist_allows_all() {
+		// An empty callback_whitelist means "allow all callbacks" (the same
+		// contract enforced at quote time by validate_callback_whitelist). A
+		// callback to any recipient must therefore be simulated, not rejected.
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+		mock_delivery
+			.expect_estimate_gas()
+			.returning(|_| Box::pin(async move { Ok(95000u64) }));
+
+		let mut delivery_implementations = HashMap::new();
+		delivery_implementations.insert(
+			137,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(
+			delivery_implementations,
+			137,
+			3600,
+			60,
+		));
+
+		let mock_pricing = MockPricingInterface::new();
+		let mock_storage = MockStorageInterface::new();
+		let pricing = Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new()));
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let token_manager = create_mock_token_manager();
+
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
+
+		let callback_data = vec![0xde, 0xad, 0xbe, 0xef];
+		let order = create_order_with_callback(callback_data);
+		let fill_tx = create_test_fill_transaction();
+		// Empty whitelist = allow all callbacks.
+		let config = create_config_with_callback_whitelist(vec![]);
+
+		let result = service
+			.simulate_callback_and_estimate_gas(&order, &fill_tx, &config)
+			.await;
+
+		assert!(
+			result.is_ok(),
+			"empty whitelist must allow all callbacks, got: {result:?}"
+		);
+		let simulation_result = result.unwrap();
+		assert!(simulation_result.has_callback);
+		assert_eq!(simulation_result.estimated_gas_units, 95000);
+	}
+
+	#[test]
+	fn callback_recipient_whitelisted_empty_allows_all() {
+		let config = create_config_with_callback_whitelist(vec![]);
+		assert!(
+			CostProfitService::callback_recipient_whitelisted(
+				&config,
+				"0x000100000189142222222222222222222222222222222222222222"
+			),
+			"empty whitelist must allow any recipient"
+		);
+	}
+
+	#[test]
+	fn callback_recipient_whitelisted_nonempty_checks_membership() {
+		let config = create_config_with_callback_whitelist(vec![
+			"0x000100000189142222222222222222222222222222222222222222".to_string(),
+		]);
+		assert!(
+			CostProfitService::callback_recipient_whitelisted(
+				&config,
+				"0x000100000189142222222222222222222222222222222222222222"
+			),
+			"listed recipient must be allowed"
+		);
+		assert!(
+			!CostProfitService::callback_recipient_whitelisted(
+				&config,
+				"0x000100000189149999999999999999999999999999999999999999"
+			),
+			"unlisted recipient must be rejected when whitelist is non-empty"
+		);
 	}
 
 	#[tokio::test]
