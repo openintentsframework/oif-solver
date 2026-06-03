@@ -75,6 +75,7 @@ jobs:
       - msrv
       - rustfmt
       - clippy
+      - test
     runs-on: ubuntu-latest
     steps:
       - name: Harden the runner (Audit all outbound calls)
@@ -171,6 +172,7 @@ jobs:
     needs:
       - changed_files
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     services:
       redis:
         image: redis:7-alpine
@@ -214,8 +216,6 @@ jobs:
       # Unit tests coverage
       - name: Run Unit Tests and Generate Coverage Report
         env:
-          LLVM_PROFILE_FILE: unit-%p-%m.profraw
-          RUSTFLAGS: -Cinstrument-coverage
           RUST_TEST_THREADS: 1
         run: cargo llvm-cov --locked --workspace --exclude solver-e2e-tests --lcov --output-path unit-lcov.info
 

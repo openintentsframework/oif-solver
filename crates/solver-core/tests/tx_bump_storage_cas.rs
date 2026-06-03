@@ -128,6 +128,7 @@ async fn file_storage_cas_preserves_canonical_hash_under_concurrent_writes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires live Redis and can stall GitHub coverage; run explicitly with --ignored"]
 async fn redis_storage_cas_preserves_canonical_hash_under_concurrent_writes() {
 	let Some(redis_url) = redis_url_or_skip() else {
 		eprintln!("skipping Redis CAS test because REDIS_URL is not set");

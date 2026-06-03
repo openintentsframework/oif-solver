@@ -25,6 +25,7 @@
 //!   "orders_auth_enabled": true,
 //!   "min_profitability_pct": "2.0",
 //!   "gas_buffer_bps": 1500,
+//!   "settlement_fee_buffer_bps": 2000,
 //!   "admin": {
 //!     "enabled": true,
 //!     "domain": "solver.example.com",
@@ -97,6 +98,11 @@ pub struct SeedOverrides {
 	/// If not set, uses default (1000 = 10%).
 	#[serde(default)]
 	pub gas_buffer_bps: Option<u32>,
+
+	/// Settlement native fee buffer in basis points (e.g., 1000 = 10%).
+	/// If not set, uses default (1000 = 10%).
+	#[serde(default)]
+	pub settlement_fee_buffer_bps: Option<u32>,
 
 	/// Commission in basis points (e.g., 20 = 0.20%).
 	/// If not set, uses default.
@@ -723,6 +729,7 @@ mod tests {
 			orders_auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -762,6 +769,7 @@ mod tests {
 			orders_auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -806,6 +814,7 @@ mod tests {
 			orders_auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -890,6 +899,7 @@ mod tests {
 			orders_auth_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
+			settlement_fee_buffer_bps: None,
 			commission_bps: None,
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
@@ -927,6 +937,7 @@ mod tests {
             ],
             "min_profitability_pct": "2.5",
             "gas_buffer_bps": 1500,
+            "settlement_fee_buffer_bps": 2000,
             "commission_bps": 20,
             "rate_buffer_bps": 14
         }"#;
@@ -938,6 +949,7 @@ mod tests {
 			Some(Decimal::from_str("2.5").unwrap())
 		);
 		assert_eq!(config.gas_buffer_bps, Some(1500));
+		assert_eq!(config.settlement_fee_buffer_bps, Some(2000));
 		assert_eq!(config.commission_bps, Some(20));
 		assert_eq!(config.rate_buffer_bps, Some(14));
 	}
@@ -964,6 +976,7 @@ mod tests {
 			Some(Decimal::from_str("3.0").unwrap())
 		);
 		assert_eq!(config.gas_buffer_bps, None);
+		assert_eq!(config.settlement_fee_buffer_bps, None);
 		assert_eq!(config.commission_bps, None);
 		assert_eq!(config.rate_buffer_bps, None);
 	}
@@ -985,6 +998,7 @@ mod tests {
 
 		assert_eq!(config.min_profitability_pct, None);
 		assert_eq!(config.gas_buffer_bps, None);
+		assert_eq!(config.settlement_fee_buffer_bps, None);
 		assert_eq!(config.commission_bps, None);
 		assert_eq!(config.rate_buffer_bps, None);
 	}

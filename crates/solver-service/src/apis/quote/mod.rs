@@ -137,6 +137,7 @@ pub async fn process_quote_request(
 		solver.delivery().clone(),
 		solver.token_manager().clone(),
 		solver.storage().clone(),
+		solver.settlement().clone(),
 	);
 
 	let solver_address = solver.solver_address().clone();
@@ -653,6 +654,9 @@ mod tests {
 		mock_settlement
 			.expect_select_oracle()
 			.returning(|oracles, _context| oracles.first().cloned());
+		mock_settlement
+			.expect_quote_post_fill_fee()
+			.returning(|_| Box::pin(async { Ok(None) }));
 
 		let mut implementations: HashMap<String, Box<dyn SettlementInterface>> = HashMap::new();
 		implementations.insert("test".to_string(), Box::new(mock_settlement));
@@ -795,6 +799,8 @@ mod tests {
 				gas_pre_claim: rust_decimal::Decimal::ZERO,
 				gas_claim: rust_decimal::Decimal::new(1, 2),  // 0.01
 				gas_buffer: rust_decimal::Decimal::new(4, 3), // 0.004
+				settlement_fee: rust_decimal::Decimal::ZERO,
+				settlement_fee_buffer: rust_decimal::Decimal::ZERO,
 				rate_buffer: rust_decimal::Decimal::ZERO,
 				base_price: rust_decimal::Decimal::ZERO,
 				min_profit: rust_decimal::Decimal::new(5, 0), // 5.0
