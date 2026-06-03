@@ -1057,6 +1057,7 @@ mod tests {
 			solver: OperatorSolverConfig {
 				min_profitability_pct: rust_decimal::Decimal::ZERO,
 				gas_buffer_bps: 1000,
+				settlement_fee_buffer_bps: 1000,
 				commission_bps: 20,
 				rate_buffer_bps: 14,
 				monitoring_timeout_seconds: 60,

@@ -8,7 +8,7 @@ use crate::{
 		address_to_bytes32, check_is_proven, create_providers_for_chains, parse_address_table,
 		parse_oracle_config, SettlementMessageTracker,
 	},
-	OracleConfig, SettlementError, SettlementInterface,
+	OracleConfig, PostFillFeeParams, SettlementError, SettlementFeeQuote, SettlementInterface,
 };
 use alloy_primitives::{hex, FixedBytes, U256};
 use alloy_provider::{DynProvider, Provider};
@@ -1004,6 +1004,52 @@ impl SettlementInterface for HyperlaneSettlement {
 		Box::new(HyperlaneSettlementSchema)
 	}
 
+	async fn quote_post_fill_fee(
+		&self,
+		params: &PostFillFeeParams,
+	) -> Result<Option<SettlementFeeQuote>, SettlementError> {
+		if self.get_output_oracles(params.dest_chain_id).is_empty()
+			|| self.get_input_oracles(params.origin_chain_id).is_empty()
+		{
+			return Ok(None);
+		}
+
+		let recipient_oracle = self
+			.select_oracle(&self.get_input_oracles(params.origin_chain_id), None)
+			.ok_or_else(|| SettlementError::ValidationFailed("No input oracle".into()))?;
+
+		let fill_description = encode_fill_description(
+			[0u8; 32],
+			[0u8; 32],
+			0,
+			params.output_token,
+			params.output_amount,
+			params.output_recipient,
+			params.output_call.clone(),
+			vec![],
+		)?;
+		let payloads = vec![fill_description];
+		let total_payload_size: usize = payloads.iter().map(|p| p.len()).sum();
+		let gas_limit = self.calculate_message_gas_limit(total_payload_size);
+
+		let fee_wei = self
+			.estimate_gas_payment(
+				params.dest_chain_id,
+				params.origin_chain_id as u32,
+				recipient_oracle,
+				gas_limit,
+				vec![],
+				params.source_settler.clone(),
+				payloads,
+			)
+			.await?;
+
+		Ok(Some(SettlementFeeQuote {
+			fee_wei,
+			chain_id: params.dest_chain_id,
+		}))
+	}
+
 	async fn get_attestation(
 		&self,
 		order: &Order,
@@ -1424,10 +1470,13 @@ impl crate::SettlementRegistry for Registry {}
 mod tests {
 	use super::*;
 	use crate::OracleSelectionStrategy;
+	use alloy_provider::ProviderBuilder;
 	use solver_types::standards::eip7683::MandateOutput;
 	use solver_types::utils::tests::builders::{
 		Eip7683OrderDataBuilder, MandateOutputBuilder, OrderBuilder,
 	};
+	use wiremock::matchers::method;
+	use wiremock::{Mock, MockServer, ResponseTemplate};
 
 	fn test_storage() -> Arc<StorageService> {
 		Arc::new(StorageService::new(Box::new(
@@ -1438,6 +1487,20 @@ mod tests {
 	fn test_hyperlane_settlement(oracle_config: OracleConfig) -> HyperlaneSettlement {
 		HyperlaneSettlement {
 			providers: HashMap::new(),
+			oracle_config,
+			mailbox_addresses: HashMap::new(),
+			igp_addresses: HashMap::new(),
+			message_tracker: Arc::new(MessageTracker::new(test_storage())),
+			default_gas_limit: 500_000,
+		}
+	}
+
+	fn test_hyperlane_settlement_with_providers(
+		oracle_config: OracleConfig,
+		providers: HashMap<u64, DynProvider>,
+	) -> HyperlaneSettlement {
+		HyperlaneSettlement {
+			providers,
 			oracle_config,
 			mailbox_addresses: HashMap::new(),
 			igp_addresses: HashMap::new(),
@@ -1931,6 +1994,85 @@ mod tests {
 			ready,
 			"can_claim must return true when PostFill is not required and message_id is missing"
 		);
+	}
+
+	#[tokio::test]
+	async fn hyperlane_quotes_post_fill_fee_using_real_message_gas_limit() {
+		let server = MockServer::start().await;
+		let quoted_fee = U256::from(1_000_000_000_000_000_000u128);
+		Mock::given(method("POST"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+				"jsonrpc": "2.0",
+				"id": 1,
+				"result": format!("0x{}", hex::encode(quoted_fee.to_be_bytes::<32>()))
+			})))
+			.mount(&server)
+			.await;
+
+		let origin_chain = 1u64;
+		let dest_chain = 2u64;
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let output_oracle = solver_types::Address(vec![0x44; 20]);
+		let provider = ProviderBuilder::new()
+			.connect_http(server.uri().parse().expect("valid RPC URL"))
+			.erased();
+		let settlement = test_hyperlane_settlement_with_providers(
+			OracleConfig {
+				input_oracles: HashMap::from([(origin_chain, vec![input_oracle.clone()])]),
+				output_oracles: HashMap::from([(dest_chain, vec![output_oracle])]),
+				routes: HashMap::from([(origin_chain, vec![dest_chain])]),
+				selection_strategy: OracleSelectionStrategy::First,
+			},
+			HashMap::from([(dest_chain, provider)]),
+		);
+		let params = PostFillFeeParams {
+			origin_chain_id: origin_chain,
+			dest_chain_id: dest_chain,
+			output_token: [0x11; 32],
+			output_amount: U256::from(1000u64),
+			output_recipient: [0x22; 32],
+			output_call: vec![0xab, 0xcd],
+			source_settler: solver_types::Address(vec![0x55; 20]),
+		};
+		let expected_payload = encode_fill_description(
+			[0u8; 32],
+			[0u8; 32],
+			0,
+			params.output_token,
+			params.output_amount,
+			params.output_recipient,
+			params.output_call.clone(),
+			vec![],
+		)
+		.unwrap();
+		let expected_gas_limit = settlement.calculate_message_gas_limit(expected_payload.len());
+
+		let quote = settlement
+			.quote_post_fill_fee(&params)
+			.await
+			.unwrap()
+			.expect("hyperlane route has a fee");
+		assert_eq!(quote.fee_wei, quoted_fee);
+		assert_eq!(quote.chain_id, dest_chain);
+
+		let requests = server.received_requests().await.unwrap();
+		assert_eq!(requests.len(), 1);
+		let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+		let input_hex = body["params"][0]["input"].as_str().unwrap();
+		let input = hex::decode(input_hex.trim_start_matches("0x")).unwrap();
+		let decoded = IHyperlaneOracle::quoteGasPayment_0Call::abi_decode(&input).unwrap();
+		assert_eq!(decoded.destinationDomain, origin_chain as u32);
+		assert_eq!(
+			decoded.recipientOracle,
+			alloy_primitives::Address::from_slice(&input_oracle.0)
+		);
+		assert_eq!(decoded.gasLimit, expected_gas_limit);
+		assert_eq!(
+			decoded.source,
+			alloy_primitives::Address::from_slice(&params.source_settler.0)
+		);
+		assert_eq!(decoded.payloads.len(), 1);
+		assert_eq!(decoded.payloads[0].as_ref(), expected_payload.as_slice());
 	}
 
 	#[tokio::test]

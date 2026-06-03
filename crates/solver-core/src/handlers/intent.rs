@@ -926,12 +926,25 @@ mod tests {
 				MockAccountInterface::new(),
 			))),
 		));
+		let mut mock_settlement = solver_settlement::MockSettlementInterface::new();
+		mock_settlement
+			.expect_quote_post_fill_fee()
+			.returning(|_| Box::pin(async { Ok(None) }));
+		let settlement_service = Arc::new(solver_settlement::SettlementService::new(
+			HashMap::from([(
+				"mock".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]),
+			"mock".to_string(),
+			1,
+		));
 
 		Arc::new(CostProfitService::new(
 			pricing_service,
 			delivery_service,
 			token_manager,
 			Arc::new(StorageService::new(Box::new(MockStorageInterface::new()))),
+			settlement_service,
 		))
 	}
 

@@ -128,6 +128,7 @@ pub struct AdminTokenResponse {
 pub struct AdminSolverResponse {
 	pub min_profitability_pct: String,
 	pub gas_buffer_bps: u32,
+	pub settlement_fee_buffer_bps: u32,
 	pub commission_bps: u32,
 	pub rate_buffer_bps: u32,
 }
@@ -151,6 +152,7 @@ pub struct AdminConfigSummary {
 pub struct FeeConfigResponse {
 	pub min_profitability_pct: String,
 	pub gas_buffer_bps: u32,
+	pub settlement_fee_buffer_bps: u32,
 	pub commission_bps: u32,
 	pub rate_buffer_bps: u32,
 	pub monitoring_timeout_seconds: u64,
