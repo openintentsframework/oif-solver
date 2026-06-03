@@ -395,6 +395,21 @@ mod tests {
 							"decimals": 18
 						}
 					]
+				},
+				"137": {
+					"chain_id": 137,
+					"input_settler_address": "0x1111111111111111111111111111111111111111",
+					"output_settler_address": "0x2222222222222222222222222222222222222222",
+					"rpc_urls": [
+						{ "http": "http://localhost:8545" }
+					],
+					"tokens": [
+						{
+							"symbol": "TEST",
+							"address": "0x3333333333333333333333333333333333333333",
+							"decimals": 18
+						}
+					]
 				}
 			}
 		}))
@@ -981,8 +996,8 @@ mod tests {
 			lock: None,
 		});
 		request.intent.outputs[0] = QuoteOutput {
-			receiver: InteropAddress::new_ethereum(1, AlloyAddress::from([0x22; 20])),
-			asset: InteropAddress::new_ethereum(1, output_token_addr),
+			receiver: InteropAddress::new_ethereum(137, AlloyAddress::from([0x22; 20])),
+			asset: InteropAddress::new_ethereum(137, output_token_addr),
 			amount: Some("950000000000000000".to_string()),
 			calldata: None,
 		};

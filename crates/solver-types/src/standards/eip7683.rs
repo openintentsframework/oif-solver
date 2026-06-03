@@ -192,6 +192,12 @@ use crate::{
 #[cfg(feature = "oif-interfaces")]
 use crate::{Order, OrderStatus};
 
+/// Maximum number of StandardOrder inputs accepted before any RPC-backed validation.
+pub const MAX_STANDARD_ORDER_INPUTS: usize = 16;
+
+/// Maximum number of StandardOrder outputs accepted before any RPC-backed validation.
+pub const MAX_STANDARD_ORDER_OUTPUTS: usize = 16;
+
 /// Implementation of OrderParsable for EIP-7683 orders
 #[cfg(feature = "oif-interfaces")]
 impl OrderParsable for Eip7683OrderData {
