@@ -784,6 +784,19 @@ async fn validate_intent_request(
 			details: None,
 		})?;
 
+	// EIP-712 signature validation for ResourceLock orders
+	let requires_validation = state
+		.signature_validation
+		.requires_signature_validation(standard, &lock_type);
+
+	if requires_validation {
+		let config = state.config.read().await;
+		state
+			.signature_validation
+			.validate_signature(standard, intent, &config.networks, state.solver.delivery())
+			.await?;
+	}
+
 	{
 		let config = state.config.read().await;
 		ensure_user_capacity_for_order(state.solver.as_ref(), &config, lock_type, &standard_order)
@@ -837,19 +850,6 @@ async fn validate_intent_request(
 				.map_err(|e| format!("Contract call failed: {e}"))
 		})
 	});
-
-	// EIP-712 signature validation for ResourceLock orders
-	let requires_validation = state
-		.signature_validation
-		.requires_signature_validation(standard, &lock_type);
-
-	if requires_validation {
-		let config = state.config.read().await;
-		state
-			.signature_validation
-			.validate_signature(standard, intent, &config.networks, state.solver.delivery())
-			.await?;
-	}
 
 	// Process the order through the OrderService
 	// This validates the order based on the standard and returns a validated Order
@@ -972,10 +972,12 @@ mod tests {
 	use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 	use serde_json::{json, to_value};
 	use solver_account::AccountService;
-	use solver_config::Config;
+	use solver_config::{Config, ConfigBuilder};
 	use solver_core::engine::event_bus::EventBus;
 	use solver_core::engine::token_manager::TokenManager;
-	use solver_delivery::{DeliveryInterface, DeliveryService, MockDeliveryInterface};
+	use solver_delivery::{
+		DeliveryError, DeliveryInterface, DeliveryService, MockDeliveryInterface,
+	};
 	use solver_discovery::DiscoveryService;
 	use solver_order::OrderService;
 	use solver_pricing::implementations::mock::create_mock_pricing;
@@ -987,9 +989,12 @@ mod tests {
 		OifOrder, OrderPayload, PostOrderRequest, PostOrderResponse, PostOrderResponseStatus,
 		SignatureType,
 	};
+	use solver_types::networks::RpcEndpoint;
+	use solver_types::standards::eip7683::interfaces::ITheCompact::DOMAIN_SEPARATORCall;
 	use solver_types::standards::eip7683::interfaces::{
 		IAllocator, ITheCompact, SolMandateOutput, StandardOrder as OifStandardOrder,
 	};
+	use solver_types::utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder};
 	use solver_types::{APIError, Address, ApiErrorType, ErrorResponse};
 	use std::collections::HashMap;
 	use std::convert::TryFrom;
@@ -1135,6 +1140,191 @@ mod tests {
 		);
 
 		Arc::new(engine)
+	}
+
+	async fn build_test_solver_engine_with_delivery(
+		config: Config,
+		delivery_implementations: HashMap<u64, Arc<dyn DeliveryInterface>>,
+	) -> Arc<SolverEngine> {
+		let storage = Arc::new(StorageService::new(Box::new(MemoryStorage::new())));
+
+		let account_config: serde_json::Value = json!({
+			"private_key": "0x1234567890123456789012345678901234567890123456789012345678901234"
+		});
+		let account_impl = solver_account::implementations::local::create_account(&account_config)
+			.await
+			.expect("failed to create account impl");
+		let account = Arc::new(AccountService::new(account_impl));
+
+		let solver_address = Address(vec![0x11; 20]);
+
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 1, 10, 60));
+		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
+
+		let strategy_config = serde_json::Value::Object(serde_json::Map::new());
+		let strategy =
+			solver_order::implementations::strategies::simple::create_strategy(&strategy_config)
+				.expect("failed to create order strategy");
+		let order = Arc::new(OrderService::new(HashMap::new(), strategy));
+
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 10));
+
+		let pricing_impl = create_mock_pricing(&serde_json::Value::Object(serde_json::Map::new()))
+			.expect("failed to create mock pricing");
+		let pricing = Arc::new(PricingService::new(pricing_impl, Vec::new()));
+
+		let event_bus = EventBus::new(10);
+
+		let token_manager = Arc::new(TokenManager::new(
+			HashMap::new(),
+			delivery.clone(),
+			account.clone(),
+		));
+
+		let dynamic_config = Arc::new(RwLock::new(config.clone()));
+		let engine = SolverEngine::new(
+			dynamic_config,
+			config.clone(),
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+			None,
+		);
+
+		Arc::new(engine)
+	}
+
+	fn resource_lock_config_for_signature_order() -> Config {
+		let network = NetworkConfigBuilder::new()
+			.input_settler_address_hex("0x0000000000000000000000000000000000000011")
+			.unwrap()
+			.output_settler_address_hex("0x0000000000000000000000000000000000000022")
+			.unwrap()
+			.input_settler_compact_address_hex("0x9999999999999999999999999999999999999999")
+			.unwrap()
+			.the_compact_address_hex("0x8888888888888888888888888888888888888888")
+			.unwrap()
+			.add_rpc_endpoint(RpcEndpoint::http_only("http://localhost:8545".to_string()))
+			.build();
+		let networks = NetworksConfigBuilder::new().add_network(1, network).build();
+		ConfigBuilder::new().networks(networks).build()
+	}
+
+	fn invalid_resource_lock_request() -> PostOrderRequest {
+		let output_chain_id = 137u64;
+		let output_amount = U256::from(500u64);
+		let input_amount = U256::from(1_000u64);
+		let token_id = {
+			let mut bytes = [0u8; 32];
+			bytes[..12].copy_from_slice(&[0xAA; 12]);
+			bytes[12..].copy_from_slice(&[0x33; 20]);
+			U256::from_be_bytes(bytes)
+		};
+		let payload = OrderPayload {
+			signature_type: SignatureType::Eip712,
+			domain: json!({
+				"name": "BatchCompact",
+				"version": "1",
+				"chainId": "1",
+				"verifyingContract": "0x8888888888888888888888888888888888888888",
+			}),
+			primary_type: "BatchCompact".to_string(),
+			message: json!({
+				"sponsor": "0x1111111111111111111111111111111111111111",
+				"nonce": "1",
+				"expires": "4102444800",
+				"mandate": {
+					"fillDeadline": "4102444700",
+					"inputOracle": "0x2222222222222222222222222222222222222222",
+					"outputs": [{
+						"oracle": "0x0000000000000000000000000000000000000000000000000000000000000066",
+						"settler": "0x0000000000000000000000000000000000000000000000000000000000000077",
+						"chainId": output_chain_id.to_string(),
+						"token": "0x0000000000000000000000000000000000000000000000000000000000000044",
+						"amount": output_amount.to_string(),
+						"recipient": "0x0000000000000000000000000000000000000000000000000000000000000055",
+						"callbackData": "0x",
+						"context": "0x"
+					}]
+				},
+				"commitments": [{
+					"lockTag": "0xaaaaaaaaaaaaaaaaaaaaaaaa",
+					"token": "0x3333333333333333333333333333333333333333",
+					"amount": input_amount.to_string(),
+					"id": token_id.to_string()
+				}]
+			}),
+			types: None,
+		};
+
+		PostOrderRequest {
+			order: OifOrder::OifResourceLockV0 { payload },
+			signature: Bytes::from(vec![0u8; 65]),
+			quote_id: None,
+			origin_submission: None,
+		}
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn validate_intent_rejects_invalid_resource_lock_signature_before_capacity_rpc() {
+		let config = resource_lock_config_for_signature_order();
+		let domain_separator = Bytes::from([0x99u8; 32].to_vec());
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_eth_call().returning(move |tx| {
+			let domain_separator = domain_separator.clone();
+			Box::pin(async move {
+				if tx.data.starts_with(&DOMAIN_SEPARATORCall::SELECTOR) {
+					Ok(domain_separator)
+				} else {
+					Err(DeliveryError::Network(
+						"capacity check reached before signature validation".to_string(),
+					))
+				}
+			})
+		});
+		let mut delivery_impls: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+		delivery_impls.insert(1, Arc::new(mock_delivery) as Arc<dyn DeliveryInterface>);
+		let solver = build_test_solver_engine_with_delivery(config.clone(), delivery_impls).await;
+		let http_client = Client::builder()
+			.no_proxy()
+			.build()
+			.expect("failed to build client");
+		let state = AppState {
+			solver,
+			config: Arc::new(RwLock::new(config)),
+			http_client,
+			discovery_url: None,
+			jwt_service: None,
+			siwe_nonce_store: None,
+			signature_validation: Arc::new(SignatureValidationService::new()),
+		};
+		let intent = invalid_resource_lock_request();
+
+		let error = super::validate_intent_request(&intent, &state, "eip7683")
+			.await
+			.expect_err("invalid signature should reject the order");
+
+		match error {
+			APIError::BadRequest { message, .. } => {
+				assert!(
+					message.to_ascii_lowercase().contains("signature")
+						|| message.contains("Failed to recover public key"),
+					"expected signature validation error, got: {message}"
+				);
+				assert!(
+					!message.contains("capacity check reached"),
+					"capacity RPC should not run before signature validation"
+				);
+			},
+			other => panic!("unexpected error: {other:?}"),
+		}
 	}
 
 	fn encode_lock_details(allocator: AlloyAddress) -> Bytes {
