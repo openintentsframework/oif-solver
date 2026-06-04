@@ -638,6 +638,22 @@ impl Eip7683OffchainDiscovery {
 	}
 }
 
+/// Map The Compact `ResetPeriod` enum (`uint8`, from `getLockDetails`) to seconds.
+/// Returns `None` for an unrecognized value (treated as un-validatable ⇒ reject).
+fn reset_period_seconds(reset_period: u8) -> Option<u64> {
+	Some(match reset_period {
+		0 => 1,         // OneSecond
+		1 => 15,        // FifteenSeconds
+		2 => 60,        // OneMinute
+		3 => 600,       // TenMinutes
+		4 => 3_900,     // OneHourAndFiveMinutes
+		5 => 86_400,    // OneDay
+		6 => 608_400,   // SevenDaysAndOneHour
+		7 => 2_592_000, // ThirtyDays
+		_ => return None,
+	})
+}
+
 async fn validate_resource_lock_allocator_authorization(
 	order: &StandardOrder,
 	allocator_data: &Bytes,
@@ -698,12 +714,55 @@ async fn validate_resource_lock_allocator_authorization(
 		));
 	}
 
+	// (C-02) The lock's reset period must outlast the fill-to-claim window the
+	// signed order allows (`expires - fillDeadline`); otherwise the user could
+	// force-withdraw the input after the solver fills the output.
+	let required_reset_secs =
+		u64::from(order.expires).saturating_sub(u64::from(order.fillDeadline));
+	if required_reset_secs == 0 {
+		return Err(DiscoveryError::ValidationError(
+			"ResourceLock order is malformed: expires must exceed fillDeadline".to_string(),
+		));
+	}
+
+	// (C-02) ResourceLock orders require a solver-trusted allocator. Allocator
+	// registration in The Compact is permissionless, so without pinning, a user
+	// could resolve to an allocator they control, authorize the claim at intake,
+	// then refuse it after the fill.
+	let expected = match network.allocator_address.as_ref() {
+		Some(addr) if addr.0.len() == 20 => AlloyAddress::from_slice(&addr.0),
+		Some(_) => {
+			return Err(DiscoveryError::ValidationError(
+				"Invalid configured allocator address length".to_string(),
+			));
+		},
+		None => {
+			return Err(DiscoveryError::ValidationError(
+				"ResourceLock orders require a configured trusted allocator (allocator_address); refusing to fill"
+					.to_string(),
+			));
+		},
+	};
+
 	let compact = ITheCompact::new(the_compact_address, provider);
 	let mut resolved_allocator: Option<AlloyAddress> = None;
 	for input in &order.inputs {
 		let details = compact.getLockDetails(input[0]).call().await.map_err(|e| {
 			DiscoveryError::Connection(format!("Failed to query TheCompact.getLockDetails: {e}"))
 		})?;
+
+		let reset_secs = reset_period_seconds(details.resetPeriod).ok_or_else(|| {
+			DiscoveryError::ValidationError(format!(
+				"ResourceLock input lock has an unrecognized reset period ({})",
+				details.resetPeriod
+			))
+		})?;
+		if reset_secs <= required_reset_secs {
+			return Err(DiscoveryError::ValidationError(format!(
+				"ResourceLock input reset period ({reset_secs}s) does not exceed the fill-to-claim window ({required_reset_secs}s)"
+			)));
+		}
+
 		match resolved_allocator {
 			None => resolved_allocator = Some(details.allocator),
 			Some(existing) if existing != details.allocator => {
@@ -716,19 +775,11 @@ async fn validate_resource_lock_allocator_authorization(
 	}
 	let allocator = resolved_allocator.expect("inputs is non-empty");
 
-	if let Some(expected) = network.allocator_address.as_ref() {
-		if expected.0.len() != 20 {
-			return Err(DiscoveryError::ValidationError(
-				"Invalid configured allocator address length".to_string(),
-			));
-		}
-		let expected = AlloyAddress::from_slice(&expected.0);
-		if allocator != expected {
-			return Err(DiscoveryError::ValidationError(
-				"ResourceLock inputs use an allocator that differs from the configured allocator_address"
-					.to_string(),
-			));
-		}
+	if allocator != expected {
+		return Err(DiscoveryError::ValidationError(
+			"ResourceLock inputs use an allocator that differs from the configured allocator_address"
+				.to_string(),
+		));
 	}
 
 	let claim_hash = compute_batch_compact_claim_hash(order, arbiter).map_err(|e| {
@@ -1227,9 +1278,9 @@ mod tests {
 			message: json!({
 				"sponsor": "0x1111111111111111111111111111111111111111",
 				"nonce": "1",
-				"expires": "1700000000",
+				"expires": "1700000600",
 				"mandate": {
-					"fillDeadline": "1700000100",
+					"fillDeadline": "1700000000",
 					"inputOracle": "0x2222222222222222222222222222222222222222",
 					"outputs": [{
 						"oracle": "0x6666666666666666666666666666666666666666666666666666666666666666",
@@ -1272,6 +1323,7 @@ mod tests {
 	fn encode_lock_details(allocator: AlloyAddress) -> Bytes {
 		let mut out = vec![0u8; 160];
 		out[44..64].copy_from_slice(allocator.as_slice());
+		out[95] = 5; // resetPeriod = OneDay (86_400s), exceeds the test fill-to-claim window
 		Bytes::from(out)
 	}
 
@@ -1604,10 +1656,18 @@ mod tests {
 		let (tx, _rx) = mpsc::unbounded_channel();
 		let mut providers = HashMap::new();
 		providers.insert(1, mocked_provider_with_allocator_authorized(false));
+		// Pin the trusted allocator to the one the lock resolves to (0xA1..) so the
+		// order reaches the allocator-authorization check rather than rejecting at
+		// the missing-trusted-allocator gate.
+		let mut networks = create_test_networks_config();
+		networks
+			.get_mut(&1)
+			.expect("chain 1 network config")
+			.allocator_address = Some(solver_types::account::Address(vec![0xA1u8; 20]));
 		let state = ApiState {
 			intent_sender: tx,
 			providers,
-			networks: create_test_networks_config(),
+			networks,
 		};
 
 		let response = handle_intent_submission(
@@ -1628,11 +1688,13 @@ mod tests {
 			parsed.get("status").and_then(|v| v.as_str()),
 			Some("rejected")
 		);
+		// Proves the order reached the allocator-authorization check (isClaimAuthorized),
+		// not an earlier gate (trusted-allocator pin / reset period / malformed window).
 		assert!(parsed
 			.get("message")
 			.and_then(|v| v.as_str())
 			.unwrap_or_default()
-			.contains("allocator"));
+			.contains("did not authorize"));
 	}
 
 	#[tokio::test]

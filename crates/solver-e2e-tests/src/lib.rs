@@ -215,6 +215,39 @@ pub struct ChainDeployment {
 	pub mock_mailbox: Option<Address>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CompactResetPeriod {
+	OneSecond = 0,
+	OneDay = 5,
+}
+
+pub fn compact_lock_tag_for_allocator(
+	allocator: Address,
+	reset_period: CompactResetPeriod,
+) -> FixedBytes<12> {
+	let mut lock_tag = [0u8; 12];
+	lock_tag[0] = ((reset_period as u8) << 4) | compact_allocator_flag(allocator);
+	lock_tag[1..].copy_from_slice(&allocator.as_slice()[9..]);
+	FixedBytes::from(lock_tag)
+}
+
+fn compact_allocator_flag(allocator: Address) -> u8 {
+	let leading_zero_nibbles = allocator
+		.as_slice()
+		.iter()
+		.take(9)
+		.flat_map(|byte| [byte >> 4, byte & 0x0f])
+		.take_while(|nibble| *nibble == 0)
+		.count();
+
+	match leading_zero_nibbles {
+		0..=3 => 0,
+		4..=17 => (leading_zero_nibbles - 3) as u8,
+		_ => 15,
+	}
+}
+
 /// Owns every resource the test needs. Drop tears everything down in reverse.
 pub struct Harness {
 	pub origin: ChainDeployment,
@@ -702,13 +735,18 @@ impl Harness {
 	}
 
 	pub fn compact_lock_tag(&self) -> Result<FixedBytes<12>> {
+		self.compact_lock_tag_with_reset_period(CompactResetPeriod::OneDay)
+	}
+
+	pub fn compact_lock_tag_with_reset_period(
+		&self,
+		reset_period: CompactResetPeriod,
+	) -> Result<FixedBytes<12>> {
 		let allocator = self
 			.origin
 			.allocator
 			.ok_or_else(|| anyhow!("Compact allocator not deployed"))?;
-		let mut lock_tag = [0u8; 12];
-		lock_tag[1..].copy_from_slice(&allocator.as_slice()[9..]);
-		Ok(FixedBytes::from(lock_tag))
+		Ok(compact_lock_tag_for_allocator(allocator, reset_period))
 	}
 
 	pub fn compact_token_id(&self) -> Result<U256> {
@@ -720,11 +758,20 @@ impl Harness {
 	}
 
 	pub async fn compact_deposit_user_token_a(&self, amount: U256) -> Result<U256> {
+		self.compact_deposit_user_token_a_with_reset_period(amount, CompactResetPeriod::OneDay)
+			.await
+	}
+
+	pub async fn compact_deposit_user_token_a_with_reset_period(
+		&self,
+		amount: U256,
+		reset_period: CompactResetPeriod,
+	) -> Result<U256> {
 		let the_compact = self
 			.origin
 			.the_compact
 			.ok_or_else(|| anyhow!("TheCompact not deployed"))?;
-		let lock_tag = self.compact_lock_tag()?;
+		let lock_tag = self.compact_lock_tag_with_reset_period(reset_period)?;
 		user_approve_max(
 			&self.origin.rpc_http,
 			&self.user_signer,
@@ -2291,5 +2338,25 @@ mod tests {
 		.unwrap();
 		assert!(log_file_contains(&path, "event=\"BumpTipAlreadyMined\"").unwrap());
 		assert!(log_file_contains(&path, "success=true").unwrap());
+	}
+
+	#[test]
+	fn compact_lock_tag_encodes_reset_period_without_losing_allocator_id() {
+		let allocator = parse_address("0x111111111111111111a1a2a3a4a5a6a7a8a9aaab").unwrap();
+		let lock_tag = compact_lock_tag_for_allocator(allocator, CompactResetPeriod::OneDay);
+		assert_eq!(lock_tag[0] >> 7, 0, "scope should be multichain");
+		assert_eq!((lock_tag[0] >> 4) & 0x07, 5, "resetPeriod should be OneDay");
+		assert_eq!(lock_tag[0] & 0x0f, 0, "compact flag should be preserved");
+		assert_eq!(&lock_tag[1..], &allocator.as_slice()[9..]);
+
+		let compact_allocator =
+			parse_address("0x000000000000000000a1a2a3a4a5a6a7a8a9aaab").unwrap();
+		let compact_lock_tag =
+			compact_lock_tag_for_allocator(compact_allocator, CompactResetPeriod::OneDay);
+		assert_eq!(
+			compact_lock_tag[0] & 0x0f,
+			15,
+			"fully compact allocator flag should be preserved"
+		);
 	}
 }

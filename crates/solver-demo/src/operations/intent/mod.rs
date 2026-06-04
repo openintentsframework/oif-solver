@@ -641,9 +641,10 @@ impl IntentOps {
 			))
 		})?;
 
-		// Generate lock tag: 0x00 + last 11 bytes of allocator address
+		// Generate lock tag with The Compact's default-safe settings:
+		// scope = Multichain (0), resetPeriod = OneDay (5), plus allocator ID.
 		let mut allocator_lock_tag = [0u8; 12];
-		allocator_lock_tag[0] = 0x00; // First byte is 0x00
+		allocator_lock_tag[0] = (5u8 << 4) | compact_allocator_flag(allocator_address);
 		allocator_lock_tag[1..].copy_from_slice(&allocator_address.as_slice()[9..]);
 
 		logging::verbose_tech(
@@ -933,6 +934,22 @@ impl IntentOps {
 	fn get_token_address(&self, chain: ChainId, symbol: &str) -> Result<Address> {
 		let token = self.ctx.tokens.get_or_error(chain, symbol)?;
 		Ok(token.address)
+	}
+}
+
+fn compact_allocator_flag(allocator: Address) -> u8 {
+	let leading_zero_nibbles = allocator
+		.as_slice()
+		.iter()
+		.take(9)
+		.flat_map(|byte| [byte >> 4, byte & 0x0f])
+		.take_while(|nibble| *nibble == 0)
+		.count();
+
+	match leading_zero_nibbles {
+		0..=3 => 0,
+		4..=17 => (leading_zero_nibbles - 3) as u8,
+		_ => 15,
 	}
 }
 

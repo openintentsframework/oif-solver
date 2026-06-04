@@ -1056,6 +1056,7 @@ mod tests {
 					"input_settler_compact_address": "0x9999999999999999999999999999999999999999",
 					"output_settler_address": "0x0000000000000000000000000000000000000022",
 					"the_compact_address": "0x8888888888888888888888888888888888888888",
+					"allocator_address": "0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
 					"rpc_urls": [
 						{ "http": "http://localhost:8545" }
 					],
@@ -1330,6 +1331,7 @@ mod tests {
 	fn encode_lock_details(allocator: AlloyAddress) -> Bytes {
 		let mut out = vec![0u8; 160];
 		out[44..64].copy_from_slice(allocator.as_slice());
+		out[95] = 5; // resetPeriod = OneDay (86_400s), exceeds the test fill-to-claim window
 		Bytes::from(out)
 	}
 
@@ -1484,8 +1486,8 @@ mod tests {
 	) -> PostOrderRequest {
 		let chain_id = 1u64;
 		let nonce = 1u64;
-		let expires = 1_700_000_000u32;
-		let fill_deadline = 1_700_000_100u32;
+		let expires = 1_700_000_600u32;
+		let fill_deadline = 1_700_000_000u32;
 		let input_oracle_hex = "0x2222222222222222222222222222222222222222";
 		let lock_tag = [0xAAu8; 12];
 		let token_address_bytes = [0x33u8; 20];
@@ -1924,7 +1926,9 @@ mod tests {
 			.expect("body");
 		let parsed: ErrorResponse = serde_json::from_slice(&body_bytes).expect("parse body");
 		assert_eq!(parsed.error, "ORDER_VALIDATION_FAILED");
-		assert!(parsed.message.contains("allocator"));
+		// Proves the order reached the allocator-authorization check (isClaimAuthorized),
+		// not an earlier gate (trusted-allocator pin / reset period / malformed window).
+		assert!(parsed.message.contains("did not authorize"));
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

@@ -45,14 +45,31 @@ fn view_tx(to: &Address, chain_id: u64, data: Vec<u8>) -> Transaction {
 	}
 }
 
-/// Resolve the allocator address controlling a Compact resource-lock `id` via
-/// `TheCompact.getLockDetails(id)`.
+/// Map The Compact `ResetPeriod` enum (`uint8`, as returned by `getLockDetails`)
+/// to seconds. Returns `None` for an unrecognized value — the caller treats that
+/// as un-validatable and rejects rather than guessing.
+fn reset_period_seconds(reset_period: u8) -> Option<u64> {
+	Some(match reset_period {
+		0 => 1,         // OneSecond
+		1 => 15,        // FifteenSeconds
+		2 => 60,        // OneMinute
+		3 => 600,       // TenMinutes
+		4 => 3_900,     // OneHourAndFiveMinutes
+		5 => 86_400,    // OneDay
+		6 => 608_400,   // SevenDaysAndOneHour
+		7 => 2_592_000, // ThirtyDays
+		_ => return None,
+	})
+}
+
+/// Resolve the allocator address and reset period controlling a Compact
+/// resource-lock `id` via `TheCompact.getLockDetails(id)`.
 async fn resolve_allocator(
 	delivery: &Arc<DeliveryService>,
 	the_compact_address: &Address,
 	chain_id: u64,
 	id: U256,
-) -> Result<AlloyAddress, APIError> {
+) -> Result<(AlloyAddress, u8), APIError> {
 	let call = ITheCompact::getLockDetailsCall { id };
 	let tx = view_tx(the_compact_address, chain_id, call.abi_encode());
 
@@ -64,7 +81,7 @@ async fn resolve_allocator(
 	let decoded = ITheCompact::getLockDetailsCall::abi_decode_returns_validate(&result)
 		.map_err(|e| validation_error(format!("Failed to decode getLockDetails: {e}")))?;
 
-	Ok(decoded.allocator)
+	Ok((decoded.allocator, decoded.resetPeriod))
 }
 
 /// Validate that `allocator_data` is authorized by the allocator that controls
@@ -94,12 +111,50 @@ pub async fn validate_allocator_authorization(
 		));
 	}
 
-	// Resolve the allocator for every input and require a single, consistent one.
-	// A mixed-allocator batch cannot be authorized by one `authorizeClaim` call.
+	// (C-02) The lock's reset period must outlast the window between filling the
+	// destination output and claiming the input; otherwise the user could force-
+	// withdraw the input after the solver has filled. Use the signed order's own
+	// fill-to-claim window: `expires - fillDeadline`.
+	let required_reset_secs =
+		u64::from(order.expires).saturating_sub(u64::from(order.fillDeadline));
+	if required_reset_secs == 0 {
+		return Err(validation_error(
+			"ResourceLock order is malformed: expires must exceed fillDeadline",
+		));
+	}
+
+	// (C-02) ResourceLock orders require a solver-trusted allocator. Allocator
+	// registration in The Compact is permissionless, so without pinning, a user
+	// could resolve to an allocator they control, authorize the claim at intake,
+	// then refuse it after the fill (or force-withdraw / consume the nonce).
+	let expected = match configured_allocator {
+		Some(addr) => AlloyAddress::from_slice(&addr.0),
+		None => {
+			return Err(validation_error(
+				"ResourceLock orders require a configured trusted allocator (allocator_address); refusing to fill",
+			));
+		},
+	};
+
+	// Resolve every input lock: require a single consistent allocator, and that
+	// each input's reset period exceeds the fill-to-claim window. A mixed-allocator
+	// batch cannot be authorized by one `authorizeClaim` call.
 	let mut resolved: Option<AlloyAddress> = None;
 	for input in &order.inputs {
-		let allocator =
+		let (allocator, reset_period_raw) =
 			resolve_allocator(delivery, the_compact_address, chain_id, input[0]).await?;
+
+		let reset_secs = reset_period_seconds(reset_period_raw).ok_or_else(|| {
+			validation_error(format!(
+				"ResourceLock input lock has an unrecognized reset period ({reset_period_raw})"
+			))
+		})?;
+		if reset_secs <= required_reset_secs {
+			return Err(validation_error(format!(
+				"ResourceLock input reset period ({reset_secs}s) does not exceed the fill-to-claim window ({required_reset_secs}s)"
+			)));
+		}
+
 		match resolved {
 			None => resolved = Some(allocator),
 			Some(existing) if existing != allocator => {
@@ -112,14 +167,11 @@ pub async fn validate_allocator_authorization(
 	}
 	let allocator = resolved.expect("inputs is non-empty");
 
-	// If the solver pins an allocator, the resolved one must match it.
-	if let Some(expected) = configured_allocator {
-		let expected = AlloyAddress::from_slice(&expected.0);
-		if expected != allocator {
-			return Err(validation_error(
-				"ResourceLock inputs use an allocator that differs from the configured allocator_address",
-			));
-		}
+	// The resolved allocator must match the solver's configured trusted one.
+	if expected != allocator {
+		return Err(validation_error(
+			"ResourceLock inputs use an allocator that differs from the configured allocator_address",
+		));
 	}
 
 	// Ask the allocator whether this claim (with its allocatorData) is authorized.
@@ -163,12 +215,27 @@ mod tests {
 
 	const CHAIN: u64 = 1;
 
+	// Order timing: the fill-to-claim window is `expires - fillDeadline`.
+	const FILL_DEADLINE: u32 = 1_700_000_000;
+	const EXPIRES: u32 = 1_700_000_600; // 600s window
+	const WINDOW_SECS: u64 = (EXPIRES - FILL_DEADLINE) as u64;
+
+	// The Compact `ResetPeriod` enum (uint8) values used by the tests.
+	const RESET_ONE_SECOND: u8 = 0; // 1s     (< window)
+	const RESET_TEN_MINUTES: u8 = 3; // 600s   (== window, boundary)
+	const RESET_ONE_DAY: u8 = 5; // 86_400s (> window)
+
 	fn allocator(byte: u8) -> AlloyAddress {
 		AlloyAddress::from([byte; 20])
 	}
 
 	fn the_compact() -> Address {
 		Address(vec![0x88u8; 20])
+	}
+
+	/// The trusted allocator the solver pins (0xA1...), matching `allocator(0xA1)`.
+	fn trusted() -> Address {
+		Address(vec![0xA1u8; 20])
 	}
 
 	fn arbiter() -> AlloyAddress {
@@ -187,9 +254,13 @@ mod tests {
 		U256::from_be_bytes(b)
 	}
 
-	fn encode_lock_details(allocator: AlloyAddress) -> Bytes {
+	/// ABI-encode the `getLockDetails` return tuple
+	/// `(token, allocator, resetPeriod, scope, lockTag)`: allocator is word 1
+	/// (bytes 44..64); resetPeriod (uint8) is the last byte of word 2 (byte 95).
+	fn encode_lock_details(allocator: AlloyAddress, reset_period: u8) -> Bytes {
 		let mut out = vec![0u8; 160];
 		out[44..64].copy_from_slice(allocator.as_slice());
+		out[95] = reset_period;
 		Bytes::from(out)
 	}
 
@@ -201,23 +272,29 @@ mod tests {
 		Bytes::from(out)
 	}
 
-	fn order_with_inputs(ids: &[U256]) -> OifStandardOrder {
+	fn order_with_window(ids: &[U256], expires: u32, fill_deadline: u32) -> OifStandardOrder {
 		OifStandardOrder {
 			user: AlloyAddress::from([0x22u8; 20]),
 			nonce: U256::from(1u64),
 			originChainId: U256::from(CHAIN),
-			expires: 2_000_000_000u32,
-			fillDeadline: 1_700_000_000u32,
+			expires,
+			fillDeadline: fill_deadline,
 			inputOracle: AlloyAddress::from([0x33u8; 20]),
 			inputs: ids.iter().map(|id| [*id, U256::from(1000u64)]).collect(),
 			outputs: vec![],
 		}
 	}
 
-	/// Delivery mock: `getLockDetails(id)` resolves via `lock_allocator_for(id)`;
-	/// `isClaimAuthorized` returns `authorized`.
+	fn order_with_inputs(ids: &[U256]) -> OifStandardOrder {
+		order_with_window(ids, EXPIRES, FILL_DEADLINE)
+	}
+
+	/// Delivery mock: `getLockDetails(id)` resolves the allocator via
+	/// `lock_allocator_for(id)` and reports `reset_period`; `isClaimAuthorized`
+	/// returns `authorized`.
 	fn delivery(
 		lock_allocator_for: impl Fn(U256) -> AlloyAddress + Send + Sync + 'static,
+		reset_period: u8,
 		authorized: bool,
 	) -> Arc<DeliveryService> {
 		let mut mock = MockDeliveryInterface::new();
@@ -227,7 +304,10 @@ mod tests {
 				Some(s) if s == ITheCompact::getLockDetailsCall::SELECTOR => {
 					let mut id_bytes = [0u8; 32];
 					id_bytes.copy_from_slice(&tx.data[4..36]);
-					encode_lock_details(lock_allocator_for(U256::from_be_bytes(id_bytes)))
+					encode_lock_details(
+						lock_allocator_for(U256::from_be_bytes(id_bytes)),
+						reset_period,
+					)
 				},
 				Some(s) if s == IAllocator::isClaimAuthorizedCall::SELECTOR => {
 					encode_bool(authorized)
@@ -242,51 +322,27 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn authorized_allocator_data_passes() {
+	async fn configured_allocator_match_passes() {
 		let order = order_with_inputs(&[id_from(1)]);
-		let d = delivery(|_| allocator(0xA1), true);
+		let d = delivery(|_| allocator(0xA1), RESET_ONE_DAY, true);
 		validate_allocator_authorization(
 			&order,
 			&Bytes::new(),
 			claim_hash(),
 			arbiter(),
 			&the_compact(),
-			None,
+			Some(&trusted()),
 			&d,
 			CHAIN,
 		)
 		.await
-		.expect("authorized empty allocator data should pass");
+		.expect("trusted allocator + authorized + sufficient reset period should pass");
 	}
 
 	#[tokio::test]
-	async fn unauthorized_allocator_data_rejected() {
+	async fn no_configured_allocator_rejected() {
 		let order = order_with_inputs(&[id_from(1)]);
-		let d = delivery(|_| allocator(0xA1), false);
-		let err = validate_allocator_authorization(
-			&order,
-			&Bytes::from_static(b"garbage allocator data"),
-			claim_hash(),
-			arbiter(),
-			&the_compact(),
-			None,
-			&d,
-			CHAIN,
-		)
-		.await
-		.expect_err("unauthorized allocator data must be rejected");
-		assert!(
-			matches!(err, APIError::BadRequest { message, .. } if message.contains("allocator"))
-		);
-	}
-
-	#[tokio::test]
-	async fn mixed_allocators_rejected() {
-		let id1 = id_from(1);
-		let id2 = id_from(2);
-		let order = order_with_inputs(&[id1, id2]);
-		let (a1, a2) = (allocator(0xA1), allocator(0xB2));
-		let d = delivery(move |id| if id == id1 { a1 } else { a2 }, true);
+		let d = delivery(|_| allocator(0xA1), RESET_ONE_DAY, true);
 		let err = validate_allocator_authorization(
 			&order,
 			&Bytes::new(),
@@ -298,16 +354,16 @@ mod tests {
 			CHAIN,
 		)
 		.await
-		.expect_err("mixed allocators must be rejected");
+		.expect_err("ResourceLock order without a configured trusted allocator must be rejected");
 		assert!(
-			matches!(err, APIError::BadRequest { message, .. } if message.contains("multiple allocators"))
+			matches!(err, APIError::BadRequest { message, .. } if message.contains("trusted allocator"))
 		);
 	}
 
 	#[tokio::test]
 	async fn configured_allocator_mismatch_rejected() {
 		let order = order_with_inputs(&[id_from(1)]);
-		let d = delivery(|_| allocator(0xA1), true);
+		let d = delivery(|_| allocator(0xA1), RESET_ONE_DAY, true);
 		let configured = Address(vec![0xB2u8; 20]);
 		let err = validate_allocator_authorization(
 			&order,
@@ -327,35 +383,65 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn configured_allocator_match_passes() {
+	async fn unauthorized_allocator_data_rejected() {
 		let order = order_with_inputs(&[id_from(1)]);
-		let d = delivery(|_| allocator(0xA1), true);
-		let configured = Address(vec![0xA1u8; 20]);
-		validate_allocator_authorization(
+		let d = delivery(|_| allocator(0xA1), RESET_ONE_DAY, false);
+		let err = validate_allocator_authorization(
 			&order,
-			&Bytes::new(),
+			&Bytes::from_static(b"garbage allocator data"),
 			claim_hash(),
 			arbiter(),
 			&the_compact(),
-			Some(&configured),
+			Some(&trusted()),
 			&d,
 			CHAIN,
 		)
 		.await
-		.expect("resolved allocator matching configured one should pass");
+		.expect_err("unauthorized allocator data must be rejected");
+		assert!(
+			matches!(err, APIError::BadRequest { message, .. } if message.contains("authorize"))
+		);
 	}
 
 	#[tokio::test]
-	async fn no_inputs_rejected() {
-		let order = order_with_inputs(&[]);
-		let d = delivery(|_| allocator(0xA1), true);
+	async fn mixed_allocators_rejected() {
+		let id1 = id_from(1);
+		let id2 = id_from(2);
+		let order = order_with_inputs(&[id1, id2]);
+		let (a1, a2) = (allocator(0xA1), allocator(0xB2));
+		let d = delivery(
+			move |id| if id == id1 { a1 } else { a2 },
+			RESET_ONE_DAY,
+			true,
+		);
 		let err = validate_allocator_authorization(
 			&order,
 			&Bytes::new(),
 			claim_hash(),
 			arbiter(),
 			&the_compact(),
-			None,
+			Some(&trusted()),
+			&d,
+			CHAIN,
+		)
+		.await
+		.expect_err("mixed allocators must be rejected");
+		assert!(
+			matches!(err, APIError::BadRequest { message, .. } if message.contains("multiple allocators"))
+		);
+	}
+
+	#[tokio::test]
+	async fn no_inputs_rejected() {
+		let order = order_with_inputs(&[]);
+		let d = delivery(|_| allocator(0xA1), RESET_ONE_DAY, true);
+		let err = validate_allocator_authorization(
+			&order,
+			&Bytes::new(),
+			claim_hash(),
+			arbiter(),
+			&the_compact(),
+			Some(&trusted()),
 			&d,
 			CHAIN,
 		)
@@ -364,5 +450,89 @@ mod tests {
 		assert!(
 			matches!(err, APIError::BadRequest { message, .. } if message.contains("no inputs"))
 		);
+	}
+
+	#[tokio::test]
+	async fn reset_period_below_window_rejected() {
+		let order = order_with_inputs(&[id_from(1)]);
+		let d = delivery(|_| allocator(0xA1), RESET_ONE_SECOND, true);
+		let err = validate_allocator_authorization(
+			&order,
+			&Bytes::new(),
+			claim_hash(),
+			arbiter(),
+			&the_compact(),
+			Some(&trusted()),
+			&d,
+			CHAIN,
+		)
+		.await
+		.expect_err("reset period below the fill-to-claim window must be rejected");
+		assert!(
+			matches!(err, APIError::BadRequest { message, .. } if message.contains("reset period"))
+		);
+	}
+
+	#[tokio::test]
+	async fn reset_period_equal_window_rejected() {
+		// resetPeriod == window must reject ("does not exceed").
+		assert_eq!(WINDOW_SECS, 600);
+		let order = order_with_inputs(&[id_from(1)]);
+		let d = delivery(|_| allocator(0xA1), RESET_TEN_MINUTES, true);
+		let err = validate_allocator_authorization(
+			&order,
+			&Bytes::new(),
+			claim_hash(),
+			arbiter(),
+			&the_compact(),
+			Some(&trusted()),
+			&d,
+			CHAIN,
+		)
+		.await
+		.expect_err("reset period equal to the window must be rejected (does not exceed)");
+		assert!(
+			matches!(err, APIError::BadRequest { message, .. } if message.contains("reset period"))
+		);
+	}
+
+	#[tokio::test]
+	async fn malformed_expires_le_fill_deadline_rejected() {
+		// expires == fillDeadline => zero window => reject regardless of reset period.
+		let order = order_with_window(&[id_from(1)], FILL_DEADLINE, FILL_DEADLINE);
+		let d = delivery(|_| allocator(0xA1), RESET_ONE_DAY, true);
+		let err = validate_allocator_authorization(
+			&order,
+			&Bytes::new(),
+			claim_hash(),
+			arbiter(),
+			&the_compact(),
+			Some(&trusted()),
+			&d,
+			CHAIN,
+		)
+		.await
+		.expect_err("order whose expires does not exceed fillDeadline must be rejected");
+		assert!(
+			matches!(err, APIError::BadRequest { message, .. } if message.contains("fillDeadline"))
+		);
+	}
+
+	#[test]
+	fn reset_period_seconds_maps_known_enum_values() {
+		assert_eq!(reset_period_seconds(0), Some(1));
+		assert_eq!(reset_period_seconds(1), Some(15));
+		assert_eq!(reset_period_seconds(2), Some(60));
+		assert_eq!(reset_period_seconds(3), Some(600));
+		assert_eq!(reset_period_seconds(4), Some(3_900));
+		assert_eq!(reset_period_seconds(5), Some(86_400));
+		assert_eq!(reset_period_seconds(6), Some(608_400));
+		assert_eq!(reset_period_seconds(7), Some(2_592_000));
+	}
+
+	#[test]
+	fn reset_period_seconds_unknown_is_none() {
+		assert_eq!(reset_period_seconds(8), None);
+		assert_eq!(reset_period_seconds(255), None);
 	}
 }
