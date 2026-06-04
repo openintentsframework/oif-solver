@@ -107,8 +107,8 @@ impl ResettableNonceManager {
 	/// arbitrary resync but unable to *reclaim* a nonce — this method moves the
 	/// cache back to `rejected_nonce`, but **only when it is provably safe**:
 	///
-	/// 1. `chain_pending <= rejected_nonce`: the chain has not advanced past the
-	///    rejected nonce, confirming the tx did not land out-of-band; and
+	/// 1. `chain_pending == rejected_nonce`: the chain is ready to accept that
+	///    exact nonce, confirming no lower nonce gap needs recovery; and
 	/// 2. the local cache is exactly `rejected_nonce + 1`: the rejected nonce was
 	///    the most recently handed-out nonce, so nothing newer is in flight that
 	///    rolling back would strand.
@@ -117,11 +117,9 @@ impl ResettableNonceManager {
 	/// allocation re-hands-it-out, closing the nonce gap a pre-pool rejection
 	/// would otherwise leak (the wedge described in audit finding H-27).
 	/// Otherwise the cache is left advanced — moving forward to `chain_pending`
-	/// if the chain is ahead — because a higher nonce is already in flight or
-	/// the chain shows the nonce consumed, and reusing it would risk a
-	/// same-nonce conflict. That is the conservative, never-reuse choice;
-	/// recovery of any resulting gap is left to the bump sweeper / nonce-too-low
-	/// resync.
+	/// if the chain is ahead — because a higher nonce is already in flight, the
+	/// chain shows the nonce consumed, or pending is lower than the rejected
+	/// future nonce. That is the conservative, never-reuse choice.
 	///
 	/// Returns `(before, after)` for tracing.
 	pub fn reclaim_rejected_nonce(
@@ -134,15 +132,17 @@ impl ResettableNonceManager {
 		let before = cache.get(&address).copied();
 		let after = match before {
 			// Safe to reclaim: the rejected nonce was the top of the local
-			// allocation and the chain has not consumed it.
+			// allocation and chain pending is exactly that nonce. If pending is
+			// lower, there is a gap below the rejected nonce; without per-lower-
+			// nonce ownership, jumping back would risk reuse.
 			Some(local)
-				if chain_pending <= rejected_nonce && local == rejected_nonce.saturating_add(1) =>
+				if chain_pending == rejected_nonce && local == rejected_nonce.saturating_add(1) =>
 			{
 				rejected_nonce
 			},
-			// A higher nonce is in flight, or the chain advanced past the
-			// rejected nonce — keep the cache advanced (honoring forward chain
-			// movement) and never reuse an in-flight nonce.
+			// A higher nonce is in flight, the chain advanced past the rejected
+			// nonce, or pending is below the future rejected nonce — keep the
+			// cache advanced and never reuse an in-flight nonce.
 			Some(local) => local.max(chain_pending),
 			None => chain_pending,
 		};
@@ -459,6 +459,20 @@ mod tests {
 		assert_eq!(mgr.peek(ADDR), Some(6));
 
 		assert_eq!(mgr.reclaim_rejected_nonce(ADDR, 5, 6), (Some(6), 6));
+		assert_eq!(mgr.take_next(ADDR), Some(6));
+	}
+
+	#[test]
+	fn reclaim_rejected_nonce_does_not_reclaim_future_nonce_above_pending() {
+		let mgr = ResettableNonceManager::new();
+		mgr.set_next_nonce(ADDR, 5);
+		assert_eq!(mgr.take_next(ADDR), Some(5));
+		assert_eq!(mgr.peek(ADDR), Some(6));
+
+		// A lower pending nonce means there is a gap before the rejected nonce.
+		// Without per-lower-nonce in-flight ownership, jumping below or back to
+		// the future rejected nonce is unsafe; keep the local cache advanced.
+		assert_eq!(mgr.reclaim_rejected_nonce(ADDR, 5, 3), (Some(6), 6));
 		assert_eq!(mgr.take_next(ADDR), Some(6));
 	}
 

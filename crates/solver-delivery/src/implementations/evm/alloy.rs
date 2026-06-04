@@ -243,6 +243,14 @@ enum NonceCacheAction {
 	AttemptRollback { rejected_nonce: Option<u64> },
 }
 
+fn nonce_too_low_retry_nonce_cache_action() -> NonceCacheAction {
+	// A nonce-too-low result proves this nonce is already consumed or held.
+	// Even if a follow-up pending read is stale, do not reclaim it.
+	NonceCacheAction::AttemptRollback {
+		rejected_nonce: None,
+	}
+}
+
 /// Outcome of a raw-send attempt, after pre-sign persisted the hash.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RawSendVerdict {
@@ -2663,9 +2671,7 @@ impl DeliveryInterface for AlloyDelivery {
 						let cache_after = apply_nonce_cache_action(
 							mgr,
 							from,
-							NonceCacheAction::AttemptRollback {
-								rejected_nonce: tx_attempt.nonce,
-							},
+							nonce_too_low_retry_nonce_cache_action(),
 							pending_opt,
 						);
 						if let Some(pending) = pending_opt {
@@ -2677,7 +2683,7 @@ impl DeliveryInterface for AlloyDelivery {
 								cache_before = ?cache_before,
 								cache_after = ?cache_after,
 								error = %second_reason,
-								"nonce-too-low retry also returned nonce too low; nonce cache reconciled after scoped rollback"
+								"nonce-too-low retry also returned nonce too low; nonce cache kept forward-only"
 							);
 						} else {
 							tracing::warn!(
@@ -4115,6 +4121,28 @@ mod tests {
 			Some(102),
 			"must not reclaim a mid-sequence nonce while a higher nonce is in flight"
 		);
+	}
+
+	#[test]
+	fn nonce_too_low_retry_rollback_preserves_high_water_on_stale_pending() {
+		let mgr = ResettableNonceManager::new();
+		let signer = Address::ZERO;
+		mgr.set_next_nonce(signer, 100);
+		assert_eq!(mgr.take_next(signer), Some(100));
+		assert_eq!(mgr.peek(signer), Some(101));
+
+		let after = apply_nonce_cache_action(
+			&mgr,
+			signer,
+			nonce_too_low_retry_nonce_cache_action(),
+			Some(100),
+		);
+		assert_eq!(
+			after,
+			Some(101),
+			"nonce-too-low means the nonce is consumed/held; stale pending must not reclaim it"
+		);
+		assert_eq!(mgr.take_next(signer), Some(101));
 	}
 
 	#[test]
