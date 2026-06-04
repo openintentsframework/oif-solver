@@ -2480,7 +2480,10 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 			resource_lock: OperatorGasFlowUnits::default(),
 			permit2_escrow: OperatorGasFlowUnits::default(),
 			eip3009_escrow: OperatorGasFlowUnits::default(),
-			live_fill_estimate_enabled: true,
+			// Off by default to match OperatorGasConfig's default (H-05): a
+			// missing gas section must not enable the unauthenticated live
+			// eth_estimateGas path.
+			live_fill_estimate_enabled: false,
 			live_post_fill_estimate_chain_ids: HashSet::new(),
 		});
 
@@ -3568,6 +3571,21 @@ mod tests {
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).expect("build ok");
 		assert!(!op_config.gas.live_fill_estimate_enabled);
+	}
+
+	#[test]
+	fn bootstrap_defaults_live_fill_estimate_enabled_off() {
+		// H-05 regression: with no override, the seed default must leave live
+		// fill estimation OFF on the public quote path. (Pins the default so a
+		// future flip back to `true` fails this test.)
+		let mut overrides = test_seed_overrides();
+		overrides.live_fill_estimate_enabled = None;
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).expect("build ok");
+		assert!(
+			!op_config.gas.live_fill_estimate_enabled,
+			"live fill estimate must default OFF on the public quote path (H-05)"
+		);
 	}
 
 	fn test_tx_bump_config() -> solver_types::OperatorTxBumpConfig {

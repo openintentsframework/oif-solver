@@ -464,12 +464,14 @@ impl UpdateFeeConfigContents {
 	}
 }
 
-/// `live_fill_estimate_enabled` defaults to `true` when omitted from the
-/// signed payload, matching `OperatorGasConfig`'s default. This keeps existing
-/// admin clients (which haven't started signing the new field yet) from
-/// accidentally turning live fill estimation off on the next gas-config update.
+/// `live_fill_estimate_enabled` defaults to `false` when omitted from the
+/// signed payload, matching `OperatorGasConfig`'s default. A signed gas-config
+/// update that omits the field therefore leaves live fill estimation OFF (the
+/// off-by-default posture of audit finding H-05) rather than silently enabling
+/// the unauthenticated `eth_estimateGas` path; clients opt in explicitly by
+/// signing `live_fill_estimate_enabled: true`.
 fn default_live_fill_estimate_enabled() -> bool {
-	true
+	false
 }
 
 /// UpdateGasConfig action contents

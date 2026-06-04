@@ -80,8 +80,63 @@ use solver_types::{
 	CostContext, GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, StorageKey, StoredQuote,
 };
 
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::info;
+
+/// Process-wide ceiling on retained `StoredQuote` records (audit finding H-13).
+///
+/// The public `/quotes` endpoint persists a `StoredQuote` per accepted request.
+/// Even with the per-IP rate limit and the quote concurrency cap, a flood from
+/// many distinct source IPs can otherwise grow persistent storage without bound
+/// (each entry only disappears on its validity TTL). This limiter tracks stored
+/// quote ids in FIFO insertion order and, once the configured capacity is
+/// exceeded, reports the oldest ids for eviction so storage stays bounded. The
+/// evicted quotes would expire on their TTL regardless; the cap just enforces
+/// the ceiling early under load.
+///
+/// Scope note: the limiter is per process (a multi-replica deployment bounds
+/// each replica independently) and its capacity is fixed on first use.
+#[derive(Debug)]
+struct QuoteRetentionLimiter {
+	capacity: usize,
+	ids: Mutex<VecDeque<String>>,
+}
+
+impl QuoteRetentionLimiter {
+	fn new(capacity: usize) -> Self {
+		Self {
+			// A zero cap would evict every quote immediately, breaking the
+			// retrieve-by-id flow; clamp to at least 1.
+			capacity: capacity.max(1),
+			ids: Mutex::new(VecDeque::new()),
+		}
+	}
+
+	/// Record newly stored quote ids and return the ids that must be evicted to
+	/// stay within `capacity` (oldest first).
+	fn register<I: IntoIterator<Item = String>>(&self, new_ids: I) -> Vec<String> {
+		let mut ids = self.ids.lock().expect("quote retention mutex poisoned");
+		let mut evicted = Vec::new();
+		for id in new_ids {
+			ids.push_back(id);
+			while ids.len() > self.capacity {
+				if let Some(old) = ids.pop_front() {
+					evicted.push(old);
+				}
+			}
+		}
+		evicted
+	}
+}
+
+/// Returns the process-wide quote retention limiter, initializing it with
+/// `capacity` on first use.
+fn quote_retention_limiter(capacity: usize) -> &'static QuoteRetentionLimiter {
+	static LIMITER: OnceLock<QuoteRetentionLimiter> = OnceLock::new();
+	LIMITER.get_or_init(|| QuoteRetentionLimiter::new(capacity))
+}
 
 /// Processes a quote request and returns available quote options.
 ///
@@ -188,8 +243,15 @@ pub async fn process_quote_request(
 		.await?;
 	log_stage("generate_quotes");
 
-	// Persist quotes and cost contexts (including settlement_name internally)
-	store_quotes(solver, &quote_pairs, &cost_context).await;
+	// Persist quotes and cost contexts (including settlement_name internally),
+	// bounded by the configured retention ceiling (H-13).
+	let max_stored_quotes = config
+		.api
+		.as_ref()
+		.and_then(|api| api.quote.as_ref())
+		.map(|q| q.max_stored_quotes)
+		.unwrap_or(solver_config::DEFAULT_QUOTE_MAX_STORED_QUOTES);
+	store_quotes(solver, &quote_pairs, &cost_context, max_stored_quotes).await;
 	log_stage("store_quotes");
 
 	let quotes: Vec<Quote> = quote_pairs.into_iter().map(|(q, _)| q).collect();
@@ -210,6 +272,7 @@ async fn store_quotes(
 	solver: &SolverEngine,
 	quotes: &[(Quote, Option<String>)],
 	cost_context: &CostContext,
+	max_stored_quotes: usize,
 ) {
 	let storage = solver.storage();
 	let now = std::time::SystemTime::now()
@@ -217,6 +280,7 @@ async fn store_quotes(
 		.unwrap_or_default()
 		.as_secs();
 
+	let mut stored_ids: Vec<String> = Vec::with_capacity(quotes.len());
 	for (quote, settlement_name) in quotes {
 		// Calculate TTL from valid_until timestamp
 		let ttl = if quote.valid_until > now {
@@ -256,7 +320,25 @@ async fn store_quotes(
 				ttl,
 				quote.valid_until
 			);
+			stored_ids.push(quote.quote_id.clone());
 		}
+	}
+
+	// Enforce the process-wide retention ceiling (H-13): evict the oldest
+	// quotes once the cap is exceeded so a quote flood cannot grow storage
+	// without bound. Eviction failures are non-fatal (the TTL still applies).
+	let evicted = quote_retention_limiter(max_stored_quotes).register(stored_ids);
+	for id in &evicted {
+		if let Err(e) = storage.remove(StorageKey::Quotes.as_str(), id).await {
+			tracing::debug!("Failed to evict over-capacity quote {}: {}", id, e);
+		}
+	}
+	if !evicted.is_empty() {
+		tracing::debug!(
+			evicted = evicted.len(),
+			cap = max_stored_quotes,
+			"Evicted oldest quotes to respect retention cap"
+		);
 	}
 }
 
@@ -307,6 +389,49 @@ pub async fn quote_exists(quote_id: &str, solver: &SolverEngine) -> Result<bool,
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn retention_limiter_evicts_oldest_beyond_capacity() {
+		let limiter = QuoteRetentionLimiter::new(3);
+		// First three fit under the cap → nothing evicted.
+		assert!(limiter
+			.register(["a", "b", "c"].iter().map(|s| s.to_string()))
+			.is_empty());
+		// Two more exceed the cap of 3 → the two oldest are evicted, oldest first.
+		let evicted = limiter.register(["d", "e"].iter().map(|s| s.to_string()));
+		assert_eq!(evicted, vec!["a".to_string(), "b".to_string()]);
+	}
+
+	#[test]
+	fn retention_limiter_capacity_one_evicts_each_previous() {
+		let limiter = QuoteRetentionLimiter::new(1);
+		assert!(limiter
+			.register(std::iter::once("a".to_string()))
+			.is_empty());
+		assert_eq!(
+			limiter.register(std::iter::once("b".to_string())),
+			vec!["a".to_string()]
+		);
+		assert_eq!(
+			limiter.register(std::iter::once("c".to_string())),
+			vec!["b".to_string()]
+		);
+	}
+
+	#[test]
+	fn retention_limiter_clamps_zero_capacity_to_one() {
+		// A zero cap must not evict the only quote it just stored (that would
+		// break retrieve-by-id immediately); capacity is clamped to >= 1.
+		let limiter = QuoteRetentionLimiter::new(0);
+		assert!(limiter
+			.register(std::iter::once("a".to_string()))
+			.is_empty());
+		assert_eq!(
+			limiter.register(std::iter::once("b".to_string())),
+			vec!["a".to_string()]
+		);
+	}
+
 	use alloy_primitives::Address as AlloyAddress;
 	use solver_account::AccountService;
 	use solver_config::{ApiConfig, ConfigBuilder, QuoteConfig, SettlementConfig};
@@ -563,6 +688,7 @@ mod tests {
 				fill_deadline_seconds: 300,
 				expires_seconds: 600,
 				max_concurrent_requests: solver_config::DEFAULT_QUOTE_MAX_CONCURRENT_REQUESTS,
+				max_stored_quotes: solver_config::DEFAULT_QUOTE_MAX_STORED_QUOTES,
 			}),
 		};
 
@@ -835,8 +961,8 @@ mod tests {
 		let quotes = vec![(create_test_quote(), None)];
 		let cost_context = create_test_cost_context();
 
-		// Test the actual store_quotes function
-		store_quotes(&solver, &quotes, &cost_context).await;
+		// Test the actual store_quotes function (large cap → no eviction)
+		store_quotes(&solver, &quotes, &cost_context, usize::MAX).await;
 
 		// Verify the quote was stored by trying to retrieve it using the public API
 		let result = get_quote_by_id(TEST_QUOTE_ID, &solver).await;
@@ -855,7 +981,7 @@ mod tests {
 		let cost_context = create_test_cost_context();
 
 		// Test the actual store_quotes function with expired quote
-		store_quotes(&solver, &quotes, &cost_context).await;
+		store_quotes(&solver, &quotes, &cost_context, usize::MAX).await;
 
 		// Verify the quote was still stored (memory storage ignores TTL)
 		// Use the public API to retrieve it

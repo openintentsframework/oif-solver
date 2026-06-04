@@ -345,6 +345,7 @@ mod tests {
 				fill_deadline_seconds: 300, // 5 minutes
 				expires_seconds: 600,       // 10 minutes
 				max_concurrent_requests: solver_config::DEFAULT_QUOTE_MAX_CONCURRENT_REQUESTS,
+				max_stored_quotes: solver_config::DEFAULT_QUOTE_MAX_STORED_QUOTES,
 			}),
 		};
 
