@@ -12,10 +12,19 @@
 //! 3. The error from `send_transaction` does NOT prove the tx was rejected
 //!    pre-pool (i.e. the outcome is `Replacement` or `Ambiguous`).
 //!
-//! Conversely: cache rollback (via `reset_next_nonce`) is only safe when:
+//! Conversely: cache rollback is only safe when:
 //! - The submission error is in `SubmissionOutcome::DefinitelyRejected`, AND
 //! - A fresh chain-pending read succeeds. If the read fails, the caller MUST
 //!   keep the cache advanced — we never reset without authoritative chain state.
+//!
+//! Two rollback primitives exist, with different safety profiles:
+//! - `reset_next_nonce`: forward-only high-water clamp. Safe for an arbitrary
+//!   resync, but cannot *reclaim* a nonce a rejection leaked.
+//! - `reclaim_rejected_nonce`: moves the cache back to the rejected nonce, but
+//!   only when that nonce was the most recently handed-out one and the chain
+//!   has not advanced past it — otherwise it falls back to the forward-only
+//!   behavior. This closes the nonce gap left by a pre-pool rejection without
+//!   ever reissuing a nonce that is still in flight.
 //!
 //! Ambiguous transport errors (timeout, 5xx, malformed JSON) and replacement-
 //! class errors keep the cache advanced — the transaction may have propagated
@@ -87,6 +96,58 @@ impl ResettableNonceManager {
 		};
 		cache.insert(address, reconciled);
 		(before, reconciled)
+	}
+
+	/// Reclaim a nonce that was allocated to a transaction which was then
+	/// definitively rejected pre-pool (the tx never entered any mempool, so the
+	/// nonce was never consumed on-chain).
+	///
+	/// This is the rollback counterpart to [`Self::reset_next_nonce`]. Where
+	/// `reset_next_nonce` is a forward-only high-water clamp — safe for an
+	/// arbitrary resync but unable to *reclaim* a nonce — this method moves the
+	/// cache back to `rejected_nonce`, but **only when it is provably safe**:
+	///
+	/// 1. `chain_pending <= rejected_nonce`: the chain has not advanced past the
+	///    rejected nonce, confirming the tx did not land out-of-band; and
+	/// 2. the local cache is exactly `rejected_nonce + 1`: the rejected nonce was
+	///    the most recently handed-out nonce, so nothing newer is in flight that
+	///    rolling back would strand.
+	///
+	/// When both hold, the cache is set to `rejected_nonce` so the next
+	/// allocation re-hands-it-out, closing the nonce gap a pre-pool rejection
+	/// would otherwise leak (the wedge described in audit finding H-27).
+	/// Otherwise the cache is left advanced — moving forward to `chain_pending`
+	/// if the chain is ahead — because a higher nonce is already in flight or
+	/// the chain shows the nonce consumed, and reusing it would risk a
+	/// same-nonce conflict. That is the conservative, never-reuse choice;
+	/// recovery of any resulting gap is left to the bump sweeper / nonce-too-low
+	/// resync.
+	///
+	/// Returns `(before, after)` for tracing.
+	pub fn reclaim_rejected_nonce(
+		&self,
+		address: Address,
+		rejected_nonce: u64,
+		chain_pending: u64,
+	) -> (Option<u64>, u64) {
+		let mut cache = self.cache.lock().expect("nonce cache mutex poisoned");
+		let before = cache.get(&address).copied();
+		let after = match before {
+			// Safe to reclaim: the rejected nonce was the top of the local
+			// allocation and the chain has not consumed it.
+			Some(local)
+				if chain_pending <= rejected_nonce && local == rejected_nonce.saturating_add(1) =>
+			{
+				rejected_nonce
+			},
+			// A higher nonce is in flight, or the chain advanced past the
+			// rejected nonce — keep the cache advanced (honoring forward chain
+			// movement) and never reuse an in-flight nonce.
+			Some(local) => local.max(chain_pending),
+			None => chain_pending,
+		};
+		cache.insert(address, after);
+		(before, after)
 	}
 
 	/// Take the next nonce and advance the counter.
@@ -351,6 +412,61 @@ mod tests {
 
 		assert_eq!(mgr.take_next(ADDR), Some(142));
 		assert_eq!(mgr.peek(ADDR), Some(143));
+	}
+
+	#[test]
+	fn reclaim_rejected_nonce_reclaims_lone_in_flight_nonce() {
+		// H-27 scenario: a single in-flight tx is rejected pre-pool. The local
+		// cache is one past the rejected nonce and the chain has not consumed
+		// it, so the nonce must be reclaimed (not leaked).
+		let mgr = ResettableNonceManager::new();
+		mgr.set_next_nonce(ADDR, 5);
+		assert_eq!(mgr.take_next(ADDR), Some(5)); // allocate nonce 5
+		assert_eq!(mgr.peek(ADDR), Some(6));
+
+		// Tx at nonce 5 is DefinitelyRejected; chain pending is still 5.
+		assert_eq!(mgr.reclaim_rejected_nonce(ADDR, 5, 5), (Some(6), 5));
+
+		// Nonce 5 is re-handed-out instead of being permanently skipped.
+		assert_eq!(mgr.take_next(ADDR), Some(5));
+		assert_eq!(mgr.peek(ADDR), Some(6));
+	}
+
+	#[test]
+	fn reclaim_rejected_nonce_does_not_reclaim_when_higher_nonce_in_flight() {
+		// A newer nonce was allocated after the rejected one — reclaiming the
+		// middle nonce would risk reissuing an in-flight nonce, so the cache
+		// must stay advanced.
+		let mgr = ResettableNonceManager::new();
+		mgr.set_next_nonce(ADDR, 5);
+		assert_eq!(mgr.take_next(ADDR), Some(5));
+		assert_eq!(mgr.take_next(ADDR), Some(6));
+		assert_eq!(mgr.peek(ADDR), Some(7));
+
+		// Nonce 5 rejected, but 6 is still in flight (cache at 7, not 6).
+		assert_eq!(mgr.reclaim_rejected_nonce(ADDR, 5, 5), (Some(7), 7));
+		assert_eq!(mgr.peek(ADDR), Some(7));
+	}
+
+	#[test]
+	fn reclaim_rejected_nonce_does_not_reclaim_when_chain_advanced_past_it() {
+		// The chain pending is already past the rejected nonce, so the nonce
+		// was consumed out-of-band; never reclaim it. The cache also moves
+		// forward to honor the chain.
+		let mgr = ResettableNonceManager::new();
+		mgr.set_next_nonce(ADDR, 5);
+		assert_eq!(mgr.take_next(ADDR), Some(5));
+		assert_eq!(mgr.peek(ADDR), Some(6));
+
+		assert_eq!(mgr.reclaim_rejected_nonce(ADDR, 5, 6), (Some(6), 6));
+		assert_eq!(mgr.take_next(ADDR), Some(6));
+	}
+
+	#[test]
+	fn reclaim_rejected_nonce_on_empty_cache_seeds_from_chain() {
+		let mgr = ResettableNonceManager::new();
+		assert_eq!(mgr.reclaim_rejected_nonce(ADDR, 5, 5), (None, 5));
+		assert_eq!(mgr.peek(ADDR), Some(5));
 	}
 
 	#[test]
