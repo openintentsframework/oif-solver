@@ -231,7 +231,10 @@ pub const COMMON_DEFAULTS: SeedDefaults = SeedDefaults {
 	},
 
 	// Live gas estimation flags
-	live_fill_estimate_enabled: true,
+	// Default OFF: the public quote endpoint must not perform an
+	// unauthenticated per-request `eth_estimateGas` by default (audit finding
+	// H-05). Opt in via bootstrap config / signed admin UpdateGasConfig.
+	live_fill_estimate_enabled: false,
 	// Default empty: post-fill override path is opt-in per chain. Operators
 	// add chain IDs via the bootstrap config (`live_post_fill_estimate_chain_ids`)
 	// or via signed admin UpdateGasConfig at runtime.

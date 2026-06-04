@@ -191,6 +191,11 @@ fn default_true() -> bool {
 	true
 }
 
+/// Returns the default value for boolean flags (false).
+fn default_false() -> bool {
+	false
+}
+
 /// Configuration for account management.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AccountConfig {
@@ -397,9 +402,11 @@ pub struct GasConfig {
 	pub flows: HashMap<String, GasFlowUnits>,
 	/// When true, quote-time pricing performs `eth_estimateGas` for the fill leg
 	/// and uses the result instead of `flows.<key>.fill`. Other legs stay static.
-	/// Defaults to true; flip to false via the admin API to disable the live path
-	/// on a chain where eth_estimateGas is unreliable.
-	#[serde(default = "default_true")]
+	/// Defaults to `false`: the public quote endpoint must not perform an
+	/// unauthenticated per-request `eth_estimateGas` by default (audit finding
+	/// H-05). Enable it explicitly (behind auth / rate limiting / the per-chain
+	/// concurrency cap) via the admin API.
+	#[serde(default = "default_false")]
 	pub live_fill_estimate_enabled: bool,
 	/// Set of chain IDs on which quote-time post-fill gas estimation
 	/// uses the stateOverride-based live path. Empty (default) = disabled
@@ -729,6 +736,14 @@ pub struct QuoteConfig {
 	/// Maximum concurrent public quote requests.
 	#[serde(default = "default_quote_max_concurrent_requests")]
 	pub max_concurrent_requests: usize,
+	/// Maximum number of generated quotes this process retains in storage at
+	/// once. The public quote endpoint persists a `StoredQuote` per accepted
+	/// request; without a ceiling a quote flood (especially from many distinct
+	/// source IPs, each under the per-IP rate limit) grows persistent storage
+	/// unbounded (audit finding H-13). When the cap is exceeded the oldest
+	/// quotes are evicted early (they would expire on their TTL regardless).
+	#[serde(default = "default_quote_max_stored_quotes")]
+	pub max_stored_quotes: usize,
 }
 
 impl Default for QuoteConfig {
@@ -738,6 +753,7 @@ impl Default for QuoteConfig {
 			fill_deadline_seconds: default_fill_deadline_seconds(),
 			expires_seconds: default_expires_seconds(),
 			max_concurrent_requests: default_quote_max_concurrent_requests(),
+			max_stored_quotes: default_quote_max_stored_quotes(),
 		}
 	}
 }
@@ -745,6 +761,11 @@ impl Default for QuoteConfig {
 pub const DEFAULT_API_RATE_LIMIT_REQUESTS_PER_MINUTE: u32 = 600;
 pub const DEFAULT_API_RATE_LIMIT_BURST: u32 = 100;
 pub const DEFAULT_QUOTE_MAX_CONCURRENT_REQUESTS: usize = 32;
+/// Default ceiling on retained `StoredQuote` records per process. Generous
+/// enough not to interfere with legitimate traffic (at 600 req/min/IP and a
+/// 60s validity TTL a single IP holds at most ~600), while bounding the
+/// storage a multi-IP flood can accumulate.
+pub const DEFAULT_QUOTE_MAX_STORED_QUOTES: usize = 50_000;
 
 fn default_rate_limiting_enabled() -> bool {
 	true
@@ -760,6 +781,10 @@ fn default_api_rate_limit_burst() -> u32 {
 
 fn default_quote_max_concurrent_requests() -> usize {
 	DEFAULT_QUOTE_MAX_CONCURRENT_REQUESTS
+}
+
+fn default_quote_max_stored_quotes() -> usize {
+	DEFAULT_QUOTE_MAX_STORED_QUOTES
 }
 
 /// Returns the default quote validity duration in seconds.

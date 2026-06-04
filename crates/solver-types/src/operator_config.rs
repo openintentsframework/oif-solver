@@ -455,7 +455,10 @@ fn default_broadcaster_finality_blocks() -> u64 {
 }
 
 fn default_live_fill_estimate_enabled() -> bool {
-	true
+	// Default OFF: the public quote endpoint must not perform an
+	// unauthenticated, per-request `eth_estimateGas` by default (audit finding
+	// H-05). Opt in explicitly behind auth / rate limiting / the concurrency cap.
+	false
 }
 
 fn default_live_post_fill_estimate_chain_ids() -> HashSet<u64> {
@@ -476,7 +479,13 @@ pub struct OperatorGasConfig {
 
 	/// When true, quote-time pricing performs `eth_estimateGas` for the fill
 	/// leg and uses the result instead of the configured per-flow `fill` units.
-	/// Other legs (open/claim) stay static. Defaults to `true`.
+	/// Other legs (open/claim) stay static.
+	///
+	/// Defaults to `false`: the quote endpoint is public/unauthenticated, and a
+	/// default-on live `eth_estimateGas` per request is an RPC-amplification
+	/// vector (audit finding H-05). Operators who want live fill estimation
+	/// should enable it explicitly and pair it with authentication and/or the
+	/// per-chain concurrency cap and request rate limiting.
 	#[serde(default = "default_live_fill_estimate_enabled")]
 	pub live_fill_estimate_enabled: bool,
 
@@ -933,6 +942,24 @@ impl Default for OperatorAdminConfig {
 mod tests {
 	use super::*;
 	use std::str::FromStr;
+
+	#[test]
+	fn operator_gas_config_defaults_live_fill_estimate_off() {
+		// H-05 regression: when the gas config omits `live_fill_estimate_enabled`
+		// it must deserialize to `false` so the public quote path does not
+		// perform an unauthenticated `eth_estimateGas` by default.
+		let json = serde_json::json!({
+			"resource_lock": {"open": 1, "fill": 1, "claim": 1},
+			"permit2_escrow": {"open": 1, "fill": 1, "claim": 1},
+			"eip3009_escrow": {"open": 1, "fill": 1, "claim": 1}
+		});
+		let cfg: OperatorGasConfig =
+			serde_json::from_value(json).expect("OperatorGasConfig should deserialize");
+		assert!(
+			!cfg.live_fill_estimate_enabled,
+			"live_fill_estimate_enabled must default to false (H-05)"
+		);
+	}
 
 	fn test_address() -> Address {
 		Address::from_str("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap()
