@@ -1209,9 +1209,9 @@ impl DeliveryInterface for AlloyDelivery {
 					.await;
 				}
 
-				// Rollback: fetch authoritative chain pending; on Some(pending)
-				// reset the cache, on None keep it advanced (no authoritative
-				// state — never roll back without it).
+				// Rollback: fetch authoritative chain pending; on success apply
+				// scoped reclaim/forward-only reconciliation, on failure keep it
+				// advanced (no authoritative state — never roll back without it).
 				let failed_nonce = first_attempt
 					.as_ref()
 					.and_then(|a| a.nonce)
@@ -1240,7 +1240,7 @@ impl DeliveryInterface for AlloyDelivery {
 						cache_before = ?cache_before,
 						cache_after = ?cache_after,
 						error = %err_msg,
-						"local signing failed before broadcast; nonce cache rolled back to chain pending"
+						"local signing failed before broadcast; nonce cache reconciled after scoped rollback"
 					);
 				} else {
 					tracing::error!(
@@ -1283,8 +1283,9 @@ impl DeliveryInterface for AlloyDelivery {
 				// Signed envelope exists locally but ledger durability cannot
 				// be proven — refuse to broadcast. Roll back the nonce since
 				// nothing went out: fetch authoritative chain pending; on
-				// Some(pending) reset the cache, on None keep it advanced
-				// (never roll back without authoritative state).
+				// success apply scoped reclaim/forward-only reconciliation,
+				// on failure keep it advanced (never roll back without
+				// authoritative state).
 				let failed_nonce = planned_attempt.nonce.unwrap();
 				let mgr = self.get_nonce_manager(chain_id)?;
 				let cache_before = mgr.peek(from);
@@ -1310,7 +1311,7 @@ impl DeliveryInterface for AlloyDelivery {
 						cache_before = ?cache_before,
 						cache_after = ?cache_after,
 						error = %persist_err,
-						"pre-broadcast hash persist failed; refusing to broadcast; nonce cache rolled back to chain pending"
+						"pre-broadcast hash persist failed; refusing to broadcast; nonce cache reconciled after scoped rollback"
 					);
 				} else {
 					tracing::error!(
@@ -1776,7 +1777,7 @@ impl DeliveryInterface for AlloyDelivery {
 						cache_before = ?cache_before,
 						cache_after = ?cache_after,
 						error = %reason,
-						"raw send definitively rejected; nonce cache rolled back to chain pending"
+						"raw send definitively rejected; nonce cache reconciled after scoped rollback"
 					);
 				} else {
 					tracing::warn!(
@@ -1981,7 +1982,7 @@ impl DeliveryInterface for AlloyDelivery {
 									cache_before = ?cache_before,
 									cache_after = ?cache_after,
 									error = %record_err_msg,
-									"nonce-too-low retry: failed to record retry planned attempt; refusing to broadcast; nonce cache rolled back to chain pending"
+									"nonce-too-low retry: failed to record retry planned attempt; refusing to broadcast; nonce cache reconciled after scoped rollback"
 								);
 							} else {
 								tracing::error!(
@@ -2035,8 +2036,9 @@ impl DeliveryInterface for AlloyDelivery {
 							.await;
 						}
 
-						// Rollback: fetch authoritative chain pending; on
-						// Some(pending) reset cache, on None keep it advanced.
+						// Rollback: fetch authoritative chain pending; on success
+						// apply scoped reclaim/forward-only reconciliation, on
+						// failure keep it advanced.
 						let mgr = self.get_nonce_manager(chain_id)?;
 						let cache_before = mgr.peek(from);
 						let pending_result = provider.get_transaction_count(from).pending().await;
@@ -2062,7 +2064,7 @@ impl DeliveryInterface for AlloyDelivery {
 								cache_before = ?cache_before,
 								cache_after = ?cache_after,
 								error = %sign_err_msg,
-								"local signing failed on nonce-too-low retry; nonce cache rolled back to chain pending"
+								"local signing failed on nonce-too-low retry; nonce cache reconciled after scoped rollback"
 							);
 						} else {
 							tracing::error!(
@@ -2129,7 +2131,7 @@ impl DeliveryInterface for AlloyDelivery {
 								cache_before = ?cache_before,
 								cache_after = ?cache_after,
 								error = %persist_err,
-								"nonce-too-low retry: pre-broadcast hash persist failed; refusing to broadcast; nonce cache rolled back to chain pending"
+								"nonce-too-low retry: pre-broadcast hash persist failed; refusing to broadcast; nonce cache reconciled after scoped rollback"
 							);
 						} else {
 							tracing::error!(
@@ -2598,7 +2600,7 @@ impl DeliveryInterface for AlloyDelivery {
 								cache_before = ?cache_before,
 								cache_after = ?cache_after,
 								error = %retry_reason,
-								"nonce-too-low retry definitively rejected; nonce cache rolled back to chain pending"
+								"nonce-too-low retry definitively rejected; nonce cache reconciled after scoped rollback"
 							);
 						} else {
 							tracing::warn!(
@@ -2675,7 +2677,7 @@ impl DeliveryInterface for AlloyDelivery {
 								cache_before = ?cache_before,
 								cache_after = ?cache_after,
 								error = %second_reason,
-								"nonce-too-low retry also returned nonce too low; nonce cache rolled back to chain pending"
+								"nonce-too-low retry also returned nonce too low; nonce cache reconciled after scoped rollback"
 							);
 						} else {
 							tracing::warn!(

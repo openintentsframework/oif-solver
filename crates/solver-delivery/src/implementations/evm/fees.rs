@@ -596,6 +596,38 @@ mod tests {
 	}
 
 	#[test]
+	fn gas_price_cap_passes_through_legacy_price_when_below_cap() {
+		let policy = ChainFeePolicy {
+			speed: FeeSpeed::Fast,
+			min_priority_fee_per_gas: Some(100_000_000),
+			priority_fee_fallback: 100_000_000,
+			quote_cost_strategy: FeeCostStrategy::BufferedEffective125,
+			gas_price_cap: Some(2_500_000_000),
+		};
+
+		assert_eq!(
+			super::clamp_legacy_gas_price_to_cap(1_000_000_000, &policy),
+			1_000_000_000
+		);
+	}
+
+	#[test]
+	fn gas_price_cap_passes_through_legacy_price_when_unset() {
+		let policy = ChainFeePolicy {
+			speed: FeeSpeed::Fast,
+			min_priority_fee_per_gas: Some(100_000_000),
+			priority_fee_fallback: 100_000_000,
+			quote_cost_strategy: FeeCostStrategy::BufferedEffective125,
+			gas_price_cap: None,
+		};
+
+		assert_eq!(
+			super::clamp_legacy_gas_price_to_cap(10_000_000_000, &policy),
+			10_000_000_000
+		);
+	}
+
+	#[test]
 	fn fee_policy_quote_cost_strategy_changes_cost_not_max_fee() {
 		// Submit-side `max_fee_per_gas` is decoupled from the quote-side
 		// `cost_per_gas`. Switching strategy moves the quote cost without
