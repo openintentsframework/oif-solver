@@ -1993,7 +1993,7 @@ mod tests {
 		api_config.rate_limiting = None;
 		let app = test_quote_app(api_config, None).await;
 
-		for _ in 0..solver_config::DEFAULT_API_RATE_LIMIT_REQUESTS_PER_MINUTE {
+		for _ in 0..solver_config::DEFAULT_API_RATE_LIMIT_BURST {
 			let response = app
 				.clone()
 				.oneshot(
