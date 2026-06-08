@@ -16,8 +16,8 @@ use solver_settlement::admission::estimate_required_expiry_window_seconds;
 use solver_storage::StorageService;
 use solver_types::{
 	current_timestamp, standards::eip7683::LockType, truncate_id, with_0x_prefix, Address,
-	DiscoveryEvent, Eip7683OrderData, ExecutionDecision, ExecutionParams, Intent, OrderEvent,
-	SolverEvent, StorageKey,
+	DiscoveryEvent, Eip7683OrderData, ExecutionDecision, ExecutionParams, Intent, Order,
+	OrderEvent, SolverEvent, StorageKey,
 };
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
@@ -347,7 +347,9 @@ impl IntentHandler {
 			)
 			.await
 		{
-			Ok(order) => {
+			Ok(mut order) => {
+				apply_prepare_gas_limit_from_config(&mut order, &intent.source, &config);
+
 				// Settlement-aware acceptance gate:
 				// Skip orders that do not leave enough time to reach claim/finalize safely.
 				if let Ok(order_data) =
@@ -495,7 +497,6 @@ impl IntentHandler {
 
 				// Update order's gas_limit_overrides with simulated gas before storing
 				// This ensures the actual fill transaction uses the simulated gas limit
-				let mut order = order;
 				if let Some(simulated_gas) = simulated_fill_gas {
 					if let Ok(mut order_data) =
 						serde_json::from_value::<Eip7683OrderData>(order.data.clone())
@@ -590,6 +591,37 @@ impl IntentHandler {
 	}
 }
 
+fn prepare_gas_cap(open_units: u64) -> u64 {
+	// Quote economics use the tight configured open units; execution needs bounded headroom for
+	// Permit2 cold nonce-bitmap writes and the configured input/output order caps.
+	open_units.saturating_mul(125).saturating_add(99) / 100
+}
+
+fn apply_prepare_gas_limit_from_config(order: &mut Order, source: &str, config: &Config) {
+	if source != "off-chain" {
+		return;
+	}
+
+	let Ok(mut order_data) = serde_json::from_value::<Eip7683OrderData>(order.data.clone()) else {
+		return;
+	};
+	let Some(lock_type) = order_data.lock_type else {
+		return;
+	};
+	if matches!(lock_type, LockType::ResourceLock) {
+		return;
+	}
+
+	let flow_keys = vec![lock_type.as_str().to_string()];
+	let (open_units, _, _, _, _) = crate::engine::cost_profit::estimate_gas_units_from_flow_keys(
+		&flow_keys, config, 150_000, 150_000, 300_000, 0, 150_000,
+	);
+	order_data.gas_limit_overrides.prepare_gas_limit = Some(prepare_gas_cap(open_units));
+	if let Ok(updated_data) = serde_json::to_value(&order_data) {
+		order.data = updated_data;
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -603,7 +635,7 @@ mod tests {
 	use solver_order::{MockExecutionStrategy, MockOrderInterface};
 	use solver_pricing::{MockPricingInterface, PricingService};
 	use solver_storage::{MockStorageInterface, StorageError};
-	use solver_types::standards::eip7683::LockType;
+	use solver_types::standards::eip7683::{GasLimitOverrides, LockType};
 	use solver_types::utils::tests::builders::{
 		Eip7683OrderDataBuilder, IntentBuilder, MandateOutputBuilder, OrderBuilder,
 	};
@@ -674,6 +706,245 @@ mod tests {
 	fn create_test_config() -> (Arc<RwLock<Config>>, Config) {
 		let config = ConfigBuilder::new().build();
 		(Arc::new(RwLock::new(config.clone())), config)
+	}
+
+	fn create_test_config_with_gas_open(flow_key: &str, open: u64) -> Config {
+		let mut config = ConfigBuilder::new().build();
+		let mut gas = solver_config::GasConfig {
+			flows: HashMap::new(),
+			live_fill_estimate_enabled: true,
+			live_post_fill_estimate_chain_ids: HashSet::new(),
+			max_concurrent_live_fill_estimates_per_chain:
+				solver_config::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
+		};
+		gas.flows.insert(
+			flow_key.to_string(),
+			solver_config::GasFlowUnits {
+				open: Some(open),
+				fill: Some(150_000),
+				post_fill: Some(300_000),
+				pre_claim: Some(0),
+				claim: Some(150_000),
+			},
+		);
+		config.gas = Some(gas);
+		config
+	}
+
+	fn create_test_order_with_lock_type(lock_type: LockType) -> Order {
+		let mut order_data = Eip7683OrderDataBuilder::new().build();
+		order_data.lock_type = Some(lock_type);
+		order_data.gas_limit_overrides = GasLimitOverrides::default();
+		create_test_order_from_data(order_data)
+	}
+
+	#[test]
+	fn prepare_gas_cap_adds_execution_headroom() {
+		assert_eq!(prepare_gas_cap(146_306), 182_883);
+		assert_eq!(prepare_gas_cap(130_254), 162_818);
+	}
+
+	#[test]
+	fn apply_prepare_gas_limit_sets_permit2_open_units_for_offchain_order() {
+		let config = create_test_config_with_gas_open("permit2_escrow", 146_306);
+		let mut order = create_test_order_with_lock_type(LockType::Permit2Escrow);
+
+		apply_prepare_gas_limit_from_config(&mut order, "off-chain", &config);
+
+		let order_data: Eip7683OrderData = serde_json::from_value(order.data).unwrap();
+		assert_eq!(
+			order_data.gas_limit_overrides.prepare_gas_limit,
+			Some(182_883)
+		);
+	}
+
+	#[test]
+	fn apply_prepare_gas_limit_sets_eip3009_open_units_for_offchain_order() {
+		let config = create_test_config_with_gas_open("eip3009_escrow", 130_254);
+		let mut order = create_test_order_with_lock_type(LockType::Eip3009Escrow);
+
+		apply_prepare_gas_limit_from_config(&mut order, "off-chain", &config);
+
+		let order_data: Eip7683OrderData = serde_json::from_value(order.data).unwrap();
+		assert_eq!(
+			order_data.gas_limit_overrides.prepare_gas_limit,
+			Some(162_818)
+		);
+	}
+
+	#[test]
+	fn apply_prepare_gas_limit_ignores_onchain_orders() {
+		let config = create_test_config_with_gas_open("permit2_escrow", 146_306);
+		let mut order = create_test_order_with_lock_type(LockType::Permit2Escrow);
+
+		apply_prepare_gas_limit_from_config(&mut order, "on-chain", &config);
+
+		let order_data: Eip7683OrderData = serde_json::from_value(order.data).unwrap();
+		assert_eq!(order_data.gas_limit_overrides.prepare_gas_limit, None);
+	}
+
+	#[test]
+	fn apply_prepare_gas_limit_skips_resource_lock() {
+		let config = create_test_config_with_gas_open("resource_lock", 123_456);
+		let mut order = create_test_order_with_lock_type(LockType::ResourceLock);
+
+		apply_prepare_gas_limit_from_config(&mut order, "off-chain", &config);
+
+		let order_data: Eip7683OrderData = serde_json::from_value(order.data).unwrap();
+		assert_eq!(order_data.gas_limit_overrides.prepare_gas_limit, None);
+	}
+
+	async fn assert_handle_stores_prepare_gas_limit_for_quote_id(quote_id: Option<String>) {
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_order_interface = MockOrderInterface::new();
+		let mut mock_strategy = MockExecutionStrategy::new();
+
+		let intent = IntentBuilder::new()
+			.with_source("off-chain")
+			.with_quote_id(quote_id.clone())
+			.build();
+		let solver_address = create_test_address();
+
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:0xtest_intent_123"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+
+		if let Some(ref quote_id) = quote_id {
+			let quote_key = format!("quotes:{quote_id}");
+			mock_storage
+				.expect_get_bytes()
+				.times(1)
+				.returning(move |key| {
+					assert_eq!(key, quote_key);
+					let key = key.to_string();
+					Box::pin(async move { Err(StorageError::NotFound(key)) })
+				});
+		}
+
+		mock_storage
+			.expect_set_bytes()
+			.withf(|key: &str, _: &Vec<u8>, _, _| key.starts_with("intents:"))
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		mock_storage
+			.expect_set_bytes()
+			.withf(|key: &str, bytes: &Vec<u8>, _, _| {
+				if !key.starts_with("orders:") {
+					return false;
+				}
+				let Ok(order) = serde_json::from_slice::<Order>(bytes) else {
+					return false;
+				};
+				if order.execution_params.is_none() {
+					return false;
+				}
+				let Ok(order_data) = serde_json::from_value::<Eip7683OrderData>(order.data.clone())
+				else {
+					return false;
+				};
+				order_data.gas_limit_overrides.prepare_gas_limit == Some(182_883)
+			})
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		mock_order_interface
+			.expect_validate_and_create_order()
+			.times(1)
+			.returning(move |_, _, _, _, _, _| {
+				Box::pin(
+					async move { Ok(create_test_order_with_lock_type(LockType::Permit2Escrow)) },
+				)
+			});
+		mock_order_interface
+			.expect_generate_fill_transaction()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					Ok(solver_types::Transaction {
+						to: Some(solver_types::Address(vec![0u8; 20])),
+						data: vec![],
+						value: U256::ZERO,
+						chain_id: 137,
+						nonce: None,
+						gas_limit: Some(200000),
+						gas_price: None,
+						max_fee_per_gas: None,
+						max_priority_fee_per_gas: None,
+					})
+				})
+			});
+
+		mock_strategy
+			.expect_should_execute()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					ExecutionDecision::Execute(ExecutionParams {
+						gas_price: U256::from(20000000000u64),
+						priority_fee: Some(U256::from(1000u64)),
+					})
+				})
+			});
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order_interface) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(mock_strategy),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let cost_profit_service = if quote_id.is_some() {
+			let mut mock_quote_storage = MockStorageInterface::new();
+			mock_quote_storage.expect_get_bytes().returning(|key| {
+				let key = key.to_string();
+				Box::pin(async move { Err(StorageError::NotFound(key)) })
+			});
+			create_mock_cost_profit_service_with_storage(mock_quote_storage)
+		} else {
+			create_mock_cost_profit_service()
+		};
+		let static_config = create_test_config_with_gas_open("permit2_escrow", 146_306);
+		let config = Arc::new(RwLock::new(static_config.clone()));
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+			&static_config,
+		);
+
+		let result = handler.handle(intent).await;
+		assert!(result.is_ok());
+	}
+
+	#[tokio::test]
+	async fn handle_direct_offchain_intent_stores_prepare_gas_limit() {
+		assert_handle_stores_prepare_gas_limit_for_quote_id(None).await;
+	}
+
+	#[tokio::test]
+	async fn handle_quote_offchain_intent_stores_prepare_gas_limit() {
+		assert_handle_stores_prepare_gas_limit_for_quote_id(Some("quote-123".to_string())).await;
 	}
 
 	fn create_test_config_with_broadcaster() -> Arc<RwLock<Config>> {
@@ -820,6 +1091,12 @@ mod tests {
 	}
 
 	fn create_mock_cost_profit_service() -> Arc<CostProfitService> {
+		create_mock_cost_profit_service_with_storage(MockStorageInterface::new())
+	}
+
+	fn create_mock_cost_profit_service_with_storage(
+		mock_storage: MockStorageInterface,
+	) -> Arc<CostProfitService> {
 		// Create mock pricing service with expected method responses
 		let mut mock_pricing = MockPricingInterface::new();
 
@@ -963,7 +1240,7 @@ mod tests {
 			pricing_service,
 			delivery_service,
 			token_manager,
-			Arc::new(StorageService::new(Box::new(MockStorageInterface::new()))),
+			Arc::new(StorageService::new(Box::new(mock_storage))),
 			settlement_service,
 		))
 	}
