@@ -254,6 +254,7 @@ mod tests {
 	fn encode_lock_details(allocator: AlloyAddress) -> Bytes {
 		let mut out = vec![0u8; 160];
 		out[44..64].copy_from_slice(allocator.as_slice());
+		out[95] = 5; // resetPeriod = OneDay (86_400s), exceeds the test fill-to-claim window
 		Bytes::from(out)
 	}
 
@@ -347,8 +348,8 @@ mod tests {
 	fn build_signature_fixture() -> SignatureFixture {
 		let chain_id = 1u64;
 		let nonce = 1u64;
-		let expires = 1_700_000_000u32;
-		let fill_deadline = 1_700_000_100u32;
+		let expires = 1_700_000_600u32;
+		let fill_deadline = 1_700_000_000u32;
 		let input_oracle_hex = "0x2222222222222222222222222222222222222222";
 		let lock_tag = [0xAAu8; 12];
 		let token_address_bytes = [0x33u8; 20];
@@ -489,7 +490,10 @@ mod tests {
 			tokens: Vec::new(),
 			input_settler_compact_address: Some(address_from_hex(compact_settler_hex)),
 			the_compact_address: Some(address_from_hex(the_compact_address_hex)),
-			allocator_address: None,
+			// Pin the trusted allocator to the one the lock resolves to (`lock_allocator()`).
+			allocator_address: Some(address_from_hex(
+				"0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+			)),
 		};
 
 		let mut networks = NetworksConfig::new();
