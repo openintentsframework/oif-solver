@@ -4,7 +4,9 @@
 //! and determining execution strategy through the order service.
 
 use crate::engine::{
-	context::ContextBuilder, cost_profit::CostProfitService, event_bus::EventBus,
+	context::ContextBuilder,
+	cost_profit::{estimate_quote_gas_units_from_flow_keys, CostProfitService},
+	event_bus::EventBus,
 	token_manager::TokenManager,
 };
 use crate::state::OrderStateMachine;
@@ -613,10 +615,8 @@ fn apply_prepare_gas_limit_from_config(order: &mut Order, source: &str, config: 
 	}
 
 	let flow_keys = vec![lock_type.as_str().to_string()];
-	let (open_units, _, _, _, _) = crate::engine::cost_profit::estimate_gas_units_from_flow_keys(
-		&flow_keys, config, 150_000, 150_000, 300_000, 0, 150_000,
-	);
-	order_data.gas_limit_overrides.prepare_gas_limit = Some(prepare_gas_cap(open_units));
+	let gas_units = estimate_quote_gas_units_from_flow_keys(&flow_keys, config);
+	order_data.gas_limit_overrides.prepare_gas_limit = Some(prepare_gas_cap(gas_units.open_units));
 	if let Ok(updated_data) = serde_json::to_value(&order_data) {
 		order.data = updated_data;
 	}
@@ -769,6 +769,23 @@ mod tests {
 		assert_eq!(
 			order_data.gas_limit_overrides.prepare_gas_limit,
 			Some(162_818)
+		);
+	}
+
+	#[test]
+	fn prepare_gas_limit_uses_quote_open_units_source() {
+		let config = create_test_config_with_gas_open("permit2_escrow", 146_306);
+		let flow_keys = vec!["permit2_escrow".to_string()];
+		let quote_open_units =
+			estimate_quote_gas_units_from_flow_keys(&flow_keys, &config).open_units;
+		let mut order = create_test_order_with_lock_type(LockType::Permit2Escrow);
+
+		apply_prepare_gas_limit_from_config(&mut order, "off-chain", &config);
+
+		let order_data: Eip7683OrderData = serde_json::from_value(order.data).unwrap();
+		assert_eq!(
+			order_data.gas_limit_overrides.prepare_gas_limit,
+			Some(prepare_gas_cap(quote_open_units))
 		);
 	}
 
