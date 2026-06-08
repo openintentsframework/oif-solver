@@ -168,6 +168,7 @@ impl ConfigBuilder {
 				monitoring_timeout_seconds: self.monitoring_timeout_seconds,
 				deny_list: self.deny_list,
 				ingress_mode: SolverIngressMode::Active,
+				resource_lock_enabled: false,
 			},
 			networks: self.networks.unwrap_or_default(),
 			storage: StorageConfig {

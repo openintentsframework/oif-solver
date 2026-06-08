@@ -106,6 +106,7 @@ Bootstrap config specifies which networks your solver will support. Networks can
 |-------|----------|-------------|
 | `solver_id` | No | Unique solver identifier. If provided, enables idempotent seeding and derives the EIP-712 admin domain salt that binds admin signatures to this solver instance. If omitted, a UUID is generated. |
 | `monitoring_timeout_seconds` | No | Top-level solver monitoring timeout in seconds. Controls how long post-fill settlement monitoring keeps polling for claim readiness. Valid range: `30` to `1209600` seconds. Defaults to seed/common default (`28800`). Long-latency broadcaster routes may need values like `864000` (10 days). |
+| `resource_lock_enabled` | No | Enables ResourceLock quote generation and intake. Defaults to `false`; leave disabled until ResourceLock reservation semantics are implemented. |
 | `networks` | Yes | Array of networks to support |
 | `networks[].chain_id` | Yes | Chain ID (seeded or non-seeded) |
 | `networks[].tokens` | Yes | Tokens for this network (can be empty at boot) |

@@ -1756,6 +1756,7 @@ mod tests {
 				rate_buffer_bps: 14,
 				monitoring_timeout_seconds: 60,
 				deny_list: None,
+				resource_lock_enabled: false,
 			},
 			admin: OperatorAdminConfig {
 				enabled: true,

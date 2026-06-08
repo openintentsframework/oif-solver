@@ -35,7 +35,7 @@ paths:
 
         Supported order types:
         - `oif-escrow-v0`: Permit2-based escrow orders
-        - `oif-resource-lock-v0`: TheCompact resource lock orders
+        - `oif-resource-lock-v0`: TheCompact resource lock orders. Disabled by default unless the solver is configured with `resource_lock_enabled: true`.
         - `oif-3009-v0`: EIP-3009 gasless transfer orders
 
         Note: This endpoint requires a configured discovery service (offchain_eip7683).
@@ -309,7 +309,7 @@ components:
 
     OifResourceLockV0:
       type: object
-      description: Resource lock order via TheCompact (v0)
+      description: Resource lock order via TheCompact (v0). Solvers reject this order type unless `resource_lock_enabled` is true.
       required:
         - type
         - payload

@@ -1970,6 +1970,7 @@ fn build_seed_overrides(
 		rate_buffer_bps: None,
 		monitoring_timeout_seconds: None,
 		deny_list: deny_list_path,
+		resource_lock_enabled: Some(options.enable_compact_simple_allocator),
 		rebalance: None,
 		live_fill_estimate_enabled: None,
 		live_post_fill_estimate_chain_ids: None,

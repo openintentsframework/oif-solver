@@ -502,6 +502,7 @@ pub fn merge_to_operator_config(
 			rate_buffer_bps,
 			monitoring_timeout_seconds,
 			deny_list: initializer.deny_list.clone(),
+			resource_lock_enabled: initializer.resource_lock_enabled.unwrap_or(false),
 		},
 		admin,
 		orders_auth_enabled: initializer.orders_auth_enabled.unwrap_or(false),
@@ -1217,6 +1218,7 @@ fn build_solver_config_from_operator(
 		} else {
 			SolverIngressMode::Active
 		},
+		resource_lock_enabled: operator_config.solver.resource_lock_enabled,
 	}
 }
 
@@ -2549,6 +2551,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 			rate_buffer_bps: config.solver.rate_buffer_bps,
 			monitoring_timeout_seconds: config.solver.monitoring_timeout_seconds,
 			deny_list: config.solver.deny_list.clone(),
+			resource_lock_enabled: config.solver.resource_lock_enabled,
 		},
 		admin,
 		orders_auth_enabled,
@@ -3509,6 +3512,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -3566,6 +3570,29 @@ mod tests {
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).expect("build ok");
 		assert!(!op_config.gas.live_fill_estimate_enabled);
+	}
+
+	#[test]
+	fn bootstrap_config_defaults_resource_lock_disabled() {
+		let overrides = test_seed_overrides();
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).expect("build ok");
+
+		assert!(!op_config.solver.resource_lock_enabled);
+	}
+
+	#[test]
+	fn bootstrap_config_overrides_resource_lock_enabled() {
+		let mut overrides = test_seed_overrides();
+		overrides.resource_lock_enabled = Some(true);
+
+		let op_config =
+			merge_to_operator_config(overrides.clone(), &TESTNET_SEED).expect("build ok");
+		let config = merge_config(overrides, &TESTNET_SEED).expect("runtime config");
+
+		assert!(op_config.solver.resource_lock_enabled);
+		assert!(config.solver.resource_lock_enabled);
+		assert!(config.solver.is_resource_lock_enabled());
 	}
 
 	fn test_tx_bump_config() -> solver_types::OperatorTxBumpConfig {
@@ -3831,6 +3858,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -3893,6 +3921,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -3949,6 +3978,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -3996,6 +4026,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -4089,6 +4120,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: Some(Decimal::from_str("2.5").unwrap()), // Override: 2.5%
 			gas_buffer_bps: Some(1500),                                     // Override: 15%
 			settlement_fee_buffer_bps: Some(2000),                          // Override: 20%
@@ -4319,6 +4351,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -4387,6 +4420,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -4480,6 +4514,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -4548,6 +4583,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -4622,6 +4658,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -4748,6 +4785,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -4882,6 +4920,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -4954,6 +4993,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -5020,6 +5060,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -5121,6 +5162,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -5231,6 +5273,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -5400,6 +5443,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -5541,6 +5585,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -5646,6 +5691,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -5773,6 +5819,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -5929,6 +5976,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -5978,6 +6026,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -6041,6 +6090,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -6097,6 +6147,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -6171,6 +6222,7 @@ mod tests {
 			}),
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,
@@ -6366,6 +6418,7 @@ mod tests {
 				rate_buffer_bps: 14,
 				monitoring_timeout_seconds: 30,
 				deny_list: None,
+				resource_lock_enabled: false,
 			},
 			admin: OperatorAdminConfig::default(),
 			orders_auth_enabled: false,
@@ -6458,6 +6511,10 @@ mod tests {
 		assert_eq!(
 			op_config.solver.settlement_fee_buffer_bps,
 			config.solver.settlement_fee_buffer_bps
+		);
+		assert_eq!(
+			op_config.solver.resource_lock_enabled,
+			config.solver.resource_lock_enabled
 		);
 		assert_eq!(
 			op_config.solver.commission_bps,
@@ -7389,6 +7446,7 @@ mod tests {
 			admin: None,
 			orders_auth_enabled: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			min_profitability_pct: None,
 			gas_buffer_bps: None,
 			settlement_fee_buffer_bps: None,

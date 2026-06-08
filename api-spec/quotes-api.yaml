@@ -18,7 +18,7 @@ info:
 
     - **Permit2 Escrow** (oif-escrow-v0): Universal token approvals via Permit2
     - **EIP-3009 Escrow** (oif-3009-v0): Native gasless transfers for supported tokens
-    - **Resource Lock** (oif-resource-lock-v0): TheCompact allocations for resource locking
+    - **Resource Lock** (oif-resource-lock-v0): TheCompact allocations for resource locking. Disabled by default unless the solver is configured with `resource_lock_enabled: true`.
   version: 1.0.0
 servers:
   - url: http://localhost:3000/api/v1
@@ -427,7 +427,7 @@ components:
 
     OifResourceLockV0:
       type: object
-      description: Resource lock order via TheCompact (v0)
+      description: Resource lock order via TheCompact (v0). Solvers reject this order type unless `resource_lock_enabled` is true.
       required:
         - type
         - payload

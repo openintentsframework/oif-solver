@@ -454,6 +454,12 @@ impl QuoteGenerator {
 		let quote_id = Uuid::new_v4().to_string();
 		let (order, settlement_name) = match custody_decision {
 			CustodyDecision::ResourceLock { lock } => {
+				if !config.solver.is_resource_lock_enabled() {
+					return Err(QuoteError::InvalidRequest(
+						"ResourceLock orders are disabled by this solver until reservation support is implemented"
+							.to_string(),
+					));
+				}
 				let order = self
 					.generate_resource_lock_order(request, config, lock)
 					.await?;
@@ -2764,23 +2770,10 @@ mod tests {
 			.await;
 
 		match result {
-			Ok((quote, _settlement_name)) => {
-				assert!(!quote.quote_id.is_empty());
-				assert_eq!(quote.provider, Some("oif-solver".to_string()));
-				assert!(quote.valid_until > 0);
-				assert!(quote.eta.is_some());
-				// Check that the order is ResourceLock based on the custody decision
-				match &quote.order {
-					OifOrder::OifResourceLockV0 { payload } => {
-						assert_eq!(payload.signature_type, SignatureType::Eip712);
-					},
-					_ => panic!("Expected OifResourceLockV0 order"),
-				}
+			Err(QuoteError::InvalidRequest(message)) => {
+				assert!(message.contains("ResourceLock orders are disabled"));
 			},
-			Err(e) => {
-				// Expected if domain configuration is incomplete
-				assert!(matches!(e, QuoteError::InvalidRequest(_)));
-			},
+			other => panic!("expected ResourceLock disabled error, got {other:?}"),
 		}
 	}
 

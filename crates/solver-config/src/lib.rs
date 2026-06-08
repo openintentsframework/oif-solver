@@ -113,6 +113,10 @@ pub struct SolverConfig {
 	/// Runtime ingress mode controlling whether new solver intake is accepted.
 	#[serde(default)]
 	pub ingress_mode: SolverIngressMode,
+	/// Whether ResourceLock orders are accepted.
+	/// Defaults off until ResourceLock reservation semantics are implemented.
+	#[serde(default)]
+	pub resource_lock_enabled: bool,
 }
 
 /// Runtime ingress mode for accepting new solver work.
@@ -135,6 +139,10 @@ impl SolverIngressMode {
 impl SolverConfig {
 	pub fn is_intake_disabled(&self) -> bool {
 		self.ingress_mode.is_intake_disabled()
+	}
+
+	pub fn is_resource_lock_enabled(&self) -> bool {
+		self.resource_lock_enabled
 	}
 }
 
@@ -1219,6 +1227,14 @@ mod tests {
 	}
 
 	#[test]
+	fn test_resource_lock_enabled_defaults_to_false() {
+		let config = ConfigBuilder::new().build();
+
+		assert!(!config.solver.resource_lock_enabled);
+		assert!(!config.solver.is_resource_lock_enabled());
+	}
+
+	#[test]
 	fn test_settlement_fee_buffer_bps_defaults_to_1000() {
 		let config = ConfigBuilder::new().build();
 
@@ -1237,6 +1253,33 @@ mod tests {
 
 		assert_eq!(solver.ingress_mode, SolverIngressMode::IntakeDisabled);
 		assert!(solver.is_intake_disabled());
+	}
+
+	#[test]
+	fn test_resource_lock_enabled_deserializes_default_false() {
+		let solver: SolverConfig = serde_json::from_value(json!({
+			"id": "test-solver",
+			"min_profitability_pct": "1",
+			"monitoring_timeout_seconds": 30
+		}))
+		.expect("solver config should deserialize");
+
+		assert!(!solver.resource_lock_enabled);
+		assert!(!solver.is_resource_lock_enabled());
+	}
+
+	#[test]
+	fn test_resource_lock_enabled_deserializes_true() {
+		let solver: SolverConfig = serde_json::from_value(json!({
+			"id": "test-solver",
+			"min_profitability_pct": "1",
+			"monitoring_timeout_seconds": 30,
+			"resource_lock_enabled": true
+		}))
+		.expect("solver config should deserialize");
+
+		assert!(solver.resource_lock_enabled);
+		assert!(solver.is_resource_lock_enabled());
 	}
 
 	fn base_config_json(
