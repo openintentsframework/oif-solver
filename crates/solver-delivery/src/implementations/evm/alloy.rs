@@ -4,7 +4,7 @@
 //! supporting blockchain transaction submission and monitoring using the Alloy library.
 
 use crate::implementations::evm::fees::{
-	FeePolicyConfig, FeePolicyRegistry, SolverEip1559Estimator,
+	clamp_legacy_gas_price_to_cap, FeePolicyConfig, FeePolicyRegistry, SolverEip1559Estimator,
 };
 // Re-import directly because the schema validator below builds a transient
 // `FeePolicyRegistry` purely to surface field-level wei-parse errors. Going
@@ -229,11 +229,26 @@ pub struct AlloyDelivery {
 /// inside callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NonceCacheAction {
-	/// Tx provably rejected pre-pool. Caller should attempt to fetch
-	/// chain pending and call `reset_next_nonce`. If the fetch fails,
-	/// caller MUST keep the cache advanced — we don't roll back without
+	/// Tx provably rejected pre-pool (or never broadcast). Caller should
+	/// attempt to fetch chain pending and roll the cache back. If the fetch
+	/// fails, caller MUST keep the cache advanced — we don't roll back without
 	/// authoritative chain state.
-	AttemptRollback,
+	///
+	/// `rejected_nonce` is the nonce the rejected/never-broadcast tx was
+	/// allocated, when known. It lets the rollback *reclaim* that nonce
+	/// (closing the gap) via `reclaim_rejected_nonce` when it is provably safe
+	/// — i.e. it was the most recently handed-out nonce and the chain has not
+	/// advanced past it. `None` falls back to the forward-only
+	/// `reset_next_nonce` clamp.
+	AttemptRollback { rejected_nonce: Option<u64> },
+}
+
+fn nonce_too_low_retry_nonce_cache_action() -> NonceCacheAction {
+	// A nonce-too-low result proves this nonce is already consumed or held.
+	// Even if a follow-up pending read is stale, do not reclaim it.
+	NonceCacheAction::AttemptRollback {
+		rejected_nonce: None,
+	}
 }
 
 /// Outcome of a raw-send attempt, after pre-sign persisted the hash.
@@ -407,8 +422,16 @@ fn apply_nonce_cache_action(
 	chain_pending: Option<u64>,
 ) -> Option<u64> {
 	match action {
-		NonceCacheAction::AttemptRollback => match chain_pending {
-			Some(pending) => Some(mgr.reset_next_nonce(signer, pending)),
+		NonceCacheAction::AttemptRollback { rejected_nonce } => match chain_pending {
+			// When the rejected nonce is known, try to reclaim it (close the
+			// gap) — safe only if it was the last nonce handed out and the
+			// chain has not advanced past it; otherwise this clamps forward
+			// exactly like `reset_next_nonce`. When unknown, fall back to the
+			// forward-only clamp.
+			Some(pending) => Some(match rejected_nonce {
+				Some(rejected) => mgr.reclaim_rejected_nonce(signer, rejected, pending).1,
+				None => mgr.reset_next_nonce(signer, pending),
+			}),
 			// No authoritative chain state — KEEP advanced. We never reset
 			// the cache without a successful pending-fetch.
 			None => mgr.peek(signer),
@@ -734,8 +757,11 @@ impl AlloyDelivery {
 	/// Returns the next nonce to use for `from` on `chain_id`, taking it from the
 	/// resettable cache. Every call samples chain `pending`, but normal allocation
 	/// is monotonic: a stale RPC pending nonce must not move the local cache
-	/// backward and reissue a nonce already handed out by this process. Backward
-	/// reset is reserved for the explicit `nonce too low` resync path.
+	/// backward and reissue a nonce already handed out by this process. The only
+	/// way the cache moves below its local high-water mark is reclaiming a
+	/// definitively-rejected nonce that was the last one handed out, via
+	/// `reclaim_rejected_nonce` (safe because that nonce's tx never entered a
+	/// pool); the `nonce too low` resync stays forward-only.
 	async fn next_nonce_for(&self, chain_id: u64, from: Address) -> Result<u64, DeliveryError> {
 		let provider = self.get_provider(chain_id)?;
 		let pending = provider
@@ -1191,9 +1217,9 @@ impl DeliveryInterface for AlloyDelivery {
 					.await;
 				}
 
-				// Rollback: fetch authoritative chain pending; on Some(pending)
-				// reset the cache, on None keep it advanced (no authoritative
-				// state — never roll back without it).
+				// Rollback: fetch authoritative chain pending; on success apply
+				// scoped reclaim/forward-only reconciliation, on failure keep it
+				// advanced (no authoritative state — never roll back without it).
 				let failed_nonce = first_attempt
 					.as_ref()
 					.and_then(|a| a.nonce)
@@ -1208,7 +1234,9 @@ impl DeliveryInterface for AlloyDelivery {
 				let cache_after = apply_nonce_cache_action(
 					mgr,
 					from,
-					NonceCacheAction::AttemptRollback,
+					NonceCacheAction::AttemptRollback {
+						rejected_nonce: tx_attempt.nonce,
+					},
 					pending_opt,
 				);
 				if let Some(pending) = pending_opt {
@@ -1220,7 +1248,7 @@ impl DeliveryInterface for AlloyDelivery {
 						cache_before = ?cache_before,
 						cache_after = ?cache_after,
 						error = %err_msg,
-						"local signing failed before broadcast; nonce cache rolled back to chain pending"
+						"local signing failed before broadcast; nonce cache reconciled after scoped rollback"
 					);
 				} else {
 					tracing::error!(
@@ -1263,8 +1291,9 @@ impl DeliveryInterface for AlloyDelivery {
 				// Signed envelope exists locally but ledger durability cannot
 				// be proven — refuse to broadcast. Roll back the nonce since
 				// nothing went out: fetch authoritative chain pending; on
-				// Some(pending) reset the cache, on None keep it advanced
-				// (never roll back without authoritative state).
+				// success apply scoped reclaim/forward-only reconciliation,
+				// on failure keep it advanced (never roll back without
+				// authoritative state).
 				let failed_nonce = planned_attempt.nonce.unwrap();
 				let mgr = self.get_nonce_manager(chain_id)?;
 				let cache_before = mgr.peek(from);
@@ -1276,7 +1305,9 @@ impl DeliveryInterface for AlloyDelivery {
 				let cache_after = apply_nonce_cache_action(
 					mgr,
 					from,
-					NonceCacheAction::AttemptRollback,
+					NonceCacheAction::AttemptRollback {
+						rejected_nonce: tx_attempt.nonce,
+					},
 					pending_opt,
 				);
 				if let Some(pending) = pending_opt {
@@ -1288,7 +1319,7 @@ impl DeliveryInterface for AlloyDelivery {
 						cache_before = ?cache_before,
 						cache_after = ?cache_after,
 						error = %persist_err,
-						"pre-broadcast hash persist failed; refusing to broadcast; nonce cache rolled back to chain pending"
+						"pre-broadcast hash persist failed; refusing to broadcast; nonce cache reconciled after scoped rollback"
 					);
 				} else {
 					tracing::error!(
@@ -1724,8 +1755,12 @@ impl DeliveryInterface for AlloyDelivery {
 				}
 
 				// Roll back the nonce: fetch authoritative chain pending; on
-				// Some(pending) reset cache, on None keep it advanced (never
-				// roll back without authoritative state).
+				// Some(pending) reclaim the rejected nonce when it was the last
+				// one handed out (closing the gap), else keep the cache
+				// advanced; on None keep it advanced (never roll back without
+				// authoritative state). Passing the rejected nonce is what lets
+				// a fee-cap/base-fee rejection of a lone in-flight tx reclaim
+				// its nonce instead of wedging the signer (audit finding H-27).
 				let mgr = self.get_nonce_manager(chain_id)?;
 				let cache_before = mgr.peek(from);
 				let pending_result = provider.get_transaction_count(from).pending().await;
@@ -1736,7 +1771,9 @@ impl DeliveryInterface for AlloyDelivery {
 				let cache_after = apply_nonce_cache_action(
 					mgr,
 					from,
-					NonceCacheAction::AttemptRollback,
+					NonceCacheAction::AttemptRollback {
+						rejected_nonce: tx_attempt.nonce,
+					},
 					pending_opt,
 				);
 				if let Some(pending) = pending_opt {
@@ -1748,7 +1785,7 @@ impl DeliveryInterface for AlloyDelivery {
 						cache_before = ?cache_before,
 						cache_after = ?cache_after,
 						error = %reason,
-						"raw send definitively rejected; nonce cache rolled back to chain pending"
+						"raw send definitively rejected; nonce cache reconciled after scoped rollback"
 					);
 				} else {
 					tracing::warn!(
@@ -1863,10 +1900,18 @@ impl DeliveryInterface for AlloyDelivery {
 				}
 
 				// Resync the local nonce cache from chain pending.
-				// `reset_next_nonce` (not `set_next_nonce`) is used so a
-				// chain-pending value BELOW the local cache (the signature
-				// of a ghost broadcast we recovered from) can move the cache
-				// backward — the whole point of the resync.
+				//
+				// `reset_next_nonce` is a forward-only high-water clamp: it moves
+				// the cache UP to `fresh_pending` but never below the local
+				// high-water mark. That is the correct, H-18-safe behavior here.
+				// A `nonce too low` means the chain has advanced to or past our
+				// tx's nonce, so the retry must use the next nonce ABOVE every
+				// nonce this process has already handed out — never a (possibly
+				// stale or load-balanced) `pending` value below an in-flight
+				// nonce, which would reissue it and cause a same-nonce conflict
+				// (the H-18 reuse window). Reclaiming a nonce LEAKED by a
+				// never-broadcast / definitively-rejected tx is handled
+				// separately, at the rejection sites, via `reclaim_rejected_nonce`.
 				let mgr = self.get_nonce_manager(chain_id)?;
 				let fresh_pending = provider
 					.get_transaction_count(from)
@@ -1878,13 +1923,13 @@ impl DeliveryInterface for AlloyDelivery {
 						))
 					})?;
 				let cache_before_resync = mgr.peek(from);
-				mgr.reset_next_nonce(from, fresh_pending);
+				let cache_after_resync = mgr.reset_next_nonce(from, fresh_pending);
 				tracing::debug!(
 					chain_id,
 					signer = %from,
 					chain_pending = fresh_pending,
 					cache_before = ?cache_before_resync,
-					cache_after = fresh_pending,
+					cache_after = cache_after_resync,
 					"Nonce-too-low retry: nonce cache resynced from chain pending"
 				);
 
@@ -1931,7 +1976,9 @@ impl DeliveryInterface for AlloyDelivery {
 							let cache_after = apply_nonce_cache_action(
 								mgr,
 								from,
-								NonceCacheAction::AttemptRollback,
+								NonceCacheAction::AttemptRollback {
+									rejected_nonce: tx_attempt.nonce,
+								},
 								pending_opt,
 							);
 							if let Some(pending) = pending_opt {
@@ -1943,7 +1990,7 @@ impl DeliveryInterface for AlloyDelivery {
 									cache_before = ?cache_before,
 									cache_after = ?cache_after,
 									error = %record_err_msg,
-									"nonce-too-low retry: failed to record retry planned attempt; refusing to broadcast; nonce cache rolled back to chain pending"
+									"nonce-too-low retry: failed to record retry planned attempt; refusing to broadcast; nonce cache reconciled after scoped rollback"
 								);
 							} else {
 								tracing::error!(
@@ -1997,8 +2044,9 @@ impl DeliveryInterface for AlloyDelivery {
 							.await;
 						}
 
-						// Rollback: fetch authoritative chain pending; on
-						// Some(pending) reset cache, on None keep it advanced.
+						// Rollback: fetch authoritative chain pending; on success
+						// apply scoped reclaim/forward-only reconciliation, on
+						// failure keep it advanced.
 						let mgr = self.get_nonce_manager(chain_id)?;
 						let cache_before = mgr.peek(from);
 						let pending_result = provider.get_transaction_count(from).pending().await;
@@ -2010,7 +2058,9 @@ impl DeliveryInterface for AlloyDelivery {
 						let cache_after = apply_nonce_cache_action(
 							mgr,
 							from,
-							NonceCacheAction::AttemptRollback,
+							NonceCacheAction::AttemptRollback {
+								rejected_nonce: tx_attempt.nonce,
+							},
 							pending_opt,
 						);
 						if let Some(pending) = pending_opt {
@@ -2022,7 +2072,7 @@ impl DeliveryInterface for AlloyDelivery {
 								cache_before = ?cache_before,
 								cache_after = ?cache_after,
 								error = %sign_err_msg,
-								"local signing failed on nonce-too-low retry; nonce cache rolled back to chain pending"
+								"local signing failed on nonce-too-low retry; nonce cache reconciled after scoped rollback"
 							);
 						} else {
 							tracing::error!(
@@ -2075,7 +2125,9 @@ impl DeliveryInterface for AlloyDelivery {
 						let cache_after = apply_nonce_cache_action(
 							mgr,
 							from,
-							NonceCacheAction::AttemptRollback,
+							NonceCacheAction::AttemptRollback {
+								rejected_nonce: tx_attempt.nonce,
+							},
 							pending_opt,
 						);
 						if let Some(pending) = pending_opt {
@@ -2087,7 +2139,7 @@ impl DeliveryInterface for AlloyDelivery {
 								cache_before = ?cache_before,
 								cache_after = ?cache_after,
 								error = %persist_err,
-								"nonce-too-low retry: pre-broadcast hash persist failed; refusing to broadcast; nonce cache rolled back to chain pending"
+								"nonce-too-low retry: pre-broadcast hash persist failed; refusing to broadcast; nonce cache reconciled after scoped rollback"
 							);
 						} else {
 							tracing::error!(
@@ -2542,7 +2594,9 @@ impl DeliveryInterface for AlloyDelivery {
 						let cache_after = apply_nonce_cache_action(
 							mgr,
 							from,
-							NonceCacheAction::AttemptRollback,
+							NonceCacheAction::AttemptRollback {
+								rejected_nonce: tx_attempt.nonce,
+							},
 							pending_opt,
 						);
 						if let Some(pending) = pending_opt {
@@ -2554,7 +2608,7 @@ impl DeliveryInterface for AlloyDelivery {
 								cache_before = ?cache_before,
 								cache_after = ?cache_after,
 								error = %retry_reason,
-								"nonce-too-low retry definitively rejected; nonce cache rolled back to chain pending"
+								"nonce-too-low retry definitively rejected; nonce cache reconciled after scoped rollback"
 							);
 						} else {
 							tracing::warn!(
@@ -2617,7 +2671,7 @@ impl DeliveryInterface for AlloyDelivery {
 						let cache_after = apply_nonce_cache_action(
 							mgr,
 							from,
-							NonceCacheAction::AttemptRollback,
+							nonce_too_low_retry_nonce_cache_action(),
 							pending_opt,
 						);
 						if let Some(pending) = pending_opt {
@@ -2629,7 +2683,7 @@ impl DeliveryInterface for AlloyDelivery {
 								cache_before = ?cache_before,
 								cache_after = ?cache_after,
 								error = %second_reason,
-								"nonce-too-low retry also returned nonce too low; nonce cache rolled back to chain pending"
+								"nonce-too-low retry also returned nonce too low; nonce cache kept forward-only"
 							);
 						} else {
 							tracing::warn!(
@@ -2727,13 +2781,15 @@ impl DeliveryInterface for AlloyDelivery {
 						"Failed to get fee history ({e}) and legacy gas price fallback ({gas_err})"
 					))
 				})?;
+				let capped_gp = clamp_legacy_gas_price_to_cap(gp, &policy);
 				tracing::warn!(
 					chain_id,
 					error = %e,
 					gas_price = gp,
+					capped_gas_price = capped_gp,
 					"Falling back to legacy gas price after feeHistory failure"
 				);
-				return Ok(FeeParams::legacy(chain_id, gp));
+				return Ok(FeeParams::legacy(chain_id, capped_gp));
 			},
 		};
 
@@ -2765,8 +2821,14 @@ impl DeliveryInterface for AlloyDelivery {
 						let gp = provider.get_gas_price().await.map_err(|e| {
 							DeliveryError::Network(format!("Failed to get legacy gas price: {e}"))
 						})?;
-						let params = FeeParams::legacy(chain_id, gp);
-						tracing::debug!(chain_id, gas_price = gp, "Resolved legacy fee params");
+						let capped_gp = clamp_legacy_gas_price_to_cap(gp, &policy);
+						let params = FeeParams::legacy(chain_id, capped_gp);
+						tracing::debug!(
+							chain_id,
+							gas_price = gp,
+							capped_gas_price = capped_gp,
+							"Resolved legacy fee params"
+						);
 						self.fee_params_cache
 							.insert(chain_id, params.clone(), now)
 							.await;
@@ -3961,20 +4023,29 @@ mod tests {
 	}
 
 	#[test]
-	fn apply_nonce_cache_action_rollback_with_pending_resets_cache() {
+	fn apply_nonce_cache_action_rollback_without_rejected_nonce_preserves_high_water_cache() {
 		use NonceCacheAction::*;
 		let mgr = ResettableNonceManager::new();
 		let signer = Address::ZERO;
 		mgr.reset_next_nonce(signer, 101);
 		assert_eq!(mgr.peek(signer), Some(101));
 
-		let after = apply_nonce_cache_action(&mgr, signer, AttemptRollback, Some(100));
+		// No rejected nonce supplied → forward-only clamp; must not move below
+		// the locally allocated high-water nonce.
+		let after = apply_nonce_cache_action(
+			&mgr,
+			signer,
+			AttemptRollback {
+				rejected_nonce: None,
+			},
+			Some(100),
+		);
 		assert_eq!(
 			after,
-			Some(100),
-			"cache must reset to authoritative pending"
+			Some(101),
+			"cache must not move below locally allocated high-water nonce"
 		);
-		assert_eq!(mgr.peek(signer), Some(100));
+		assert_eq!(mgr.peek(signer), Some(101));
 	}
 
 	#[test]
@@ -3984,13 +4055,94 @@ mod tests {
 		let signer = Address::ZERO;
 		mgr.reset_next_nonce(signer, 101);
 
-		let after = apply_nonce_cache_action(&mgr, signer, AttemptRollback, None);
+		let after = apply_nonce_cache_action(
+			&mgr,
+			signer,
+			AttemptRollback {
+				rejected_nonce: Some(100),
+			},
+			None,
+		);
 		assert_eq!(
 			after,
 			Some(101),
 			"no authoritative chain state → cache must NOT be reset"
 		);
 		assert_eq!(mgr.peek(signer), Some(101));
+	}
+
+	#[test]
+	fn apply_nonce_cache_action_rollback_reclaims_rejected_lone_nonce() {
+		// H-27 end-to-end at the policy layer: a lone in-flight tx at nonce 100
+		// is definitively rejected pre-pool. The cache (101) is rolled back so
+		// nonce 100 is reclaimed rather than permanently leaked.
+		use NonceCacheAction::*;
+		let mgr = ResettableNonceManager::new();
+		let signer = Address::ZERO;
+		mgr.set_next_nonce(signer, 100);
+		assert_eq!(mgr.take_next(signer), Some(100)); // allocate 100
+		assert_eq!(mgr.peek(signer), Some(101));
+
+		let after = apply_nonce_cache_action(
+			&mgr,
+			signer,
+			AttemptRollback {
+				rejected_nonce: Some(100),
+			},
+			Some(100),
+		);
+		assert_eq!(after, Some(100), "rejected lone nonce must be reclaimed");
+		// The very next allocation re-hands-out 100 (no permanent gap / wedge).
+		assert_eq!(mgr.take_next(signer), Some(100));
+	}
+
+	#[test]
+	fn apply_nonce_cache_action_rollback_keeps_cache_when_higher_nonce_in_flight() {
+		// A newer nonce (101) is still in flight, so reclaiming the rejected
+		// nonce 100 would risk reissuing 101 — the cache must stay advanced.
+		use NonceCacheAction::*;
+		let mgr = ResettableNonceManager::new();
+		let signer = Address::ZERO;
+		mgr.set_next_nonce(signer, 100);
+		assert_eq!(mgr.take_next(signer), Some(100));
+		assert_eq!(mgr.take_next(signer), Some(101));
+		assert_eq!(mgr.peek(signer), Some(102));
+
+		let after = apply_nonce_cache_action(
+			&mgr,
+			signer,
+			AttemptRollback {
+				rejected_nonce: Some(100),
+			},
+			Some(100),
+		);
+		assert_eq!(
+			after,
+			Some(102),
+			"must not reclaim a mid-sequence nonce while a higher nonce is in flight"
+		);
+	}
+
+	#[test]
+	fn nonce_too_low_retry_rollback_preserves_high_water_on_stale_pending() {
+		let mgr = ResettableNonceManager::new();
+		let signer = Address::ZERO;
+		mgr.set_next_nonce(signer, 100);
+		assert_eq!(mgr.take_next(signer), Some(100));
+		assert_eq!(mgr.peek(signer), Some(101));
+
+		let after = apply_nonce_cache_action(
+			&mgr,
+			signer,
+			nonce_too_low_retry_nonce_cache_action(),
+			Some(100),
+		);
+		assert_eq!(
+			after,
+			Some(101),
+			"nonce-too-low means the nonce is consumed/held; stale pending must not reclaim it"
+		);
+		assert_eq!(mgr.take_next(signer), Some(101));
 	}
 
 	#[test]
