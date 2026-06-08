@@ -1003,8 +1003,8 @@ mod tests {
 	fn default_output_settler_bytes32() -> alloy_primitives::B256 {
 		let mut bytes = [0u8; 32];
 		bytes[12..32].copy_from_slice(&[
-			0x5C, 0x69, 0xbE, 0xe7, 0x01, 0xef, 0x81, 0x4a, 0x2B, 0x6a, 0x3E, 0xDD, 0x4B, 0x16,
-			0x52, 0xCB, 0x9c, 0xc5, 0xaA, 0x6f,
+			0x5c, 0x69, 0xbe, 0xe7, 0x01, 0xef, 0x81, 0x4a, 0x2b, 0x6a, 0x3e, 0xdd, 0x4b, 0x16,
+			0x52, 0xcb, 0x9c, 0xc5, 0xaa, 0x6f,
 		]);
 		alloy_primitives::B256::from(bytes)
 	}
@@ -1134,6 +1134,7 @@ mod tests {
 		order_data.raw_order_data = Some(format!("0x{}", hex::encode(test_order.abi_encode())));
 		order_data.sponsor = Some("0x1111111111111111111111111111111111111111".to_string());
 		order_data.signature = Some("0x22222222".to_string());
+		order_data.gas_limit_overrides.prepare_gas_limit = Some(182_883);
 
 		let intent = create_test_intent(order_data.clone(), "off-chain");
 		let order = OrderBuilder::new()
@@ -1156,6 +1157,7 @@ mod tests {
 		let tx = result.unwrap().unwrap();
 		assert_eq!(tx.chain_id, 1);
 		assert_eq!(tx.to, Some(Address(vec![0x11; 20])));
+		assert_eq!(tx.gas_limit, Some(182_883));
 		assert!(!tx.data.is_empty());
 	}
 

@@ -173,6 +173,12 @@ pub struct GasUnits {
 	pub claim_units: u64,
 }
 
+pub(crate) const DEFAULT_OPEN_GAS_UNITS: u64 = 150_000;
+pub(crate) const DEFAULT_FILL_GAS_UNITS: u64 = 150_000;
+pub(crate) const DEFAULT_POST_FILL_GAS_UNITS: u64 = 300_000;
+pub(crate) const DEFAULT_PRE_CLAIM_GAS_UNITS: u64 = 0;
+pub(crate) const DEFAULT_CLAIM_GAS_UNITS: u64 = 150_000;
+
 /// Wei-denominated cost split for the OIF contract gas legs.
 ///
 /// The chain boundaries follow the OIF settler/filler topology:
@@ -677,17 +683,8 @@ impl CostProfitService {
 		// without joining across events.
 		tracing::Span::current().record("chain_id", dest_chain_id);
 
-		let (open_units, fill_units, post_fill_units, pre_claim_units, claim_units) =
-			estimate_gas_units_from_flow_keys(flow_keys, config, 150000, 150000, 300000, 0, 150000);
-
 		// Get gas units for cost calculation
-		let mut gas_units = GasUnits {
-			open_units,
-			fill_units,
-			post_fill_units,
-			pre_claim_units,
-			claim_units,
-		};
+		let mut gas_units = estimate_quote_gas_units_from_flow_keys(flow_keys, config);
 
 		// Optional: live-estimate destination-chain legs against the destination
 		// chain so quote-time costs track the transactions the solver will send.
@@ -3029,6 +3026,30 @@ pub fn estimate_gas_units_from_flow_keys(
 		fallback_pre_claim,
 		fallback_claim,
 	)
+}
+
+pub(crate) fn estimate_quote_gas_units_from_flow_keys(
+	flow_keys: &[String],
+	config: &Config,
+) -> GasUnits {
+	let (open_units, fill_units, post_fill_units, pre_claim_units, claim_units) =
+		estimate_gas_units_from_flow_keys(
+			flow_keys,
+			config,
+			DEFAULT_OPEN_GAS_UNITS,
+			DEFAULT_FILL_GAS_UNITS,
+			DEFAULT_POST_FILL_GAS_UNITS,
+			DEFAULT_PRE_CLAIM_GAS_UNITS,
+			DEFAULT_CLAIM_GAS_UNITS,
+		);
+
+	GasUnits {
+		open_units,
+		fill_units,
+		post_fill_units,
+		pre_claim_units,
+		claim_units,
+	}
 }
 
 #[cfg(test)]
