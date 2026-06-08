@@ -249,16 +249,20 @@ impl Eip7683Discovery {
 	/// Process discovered logs into intents and send them.
 	///
 	/// Common logic for both polling and subscription modes.
-	fn process_discovered_logs(
+	async fn process_discovered_logs(
 		logs: Vec<Log>,
-		sender: &mpsc::UnboundedSender<Intent>,
+		sender: &mpsc::Sender<Intent>,
 		_chain_id: u64,
-	) {
+	) -> bool {
 		for log in logs {
 			if let Ok(intent) = Self::parse_open_event(&log) {
-				let _ = sender.send(intent);
+				if sender.send(intent).await.is_err() {
+					tracing::warn!("Failed to send discovered intent to solver channel");
+					return false;
+				}
 			}
 		}
+		true
 	}
 
 	/// Polling-based monitoring for a single chain.
@@ -270,7 +274,7 @@ impl Eip7683Discovery {
 		chain_id: u64,
 		networks: NetworksConfig,
 		last_blocks: Arc<Mutex<HashMap<u64, u64>>>,
-		sender: mpsc::UnboundedSender<Intent>,
+		sender: mpsc::Sender<Intent>,
 		mut stop_rx: broadcast::Receiver<()>,
 		polling_interval_secs: u64,
 	) {
@@ -338,7 +342,9 @@ impl Eip7683Discovery {
 					};
 
 					// Process discovered logs
-					Self::process_discovered_logs(logs, &sender, chain_id);
+					if !Self::process_discovered_logs(logs, &sender, chain_id).await {
+						break;
+					}
 
 					// Update last block for this chain
 					last_blocks.lock().await.insert(chain_id, current_block);
@@ -359,7 +365,7 @@ impl Eip7683Discovery {
 		provider: DynProvider,
 		chain_id: u64,
 		networks: NetworksConfig,
-		sender: mpsc::UnboundedSender<Intent>,
+		sender: mpsc::Sender<Intent>,
 		mut stop_rx: broadcast::Receiver<()>,
 	) {
 		// Get the input settler address for this chain
@@ -403,7 +409,9 @@ impl Eip7683Discovery {
 			tokio::select! {
 				Some(log) = stream.next() => {
 					// Process single log as it arrives
-					Self::process_discovered_logs(vec![log], &sender, chain_id);
+					if !Self::process_discovered_logs(vec![log], &sender, chain_id).await {
+						break;
+					}
 				}
 				_ = stop_rx.recv() => {
 					tracing::info!(chain = chain_id, "Stopping WebSocket monitor");
@@ -471,10 +479,7 @@ impl DiscoveryInterface for Eip7683Discovery {
 	fn config_schema(&self) -> Box<dyn ConfigSchema> {
 		Box::new(Eip7683DiscoverySchema)
 	}
-	async fn start_monitoring(
-		&self,
-		sender: mpsc::UnboundedSender<Intent>,
-	) -> Result<(), DiscoveryError> {
+	async fn start_monitoring(&self, sender: mpsc::Sender<Intent>) -> Result<(), DiscoveryError> {
 		if self.is_monitoring.load(Ordering::SeqCst) {
 			return Err(DiscoveryError::AlreadyMonitoring);
 		}
@@ -847,9 +852,9 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn test_process_discovered_logs() {
-		let (sender, mut receiver) = mpsc::unbounded_channel();
+	#[tokio::test]
+	async fn test_process_discovered_logs() {
+		let (sender, mut receiver) = mpsc::channel(16);
 
 		// First, let's test if we can parse the log directly
 		let log = create_test_open_log();
@@ -859,7 +864,7 @@ mod tests {
 		}
 
 		let logs = vec![log];
-		Eip7683Discovery::process_discovered_logs(logs, &sender, 1);
+		assert!(Eip7683Discovery::process_discovered_logs(logs, &sender, 1).await);
 
 		// Should receive one intent
 		match receiver.try_recv() {
@@ -877,9 +882,9 @@ mod tests {
 		assert!(receiver.try_recv().is_err());
 	}
 
-	#[test]
-	fn test_process_discovered_logs_invalid_log() {
-		let (sender, mut receiver) = mpsc::unbounded_channel();
+	#[tokio::test]
+	async fn test_process_discovered_logs_invalid_log() {
+		let (sender, mut receiver) = mpsc::channel(16);
 
 		// Create invalid log
 		let invalid_log = Log {
@@ -900,7 +905,7 @@ mod tests {
 		};
 
 		let logs = vec![invalid_log];
-		Eip7683Discovery::process_discovered_logs(logs, &sender, 1);
+		assert!(Eip7683Discovery::process_discovered_logs(logs, &sender, 1).await);
 
 		// Should not receive any intents due to invalid log
 		assert!(receiver.try_recv().is_err());

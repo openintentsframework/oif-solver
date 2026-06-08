@@ -260,7 +260,7 @@ struct IntentResponse {
 #[derive(Clone)]
 struct ApiState {
 	/// Channel to send discovered intents
-	intent_sender: mpsc::UnboundedSender<Intent>,
+	intent_sender: mpsc::Sender<Intent>,
 	/// RPC providers for each supported network
 	providers: HashMap<u64, DynProvider>,
 	/// Networks configuration for settler lookups
@@ -600,7 +600,7 @@ impl Eip7683OffchainDiscovery {
 	async fn run_server(
 		api_host: String,
 		api_port: u16,
-		intent_sender: mpsc::UnboundedSender<Intent>,
+		intent_sender: mpsc::Sender<Intent>,
 		providers: HashMap<u64, DynProvider>,
 		networks: NetworksConfig,
 		mut shutdown_rx: mpsc::Receiver<()>,
@@ -946,10 +946,10 @@ async fn handle_intent_submission(
 			let order_id = intent.id.clone();
 
 			// Send intent through channel
-			if let Err(e) = state.intent_sender.send(intent) {
+			if let Err(e) = enqueue_intent(&state.intent_sender, intent) {
 				tracing::warn!(error = %e, "Failed to send intent to solver channel");
 				return (
-					StatusCode::INTERNAL_SERVER_ERROR,
+					StatusCode::SERVICE_UNAVAILABLE,
 					Json(IntentResponse {
 						order_id: Some(order_id),
 						status: IntentResponseStatus::Error,
@@ -987,6 +987,31 @@ async fn handle_intent_submission(
 				.into_response()
 		},
 	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnqueueIntentError {
+	Full,
+	Closed,
+}
+
+impl std::fmt::Display for EnqueueIntentError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Full => write!(f, "intent queue is full"),
+			Self::Closed => write!(f, "intent queue is closed"),
+		}
+	}
+}
+
+fn enqueue_intent(
+	intent_sender: &mpsc::Sender<Intent>,
+	intent: Intent,
+) -> Result<(), EnqueueIntentError> {
+	intent_sender.try_send(intent).map_err(|e| match e {
+		mpsc::error::TrySendError::Full(_) => EnqueueIntentError::Full,
+		mpsc::error::TrySendError::Closed(_) => EnqueueIntentError::Closed,
+	})
 }
 
 /// Configuration schema for EIP-7683 off-chain discovery service.
@@ -1045,10 +1070,7 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 		Box::new(Eip7683OffchainDiscoverySchema)
 	}
 
-	async fn start_monitoring(
-		&self,
-		sender: mpsc::UnboundedSender<Intent>,
-	) -> Result<(), DiscoveryError> {
+	async fn start_monitoring(&self, sender: mpsc::Sender<Intent>) -> Result<(), DiscoveryError> {
 		if self.is_running.load(Ordering::SeqCst) {
 			return Err(DiscoveryError::AlreadyMonitoring);
 		}
@@ -1185,7 +1207,7 @@ mod tests {
 	use solver_types::api::{OifOrder, OrderPayload, PostOrderRequest, SignatureType};
 	use solver_types::{
 		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
-		NetworksConfig,
+		Intent, IntentMetadata, NetworksConfig,
 	};
 	use std::collections::HashMap;
 	use tokio::sync::mpsc;
@@ -1568,7 +1590,7 @@ mod tests {
 		)
 		.unwrap();
 
-		let (tx, _rx) = mpsc::unbounded_channel();
+		let (tx, _rx) = mpsc::channel(16);
 
 		// Test start monitoring
 		let start_result = discovery.start_monitoring(tx).await;
@@ -1587,8 +1609,8 @@ mod tests {
 		let discovery =
 			Eip7683OffchainDiscovery::new("127.0.0.1".to_string(), 0, vec![1], &networks).unwrap();
 
-		let (tx1, _rx1) = mpsc::unbounded_channel();
-		let (tx2, _rx2) = mpsc::unbounded_channel();
+		let (tx1, _rx1) = mpsc::channel(16);
+		let (tx2, _rx2) = mpsc::channel(16);
 
 		// Start monitoring
 		discovery.start_monitoring(tx1).await.unwrap();
@@ -1618,7 +1640,7 @@ mod tests {
 		use axum::extract::State;
 		use axum::Json;
 
-		let (tx, _rx) = mpsc::unbounded_channel();
+		let (tx, _rx) = mpsc::channel(16);
 		let state = ApiState {
 			intent_sender: tx,
 			providers: HashMap::new(),
@@ -1653,7 +1675,7 @@ mod tests {
 		use axum::extract::State;
 		use axum::Json;
 
-		let (tx, _rx) = mpsc::unbounded_channel();
+		let (tx, _rx) = mpsc::channel(16);
 		let mut providers = HashMap::new();
 		providers.insert(1, mocked_provider_with_allocator_authorized(false));
 		// Pin the trusted allocator to the one the lock resolves to (0xA1..) so the
@@ -1702,7 +1724,7 @@ mod tests {
 		use axum::extract::State;
 		use axum::Json;
 
-		let (tx, _rx) = mpsc::unbounded_channel();
+		let (tx, _rx) = mpsc::channel(16);
 		let state = ApiState {
 			intent_sender: tx,
 			providers: HashMap::new(),
@@ -1726,5 +1748,46 @@ mod tests {
 
 		// Should return BAD_REQUEST status due to parsing failure
 		assert_eq!(response.into_response().status(), StatusCode::BAD_REQUEST);
+	}
+
+	#[tokio::test]
+	async fn test_enqueue_intent_returns_service_unavailable_when_queue_full() {
+		let (tx, _rx) = mpsc::channel(1);
+		tx.try_send(Intent {
+			id: "already-queued".to_string(),
+			source: "test".to_string(),
+			standard: "eip7683".to_string(),
+			metadata: IntentMetadata {
+				requires_auction: false,
+				exclusive_until: None,
+				discovered_at: current_timestamp(),
+			},
+			data: json!({}),
+			order_bytes: Bytes::new(),
+			quote_id: None,
+			lock_type: "permit2_escrow".to_string(),
+		})
+		.expect("first intent should fill queue");
+
+		let error = enqueue_intent(
+			&tx,
+			Intent {
+				id: "backpressured".to_string(),
+				source: "test".to_string(),
+				standard: "eip7683".to_string(),
+				metadata: IntentMetadata {
+					requires_auction: false,
+					exclusive_until: None,
+					discovered_at: current_timestamp(),
+				},
+				data: json!({}),
+				order_bytes: Bytes::new(),
+				quote_id: None,
+				lock_type: "permit2_escrow".to_string(),
+			},
+		)
+		.expect_err("full queue should reject the intent immediately");
+
+		assert_eq!(error, EnqueueIntentError::Full);
 	}
 }

@@ -3,6 +3,7 @@
 //! This library provides the core functionality for the OIF solver service,
 //! including API handlers, authentication, and server components.
 
+pub mod api_hardening;
 pub mod apis;
 pub mod auth;
 pub mod config_merge;

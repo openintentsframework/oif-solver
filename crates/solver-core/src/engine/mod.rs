@@ -8,6 +8,7 @@ pub mod context;
 pub mod cost_profit;
 pub mod event_bus;
 pub mod lifecycle;
+pub mod live_estimate;
 pub mod post_fill_overrides;
 pub mod startup_readiness;
 pub mod token_manager;
@@ -40,6 +41,8 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::instrument;
+
+const INTENT_QUEUE_CAPACITY: usize = 1024;
 
 /// Errors that can occur during engine operations.
 ///
@@ -85,6 +88,8 @@ pub struct SolverEngine {
 	/// Token manager for token approvals and validation.
 	#[allow(dead_code)]
 	pub(crate) token_manager: Arc<TokenManager>,
+	/// Shared cost/profit service, including quote-time live estimate limits.
+	pub(crate) cost_profit_service: Arc<CostProfitService>,
 	/// Event bus for inter-service communication.
 	pub(crate) event_bus: event_bus::EventBus,
 	/// Order state machine
@@ -195,7 +200,7 @@ impl SolverEngine {
 			delivery.clone(),
 			solver_address,
 			token_manager.clone(),
-			cost_profit_service,
+			cost_profit_service.clone(),
 			dynamic_config.clone(), // Pass dynamic config for hot-reload support
 			&static_config,         // Pass static config for deny list loading
 		));
@@ -237,6 +242,7 @@ impl SolverEngine {
 			settlement,
 			pricing,
 			token_manager,
+			cost_profit_service,
 			event_bus,
 			state_machine,
 			intent_handler,
@@ -329,12 +335,14 @@ impl SolverEngine {
 		// Perform recovery and get orphaned intents
 		let orphaned_intents = self.initialize_with_recovery().await?;
 
-		// Start discovery monitoring
-		let (intent_tx, mut intent_rx) = mpsc::unbounded_channel();
+		// Start discovery monitoring with bounded intake so external discovery
+		// sources cannot accumulate unbounded in-memory intent backlog.
+		let intent_queue_capacity = INTENT_QUEUE_CAPACITY.max(orphaned_intents.len());
+		let (intent_tx, mut intent_rx) = mpsc::channel(intent_queue_capacity);
 
 		// Re-inject orphaned intents if any
 		for intent in orphaned_intents {
-			if let Err(e) = intent_tx.send(intent) {
+			if let Err(e) = intent_tx.try_send(intent) {
 				tracing::warn!("Failed to re-inject orphaned intent: {}", e);
 			}
 		}
@@ -858,6 +866,11 @@ impl SolverEngine {
 	/// Returns a reference to the pricing service.
 	pub fn pricing(&self) -> &Arc<PricingService> {
 		&self.pricing
+	}
+
+	/// Returns the shared cost/profit service.
+	pub fn cost_profit_service(&self) -> &Arc<CostProfitService> {
+		&self.cost_profit_service
 	}
 
 	/// Returns a reference to the bridge service, if configured.

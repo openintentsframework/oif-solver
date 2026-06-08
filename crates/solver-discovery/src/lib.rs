@@ -55,10 +55,7 @@ pub trait DiscoveryInterface: Send + Sync {
 	///
 	/// Discovered intents are sent through the provided channel. The implementation
 	/// should continue monitoring until stop_monitoring is called or an error occurs.
-	async fn start_monitoring(
-		&self,
-		sender: mpsc::UnboundedSender<Intent>,
-	) -> Result<(), DiscoveryError>;
+	async fn start_monitoring(&self, sender: mpsc::Sender<Intent>) -> Result<(), DiscoveryError>;
 
 	/// Stops monitoring for new intents from this implementation.
 	///
@@ -149,10 +146,7 @@ impl DiscoveryService {
 	/// All discovered intents from any implementation will be sent through the
 	/// provided channel. If any implementation fails to start, the entire operation
 	/// fails and no implementations will be monitoring.
-	pub async fn start_all(
-		&self,
-		sender: mpsc::UnboundedSender<Intent>,
-	) -> Result<(), DiscoveryError> {
+	pub async fn start_all(&self, sender: mpsc::Sender<Intent>) -> Result<(), DiscoveryError> {
 		for implementation in self.implementations.values() {
 			implementation.start_monitoring(sender.clone()).await?;
 		}

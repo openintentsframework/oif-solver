@@ -206,8 +206,11 @@ impl ConfigBuilder {
 			api: self.api,
 			gas: Some(GasConfig {
 				flows: HashMap::new(),
-				live_fill_estimate_enabled: true,
+				// Default OFF on the public quote path (audit finding H-05).
+				live_fill_estimate_enabled: false,
 				live_post_fill_estimate_chain_ids: HashSet::new(),
+				max_concurrent_live_fill_estimates_per_chain:
+					crate::DEFAULT_MAX_CONCURRENT_LIVE_FILL_ESTIMATES_PER_CHAIN,
 			}),
 			rebalance: None,
 			tx_bump: crate::TxBumpConfig::default(),
