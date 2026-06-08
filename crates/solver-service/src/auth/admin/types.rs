@@ -140,6 +140,7 @@ sol! {
 	/// Update fee configuration (gas buffer and min profitability)
 	struct UpdateFeeConfig {
 		uint32 gasBufferBps;
+		uint32 settlementFeeBufferBps;
 		string minProfitabilityPct;
 		uint32 commissionBps;
 		uint32 rateBufferBps;
@@ -428,6 +429,8 @@ impl WithdrawContents {
 pub struct UpdateFeeConfigContents {
 	/// Gas buffer in basis points (e.g., 1000 = 10%)
 	pub gas_buffer_bps: u32,
+	/// Settlement native fee buffer in basis points (e.g., 1000 = 10%)
+	pub settlement_fee_buffer_bps: u32,
 	/// Minimum profitability percentage as a decimal string (e.g., "1.5" for 1.5%)
 	pub min_profitability_pct: String,
 	/// Commission in basis points (e.g., 20 = 0.20%)
@@ -445,6 +448,7 @@ impl UpdateFeeConfigContents {
 	pub fn to_eip712(&self) -> UpdateFeeConfig {
 		UpdateFeeConfig {
 			gasBufferBps: self.gas_buffer_bps,
+			settlementFeeBufferBps: self.settlement_fee_buffer_bps,
 			minProfitabilityPct: self.min_profitability_pct.clone(),
 			commissionBps: self.commission_bps,
 			rateBufferBps: self.rate_buffer_bps,
@@ -1707,6 +1711,7 @@ mod tests {
 	fn test_update_fee_config_struct_hash() {
 		let contents = UpdateFeeConfigContents {
 			gas_buffer_bps: 1500,
+			settlement_fee_buffer_bps: 1000,
 			min_profitability_pct: "2.5".to_string(),
 			commission_bps: 20,
 			rate_buffer_bps: 14,
@@ -1726,6 +1731,7 @@ mod tests {
 	fn test_update_fee_config_different_values_different_hash() {
 		let contents1 = UpdateFeeConfigContents {
 			gas_buffer_bps: 1500,
+			settlement_fee_buffer_bps: 1000,
 			min_profitability_pct: "2.5".to_string(),
 			commission_bps: 20,
 			rate_buffer_bps: 14,
@@ -1735,6 +1741,7 @@ mod tests {
 
 		let contents2 = UpdateFeeConfigContents {
 			gas_buffer_bps: 2000, // Different gas buffer
+			settlement_fee_buffer_bps: 1000,
 			min_profitability_pct: "2.5".to_string(),
 			commission_bps: 20,
 			rate_buffer_bps: 14,
@@ -1746,6 +1753,7 @@ mod tests {
 
 		let contents3 = UpdateFeeConfigContents {
 			gas_buffer_bps: 1500,
+			settlement_fee_buffer_bps: 1000,
 			min_profitability_pct: "3.0".to_string(), // Different profitability
 			commission_bps: 20,
 			rate_buffer_bps: 14,
@@ -1760,6 +1768,7 @@ mod tests {
 	fn test_update_fee_config_admin_action_trait() {
 		let contents = UpdateFeeConfigContents {
 			gas_buffer_bps: 1000,
+			settlement_fee_buffer_bps: 1000,
 			min_profitability_pct: "1.5".to_string(),
 			commission_bps: 20,
 			rate_buffer_bps: 14,
@@ -1779,6 +1788,7 @@ mod tests {
 	fn test_update_fee_config_message_hash() {
 		let contents = UpdateFeeConfigContents {
 			gas_buffer_bps: 1500,
+			settlement_fee_buffer_bps: 1000,
 			min_profitability_pct: "2.5".to_string(),
 			commission_bps: 20,
 			rate_buffer_bps: 14,
@@ -1798,6 +1808,7 @@ mod tests {
 	fn test_update_fee_config_serialization() {
 		let contents = UpdateFeeConfigContents {
 			gas_buffer_bps: 1500,
+			settlement_fee_buffer_bps: 1000,
 			min_profitability_pct: "2.5".to_string(),
 			commission_bps: 20,
 			rate_buffer_bps: 14,
@@ -1807,6 +1818,7 @@ mod tests {
 
 		let json = serde_json::to_string(&contents).unwrap();
 		assert!(json.contains("\"gasBufferBps\":1500"));
+		assert!(json.contains("\"settlementFeeBufferBps\":1000"));
 		assert!(json.contains("\"minProfitabilityPct\":\"2.5\""));
 		assert!(json.contains("\"commissionBps\":20"));
 		assert!(json.contains("\"rateBufferBps\":14"));
@@ -1824,6 +1836,7 @@ mod tests {
 	fn test_update_fee_config_deserialize_with_string_nonce() {
 		let json = r#"{
 			"gasBufferBps": 1500,
+			"settlementFeeBufferBps": 1000,
 			"minProfitabilityPct": "2.5",
 			"commissionBps": 20,
 			"rateBufferBps": 14,
@@ -1833,6 +1846,7 @@ mod tests {
 
 		let contents: UpdateFeeConfigContents = serde_json::from_str(json).unwrap();
 		assert_eq!(contents.gas_buffer_bps, 1500);
+		assert_eq!(contents.settlement_fee_buffer_bps, 1000);
 		assert_eq!(contents.min_profitability_pct, "2.5");
 		assert_eq!(contents.commission_bps, 20);
 		assert_eq!(contents.rate_buffer_bps, 14);
@@ -1846,6 +1860,7 @@ mod tests {
 			"signature": "0xabababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab1b",
 			"contents": {
 				"gasBufferBps": 1500,
+				"settlementFeeBufferBps": 1000,
 				"minProfitabilityPct": "2.5",
 				"commissionBps": 20,
 				"rateBufferBps": 14,
@@ -1857,6 +1872,7 @@ mod tests {
 		let request: SignedAdminRequest<UpdateFeeConfigContents> =
 			serde_json::from_str(json).unwrap();
 		assert_eq!(request.contents.gas_buffer_bps, 1500);
+		assert_eq!(request.contents.settlement_fee_buffer_bps, 1000);
 		assert_eq!(request.contents.min_profitability_pct, "2.5");
 		assert_eq!(request.contents.commission_bps, 20);
 		assert_eq!(request.contents.rate_buffer_bps, 14);

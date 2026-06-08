@@ -4,6 +4,11 @@
 //! that are shared across the solver system. Updated to match the OIF
 //! contracts structure with StandardOrder and MandateOutput types.
 
+pub mod compact_signatures;
+
+#[cfg(feature = "oif-interfaces")]
+pub mod compact_claims;
+
 use alloy_primitives::U256;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
@@ -187,6 +192,12 @@ use crate::{
 #[cfg(feature = "oif-interfaces")]
 use crate::{Order, OrderStatus};
 
+/// Maximum number of StandardOrder inputs accepted before any RPC-backed validation.
+pub const MAX_STANDARD_ORDER_INPUTS: usize = 16;
+
+/// Maximum number of StandardOrder outputs accepted before any RPC-backed validation.
+pub const MAX_STANDARD_ORDER_OUTPUTS: usize = 16;
+
 /// Implementation of OrderParsable for EIP-7683 orders
 #[cfg(feature = "oif-interfaces")]
 impl OrderParsable for Eip7683OrderData {
@@ -366,10 +377,20 @@ pub mod interfaces {
 			function fillOrderOutputs(bytes32 orderId, SolMandateOutput[] calldata outputs, bytes calldata fillerData) external;
 		}
 
-		/// TheCompact contract interface for domain separator fetching.
+		/// TheCompact contract interface for domain separator fetching and lock
+		/// detail resolution (used to resolve the allocator controlling a lock).
 		#[sol(rpc)]
 		interface ITheCompact {
 			function DOMAIN_SEPARATOR() external view returns (bytes32);
+			function getLockDetails(uint256 id) external view returns (address token, address allocator, uint8 resetPeriod, uint8 scope, bytes12 lockTag);
+		}
+
+		/// IAllocator interface exposing the off-chain claim authorization predicate.
+		/// `isClaimAuthorized` returns whether the allocator authorizes the given
+		/// claim (the same predicate enforced on-chain during `finalise`).
+		#[sol(rpc)]
+		interface IAllocator {
+			function isClaimAuthorized(bytes32 claimHash, address arbiter, address sponsor, uint256 nonce, uint256 expires, uint256[2][] idsAndAmounts, bytes allocatorData) external view returns (bool);
 		}
 
 		/// Emitted by `InputSettlerEscrow.open()` on the origin chain.

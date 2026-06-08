@@ -163,6 +163,31 @@ pub struct OracleConfig {
 	pub selection_strategy: OracleSelectionStrategy,
 }
 
+/// Inputs needed to quote a settlement backend's native post-fill message fee.
+///
+/// Callers derive the output fields from quote/order data, while payload encoding
+/// and backend-specific fee mechanics stay owned by the settlement implementation.
+#[derive(Debug, Clone)]
+pub struct PostFillFeeParams {
+	pub origin_chain_id: u64,
+	pub dest_chain_id: u64,
+	pub output_token: [u8; 32],
+	pub output_amount: alloy_primitives::U256,
+	pub output_recipient: [u8; 32],
+	pub output_call: Vec<u8>,
+	/// Output settler that attests on the destination chain.
+	pub source_settler: Address,
+}
+
+/// Native-token settlement-message fee quote returned by a backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettlementFeeQuote {
+	/// Native `msg.value` paid by the settlement transaction.
+	pub fee_wei: alloy_primitives::U256,
+	/// Chain whose native token denominates `fee_wei`.
+	pub chain_id: u64,
+}
+
 /// Trait defining the interface for settlement mechanisms.
 ///
 /// This trait must be implemented by each settlement mechanism to handle
@@ -264,6 +289,17 @@ pub trait SettlementInterface: Send + Sync {
 	/// with specific validation rules. The schema is used to validate TOML configuration
 	/// before initializing the settlement mechanism.
 	fn config_schema(&self) -> Box<dyn ConfigSchema>;
+
+	/// Quote the native-token fee this backend attaches to its post-fill message.
+	///
+	/// Backends without a native post-fill fee use the default `None`. Callers should
+	/// treat `Err` as unpriceable for routes that require the backend.
+	async fn quote_post_fill_fee(
+		&self,
+		_params: &PostFillFeeParams,
+	) -> Result<Option<SettlementFeeQuote>, SettlementError> {
+		Ok(None)
+	}
 
 	/// Gets attestation data for a filled order by extracting proof data needed for claiming.
 	///
@@ -453,6 +489,31 @@ impl SettlementService {
 	/// Get the configured poll interval for settlement monitoring
 	pub fn poll_interval_seconds(&self) -> u64 {
 		self.poll_interval_seconds
+	}
+
+	/// Quote the native post-fill fee from the primary settlement implementation.
+	pub async fn quote_post_fill_fee_primary(
+		&self,
+		params: &PostFillFeeParams,
+	) -> Result<Option<SettlementFeeQuote>, SettlementError> {
+		let settlement = self.implementations.get(&self.primary).ok_or_else(|| {
+			SettlementError::ValidationFailed(format!(
+				"Primary settlement '{}' not found",
+				self.primary
+			))
+		})?;
+		settlement.quote_post_fill_fee(params).await
+	}
+
+	/// Quote the native post-fill fee using the settlement bound to an order.
+	pub async fn quote_post_fill_fee_for_order(
+		&self,
+		order: &Order,
+		params: &PostFillFeeParams,
+	) -> Result<Option<SettlementFeeQuote>, SettlementError> {
+		self.find_settlement_for_order(order)?
+			.quote_post_fill_fee(params)
+			.await
 	}
 
 	/// Check whether the L2 block-hash buffer needs to be advanced for an order.
@@ -840,6 +901,8 @@ mod tests {
 		buffer_coverage: Option<(PusherDirection, u64)>,
 		post_fill_tx: Option<Transaction>,
 		pre_claim_tx: Option<Transaction>,
+		post_fill_fee_quote: Option<SettlementFeeQuote>,
+		post_fill_fee_should_fail: bool,
 	}
 
 	#[async_trait]
@@ -850,6 +913,18 @@ mod tests {
 
 		fn config_schema(&self) -> Box<dyn ConfigSchema> {
 			Box::new(TestSchema)
+		}
+
+		async fn quote_post_fill_fee(
+			&self,
+			_params: &PostFillFeeParams,
+		) -> Result<Option<SettlementFeeQuote>, SettlementError> {
+			if self.post_fill_fee_should_fail {
+				return Err(SettlementError::ValidationFailed(
+					"fee quote failed".to_string(),
+				));
+			}
+			Ok(self.post_fill_fee_quote.clone())
 		}
 
 		async fn get_attestation(
@@ -955,6 +1030,8 @@ mod tests {
 			buffer_coverage: None,
 			post_fill_tx: None,
 			pre_claim_tx: None,
+			post_fill_fee_quote: None,
+			post_fill_fee_should_fail: false,
 		}
 	}
 
@@ -1145,6 +1222,124 @@ mod tests {
 			readiness,
 			SettlementReadiness::Waiting(WaitingReason::Unknown)
 		));
+	}
+
+	#[tokio::test]
+	async fn default_post_fill_fee_quote_returns_none() {
+		let settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		let params = PostFillFeeParams {
+			origin_chain_id: 1,
+			dest_chain_id: 2,
+			output_token: [0u8; 32],
+			output_amount: alloy_primitives::U256::from(1u64),
+			output_recipient: [0u8; 32],
+			output_call: vec![],
+			source_settler: addr(0x11),
+		};
+
+		assert!(settlement
+			.quote_post_fill_fee(&params)
+			.await
+			.unwrap()
+			.is_none());
+	}
+
+	fn sample_post_fill_fee_params() -> PostFillFeeParams {
+		PostFillFeeParams {
+			origin_chain_id: 1,
+			dest_chain_id: 2,
+			output_token: [0u8; 32],
+			output_amount: alloy_primitives::U256::from(1u64),
+			output_recipient: [0u8; 32],
+			output_call: vec![],
+			source_settler: addr(0x11),
+		}
+	}
+
+	#[tokio::test]
+	async fn service_routes_post_fill_fee_quote_to_primary() {
+		let mut settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		settlement.post_fill_fee_quote = Some(SettlementFeeQuote {
+			fee_wei: alloy_primitives::U256::from(5u64),
+			chain_id: 2,
+		});
+		let service = SettlementService::new(
+			HashMap::from([(
+				"primary_impl".to_string(),
+				Box::new(settlement) as Box<dyn SettlementInterface>,
+			)]),
+			"primary_impl".to_string(),
+			20,
+		);
+
+		let quote = service
+			.quote_post_fill_fee_primary(&sample_post_fill_fee_params())
+			.await
+			.unwrap()
+			.unwrap();
+
+		assert_eq!(quote.fee_wei, alloy_primitives::U256::from(5u64));
+		assert_eq!(quote.chain_id, 2);
+	}
+
+	#[tokio::test]
+	async fn service_routes_post_fill_fee_quote_to_order_binding() {
+		let mut settlement = make_test_settlement(OracleConfig {
+			input_oracles: HashMap::new(),
+			output_oracles: HashMap::new(),
+			routes: HashMap::new(),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		settlement.post_fill_fee_quote = Some(SettlementFeeQuote {
+			fee_wei: alloy_primitives::U256::from(7u64),
+			chain_id: 2,
+		});
+		let service = SettlementService::new(
+			HashMap::from([(
+				"bound".to_string(),
+				Box::new(settlement) as Box<dyn SettlementInterface>,
+			)]),
+			"missing_primary".to_string(),
+			20,
+		);
+		let order = OrderBuilder::new()
+			.with_settlement_name(Some("bound"))
+			.build();
+
+		let quote = service
+			.quote_post_fill_fee_for_order(&order, &sample_post_fill_fee_params())
+			.await
+			.unwrap()
+			.unwrap();
+
+		assert_eq!(quote.fee_wei, alloy_primitives::U256::from(7u64));
+		assert_eq!(quote.chain_id, 2);
+	}
+
+	#[tokio::test]
+	async fn service_fails_closed_when_primary_missing_for_post_fill_fee_quote() {
+		let service = SettlementService::new(HashMap::new(), "missing".to_string(), 20);
+
+		let err = service
+			.quote_post_fill_fee_primary(&sample_post_fill_fee_params())
+			.await
+			.unwrap_err();
+
+		assert!(
+			err.to_string()
+				.contains("Primary settlement 'missing' not found"),
+			"unexpected error: {err}"
+		);
 	}
 
 	#[test]

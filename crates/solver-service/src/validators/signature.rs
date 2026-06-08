@@ -11,7 +11,10 @@ use async_trait::async_trait;
 use solver_delivery::DeliveryService;
 use solver_types::{
 	api::PostOrderRequest,
-	standards::eip7683::{interfaces::StandardOrder as OifStandardOrder, LockType},
+	standards::eip7683::{
+		compact_signatures::decode_compact_signatures,
+		interfaces::StandardOrder as OifStandardOrder, LockType,
+	},
 	APIError, ApiErrorType, NetworksConfig,
 };
 use std::collections::HashMap;
@@ -83,13 +86,15 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 				})?;
 
 		// Get contract address for signature validation
-		let contract_address = {
-			let addr = network
-				.input_settler_compact_address
-				.clone()
-				.unwrap_or_else(|| network.input_settler_address.clone());
-			AlloyAddress::from_slice(&addr.0)
-		};
+		let contract_address = network
+			.input_settler_compact_address
+			.as_ref()
+			.map(|addr| AlloyAddress::from_slice(&addr.0))
+			.ok_or_else(|| APIError::BadRequest {
+				error_type: ApiErrorType::OrderValidationFailed,
+				message: "InputSettlerCompact contract not configured".to_string(),
+				details: None,
+			})?;
 
 		// Create compact-specific implementations using factory functions
 		let message_hasher = compact::create_message_hasher();
@@ -102,16 +107,17 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 		// 2. Compute message hash using interface
 		let struct_hash = message_hasher.compute_message_hash(&order_bytes, contract_address)?;
 
-		// 3. Extract signature using interface
-		let signature = signature_validator.extract_signature(&intent.signature);
+		// 3. Decode the canonical Compact signature tuple (sponsor + allocator).
+		//    Non-canonical encodings are rejected here (pC-04).
+		let decoded = decode_compact_signatures(&intent.signature)?;
 
-		// 4. Validate EIP-712 signature using interface
+		// 4. Validate the sponsor EIP-712 signature using interface.
 		let expected_signer = standard_order.user;
 
 		let is_valid = signature_validator.validate_signature(
 			domain_separator,
 			struct_hash,
-			&signature,
+			&decoded.sponsor,
 			expected_signer,
 		)?;
 
@@ -123,6 +129,23 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 			});
 		}
 		tracing::debug!("EIP-712 signature validated");
+
+		// 5. Validate allocator authorization for the decoded allocatorData (pC-02).
+		//    `struct_hash` is the BatchCompact claim hash the allocator authorizes;
+		//    `contract_address` is the InputSettlerCompact (the finalise arbiter).
+		crate::validators::compact_allocator::validate_allocator_authorization(
+			&standard_order,
+			&decoded.allocator_data,
+			struct_hash,
+			contract_address,
+			the_compact_address,
+			network.allocator_address.as_ref(),
+			delivery_service,
+			origin_chain_id,
+		)
+		.await?;
+		tracing::debug!("Compact allocator authorization validated");
+
 		Ok(())
 	}
 }
@@ -193,6 +216,7 @@ mod tests {
 	};
 	use solver_types::api::{OrderPayload, PostOrderRequest, SignatureType};
 	use solver_types::networks::RpcEndpoint;
+	use solver_types::standards::eip7683::compact_signatures::decode_compact_signatures;
 	use solver_types::standards::eip7683::interfaces::{SolMandateOutput, StandardOrder};
 	use solver_types::standards::eip7683::LockType;
 	use solver_types::{Address, NetworkConfig, NetworksConfig};
@@ -216,17 +240,116 @@ mod tests {
 		Arc::new(DeliveryService::new(implementations, 1, 30, 60))
 	}
 
+	fn fixture_domain_separator() -> FixedBytes<32> {
+		FixedBytes::from([0x99u8; 32])
+	}
+
+	fn lock_allocator() -> AlloyAddress {
+		AlloyAddress::from([0xA1u8; 20])
+	}
+
+	/// ABI return of `getLockDetails`: `(address token, address allocator,
+	/// uint8 resetPeriod, uint8 scope, bytes12 lockTag)` — five static words.
+	/// Only word 1 (allocator) matters for resolution.
+	fn encode_lock_details(allocator: AlloyAddress) -> Bytes {
+		let mut out = vec![0u8; 160];
+		out[44..64].copy_from_slice(allocator.as_slice());
+		out[95] = 5; // resetPeriod = OneDay (86_400s), exceeds the test fill-to-claim window
+		Bytes::from(out)
+	}
+
+	fn encode_bool(value: bool) -> Bytes {
+		let mut out = vec![0u8; 32];
+		if value {
+			out[31] = 1;
+		}
+		Bytes::from(out)
+	}
+
+	/// Delivery mock answering `DOMAIN_SEPARATOR` (the fixture separator),
+	/// `getLockDetails` (resolving to `lock_allocator`), and `isClaimAuthorized`
+	/// (returning `authorized`).
+	fn compact_delivery(
+		chain_id: u64,
+		domain_separator: FixedBytes<32>,
+		lock_allocator: AlloyAddress,
+		authorized: bool,
+	) -> Arc<DeliveryService> {
+		use alloy_sol_types::SolCall;
+		use solver_types::standards::eip7683::interfaces::{IAllocator, ITheCompact};
+
+		let domain = Bytes::from(domain_separator.to_vec());
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_eth_call().returning(move |tx| {
+			let selector = tx.data.get(0..4).map(|s| [s[0], s[1], s[2], s[3]]);
+			let resp = match selector {
+				Some(s) if s == ITheCompact::getLockDetailsCall::SELECTOR => {
+					encode_lock_details(lock_allocator)
+				},
+				Some(s) if s == IAllocator::isClaimAuthorizedCall::SELECTOR => {
+					encode_bool(authorized)
+				},
+				_ => domain.clone(),
+			};
+			Box::pin(async move { Ok(resp) })
+		});
+		delivery_service_from_mock(chain_id, mock)
+	}
+
 	fn address_from_hex(hex_str: &str) -> Address {
 		let bytes = hex::decode(hex_str.trim_start_matches("0x")).expect("valid hex address");
 		assert_eq!(bytes.len(), 20);
 		Address(bytes)
 	}
 
+	fn abi_word(value: usize) -> [u8; 32] {
+		let mut word = [0u8; 32];
+		word[24..32].copy_from_slice(&(value as u64).to_be_bytes());
+		word
+	}
+
+	fn padded_bytes(bytes: &[u8]) -> Vec<u8> {
+		let mut encoded = Vec::new();
+		encoded.extend_from_slice(&abi_word(bytes.len()));
+		encoded.extend_from_slice(bytes);
+		let padding = (32 - (bytes.len() % 32)) % 32;
+		encoded.extend(std::iter::repeat_n(0u8, padding));
+		encoded
+	}
+
+	fn compact_signature(sponsor_sig: &[u8], allocator_data: &[u8]) -> Bytes {
+		let sponsor_tail = padded_bytes(sponsor_sig);
+		let allocator_offset = 64 + sponsor_tail.len();
+
+		let mut signature = Vec::new();
+		signature.extend_from_slice(&abi_word(64));
+		signature.extend_from_slice(&abi_word(allocator_offset));
+		signature.extend_from_slice(&sponsor_tail);
+		signature.extend_from_slice(&padded_bytes(allocator_data));
+		Bytes::from(signature)
+	}
+
+	fn shifted_compact_signature(valid_sponsor_sig: &[u8]) -> Bytes {
+		let fake_fixed_offset_tail = padded_bytes(valid_sponsor_sig);
+		let actual_sponsor_sig = vec![0x44u8; valid_sponsor_sig.len()];
+		let actual_sponsor_offset = 64 + fake_fixed_offset_tail.len();
+		let actual_sponsor_tail = padded_bytes(&actual_sponsor_sig);
+		let allocator_offset = actual_sponsor_offset + actual_sponsor_tail.len();
+
+		let mut shifted_payload = Vec::new();
+		shifted_payload.extend_from_slice(&abi_word(actual_sponsor_offset));
+		shifted_payload.extend_from_slice(&abi_word(allocator_offset));
+		shifted_payload.extend_from_slice(&fake_fixed_offset_tail);
+		shifted_payload.extend_from_slice(&actual_sponsor_tail);
+		shifted_payload.extend_from_slice(&padded_bytes(&[]));
+		Bytes::from(shifted_payload)
+	}
+
 	fn build_signature_fixture() -> SignatureFixture {
 		let chain_id = 1u64;
 		let nonce = 1u64;
-		let expires = 1_700_000_000u32;
-		let fill_deadline = 1_700_000_100u32;
+		let expires = 1_700_000_600u32;
+		let fill_deadline = 1_700_000_000u32;
 		let input_oracle_hex = "0x2222222222222222222222222222222222222222";
 		let lock_tag = [0xAAu8; 12];
 		let token_address_bytes = [0x33u8; 20];
@@ -296,7 +419,7 @@ mod tests {
 			.compute_message_hash(&order_bytes, contract_address)
 			.expect("struct hash");
 
-		let domain_separator = FixedBytes::from([0x99u8; 32]);
+		let domain_separator = fixture_domain_separator();
 		let digest = keccak256(
 			[
 				&[0x19, 0x01][..],
@@ -353,7 +476,7 @@ mod tests {
 			order: solver_types::OifOrder::OifResourceLockV0 {
 				payload: order_payload,
 			},
-			signature: Bytes::from(signature_bytes),
+			signature: compact_signature(&signature_bytes, &[]),
 			quote_id: None,
 			origin_submission: None,
 		};
@@ -367,19 +490,16 @@ mod tests {
 			tokens: Vec::new(),
 			input_settler_compact_address: Some(address_from_hex(compact_settler_hex)),
 			the_compact_address: Some(address_from_hex(the_compact_address_hex)),
-			allocator_address: None,
+			// Pin the trusted allocator to the one the lock resolves to (`lock_allocator()`).
+			allocator_address: Some(address_from_hex(
+				"0xa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+			)),
 		};
 
 		let mut networks = NetworksConfig::new();
 		networks.insert(chain_id, network_config);
 
-		let mut mock_delivery = MockDeliveryInterface::new();
-		let domain_bytes = Bytes::from(domain_separator.to_vec());
-		mock_delivery.expect_eth_call().returning(move |_tx| {
-			let bytes = domain_bytes.clone();
-			Box::pin(async move { Ok(bytes) })
-		});
-		let delivery = delivery_service_from_mock(chain_id, mock_delivery);
+		let delivery = compact_delivery(chain_id, domain_separator, lock_allocator(), true);
 
 		SignatureFixture {
 			intent,
@@ -410,6 +530,85 @@ mod tests {
 			)
 			.await
 			.expect("signature should validate");
+	}
+
+	#[tokio::test]
+	async fn validate_signature_rejects_shifted_compact_signature_offsets() {
+		let mut fixture = build_signature_fixture();
+		let valid_sponsor_sig = decode_compact_signatures(&fixture.intent.signature)
+			.expect("canonical compact signature")
+			.sponsor
+			.to_vec();
+		fixture.intent.signature = shifted_compact_signature(&valid_sponsor_sig);
+
+		let service = SignatureValidationService::new();
+		let result = service
+			.validate_signature(
+				"eip7683",
+				&fixture.intent,
+				&fixture.networks,
+				&fixture.delivery,
+			)
+			.await;
+
+		assert!(matches!(
+			result,
+			Err(APIError::BadRequest { message, .. }) if message.contains("Compact")
+		));
+	}
+
+	#[tokio::test]
+	async fn validate_signature_rejects_unauthorized_allocator_data() {
+		let mut fixture = build_signature_fixture();
+		// Keep the valid sponsor signature, but supply unauthorized allocator data.
+		let sponsor = decode_compact_signatures(&fixture.intent.signature)
+			.expect("canonical compact signature")
+			.sponsor
+			.to_vec();
+		fixture.intent.signature = compact_signature(&sponsor, b"garbage allocator data");
+
+		// An enforcing allocator rejects the unauthorized allocatorData.
+		let delivery = compact_delivery(
+			fixture.chain_id,
+			fixture_domain_separator(),
+			lock_allocator(),
+			false,
+		);
+
+		let service = SignatureValidationService::new();
+		let result = service
+			.validate_signature("eip7683", &fixture.intent, &fixture.networks, &delivery)
+			.await;
+
+		assert!(matches!(
+			result,
+			Err(APIError::BadRequest { message, .. }) if message.contains("allocator")
+		));
+	}
+
+	#[tokio::test]
+	async fn validate_signature_rejects_missing_input_settler_compact_address() {
+		let mut fixture = build_signature_fixture();
+		fixture
+			.networks
+			.get_mut(&fixture.chain_id)
+			.expect("network")
+			.input_settler_compact_address = None;
+
+		let service = SignatureValidationService::new();
+		let result = service
+			.validate_signature(
+				"eip7683",
+				&fixture.intent,
+				&fixture.networks,
+				&fixture.delivery,
+			)
+			.await;
+
+		assert!(matches!(
+			result,
+			Err(APIError::BadRequest { message, .. }) if message.contains("InputSettlerCompact")
+		));
 	}
 
 	#[tokio::test]
@@ -507,6 +706,7 @@ mod tests {
 			Err(APIError::BadRequest { message, .. }) => {
 				assert!(
 					(message.contains("Invalid") && message.contains("signature"))
+						|| message.contains("Compact")
 						|| message.contains("Failed to recover public key"),
 					"unexpected error message: {message}"
 				);

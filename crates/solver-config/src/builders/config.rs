@@ -20,6 +20,7 @@ pub struct ConfigBuilder {
 	monitoring_timeout_seconds: u64,
 	min_profitability_pct: Decimal,
 	gas_buffer_bps: u32,
+	settlement_fee_buffer_bps: u32,
 	commission_bps: u32,
 	rate_buffer_bps: u32,
 	storage_primary: String,
@@ -47,9 +48,10 @@ impl ConfigBuilder {
 			solver_id: "test-solver".to_string(),
 			monitoring_timeout_seconds: 60,
 			min_profitability_pct: Decimal::ZERO,
-			gas_buffer_bps: 1000, // 10% default
-			commission_bps: 0,    // Disabled by default for backward compatibility
-			rate_buffer_bps: 14,  // 0.14% default
+			gas_buffer_bps: 1000,            // 10% default
+			settlement_fee_buffer_bps: 1000, // 10% default
+			commission_bps: 0,               // Disabled by default for backward compatibility
+			rate_buffer_bps: 14,             // 0.14% default
 			storage_primary: "memory".to_string(),
 			storage_cleanup_interval_seconds: 60,
 			min_confirmations: 1,
@@ -160,6 +162,7 @@ impl ConfigBuilder {
 				id: self.solver_id,
 				min_profitability_pct: self.min_profitability_pct,
 				gas_buffer_bps: self.gas_buffer_bps,
+				settlement_fee_buffer_bps: self.settlement_fee_buffer_bps,
 				commission_bps: self.commission_bps,
 				rate_buffer_bps: self.rate_buffer_bps,
 				monitoring_timeout_seconds: self.monitoring_timeout_seconds,
