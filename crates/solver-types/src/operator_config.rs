@@ -576,6 +576,10 @@ pub struct OperatorSolverConfig {
 	/// When set, any intent whose sender or recipient appears in the list is rejected.
 	#[serde(default)]
 	pub deny_list: Option<String>,
+
+	/// Whether ResourceLock orders are accepted by this solver.
+	#[serde(default)]
+	pub resource_lock_enabled: bool,
 }
 
 fn default_gas_buffer_bps() -> u32 {
@@ -1175,6 +1179,7 @@ mod tests {
 				rate_buffer_bps: 14,
 				monitoring_timeout_seconds: 28800,
 				deny_list: None,
+				resource_lock_enabled: false,
 			},
 			admin: OperatorAdminConfig {
 				enabled: true,
@@ -1297,5 +1302,30 @@ mod tests {
 		let parsed: OperatorSolverConfig = serde_json::from_value(json).unwrap();
 
 		assert_eq!(parsed.settlement_fee_buffer_bps, 1000);
+	}
+
+	#[test]
+	fn test_operator_solver_config_defaults_resource_lock_enabled_false() {
+		let json = serde_json::json!({
+			"min_profitability_pct": "1",
+			"monitoring_timeout_seconds": 28800
+		});
+
+		let parsed: OperatorSolverConfig = serde_json::from_value(json).unwrap();
+
+		assert!(!parsed.resource_lock_enabled);
+	}
+
+	#[test]
+	fn test_operator_solver_config_parses_resource_lock_enabled_true() {
+		let json = serde_json::json!({
+			"min_profitability_pct": "1",
+			"monitoring_timeout_seconds": 28800,
+			"resource_lock_enabled": true
+		});
+
+		let parsed: OperatorSolverConfig = serde_json::from_value(json).unwrap();
+
+		assert!(parsed.resource_lock_enabled);
 	}
 }

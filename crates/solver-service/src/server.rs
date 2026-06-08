@@ -37,9 +37,10 @@ use solver_storage::{
 	StoreConfig,
 };
 use solver_types::{
-	api::PostOrderRequest, standards::eip7683::interfaces::StandardOrder, APIError, Address,
-	ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse, OperatorConfig, Order,
-	OrderIdCallback, Transaction,
+	api::PostOrderRequest,
+	standards::eip7683::{interfaces::StandardOrder, LockType},
+	APIError, Address, ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse,
+	OperatorConfig, Order, OrderIdCallback, Transaction,
 };
 use std::{convert::TryInto, net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
@@ -791,6 +792,20 @@ async fn validate_intent_request(
 	let lock_type = intent.order.get_lock_type();
 	let lock_type_str = lock_type.as_str();
 
+	{
+		let config = state.config.read().await;
+		if matches!(lock_type, LockType::ResourceLock) && !config.solver.is_resource_lock_enabled()
+		{
+			return Err(APIError::BadRequest {
+				error_type: ApiErrorType::OrderValidationFailed,
+				message:
+					"ResourceLock orders are disabled by this solver until reservation support is implemented"
+						.to_string(),
+				details: None,
+			});
+		}
+	}
+
 	// Convert to StandardOrder and encode
 	let standard_order =
 		StandardOrder::try_from(&intent.order).map_err(|e| APIError::BadRequest {
@@ -1033,7 +1048,8 @@ mod tests {
 			"solver": {
 				"id": "test-solver",
 				"monitoring_timeout_seconds": 30,
-				"min_profitability_pct": 1.0
+				"min_profitability_pct": 1.0,
+				"resource_lock_enabled": true
 			},
 			"storage": {
 				"primary": "memory",
@@ -1235,7 +1251,9 @@ mod tests {
 			.add_rpc_endpoint(RpcEndpoint::http_only("http://localhost:8545".to_string()))
 			.build();
 		let networks = NetworksConfigBuilder::new().add_network(1, network).build();
-		ConfigBuilder::new().networks(networks).build()
+		let mut config = ConfigBuilder::new().networks(networks).build();
+		config.solver.resource_lock_enabled = true;
+		config
 	}
 
 	fn invalid_resource_lock_request() -> PostOrderRequest {
@@ -1290,6 +1308,46 @@ mod tests {
 			signature: Bytes::from(vec![0u8; 65]),
 			quote_id: None,
 			origin_submission: None,
+		}
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn validate_intent_rejects_resource_lock_when_disabled_before_rpc() {
+		let config = ConfigBuilder::new().build();
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_eth_call().times(0);
+		let mut delivery_impls: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+		delivery_impls.insert(1, Arc::new(mock_delivery) as Arc<dyn DeliveryInterface>);
+		let solver = build_test_solver_engine_with_delivery(config.clone(), delivery_impls).await;
+		let http_client = Client::builder()
+			.no_proxy()
+			.build()
+			.expect("failed to build client");
+		let state = AppState {
+			solver,
+			config: Arc::new(RwLock::new(config)),
+			http_client,
+			discovery_url: None,
+			jwt_service: None,
+			siwe_nonce_store: None,
+			signature_validation: Arc::new(SignatureValidationService::new()),
+		};
+		let intent = invalid_resource_lock_request();
+
+		let error = super::validate_intent_request(&intent, &state, "eip7683")
+			.await
+			.expect_err("resource lock should be rejected when disabled");
+
+		match error {
+			APIError::BadRequest {
+				error_type,
+				message,
+				..
+			} => {
+				assert_eq!(error_type, ApiErrorType::OrderValidationFailed);
+				assert!(message.contains("ResourceLock orders are disabled"));
+			},
+			other => panic!("unexpected error: {other:?}"),
 		}
 	}
 

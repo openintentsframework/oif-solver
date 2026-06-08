@@ -458,6 +458,7 @@ Token arrays may be empty at boot and can be populated later via admin APIs.
   "gas_buffer_bps": 1500,
   "commission_bps": 20,
   "rate_buffer_bps": 14,
+  "resource_lock_enabled": false,
   "networks": [
     {
       "chain_id": 11155420,
@@ -491,6 +492,8 @@ Token arrays may be empty at boot and can be populated later via admin APIs.
 ```
 
 Optional fee overrides can be set at the top level: `min_profitability_pct` (decimal string), `gas_buffer_bps`, `commission_bps`, and `rate_buffer_bps` (basis points).
+
+`resource_lock_enabled` is optional and defaults to `false`. Leave it disabled in production until ResourceLock reservation semantics are implemented. When disabled, the solver rejects ResourceLock quotes, direct `/orders` submissions, and discovered ResourceLock intents before fill. Local Compact demos and e2e runs must opt in explicitly.
 
 For per-chain EIP-1559 fee tuning (priority floor, fallback, percentile speed, gas-price cap), see [docs/fee-policy.md](docs/fee-policy.md). The solver auto-generates sensible defaults — you only need a `fee_policy` block in your bootstrap config if you want to override them.
 
@@ -1371,7 +1374,7 @@ cargo run -p solver-demo -- intent test <post-orders-file>
 **Supported Options:**
 
 - `--swap-type`: `exact-input` or `exact-output`
-- `--settlement`: `escrow` or `compact` (resource locks)
+- `--settlement`: `escrow` or `compact` (resource locks; requires `resource_lock_enabled: true`)
 - `--auth`: `permit2` or `eip3009` (for off-chain submission)
 - `--callback-recipient`: Address to receive callback after fill (optional)
 - `--callback-data`: Hex-encoded data to pass to callback (optional)
