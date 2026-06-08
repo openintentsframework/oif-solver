@@ -1207,6 +1207,7 @@ mod tests {
 			rate_buffer_bps: None,
 			monitoring_timeout_seconds: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			rebalance: None,
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,

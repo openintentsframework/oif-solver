@@ -210,7 +210,8 @@
   "solver": {
     "id": "oif-solver-demo",
     "min_profitability_pct": "1.0",
-    "monitoring_timeout_seconds": 28800
+    "monitoring_timeout_seconds": 28800,
+    "resource_lock_enabled": true
   },
   "storage": {
     "cleanup_interval_seconds": 60,

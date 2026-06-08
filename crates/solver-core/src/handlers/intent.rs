@@ -15,8 +15,9 @@ use solver_order::OrderService;
 use solver_settlement::admission::estimate_required_expiry_window_seconds;
 use solver_storage::StorageService;
 use solver_types::{
-	current_timestamp, truncate_id, with_0x_prefix, Address, DiscoveryEvent, Eip7683OrderData,
-	ExecutionDecision, ExecutionParams, Intent, OrderEvent, SolverEvent, StorageKey,
+	current_timestamp, standards::eip7683::LockType, truncate_id, with_0x_prefix, Address,
+	DiscoveryEvent, Eip7683OrderData, ExecutionDecision, ExecutionParams, Intent, OrderEvent,
+	SolverEvent, StorageKey,
 };
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
@@ -152,6 +153,24 @@ impl IntentHandler {
 				.publish(SolverEvent::Discovery(DiscoveryEvent::IntentRejected {
 					intent_id: intent.id,
 					reason: "Solver intake is disabled".to_string(),
+				}))
+				.ok();
+			return Ok(());
+		}
+
+		if intent.lock_type == LockType::ResourceLock.as_str()
+			&& !config.solver.is_resource_lock_enabled()
+		{
+			tracing::warn!(
+				intent_id = %intent.id,
+				"Intent rejected because ResourceLock orders are disabled"
+			);
+			self.event_bus
+				.publish(SolverEvent::Discovery(DiscoveryEvent::IntentRejected {
+					intent_id: intent.id,
+					reason:
+						"ResourceLock orders are disabled by this solver until reservation support is implemented"
+							.to_string(),
 				}))
 				.ok();
 			return Ok(());
@@ -584,6 +603,7 @@ mod tests {
 	use solver_order::{MockExecutionStrategy, MockOrderInterface};
 	use solver_pricing::{MockPricingInterface, PricingService};
 	use solver_storage::{MockStorageInterface, StorageError};
+	use solver_types::standards::eip7683::LockType;
 	use solver_types::utils::tests::builders::{
 		Eip7683OrderDataBuilder, IntentBuilder, MandateOutputBuilder, OrderBuilder,
 	};
@@ -1636,6 +1656,152 @@ mod tests {
 			event,
 			SolverEvent::Discovery(DiscoveryEvent::IntentRejected { intent_id: id, reason })
 				if id == intent_id && reason.contains("intake")
+		));
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_rejects_resource_lock_before_storage_when_disabled() {
+		let mut mock_storage = MockStorageInterface::new();
+		mock_storage.expect_exists().times(0);
+		mock_storage.expect_set_bytes().times(0);
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::new(),
+			Box::new(MockExecutionStrategy::new()),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let mut event_receiver = event_bus.subscribe();
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let cost_profit_service = create_mock_cost_profit_service();
+		let (config, static_config) = create_test_config();
+		let intent = IntentBuilder::new()
+			.with_lock_type(LockType::ResourceLock.to_string())
+			.build();
+		let intent_id = intent.id.clone();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			create_test_address(),
+			token_manager,
+			cost_profit_service,
+			config,
+			&static_config,
+		);
+
+		handler
+			.handle(intent)
+			.await
+			.expect("handler should not error");
+
+		let event = tokio::time::timeout(Duration::from_millis(100), event_receiver.recv())
+			.await
+			.expect("expected rejection event")
+			.expect("event bus should return event");
+
+		assert!(matches!(
+			event,
+			SolverEvent::Discovery(DiscoveryEvent::IntentRejected { intent_id: id, reason })
+				if id == intent_id && reason.contains("ResourceLock orders are disabled")
+		));
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_allows_resource_lock_when_enabled() {
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_order_interface = MockOrderInterface::new();
+
+		let intent = IntentBuilder::new()
+			.with_lock_type(LockType::ResourceLock.to_string())
+			.build();
+		let intent_id = intent.id.clone();
+		let solver_address = create_test_address();
+
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:0xtest_intent_123"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+
+		mock_storage
+			.expect_set_bytes()
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		mock_order_interface
+			.expect_validate_and_create_order()
+			.times(1)
+			.withf(|_, _, lock_type, _, _, _| lock_type == LockType::ResourceLock.as_str())
+			.returning(|_, _, _, _, _, _| {
+				Box::pin(async move {
+					Err(solver_order::OrderError::ValidationFailed(
+						"resource lock reached validation".to_string(),
+					))
+				})
+			});
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order_interface) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(MockExecutionStrategy::new()),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let mut event_receiver = event_bus.subscribe();
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let cost_profit_service = create_mock_cost_profit_service();
+		let (config, static_config) = create_test_config();
+		config.write().await.solver.resource_lock_enabled = true;
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+			&static_config,
+		);
+
+		handler
+			.handle(intent)
+			.await
+			.expect("handler should not error");
+
+		let event = tokio::time::timeout(Duration::from_millis(100), event_receiver.recv())
+			.await
+			.expect("expected validation failure event")
+			.expect("event bus should return event");
+
+		assert!(matches!(
+			event,
+			SolverEvent::Discovery(DiscoveryEvent::IntentRejected { intent_id: id, reason })
+				if id == intent_id && reason.contains("resource lock reached validation")
 		));
 	}
 

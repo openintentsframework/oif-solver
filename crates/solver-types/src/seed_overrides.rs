@@ -125,6 +125,11 @@ pub struct SeedOverrides {
 	#[serde(default)]
 	pub deny_list: Option<String>,
 
+	/// Enables ResourceLock order intake and quote generation.
+	/// Defaults to false until ResourceLock reservation semantics are implemented.
+	#[serde(default)]
+	pub resource_lock_enabled: Option<bool>,
+
 	/// Optional cross-chain rebalancing configuration.
 	/// If provided, enables the rebalance monitor and admin endpoints.
 	#[serde(default)]
@@ -736,6 +741,7 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			rebalance: None,
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
@@ -776,6 +782,7 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			rebalance: None,
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
@@ -821,6 +828,7 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			rebalance: None,
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
@@ -906,6 +914,7 @@ mod tests {
 			settlement: None,
 			routing_defaults: None,
 			deny_list: None,
+			resource_lock_enabled: None,
 			rebalance: None,
 			live_fill_estimate_enabled: None,
 			live_post_fill_estimate_chain_ids: None,
@@ -927,8 +936,8 @@ mod tests {
 	#[test]
 	fn test_parse_fee_config_fields() {
 		let json = r#"{
-            "networks": [
-                {
+	            "networks": [
+	                {
                     "chain_id": 10,
                     "tokens": [
                         {"symbol": "USDC", "address": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85", "decimals": 6}
@@ -952,6 +961,25 @@ mod tests {
 		assert_eq!(config.settlement_fee_buffer_bps, Some(2000));
 		assert_eq!(config.commission_bps, Some(20));
 		assert_eq!(config.rate_buffer_bps, Some(14));
+	}
+
+	#[test]
+	fn test_parse_resource_lock_enabled() {
+		let json = r#"{
+	            "networks": [
+	                {
+	                    "chain_id": 10,
+	                    "tokens": [
+	                        {"symbol": "USDC", "address": "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85", "decimals": 6}
+	                    ]
+	                }
+	            ],
+	            "resource_lock_enabled": true
+	        }"#;
+
+		let config: SeedOverrides = serde_json::from_str(json).unwrap();
+
+		assert_eq!(config.resource_lock_enabled, Some(true));
 	}
 
 	#[test]
@@ -979,6 +1007,7 @@ mod tests {
 		assert_eq!(config.settlement_fee_buffer_bps, None);
 		assert_eq!(config.commission_bps, None);
 		assert_eq!(config.rate_buffer_bps, None);
+		assert_eq!(config.resource_lock_enabled, None);
 	}
 
 	#[test]
