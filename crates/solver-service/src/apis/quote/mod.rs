@@ -75,13 +75,14 @@ pub use signing::payloads::permit2;
 pub use validation::QuoteValidator;
 
 use solver_config::Config;
+use solver_core::engine::cost_profit::CostProfitService;
 use solver_core::SolverEngine;
 use solver_types::{
 	CostContext, GetQuoteRequest, GetQuoteResponse, Quote, QuoteError, StorageKey, StoredQuote,
 };
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::info;
 
@@ -187,13 +188,7 @@ pub async fn process_quote_request(
 	let resolved_flow_keys = vec![resolved_request.flow_key.clone()];
 	log_stage("resolve_quote_request");
 
-	let cost_profit_service = solver_core::engine::cost_profit::CostProfitService::new(
-		solver.pricing().clone(),
-		solver.delivery().clone(),
-		solver.token_manager().clone(),
-		solver.storage().clone(),
-		solver.settlement().clone(),
-	);
+	let cost_profit_service = quote_cost_profit_service(solver);
 
 	let solver_address = solver.solver_address().clone();
 	let cost_context = cost_profit_service
@@ -262,6 +257,10 @@ pub async fn process_quote_request(
 	);
 
 	Ok(GetQuoteResponse { quotes })
+}
+
+fn quote_cost_profit_service(solver: &SolverEngine) -> Arc<CostProfitService> {
+	solver.cost_profit_service().clone()
 }
 
 /// Stores generated quotes with their cost contexts.
@@ -586,6 +585,16 @@ mod tests {
 			token_manager,
 			None,
 		)
+	}
+
+	#[test]
+	fn quote_cost_profit_service_is_shared_for_solver() {
+		let solver = create_test_solver_engine();
+
+		let first = quote_cost_profit_service(&solver);
+		let second = quote_cost_profit_service(&solver);
+
+		assert!(Arc::ptr_eq(&first, &second));
 	}
 
 	/// Creates a valid test quote request

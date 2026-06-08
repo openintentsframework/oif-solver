@@ -88,6 +88,8 @@ pub struct SolverEngine {
 	/// Token manager for token approvals and validation.
 	#[allow(dead_code)]
 	pub(crate) token_manager: Arc<TokenManager>,
+	/// Shared cost/profit service, including quote-time live estimate limits.
+	pub(crate) cost_profit_service: Arc<CostProfitService>,
 	/// Event bus for inter-service communication.
 	pub(crate) event_bus: event_bus::EventBus,
 	/// Order state machine
@@ -198,7 +200,7 @@ impl SolverEngine {
 			delivery.clone(),
 			solver_address,
 			token_manager.clone(),
-			cost_profit_service,
+			cost_profit_service.clone(),
 			dynamic_config.clone(), // Pass dynamic config for hot-reload support
 			&static_config,         // Pass static config for deny list loading
 		));
@@ -240,6 +242,7 @@ impl SolverEngine {
 			settlement,
 			pricing,
 			token_manager,
+			cost_profit_service,
 			event_bus,
 			state_machine,
 			intent_handler,
@@ -863,6 +866,11 @@ impl SolverEngine {
 	/// Returns a reference to the pricing service.
 	pub fn pricing(&self) -> &Arc<PricingService> {
 		&self.pricing
+	}
+
+	/// Returns the shared cost/profit service.
+	pub fn cost_profit_service(&self) -> &Arc<CostProfitService> {
+		&self.cost_profit_service
 	}
 
 	/// Returns a reference to the bridge service, if configured.
