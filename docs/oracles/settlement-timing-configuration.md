@@ -26,7 +26,22 @@ Important:
 - If `monitoring_timeout_seconds` is too small, the solver can accept and fill an intent but stop monitoring before the route becomes claimable.
 - For week-scale broadcaster proofs such as Arbitrum L2 -> L1, use a monitoring timeout that exceeds the operational claim delay, for example `864000` seconds (10 days).
 
-## 2) Common field name across oracles
+## 2) Quote expiry is settlement-aware
+
+Quote responses expose two separate time concepts:
+
+- `quote.valid_until` controls how long the quote can be retrieved and submitted through the quote flow.
+- The signed order `expires` field controls whether the solver will later admit the intent for execution.
+
+The signed order expiry is computed with the same route-aware settlement window used by the admission gate. `api.quote.expires_seconds` is therefore a floor/preference, not a hard override. The solver may raise the signed order expiry above `api.quote.expires_seconds` when the selected settlement implementation requires a longer window.
+
+For example, with `api.quote.fill_deadline_seconds = 300` and `settlement.broadcaster.intent_min_expiry_seconds = 691200`, generated orders need at least:
+
+`expires_seconds = 300 + 691200 = 691500`
+
+This lets the quote remain short-lived while still producing an order that will pass admission after submission.
+
+## 3) Common field name across oracles
 
 Yes. The same key name is used across implementations:
 
@@ -40,7 +55,7 @@ Supported JSON paths:
 
 When set, this value is used as a fixed minimum window for that implementation.
 
-## 3) Broadcaster computed window (when explicit min is not set)
+## 4) Broadcaster computed window (when explicit min is not set)
 
 If `settlement.broadcaster.intent_min_expiry_seconds` is absent, solver estimates:
 
@@ -58,17 +73,17 @@ Where:
     - OP Stack + Arbitrum IDs: `2s`
     - fallback: `12s`
 
-## 4) Timing fields and defaults
+## 5) Timing fields and defaults
 
-### 4.1 Hyperlane
+### 5.1 Hyperlane
 
 - `settlement.hyperlane.intent_min_expiry_seconds` (optional, no default)
 
-### 4.2 Direct
+### 5.2 Direct
 
 - `settlement.direct.intent_min_expiry_seconds` (optional, no default)
 
-### 4.3 Broadcaster
+### 5.3 Broadcaster
 
 - `settlement.broadcaster.intent_min_expiry_seconds` (optional, no default; fixed window when set)
 - `settlement.broadcaster.proof_wait_time_seconds` (default: `30`)
@@ -78,15 +93,15 @@ Where:
 - `settlement.broadcaster.chain_block_time_seconds` (optional per-chain map)
 - `settlement.broadcaster.intent_safety_buffer_seconds` (default: `90`)
 
-### 4.4 Poll interval (global settlement loop)
+### 5.4 Poll interval (global settlement loop)
 
 - `settlement.settlement_poll_interval_seconds` (in stored operator config; seed defaults usually `3`)
 
 Broadcaster budget includes `2 * settlement_poll_interval_seconds`.
 
-## 5) JSON examples
+## 6) JSON examples
 
-### 5.1 Hyperlane fixed minimum window
+### 6.1 Hyperlane fixed minimum window
 
 ```json
 {
@@ -99,7 +114,7 @@ Broadcaster budget includes `2 * settlement_poll_interval_seconds`.
 }
 ```
 
-### 5.2 Direct fixed minimum window
+### 6.2 Direct fixed minimum window
 
 ```json
 {
@@ -112,7 +127,7 @@ Broadcaster budget includes `2 * settlement_poll_interval_seconds`.
 }
 ```
 
-### 5.3 Broadcaster computed budget with per-chain tuning
+### 6.3 Broadcaster computed budget with per-chain tuning
 
 ```json
 {
@@ -136,7 +151,7 @@ Broadcaster budget includes `2 * settlement_poll_interval_seconds`.
 }
 ```
 
-### 5.4 Broadcaster fixed minimum window (overrides computed budget)
+### 6.4 Broadcaster fixed minimum window (overrides computed budget)
 
 ```json
 {
@@ -149,14 +164,14 @@ Broadcaster budget includes `2 * settlement_poll_interval_seconds`.
 }
 ```
 
-## 6) Practical recommendation
+## 7) Practical recommendation
 
 1. Start with explicit `intent_min_expiry_seconds` for each settlement.
 2. Measure real settlement latency by route.
 3. Keep a safety margin for reorgs/prover delays.
 4. For broadcaster, only move to computed budgeting when per-chain finality and block-time inputs are accurate.
 
-## 7) Type references
+## 8) Type references
 
 - Seed override JSON model: `crates/solver-types/src/seed_overrides.rs`
 - Stored operator config model: `crates/solver-types/src/operator_config.rs`

@@ -66,6 +66,7 @@ pub mod custody;
 pub mod generation;
 pub mod registry;
 pub mod signing;
+pub(crate) mod timing;
 pub mod validation;
 
 use self::generation::QuoteGenerator;
@@ -758,6 +759,29 @@ mod tests {
 			.build()
 	}
 
+	fn add_broadcaster_min_expiry_to_quote_processing_config(
+		config: &mut solver_config::Config,
+		min_expiry_seconds: u64,
+	) {
+		config.settlement.implementations.insert(
+			"test".to_string(),
+			serde_json::json!({
+				"oracles": {
+					"input": {
+						"1": ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+					},
+					"output": {
+						"137": ["0xdddddddddddddddddddddddddddddddddddddddd"]
+					}
+				},
+				"routes": {
+					"1": [137]
+				},
+				"intent_min_expiry_seconds": min_expiry_seconds
+			}),
+		);
+	}
+
 	fn create_quote_processing_settlement_service() -> Arc<SettlementService> {
 		let mut input_oracles = HashMap::new();
 		let mut output_oracles = HashMap::new();
@@ -1178,5 +1202,36 @@ mod tests {
 		assert_eq!(response.quotes[0].provider.as_deref(), Some("oif-solver"));
 		assert_eq!(response.quotes[0].eta, Some(96));
 		assert!(!response.quotes[0].quote_id.is_empty());
+	}
+
+	#[tokio::test]
+	async fn test_process_quote_request_clamps_permit2_expiry_to_broadcaster_window() {
+		let solver = create_quote_processing_solver_engine();
+		let request = create_quote_processing_request();
+		let mut config = solver.dynamic_config().read().await.clone();
+		add_broadcaster_min_expiry_to_quote_processing_config(&mut config, 3_600);
+
+		let before = current_timestamp();
+		let result = process_quote_request(request, &solver, &config).await;
+
+		assert!(
+			result.is_ok(),
+			"expected quote generation to succeed: {result:?}"
+		);
+
+		let response = result.unwrap();
+		let quote = &response.quotes[0];
+		match &quote.order {
+			OifOrder::OifEscrowV0 { payload } => {
+				let expires = payload.message["witness"]["expires"]
+					.as_u64()
+					.expect("Permit2 witness expires should be numeric");
+				assert!(
+					expires >= before + 3_900,
+					"expires={expires} should cover fill_deadline_seconds + broadcaster minimum"
+				);
+			},
+			other => panic!("expected Permit2 escrow quote, got {other:?}"),
+		}
 	}
 }

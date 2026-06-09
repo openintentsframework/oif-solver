@@ -619,14 +619,26 @@ impl QuoteGenerator {
 
 		let order = match lock_type {
 			LockType::Permit2Escrow => {
-				self.generate_permit2_order(request, config, input_oracle, output_oracle)
-					.await?
+				self.generate_permit2_order(
+					request,
+					config,
+					Some(selected_settlement),
+					input_oracle,
+					output_oracle,
+				)
+				.await?
 			},
 			// Permit2Escrow and Eip3009Escrow are the only variants that reach
 			// here; the early-return guard above rules out all other lock types.
 			_ => {
-				self.generate_eip3009_order(request, config, input_oracle, output_oracle)
-					.await?
+				self.generate_eip3009_order(
+					request,
+					config,
+					Some(selected_settlement),
+					input_oracle,
+					output_oracle,
+				)
+				.await?
 			},
 		};
 
@@ -637,6 +649,7 @@ impl QuoteGenerator {
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
+		settlement_name: Option<&str>,
 		input_oracle: solver_types::Address,
 		output_oracle: solver_types::Address,
 	) -> Result<OifOrder, QuoteError> {
@@ -651,8 +664,13 @@ impl QuoteGenerator {
 		let domain_object = self.build_permit2_domain_object(config, chain_id).await?;
 
 		// Generate the message object without pre-computed digest
-		let message_obj =
-			self.build_permit2_message_object(request, config, input_oracle, output_oracle)?;
+		let message_obj = self.build_permit2_message_object(
+			request,
+			config,
+			settlement_name,
+			input_oracle,
+			output_oracle,
+		)?;
 
 		let order = OifOrder::OifEscrowV0 {
 			payload: OrderPayload {
@@ -671,33 +689,13 @@ impl QuoteGenerator {
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
+		settlement_name: Option<&str>,
 		input_oracle: solver_types::Address,
 		output_oracle: solver_types::Address,
 	) -> Result<OifOrder, QuoteError> {
 		use alloy_primitives::hex;
 
 		let current_time = chrono::Utc::now().timestamp() as u64;
-
-		// Calculate separate deadlines
-		// fillDeadline: Time to fill outputs on destination chains (default 5 minutes)
-		let fill_deadline_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until
-		{
-			// If user specifies min_valid_until, use it as fillDeadline
-			min_valid_until
-		} else {
-			let fill_deadline_seconds = self.get_fill_deadline_seconds(config);
-			current_time + fill_deadline_seconds
-		};
-
-		// expires: Time to finalize/claim on origin chain (default 10 minutes, must be > fillDeadline)
-		let expires_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until {
-			// If user specifies min_valid_until, add buffer for expires
-			min_valid_until
-				+ (self.get_expires_seconds(config) - self.get_fill_deadline_seconds(config))
-		} else {
-			let expires_seconds = self.get_expires_seconds(config);
-			current_time + expires_seconds
-		};
 
 		// Get input chain to find the input settler address (the 'to' field)
 		let first_input = &request.intent.inputs[0];
@@ -717,10 +715,32 @@ impl QuoteGenerator {
 			.asset
 			.ethereum_address()
 			.map_err(|e| QuoteError::InvalidRequest(format!("Invalid token address: {e}")))?;
+		let output_chain_ids = request
+			.intent
+			.outputs
+			.iter()
+			.map(|output| {
+				output.asset.ethereum_chain_id().map_err(|e| {
+					QuoteError::InvalidRequest(format!("Invalid output chain ID: {e}"))
+				})
+			})
+			.collect::<Result<Vec<_>, _>>()?;
+		let timing = crate::apis::quote::timing::quote_timing_for_settlement(
+			config,
+			settlement_name,
+			&input_oracle,
+			input_chain_id,
+			&output_chain_ids,
+		);
+		let timestamps = timing.timestamps(current_time, request.intent.min_valid_until);
 
 		// Set fillDeadline for order
-		let fill_deadline = fill_deadline_timestamp as u32;
-		let expires = expires_timestamp as u32;
+		let fill_deadline: u32 = timestamps.fill_deadline.try_into().map_err(|_| {
+			QuoteError::InvalidRequest("Computed fill deadline exceeds uint32".to_string())
+		})?;
+		let expires: u32 = timestamps.expires.try_into().map_err(|_| {
+			QuoteError::InvalidRequest("Computed order expiry exceeds uint32".to_string())
+		})?;
 
 		let ((nonce_u64, order_identifier), domain_object, domain_separator) = tokio::try_join!(
 			self.compute_eip3009_order_identifier(
@@ -1115,27 +1135,6 @@ impl QuoteGenerator {
 
 		let current_time = chrono::Utc::now().timestamp() as u64;
 
-		// Calculate separate deadlines
-		// fillDeadline: Time to fill outputs on destination chains (default 5 minutes)
-		let fill_deadline_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until
-		{
-			// If user specifies min_valid_until, use it as fillDeadline
-			min_valid_until
-		} else {
-			let fill_deadline_seconds = self.get_fill_deadline_seconds(config);
-			current_time + fill_deadline_seconds
-		};
-
-		// expires: Time for BatchCompact signature/claim on origin chain (default 10 minutes, must be > fillDeadline)
-		let expires = if let Some(min_valid_until) = request.intent.min_valid_until {
-			// If user specifies min_valid_until, add buffer for expires
-			min_valid_until
-				+ (self.get_expires_seconds(config) - self.get_fill_deadline_seconds(config))
-		} else {
-			let expires_seconds = self.get_expires_seconds(config);
-			current_time + expires_seconds
-		};
-
 		let nonce = chrono::Utc::now().timestamp_millis() as u64; // Use milliseconds timestamp as nonce for uniqueness (matching direct intent flow)
 
 		// Get user address
@@ -1173,6 +1172,26 @@ impl QuoteGenerator {
 			settlement = selected_input_settlement,
 			"Selected settlement for resource-lock input chain"
 		);
+		let output_chain_ids = request
+			.intent
+			.outputs
+			.iter()
+			.map(|output| {
+				output.asset.ethereum_chain_id().map_err(|e| {
+					QuoteError::InvalidRequest(format!("Invalid output chain ID: {e}"))
+				})
+			})
+			.collect::<Result<Vec<_>, _>>()?;
+		let timing = crate::apis::quote::timing::quote_timing_for_settlement(
+			config,
+			Some(selected_input_settlement),
+			&input_oracle,
+			origin_chain_id,
+			&output_chain_ids,
+		);
+		let timestamps = timing.timestamps(current_time, request.intent.min_valid_until);
+		let fill_deadline_timestamp = timestamps.fill_deadline;
+		let expires = timestamps.expires;
 
 		// Convert inputs to the format expected by TheCompact
 		// For ResourceLock orders, we need to build the proper token IDs and amounts
@@ -1622,14 +1641,20 @@ impl QuoteGenerator {
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
+		settlement_name: Option<&str>,
 		input_oracle: solver_types::Address,
 		output_oracle: solver_types::Address,
 	) -> Result<serde_json::Value, QuoteError> {
 		use crate::apis::quote::permit2::build_permit2_batch_witness_digest;
 
 		// Generate the complete message structure
-		let (_final_digest, message_obj) =
-			build_permit2_batch_witness_digest(request, config, input_oracle, output_oracle)?;
+		let (_final_digest, message_obj) = build_permit2_batch_witness_digest(
+			request,
+			config,
+			settlement_name,
+			input_oracle,
+			output_oracle,
+		)?;
 
 		// Extract only the EIP-712 message fields (no metadata like "signing", "digest")
 		let permitted = message_obj
@@ -1700,61 +1725,6 @@ impl QuoteGenerator {
 			.and_then(|api| api.quote.as_ref())
 			.map(|quote| quote.validity_seconds)
 			.unwrap_or_else(|| QuoteConfig::default().validity_seconds)
-	}
-
-	/// Gets the fill deadline duration from configuration.
-	///
-	/// Returns the configured fill deadline seconds from api.quote config or default.
-	fn get_fill_deadline_seconds(&self, config: &Config) -> u64 {
-		config
-			.api
-			.as_ref()
-			.and_then(|api| api.quote.as_ref())
-			.map(|quote| quote.fill_deadline_seconds)
-			.unwrap_or_else(|| QuoteConfig::default().fill_deadline_seconds)
-	}
-
-	/// Gets the expires duration from configuration.
-	///
-	/// Returns the configured expires seconds from api.quote config.
-	///
-	/// If api.quote is not configured, this falls back to the larger of:
-	/// - QuoteConfig default expires
-	/// - settlement implementation `intent_min_expiry_seconds` (when present)
-	///
-	/// This keeps quote expiry aligned with settlement admission guards so
-	/// broadcaster intents are not rejected immediately for short windows.
-	fn get_expires_seconds(&self, config: &Config) -> u64 {
-		let fill_deadline = self.get_fill_deadline_seconds(config);
-		if let Some(expires_seconds) = config
-			.api
-			.as_ref()
-			.and_then(|api| api.quote.as_ref())
-			.map(|quote| quote.expires_seconds)
-		{
-			// Clamp to fill deadline so quotes never expire before they can be filled.
-			return expires_seconds.max(fill_deadline);
-		}
-
-		let default_expires = QuoteConfig::default().expires_seconds;
-		let settlement_min_expiry: u64 = config
-			.settlement
-			.implementations
-			.values()
-			.filter_map(|implementation| {
-				implementation
-					.as_object()
-					.and_then(|table| table.get("intent_min_expiry_seconds"))
-					.and_then(|value| value.as_i64())
-					.filter(|seconds| *seconds >= 0)
-					.map(|seconds| seconds as u64)
-			})
-			.max()
-			.unwrap_or(0);
-
-		let admission_safe_expires =
-			settlement_min_expiry.saturating_add(self.get_fill_deadline_seconds(config));
-		default_expires.max(admission_safe_expires)
 	}
 
 	/// Generates EIP-712 types definition for Permit2 orders
@@ -2430,7 +2400,7 @@ mod tests {
 		let request = create_test_request();
 
 		let result = generator
-			.generate_eip3009_order(&request, &config, input_oracle, output_oracle)
+			.generate_eip3009_order(&request, &config, None, input_oracle, output_oracle)
 			.await;
 
 		match result {
@@ -2465,6 +2435,34 @@ mod tests {
 				assert!(matches!(e, QuoteError::InvalidRequest(_)));
 			},
 		}
+	}
+
+	#[tokio::test]
+	async fn test_generate_eip3009_order_clamps_expiry_to_broadcaster_minimum() {
+		let generator = create_eip3009_success_generator();
+		let mut config = create_test_config();
+		add_broadcaster_min_expiry_to_test_config(&mut config, "test");
+		let mut request = create_test_request();
+		let now = chrono::Utc::now().timestamp() as u64;
+		request.intent.min_valid_until = Some(now + 600);
+		let input_oracle = solver_types::Address(vec![0xaa; 20]);
+		let output_oracle = solver_types::Address(vec![0xdd; 20]);
+
+		let order = generator
+			.generate_eip3009_order(&request, &config, Some("test"), input_oracle, output_oracle)
+			.await
+			.expect("expected EIP-3009 order generation");
+
+		let OifOrder::Oif3009V0 { metadata, .. } = order else {
+			panic!("Expected Oif3009V0 order");
+		};
+		let expires = metadata["expires"].as_u64().expect("metadata expires");
+
+		assert!(
+			expires >= now + 691_200,
+			"expected expires to leave broadcaster settlement window, expires_in={}s",
+			expires.saturating_sub(now)
+		);
 	}
 
 	#[tokio::test]
@@ -2524,6 +2522,33 @@ mod tests {
 			.expect("at least one output should be present");
 		assert!(first_output["chainId"].is_u64());
 		assert_eq!(first_output["chainId"], 137);
+	}
+
+	#[tokio::test]
+	async fn test_build_compact_message_clamps_expiry_to_broadcaster_minimum() {
+		let generator = create_test_generator();
+		let mut config = create_test_config();
+		add_broadcaster_min_expiry_to_test_config(&mut config, "test");
+		let mut request = create_test_request();
+		let now = chrono::Utc::now().timestamp() as u64;
+		request.intent.min_valid_until = Some(now + 600);
+		let params = serde_json::json!({"test": "value"});
+
+		let result = generator
+			.build_compact_message(&request, &config, &params)
+			.await
+			.expect("expected Compact message");
+		let expires = result["expires"]
+			.as_str()
+			.expect("expires string")
+			.parse::<u64>()
+			.expect("expires integer");
+
+		assert!(
+			expires >= now + 691_200,
+			"expected expires to leave broadcaster settlement window, expires_in={}s",
+			expires.saturating_sub(now)
+		);
 	}
 
 	#[test]
@@ -2886,6 +2911,62 @@ mod tests {
 		QuoteGenerator::new(settlement_service, delivery_service)
 	}
 
+	fn create_eip3009_success_generator() -> QuoteGenerator {
+		use alloy_sol_types::{sol, SolCall};
+
+		sol! {
+			function name() external view returns (string);
+			function DOMAIN_SEPARATOR() external view returns (bytes32);
+		}
+
+		let name_selector = nameCall {}.abi_encode()[0..4].to_vec();
+		let name_response = Bytes::from(nameCall::abi_encode_returns(&"USD Coin".to_string()));
+		let domain_separator_selector = DOMAIN_SEPARATORCall {}.abi_encode()[0..4].to_vec();
+		let domain_separator_response = Bytes::from(vec![0x44; 32]);
+		let order_identifier_response = Bytes::from(vec![0x55; 32]);
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_eth_call().returning(move |tx| {
+			let name_selector = name_selector.clone();
+			let name_response = name_response.clone();
+			let domain_separator_selector = domain_separator_selector.clone();
+			let domain_separator_response = domain_separator_response.clone();
+			let order_identifier_response = order_identifier_response.clone();
+			Box::pin(async move {
+				if tx.data.starts_with(&name_selector) {
+					return Ok(name_response);
+				}
+				if tx.data.starts_with(&domain_separator_selector) {
+					return Ok(domain_separator_response);
+				}
+				Ok(order_identifier_response)
+			})
+		});
+
+		create_test_generator_with_mock_delivery(1, mock_delivery)
+	}
+
+	fn add_broadcaster_min_expiry_to_test_config(config: &mut Config, implementation_name: &str) {
+		config.settlement.implementations.insert(
+			implementation_name.to_string(),
+			serde_json::json!({
+				"intent_min_expiry_seconds": 691_200,
+				"oracles": {
+					"input": {
+						"1": ["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+					},
+					"output": {
+						"137": ["0xdddddddddddddddddddddddddddddddddddddddd"]
+					}
+				},
+				"routes": {
+					"1": [137]
+				}
+			}),
+		);
+		config.settlement.primary = implementation_name.to_string();
+	}
+
 	fn create_exact_input_request(
 		input_amount: Option<&str>,
 		output_amount: Option<&str>,
@@ -3166,7 +3247,7 @@ mod tests {
 			.expect("Should have settlement for test chains");
 
 		let result = generator
-			.generate_permit2_order(&request, &config, input_oracle, output_oracle)
+			.generate_permit2_order(&request, &config, None, input_oracle, output_oracle)
 			.await;
 
 		match result {
@@ -4041,8 +4122,13 @@ mod tests {
 		let input_oracle = solver_types::Address(vec![0xaa; 20]);
 		let output_oracle = solver_types::Address(vec![0xbb; 20]);
 
-		let result =
-			generator.build_permit2_message_object(&request, &config, input_oracle, output_oracle);
+		let result = generator.build_permit2_message_object(
+			&request,
+			&config,
+			None,
+			input_oracle,
+			output_oracle,
+		);
 
 		match result {
 			Ok(message) => {

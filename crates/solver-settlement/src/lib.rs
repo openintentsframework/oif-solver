@@ -26,6 +26,7 @@ pub mod implementations {
 
 /// Helpers for intent admission heuristics based on settlement configuration.
 pub mod admission;
+pub use admission::{estimate_required_expiry_window_for_route, RouteExpiryInputs};
 
 /// Common utilities for settlement implementations
 pub mod utils;

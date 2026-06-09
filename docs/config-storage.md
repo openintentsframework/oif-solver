@@ -148,6 +148,10 @@ For broadcaster routes with slow proof availability, tune both:
 - `monitoring_timeout_seconds` for the post-fill claimability loop
 - settlement timing fields such as `settlement.broadcaster.proof_wait_time_seconds` and `settlement.broadcaster.intent_min_expiry_seconds`
 
+Quote expiry is settlement-aware. `api.quote.expires_seconds` controls the operator-preferred minimum order lifetime, but generated signed orders are clamped upward when the selected settlement implementation requires a longer admission window. Keep `api.quote.validity_seconds` short for quote retrieval/cache TTL; do not rely on `api.quote.expires_seconds` to shorten broadcaster orders below `settlement.broadcaster.intent_min_expiry_seconds`.
+
+For seeded deployments, the bootstrap/seed override model does not currently expose `api.quote`. Runtime config still receives the default quote settings during operator-config merge, and the admission-safe quote floor is applied from settlement timing regardless.
+
 The key `intent_min_expiry_seconds` uses the same field name across:
 
 - `settlement.hyperlane.intent_min_expiry_seconds`
