@@ -10,6 +10,15 @@ const DEFAULT_BROADCASTER_FINALITY_BLOCKS: u64 = 20;
 const DEFAULT_SETTLEMENT_SAFETY_BUFFER_SECONDS: u64 = 90;
 const DEFAULT_BLOCK_TIME_SECONDS: u64 = 12;
 
+/// Minimal route data needed to estimate the settlement window required before
+/// an order expires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteExpiryInputs {
+	pub input_oracle: Address,
+	pub origin_chain_id: u64,
+	pub output_chain_ids: Vec<u64>,
+}
+
 fn parse_optional_u64(value: Option<&serde_json::Value>, default_value: u64) -> u64 {
 	value
 		.and_then(serde_json::Value::as_u64)
@@ -31,17 +40,15 @@ fn parse_chain_u64_table(value: Option<&serde_json::Value>) -> HashMap<u64, u64>
 	parsed
 }
 
-fn implementation_supports_order(
+fn implementation_supports_route(
 	implementation_cfg: &serde_json::Value,
-	order_data: &Eip7683OrderData,
-	input_oracle: &Address,
+	inputs: &RouteExpiryInputs,
 ) -> bool {
-	let origin_chain = order_data.origin_chain_id.to::<u64>();
-	let cross_chain_outputs: Vec<u64> = order_data
-		.outputs
+	let cross_chain_outputs: Vec<u64> = inputs
+		.output_chain_ids
 		.iter()
-		.map(|output| output.chain_id.to::<u64>())
-		.filter(|destination| *destination != origin_chain)
+		.copied()
+		.filter(|destination| *destination != inputs.origin_chain_id)
 		.collect();
 
 	if cross_chain_outputs.is_empty() {
@@ -52,14 +59,15 @@ fn implementation_supports_order(
 		return false;
 	};
 
-	let Some(source_input_oracles) = oracle_config.input_oracles.get(&origin_chain) else {
+	let Some(source_input_oracles) = oracle_config.input_oracles.get(&inputs.origin_chain_id)
+	else {
 		return false;
 	};
-	if !source_input_oracles.contains(input_oracle) {
+	if !source_input_oracles.contains(&inputs.input_oracle) {
 		return false;
 	}
 
-	let Some(route_destinations) = oracle_config.routes.get(&origin_chain) else {
+	let Some(route_destinations) = oracle_config.routes.get(&inputs.origin_chain_id) else {
 		return false;
 	};
 	for destination in cross_chain_outputs {
@@ -91,7 +99,7 @@ fn estimated_block_time_seconds(chain_id: u64, chain_block_times: &HashMap<u64, 
 }
 
 fn estimate_broadcaster_expiry_buffer_seconds(
-	order_data: &Eip7683OrderData,
+	inputs: &RouteExpiryInputs,
 	implementation_cfg: &serde_json::Value,
 	poll_interval_seconds: u64,
 ) -> Option<(u64, String)> {
@@ -115,21 +123,19 @@ fn estimate_broadcaster_expiry_buffer_seconds(
 		DEFAULT_SETTLEMENT_SAFETY_BUFFER_SECONDS,
 	);
 
-	let origin_chain = order_data.origin_chain_id.to::<u64>();
 	let mut max_finality_seconds = 0u64;
 	let mut has_cross_chain_output = false;
-	for output in &order_data.outputs {
-		let destination_chain = output.chain_id.to::<u64>();
-		if destination_chain == origin_chain {
+	for destination_chain in &inputs.output_chain_ids {
+		if *destination_chain == inputs.origin_chain_id {
 			continue;
 		}
 		has_cross_chain_output = true;
 		let blocks = finality_blocks
-			.get(&destination_chain)
+			.get(destination_chain)
 			.copied()
 			.unwrap_or(default_finality_blocks);
 		let chain_finality_seconds = blocks.saturating_mul(estimated_block_time_seconds(
-			destination_chain,
+			*destination_chain,
 			&chain_block_times,
 		));
 		max_finality_seconds = max_finality_seconds.max(chain_finality_seconds);
@@ -154,13 +160,12 @@ fn estimate_broadcaster_expiry_buffer_seconds(
 	))
 }
 
-pub fn estimate_required_expiry_window_seconds(
-	order_data: &Eip7683OrderData,
+pub fn estimate_required_expiry_window_for_route(
+	inputs: &RouteExpiryInputs,
 	settlement_implementations: &HashMap<String, serde_json::Value>,
 	settlement_poll_interval_seconds: u64,
 	pinned_settlement_name: Option<&str>,
 ) -> Option<(u64, String)> {
-	let input_oracle = parse_address(&order_data.input_oracle).ok()?;
 	let mut matches: Vec<(u64, String)> = Vec::new();
 
 	for (implementation_name, implementation_cfg) in settlement_implementations {
@@ -170,7 +175,7 @@ pub fn estimate_required_expiry_window_seconds(
 			}
 		}
 
-		if !implementation_supports_order(implementation_cfg, order_data, &input_oracle) {
+		if !implementation_supports_route(implementation_cfg, inputs) {
 			continue;
 		}
 
@@ -189,7 +194,7 @@ pub fn estimate_required_expiry_window_seconds(
 
 		if implementation_name == "broadcaster" {
 			if let Some((required_window, breakdown)) = estimate_broadcaster_expiry_buffer_seconds(
-				order_data,
+				inputs,
 				implementation_cfg,
 				settlement_poll_interval_seconds,
 			) {
@@ -204,6 +209,31 @@ pub fn estimate_required_expiry_window_seconds(
 	matches
 		.into_iter()
 		.max_by_key(|(required_window, _)| *required_window)
+}
+
+pub fn estimate_required_expiry_window_seconds(
+	order_data: &Eip7683OrderData,
+	settlement_implementations: &HashMap<String, serde_json::Value>,
+	settlement_poll_interval_seconds: u64,
+	pinned_settlement_name: Option<&str>,
+) -> Option<(u64, String)> {
+	let input_oracle = parse_address(&order_data.input_oracle).ok()?;
+	let inputs = RouteExpiryInputs {
+		input_oracle,
+		origin_chain_id: order_data.origin_chain_id.to::<u64>(),
+		output_chain_ids: order_data
+			.outputs
+			.iter()
+			.map(|output| output.chain_id.to::<u64>())
+			.collect(),
+	};
+
+	estimate_required_expiry_window_for_route(
+		&inputs,
+		settlement_implementations,
+		settlement_poll_interval_seconds,
+		pinned_settlement_name,
+	)
 }
 
 #[cfg(test)]
@@ -270,5 +300,36 @@ mod tests {
 		assert!(!pinned_broadcaster.1.contains("hyperlane"));
 		assert!(unpinned.0 >= 500);
 		assert!(pinned_broadcaster.0 < unpinned.0);
+	}
+
+	#[test]
+	fn test_route_based_expiry_window_matches_order_based_gate() {
+		let implementations = HashMap::from([("broadcaster".to_string(), broadcaster_config())]);
+		let order_data = Eip7683OrderDataBuilder::new().build();
+		let input_oracle = parse_address(&order_data.input_oracle).unwrap();
+		let route_inputs = RouteExpiryInputs {
+			input_oracle,
+			origin_chain_id: order_data.origin_chain_id.to::<u64>(),
+			output_chain_ids: order_data
+				.outputs
+				.iter()
+				.map(|output| output.chain_id.to::<u64>())
+				.collect(),
+		};
+
+		let order_based = estimate_required_expiry_window_seconds(
+			&order_data,
+			&implementations,
+			3,
+			Some("broadcaster"),
+		);
+		let route_based = estimate_required_expiry_window_for_route(
+			&route_inputs,
+			&implementations,
+			3,
+			Some("broadcaster"),
+		);
+
+		assert_eq!(route_based, order_based);
 	}
 }

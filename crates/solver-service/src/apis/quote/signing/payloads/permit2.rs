@@ -21,7 +21,7 @@
 use crate::apis::quote::registry::PROTOCOL_REGISTRY;
 use alloy_primitives::{keccak256, B256, U256};
 use serde_json::json;
-use solver_config::{Config, QuoteConfig};
+use solver_config::Config;
 use solver_types::utils::{
 	bytes20_to_alloy_address, DOMAIN_TYPE, MANDATE_OUTPUT_TYPE, NAME_PERMIT2, PERMIT2_WITNESS_TYPE,
 	PERMIT_BATCH_WITNESS_TYPE, TOKEN_PERMISSIONS_TYPE,
@@ -31,52 +31,10 @@ use solver_types::{
 	GetQuoteRequest, QuoteError,
 };
 
-fn settlement_min_expiry_seconds(config: &Config) -> u64 {
-	config
-		.settlement
-		.implementations
-		.values()
-		.filter_map(|implementation| {
-			implementation
-				.as_object()
-				.and_then(|table| table.get("intent_min_expiry_seconds"))
-				.and_then(|value| value.as_i64())
-				.filter(|seconds| *seconds >= 0)
-				.map(|seconds| seconds as u64)
-		})
-		.max()
-		.unwrap_or(0)
-}
-
-fn quote_fill_deadline_seconds(config: &Config) -> u64 {
-	config
-		.api
-		.as_ref()
-		.and_then(|api| api.quote.as_ref())
-		.map(|quote| quote.fill_deadline_seconds)
-		.unwrap_or_else(|| QuoteConfig::default().fill_deadline_seconds)
-}
-
-fn quote_expires_seconds(config: &Config) -> u64 {
-	if let Some(expires_seconds) = config
-		.api
-		.as_ref()
-		.and_then(|api| api.quote.as_ref())
-		.map(|quote| quote.expires_seconds)
-	{
-		return expires_seconds;
-	}
-
-	let admission_safe_expires =
-		settlement_min_expiry_seconds(config).saturating_add(quote_fill_deadline_seconds(config));
-	QuoteConfig::default()
-		.expires_seconds
-		.max(admission_safe_expires)
-}
-
 pub fn build_permit2_batch_witness_digest(
 	request: &GetQuoteRequest,
 	config: &Config,
+	settlement_name: Option<&str>,
 	input_oracle: solver_types::Address,
 	output_oracle: solver_types::Address,
 ) -> Result<(B256, serde_json::Value), QuoteError> {
@@ -149,6 +107,7 @@ pub fn build_permit2_batch_witness_digest(
 		})?;
 
 	// Use the pre-selected oracle address
+	let input_oracle_for_timing = input_oracle.clone();
 	let input_oracle = bytes20_to_alloy_address(&input_oracle.0)
 		.map_err(|e| QuoteError::InvalidRequest(format!("Invalid oracle address: {e}")))?;
 	let output_oracle_address = bytes20_to_alloy_address(&output_oracle.0)
@@ -161,27 +120,19 @@ pub fn build_permit2_batch_witness_digest(
 	let now_secs = chrono::Utc::now().timestamp() as u64;
 	let nonce_ms: U256 = U256::from((chrono::Utc::now().timestamp_millis()) as u128);
 
-	// Calculate separate deadlines
-	// deadline (Permit2 openFor deadline): Time to open the order (default 5 minutes, matches fillDeadline)
-	let fill_deadline_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until {
-		// If user specifies min_valid_until, use it as fillDeadline
-		min_valid_until
-	} else {
-		now_secs + quote_fill_deadline_seconds(config)
-	};
+	let timing = crate::apis::quote::timing::quote_timing_for_settlement(
+		config,
+		settlement_name,
+		&input_oracle_for_timing,
+		origin_chain_id,
+		&[dest_chain_id],
+	);
+	let timestamps = timing.timestamps(now_secs, request.intent.min_valid_until);
 
-	// expires (witness expires): Time to finalize/claim on origin chain (default 10 minutes, must be > fillDeadline)
-	let expires_timestamp = if let Some(min_valid_until) = request.intent.min_valid_until {
-		// If user specifies min_valid_until, add buffer for expires
-		let fill_deadline_seconds = quote_fill_deadline_seconds(config);
-		let expires_seconds = quote_expires_seconds(config);
-		min_valid_until + (expires_seconds - fill_deadline_seconds)
-	} else {
-		now_secs + quote_expires_seconds(config)
-	};
-
-	let deadline_secs: U256 = U256::from(fill_deadline_timestamp);
-	let expires_secs: u32 = expires_timestamp as u32;
+	let deadline_secs: U256 = U256::from(timestamps.fill_deadline);
+	let expires_secs: u32 = timestamps.expires.try_into().map_err(|_| {
+		QuoteError::InvalidRequest("Computed order expiry exceeds uint32".to_string())
+	})?;
 
 	// Type hashes
 	let domain_type_hash = keccak256(DOMAIN_TYPE.as_bytes());
@@ -415,6 +366,27 @@ mod tests {
 		}
 	}
 
+	fn add_broadcaster_min_expiry(config: &mut Config) {
+		config.settlement.implementations.insert(
+			"broadcaster".to_string(),
+			serde_json::json!({
+				"intent_min_expiry_seconds": 691_200,
+				"oracles": {
+					"input": {
+						"1": ["0x1999999999999999999999999999999999999999"]
+					},
+					"output": {
+						"137": ["0x2999999999999999999999999999999999999999"]
+					}
+				},
+				"routes": {
+					"1": [137]
+				}
+			}),
+		);
+		config.settlement.primary = "broadcaster".to_string();
+	}
+
 	#[test]
 	fn test_build_permit2_batch_witness_digest_success() {
 		let config = create_test_config();
@@ -427,6 +399,7 @@ mod tests {
 		let result = build_permit2_batch_witness_digest(
 			&request,
 			&config,
+			None,
 			input_oracle_address,
 			output_oracle_address,
 		);
@@ -486,6 +459,7 @@ mod tests {
 		let (digest, message_json) = build_permit2_batch_witness_digest(
 			&request,
 			&config,
+			None,
 			input_oracle_address,
 			output_oracle_address,
 		)
@@ -527,6 +501,7 @@ mod tests {
 		let result = build_permit2_batch_witness_digest(
 			&request,
 			&config,
+			None,
 			input_oracle_address,
 			output_oracle_address,
 		);
@@ -560,6 +535,7 @@ mod tests {
 		let result = build_permit2_batch_witness_digest(
 			&request,
 			&config,
+			None,
 			input_oracle_address,
 			output_oracle_address,
 		);
@@ -593,6 +569,7 @@ mod tests {
 		let result = build_permit2_batch_witness_digest(
 			&request,
 			&config,
+			None,
 			input_oracle_address,
 			output_oracle_address,
 		);
@@ -639,6 +616,7 @@ mod tests {
 		let result = build_permit2_batch_witness_digest(
 			&request,
 			&config,
+			None,
 			input_oracle_address,
 			output_oracle_address,
 		);
@@ -669,6 +647,7 @@ mod tests {
 		let result = build_permit2_batch_witness_digest(
 			&request,
 			&config,
+			None,
 			input_oracle_address,
 			output_oracle_address,
 		);
@@ -694,6 +673,43 @@ mod tests {
 	}
 
 	#[test]
+	fn test_build_permit2_batch_witness_digest_clamps_expiry_to_broadcaster_minimum() {
+		let mut config = create_test_config();
+		add_broadcaster_min_expiry(&mut config);
+		let mut request = create_test_quote_request();
+		let now = chrono::Utc::now().timestamp() as u64;
+		let min_valid_until = now + 600;
+		request.intent.min_valid_until = Some(min_valid_until);
+		let input_oracle_address =
+			parse_address("0x1999999999999999999999999999999999999999").unwrap();
+		let output_oracle_address =
+			parse_address("0x2999999999999999999999999999999999999999").unwrap();
+
+		let (_digest, message_json) = build_permit2_batch_witness_digest(
+			&request,
+			&config,
+			Some("broadcaster"),
+			input_oracle_address,
+			output_oracle_address,
+		)
+		.expect("Expected successful digest generation");
+
+		let deadline = message_json["deadline"]
+			.as_str()
+			.unwrap()
+			.parse::<u64>()
+			.unwrap();
+		let expires = message_json["witness"]["expires"].as_u64().unwrap();
+
+		assert_eq!(deadline, min_valid_until);
+		assert!(
+			expires >= now + 691_200,
+			"expected expires to leave broadcaster settlement window, expires_in={}s",
+			expires.saturating_sub(now)
+		);
+	}
+
+	#[test]
 	fn test_build_permit2_batch_witness_digest_deterministic() {
 		let config = create_test_config();
 		let request = create_test_quote_request();
@@ -706,6 +722,7 @@ mod tests {
 		let result1 = build_permit2_batch_witness_digest(
 			&request,
 			&config,
+			None,
 			input_oracle_address.clone(),
 			output_oracle_address.clone(),
 		);
@@ -716,6 +733,7 @@ mod tests {
 		let result2 = build_permit2_batch_witness_digest(
 			&request,
 			&config,
+			None,
 			input_oracle_address,
 			output_oracle_address,
 		);
@@ -745,6 +763,7 @@ mod tests {
 		let result = build_permit2_batch_witness_digest(
 			&request,
 			&config,
+			None,
 			input_oracle_address,
 			output_oracle_address,
 		);

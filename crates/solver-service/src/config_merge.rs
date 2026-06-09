@@ -7069,6 +7069,57 @@ mod tests {
 	}
 
 	#[test]
+	fn test_operator_default_quote_config_does_not_undercut_broadcaster_expiry() {
+		let admin = OperatorAdminConfig {
+			enabled: false,
+			domain: "".to_string(),
+			chain_id: 0,
+			nonce_ttl_seconds: 0,
+			whitelist: vec![],
+			withdrawals: OperatorWithdrawalsConfig::default(),
+		};
+		let api = build_api_config_from_operator(&admin, false).unwrap();
+		let config = solver_config::ConfigBuilder::new()
+			.api(Some(api))
+			.settlement(SettlementConfig {
+				implementations: HashMap::from([(
+					"broadcaster".to_string(),
+					serde_json::json!({
+						"intent_min_expiry_seconds": 691_200,
+						"oracles": {
+							"input": {
+								"1": ["0x1111111111111111111111111111111111111111"]
+							},
+							"output": {
+								"42161": ["0x2222222222222222222222222222222222222222"]
+							}
+						},
+						"routes": {
+							"1": [42161]
+						}
+					}),
+				)]),
+				primary: "broadcaster".to_string(),
+				settlement_poll_interval_seconds: 3,
+			})
+			.build();
+		let input_oracle =
+			solver_types::utils::parse_address("0x1111111111111111111111111111111111111111")
+				.unwrap();
+
+		let timing = crate::apis::quote::timing::quote_timing_for_settlement(
+			&config,
+			Some("broadcaster"),
+			&input_oracle,
+			1,
+			&[42161],
+		);
+
+		assert_eq!(timing.fill_deadline_seconds, 300);
+		assert!(timing.expires_seconds >= 691_500);
+	}
+
+	#[test]
 	#[serial]
 	fn test_build_api_config_from_operator_uses_env_port_override() {
 		let key = "SOLVER_API_PORT";
