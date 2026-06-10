@@ -29,4 +29,6 @@ tower-http = { version = "0.6.6", features = ["cors"] }
 tracing = "0.1"
 
 [dev-dependencies]
+alloy-signer = { workspace = true }
+alloy-signer-local = { workspace = true }
 mockall = { workspace = true }

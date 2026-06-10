@@ -29,8 +29,10 @@
 //! ## Configuration
 //!
 //! The service requires the following configuration:
-//! - `api_host` - The host address to bind the API server (default: "0.0.0.0")
-//! - `api_port` - The port to listen on (default: 8080)
+//! - `api_host` - The host address to bind the API server (default: "127.0.0.1";
+//!   set explicitly to a public address such as "0.0.0.0" to expose the
+//!   unauthenticated `/intent` endpoint beyond loopback)
+//! - `api_port` - The port to listen on (default: 8081)
 //! - `rpc_url` - Ethereum RPC URL for calling settler contracts
 //!
 //! ## Order Flow
@@ -810,6 +812,88 @@ async fn validate_resource_lock_allocator_authorization(
 
 	Ok(())
 }
+
+/// Validate the sponsor's EIP-712 signature for a ResourceLock order.
+///
+/// The unauthenticated `/intent` endpoint previously validated only allocator
+/// authorization, never the sponsor's signature (unlike the `/orders` path in
+/// solver-service). Without this check anyone could submit an order on behalf of
+/// any `user`, and the solver would fill it (C-04). This reuses the shared
+/// BatchCompact claim-hash and sponsor-signature primitives in `solver-types`, so
+/// `/intent` and `/orders` enforce the same binding: the recovered signer must
+/// equal `order.user`.
+async fn validate_resource_lock_sponsor_signature(
+	order: &StandardOrder,
+	sponsor_signature: &Bytes,
+	providers: &HashMap<u64, DynProvider>,
+	networks: &NetworksConfig,
+) -> Result<(), DiscoveryError> {
+	use solver_types::standards::eip7683::compact_signatures::verify_compact_sponsor_signature;
+
+	let origin_chain_id = order.originChainId.to::<u64>();
+	let network = networks.get(&origin_chain_id).ok_or_else(|| {
+		DiscoveryError::ValidationError(format!(
+			"Chain ID {} not found in networks configuration",
+			order.originChainId
+		))
+	})?;
+	let provider = providers.get(&origin_chain_id).ok_or_else(|| {
+		DiscoveryError::ValidationError(format!(
+			"No RPC provider configured for chain ID {origin_chain_id}"
+		))
+	})?;
+
+	let the_compact_address = network
+		.the_compact_address
+		.as_ref()
+		.ok_or_else(|| {
+			DiscoveryError::ValidationError(format!(
+				"No TheCompact address found for chain ID {origin_chain_id}"
+			))
+		})
+		.and_then(|addr| {
+			if addr.0.len() == 20 {
+				Ok(AlloyAddress::from_slice(&addr.0))
+			} else {
+				Err(DiscoveryError::ValidationError(
+					"Invalid TheCompact address length".to_string(),
+				))
+			}
+		})?;
+	// The arbiter (InputSettlerCompact) is the verifying contract baked into the
+	// BatchCompact claim hash the sponsor signs.
+	let arbiter = network
+		.input_settler_compact_address
+		.as_ref()
+		.ok_or_else(|| {
+			DiscoveryError::ValidationError(format!(
+				"No input settler compact address found for chain ID {origin_chain_id}"
+			))
+		})
+		.and_then(|addr| {
+			if addr.0.len() == 20 {
+				Ok(AlloyAddress::from_slice(&addr.0))
+			} else {
+				Err(DiscoveryError::ValidationError(
+					"Invalid input settler compact address length".to_string(),
+				))
+			}
+		})?;
+
+	// TheCompact is the EIP-712 verifying contract for the sponsor signature; its
+	// DOMAIN_SEPARATOR() binds the signature to this chain and deployment.
+	let compact = ITheCompact::new(the_compact_address, provider);
+	let domain_separator = compact.DOMAIN_SEPARATOR().call().await.map_err(|e| {
+		DiscoveryError::Connection(format!("Failed to query TheCompact.DOMAIN_SEPARATOR: {e}"))
+	})?;
+
+	let struct_hash = compute_batch_compact_claim_hash(order, arbiter).map_err(|e| {
+		DiscoveryError::ValidationError(format!("Failed to compute Compact claim hash: {e}"))
+	})?;
+
+	verify_compact_sponsor_signature(domain_separator, struct_hash, sponsor_signature, order.user)
+		.map_err(|e| DiscoveryError::ValidationError(e.to_string()))
+}
 /// Handles intent submission requests.
 ///
 /// This is the main request handler for the POST /intent endpoint.
@@ -908,6 +992,28 @@ async fn handle_intent_submission(
 					.into_response();
 			},
 		};
+		// Verify the sponsor's EIP-712 signature before anything else: an order whose
+		// `user` did not sign it must never be accepted or filled (C-04).
+		if let Err(e) = validate_resource_lock_sponsor_signature(
+			&order,
+			&decoded.sponsor,
+			&state.providers,
+			&state.networks,
+		)
+		.await
+		{
+			tracing::warn!(error = %e, "Failed to validate Compact sponsor signature");
+			return (
+				StatusCode::BAD_REQUEST,
+				Json(IntentResponse {
+					order_id: None,
+					status: IntentResponseStatus::Rejected,
+					message: Some(e.to_string()),
+					order: order_json.clone(),
+				}),
+			)
+				.into_response();
+		}
 		if let Err(e) = validate_resource_lock_allocator_authorization(
 			&order,
 			&decoded.allocator_data,
@@ -1041,7 +1147,6 @@ impl ConfigSchema for Eip7683OffchainDiscoverySchema {
 		let schema = Schema::new(
 			// Required fields
 			vec![
-				Field::new("api_host", FieldType::String),
 				Field::new(
 					"api_port",
 					FieldType::Integer {
@@ -1057,7 +1162,11 @@ impl ConfigSchema for Eip7683OffchainDiscoverySchema {
 					})),
 				),
 			],
-			vec![],
+			// Optional fields. `api_host` is optional and defaults to the loopback
+			// address `127.0.0.1` (C-04): the unauthenticated `/intent` endpoint must
+			// not bind publicly unless an operator explicitly sets `api_host`
+			// (for example to "0.0.0.0").
+			vec![Field::new("api_host", FieldType::String)],
 		);
 
 		schema.validate(config)
@@ -1134,11 +1243,19 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 /// Expected configuration format:
 /// ```json
 /// {
-///   "api_host": "0.0.0.0",
+///   "api_host": "127.0.0.1",
 ///   "api_port": 8081,
 ///   "network_ids": [1, 10, 137]
 /// }
 /// ```
+///
+/// # Binding
+///
+/// `api_host` defaults to the loopback address `127.0.0.1` so the
+/// unauthenticated `/intent` endpoint is not exposed publicly by default
+/// (C-04). Operators who intentionally want the endpoint reachable from other
+/// hosts must opt in explicitly by setting `api_host` to a public bind address
+/// (for example `0.0.0.0`), which is honored as-is for backward compatibility.
 ///
 /// # Errors
 ///
@@ -1153,11 +1270,22 @@ pub fn create_discovery(
 	Eip7683OffchainDiscoverySchema::validate_config(config)
 		.map_err(|e| DiscoveryError::ValidationError(format!("Invalid configuration: {e}")))?;
 
+	// Default to loopback: the `/intent` endpoint is unauthenticated, so it must
+	// not bind to all interfaces unless an operator explicitly opts in by setting
+	// `api_host` to a public address (e.g. "0.0.0.0"), which is preserved here.
 	let api_host = config
 		.get("api_host")
 		.and_then(|v| v.as_str())
-		.unwrap_or("0.0.0.0")
+		.unwrap_or("127.0.0.1")
 		.to_string();
+
+	if api_host == "0.0.0.0" || api_host == "::" {
+		tracing::warn!(
+			api_host = %api_host,
+			"Offchain discovery /intent endpoint is bound to a public interface; \
+			 it is unauthenticated, ensure access is restricted at the network layer"
+		);
+	}
 
 	let api_port = config
 		.get("api_port")
@@ -1336,12 +1464,6 @@ mod tests {
 		resource_lock_request(shifted_compact_signature(&[0x11u8; 65]))
 	}
 
-	fn resource_lock_request_with_allocator_data(
-		allocator_data: &'static [u8],
-	) -> PostOrderRequest {
-		resource_lock_request(compact_signature(&[0x11u8; 65], allocator_data))
-	}
-
 	fn encode_lock_details(allocator: AlloyAddress) -> Bytes {
 		let mut out = vec![0u8; 160];
 		out[44..64].copy_from_slice(allocator.as_slice());
@@ -1357,13 +1479,125 @@ mod tests {
 		Bytes::from(out)
 	}
 
+	/// Fixed EIP-712 domain separator returned by the mocked
+	/// `TheCompact.DOMAIN_SEPARATOR()` call in tests. Signed fixtures use the same
+	/// value so the recovered signer matches the order user.
+	fn test_domain_separator() -> alloy_primitives::FixedBytes<32> {
+		alloy_primitives::FixedBytes::from([0x99u8; 32])
+	}
+
+	fn encode_domain_separator(ds: alloy_primitives::FixedBytes<32>) -> Bytes {
+		Bytes::from(ds.to_vec())
+	}
+
+	/// Mocked provider that answers, in order, the three `eth_call`s the
+	/// ResourceLock `/intent` path makes: `DOMAIN_SEPARATOR` (sponsor-signature
+	/// check), then `getLockDetails` + `isClaimAuthorized` (allocator check).
 	fn mocked_provider_with_allocator_authorized(authorized: bool) -> DynProvider {
 		let asserter = Asserter::new();
+		asserter.push_success(&encode_domain_separator(test_domain_separator()));
 		asserter.push_success(&encode_lock_details(AlloyAddress::from([0xA1u8; 20])));
 		asserter.push_success(&encode_bool(authorized));
 		ProviderBuilder::new()
 			.connect_mocked_client(asserter)
 			.erased()
+	}
+
+	/// Mocked provider that only answers `DOMAIN_SEPARATOR`, for tests that expect
+	/// the sponsor-signature check to reject before any allocator call.
+	fn mocked_provider_with_domain_separator() -> DynProvider {
+		let asserter = Asserter::new();
+		asserter.push_success(&encode_domain_separator(test_domain_separator()));
+		ProviderBuilder::new()
+			.connect_mocked_client(asserter)
+			.erased()
+	}
+
+	/// The arbiter (InputSettlerCompact) baked into the BatchCompact claim hash —
+	/// must match `input_settler_compact_address` in `create_test_networks_config`.
+	fn test_arbiter() -> AlloyAddress {
+		AlloyAddress::from_slice(
+			&hex::decode("00000000000c2e074ec69a0dfb2997ba6c7d2e1e").expect("valid arbiter hex"),
+		)
+	}
+
+	/// Build a ResourceLock `/intent` request whose `user`/`sponsor` is `signer`'s
+	/// address and whose Compact payload carries a valid sponsor EIP-712 signature
+	/// over the BatchCompact claim hash (using `test_domain_separator`). The
+	/// `allocator_data` is embedded as the second element of the Compact signature.
+	fn signed_resource_lock_request(
+		signer: &alloy_signer_local::PrivateKeySigner,
+		allocator_data: &[u8],
+	) -> PostOrderRequest {
+		use alloy_signer::SignerSync;
+
+		let user = alloy_signer::Signer::address(signer);
+		let user_hex = format!("0x{}", hex::encode(user.as_slice()));
+
+		// Placeholder signature; replaced below once we can convert to StandardOrder.
+		let mut request = resource_lock_request_for_user(&user_hex, Bytes::new());
+		let order = StandardOrder::try_from(&request.order).expect("convertible order");
+
+		let struct_hash =
+			compute_batch_compact_claim_hash(&order, test_arbiter()).expect("claim hash");
+		let digest = alloy_primitives::keccak256(
+			[
+				&[0x19, 0x01][..],
+				test_domain_separator().as_slice(),
+				struct_hash.as_slice(),
+			]
+			.concat(),
+		);
+		let sponsor_sig = signer.sign_hash_sync(&digest).expect("sign digest");
+		let sponsor_bytes = Bytes::from(sponsor_sig.as_bytes().to_vec());
+
+		request.signature = compact_signature(&sponsor_bytes, allocator_data);
+		request
+	}
+
+	fn resource_lock_request_for_user(user_hex: &str, signature: Bytes) -> PostOrderRequest {
+		let payload = OrderPayload {
+			signature_type: SignatureType::Eip712,
+			domain: json!({
+				"name": "BatchCompact",
+				"version": "1",
+				"chainId": "1",
+				"verifyingContract": "0x8888888888888888888888888888888888888888",
+			}),
+			primary_type: "BatchCompact".to_string(),
+			message: json!({
+				"sponsor": user_hex,
+				"nonce": "1",
+				"expires": "1700000600",
+				"mandate": {
+					"fillDeadline": "1700000000",
+					"inputOracle": "0x2222222222222222222222222222222222222222",
+					"outputs": [{
+						"oracle": "0x6666666666666666666666666666666666666666666666666666666666666666",
+						"settler": "0x7777777777777777777777777777777777777777777777777777777777777777",
+						"chainId": "137",
+						"token": "0x4444444444444444444444444444444444444444444444444444444444444444",
+						"amount": "500",
+						"recipient": "0x5555555555555555555555555555555555555555555555555555555555555555",
+						"callbackData": "0x",
+						"context": "0x"
+					}]
+				},
+				"commitments": [{
+					"lockTag": "0xaaaaaaaaaaaaaaaaaaaaaaaa",
+					"token": "0x3333333333333333333333333333333333333333",
+					"amount": "1000"
+				}]
+			}),
+			types: None,
+		};
+
+		PostOrderRequest {
+			order: OifOrder::OifResourceLockV0 { payload },
+			signature,
+			quote_id: None,
+			origin_submission: None,
+		}
 	}
 
 	#[test]
@@ -1692,9 +1926,13 @@ mod tests {
 			networks,
 		};
 
+		// A validly-signed sponsor is required so the order reaches the allocator
+		// check rather than rejecting at the (now earlier) sponsor-signature gate.
+		let signer = alloy_signer_local::PrivateKeySigner::random();
 		let response = handle_intent_submission(
 			State(state),
-			Json(resource_lock_request_with_allocator_data(
+			Json(signed_resource_lock_request(
+				&signer,
 				b"garbage allocator data",
 			)),
 		)
@@ -1711,12 +1949,149 @@ mod tests {
 			Some("rejected")
 		);
 		// Proves the order reached the allocator-authorization check (isClaimAuthorized),
-		// not an earlier gate (trusted-allocator pin / reset period / malformed window).
+		// not an earlier gate (sponsor signature / trusted-allocator pin / reset period).
 		assert!(parsed
 			.get("message")
 			.and_then(|v| v.as_str())
 			.unwrap_or_default()
 			.contains("did not authorize"));
+	}
+
+	/// C-04 (RED→GREEN): a ResourceLock `/intent` whose Compact payload carries a
+	/// well-formed but WRONG sponsor signature (signed by a key other than the
+	/// order's `user`) must be rejected before fill. Before the fix the `/intent`
+	/// path never verified the sponsor signature, so this order would have been
+	/// accepted.
+	#[tokio::test]
+	async fn test_handle_intent_submission_rejects_invalid_sponsor_signature() {
+		use axum::extract::State;
+		use axum::Json;
+
+		let (tx, _rx) = mpsc::channel(16);
+		let mut providers = HashMap::new();
+		// Only DOMAIN_SEPARATOR is answered: the sponsor check must reject before
+		// any allocator call is made.
+		providers.insert(1, mocked_provider_with_domain_separator());
+		let mut networks = create_test_networks_config();
+		networks
+			.get_mut(&1)
+			.expect("chain 1 network config")
+			.allocator_address = Some(solver_types::account::Address(vec![0xA1u8; 20]));
+		let state = ApiState {
+			intent_sender: tx,
+			providers,
+			networks,
+		};
+
+		// Sign with `attacker`, but submit an order whose `user` is `attacker`'s
+		// address overwritten with a different address: build the signed request
+		// with one signer, then point the order at a different user so recovery
+		// no longer matches.
+		let attacker = alloy_signer_local::PrivateKeySigner::random();
+		let mut request = signed_resource_lock_request(&attacker, b"");
+		// Rewrite the sponsor/user to a different address than the one that signed.
+		if let OifOrder::OifResourceLockV0 { payload } = &mut request.order {
+			payload.message["sponsor"] = json!("0x000000000000000000000000000000000000dEaD");
+		}
+
+		let response = handle_intent_submission(State(state), Json(request))
+			.await
+			.into_response();
+
+		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+		let body_bytes = body::to_bytes(response.into_body(), usize::MAX)
+			.await
+			.expect("body");
+		let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).expect("parse body");
+		assert_eq!(
+			parsed.get("status").and_then(|v| v.as_str()),
+			Some("rejected")
+		);
+		assert!(
+			parsed
+				.get("message")
+				.and_then(|v| v.as_str())
+				.unwrap_or_default()
+				.contains("Sponsor"),
+			"expected sponsor-signature rejection, got: {parsed:?}"
+		);
+	}
+
+	/// A correctly-signed sponsor passes the sponsor-signature gate and proceeds to
+	/// the allocator check (here authorized), so the order is accepted. This guards
+	/// against the fix over-rejecting valid orders.
+	#[tokio::test]
+	async fn test_handle_intent_submission_accepts_valid_sponsor_signature() {
+		use axum::extract::State;
+		use axum::Json;
+
+		let (tx, _rx) = mpsc::channel(16);
+		let mut providers = HashMap::new();
+		// Answers, in order: DOMAIN_SEPARATOR (sponsor check), getLockDetails +
+		// isClaimAuthorized (allocator check), then orderIdentifier (order_to_intent).
+		let provider = {
+			let asserter = Asserter::new();
+			asserter.push_success(&encode_domain_separator(test_domain_separator()));
+			asserter.push_success(&encode_lock_details(AlloyAddress::from([0xA1u8; 20])));
+			asserter.push_success(&encode_bool(true));
+			asserter.push_success(&Bytes::from(vec![0x01u8; 32])); // orderIdentifier -> bytes32
+			ProviderBuilder::new()
+				.connect_mocked_client(asserter)
+				.erased()
+		};
+		providers.insert(1, provider);
+		let mut networks = create_test_networks_config();
+		networks
+			.get_mut(&1)
+			.expect("chain 1 network config")
+			.allocator_address = Some(solver_types::account::Address(vec![0xA1u8; 20]));
+		let state = ApiState {
+			intent_sender: tx,
+			providers,
+			networks,
+		};
+
+		let signer = alloy_signer_local::PrivateKeySigner::random();
+		let response = handle_intent_submission(
+			State(state),
+			Json(signed_resource_lock_request(&signer, b"")),
+		)
+		.await
+		.into_response();
+
+		let status = response.status();
+		let body_bytes = body::to_bytes(response.into_body(), usize::MAX)
+			.await
+			.expect("body");
+		let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or(json!({}));
+		assert_eq!(status, StatusCode::ACCEPTED, "body: {parsed:?}");
+	}
+
+	/// C-04: the offchain `/intent` server defaults to loopback so the
+	/// unauthenticated endpoint is not exposed publicly unless explicitly opted in.
+	#[test]
+	fn test_create_discovery_defaults_to_loopback_bind() {
+		let config = serde_json::json!({
+			"api_port": 8081,
+			"network_ids": [1],
+		});
+		let networks = create_test_networks_config();
+		let discovery = create_discovery(&config, &networks).expect("discovery created");
+		assert_eq!(discovery.get_url(), Some("127.0.0.1:8081".to_string()));
+	}
+
+	/// Backward compat: an operator explicitly opting into public exposure still
+	/// gets the public bind address they configured.
+	#[test]
+	fn test_create_discovery_honors_explicit_public_bind() {
+		let config = serde_json::json!({
+			"api_host": "0.0.0.0",
+			"api_port": 8081,
+			"network_ids": [1],
+		});
+		let networks = create_test_networks_config();
+		let discovery = create_discovery(&config, &networks).expect("discovery created");
+		assert_eq!(discovery.get_url(), Some("0.0.0.0:8081".to_string()));
 	}
 
 	#[tokio::test]

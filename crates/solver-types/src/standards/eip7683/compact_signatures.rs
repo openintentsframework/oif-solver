@@ -5,7 +5,8 @@
 //! off-chain validation and on-chain decoding cannot disagree about which bytes
 //! are the sponsor signature.
 
-use alloy_primitives::Bytes;
+use alloy_primitives::{keccak256, Address as AlloyAddress, Bytes, FixedBytes};
+use alloy_signer::Signature;
 
 use crate::{APIError, ApiErrorType};
 
@@ -114,6 +115,57 @@ fn invalid_compact_signature_error(message: &str) -> APIError {
 	}
 }
 
+/// Verify a sponsor's EIP-712 signature over a BatchCompact claim.
+///
+/// Recomputes the EIP-712 digest (`keccak256(0x1901 || domainSeparator ||
+/// structHash)`), recovers the signer from `sponsor_signature`, and checks it
+/// equals `expected_signer` (the order's `user`).
+///
+/// `domain_separator` is `TheCompact.DOMAIN_SEPARATOR()`; `struct_hash` is the
+/// BatchCompact claim hash (see [`compute_batch_compact_claim_hash`]).
+/// `sponsor_signature` is the canonical sponsor signature decoded from the
+/// Compact payload by [`decode_compact_signatures`].
+///
+/// This is the single shared sponsor-signature check used by both `/orders`
+/// intake (solver-service) and direct discovery `/intent` intake
+/// (solver-discovery), so the two paths cannot disagree on which key must have
+/// signed the order.
+///
+/// [`compute_batch_compact_claim_hash`]: super::compact_claims::compute_batch_compact_claim_hash
+pub fn verify_compact_sponsor_signature(
+	domain_separator: FixedBytes<32>,
+	struct_hash: FixedBytes<32>,
+	sponsor_signature: &Bytes,
+	expected_signer: AlloyAddress,
+) -> Result<(), APIError> {
+	let digest = keccak256(
+		[
+			&[0x19, 0x01][..],
+			domain_separator.as_slice(),
+			struct_hash.as_slice(),
+		]
+		.concat(),
+	);
+
+	let signature = Signature::try_from(sponsor_signature.as_ref()).map_err(|e| {
+		invalid_compact_signature_error(&format!("Invalid sponsor signature format: {e}"))
+	})?;
+
+	let recovered = signature
+		.recover_address_from_prehash(&digest)
+		.map_err(|e| {
+			invalid_compact_signature_error(&format!("Failed to recover sponsor signer: {e}"))
+		})?;
+
+	if recovered != expected_signer {
+		return Err(invalid_compact_signature_error(
+			"Sponsor EIP-712 signature does not match the order user",
+		));
+	}
+
+	Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -143,6 +195,56 @@ mod tests {
 		encoded.extend_from_slice(&sponsor_tail);
 		encoded.extend_from_slice(&padded_bytes(allocator_data));
 		Bytes::from(encoded)
+	}
+
+	#[test]
+	fn verify_compact_sponsor_signature_rejects_malformed_signature() {
+		// A signature that is not 65 bytes cannot be parsed and must be rejected
+		// rather than silently passing or panicking.
+		let err = verify_compact_sponsor_signature(
+			FixedBytes::from([0x99u8; 32]),
+			FixedBytes::from([0x11u8; 32]),
+			&Bytes::from(vec![0u8; 10]),
+			AlloyAddress::from([0x22u8; 20]),
+		)
+		.expect_err("malformed signature must be rejected");
+		match err {
+			APIError::BadRequest { message, .. } => {
+				assert!(
+					message.contains("Invalid sponsor signature format")
+						|| message.contains("Failed to recover sponsor signer"),
+					"unexpected message: {message}"
+				);
+			},
+			other => panic!("unexpected error: {other:?}"),
+		}
+	}
+
+	#[test]
+	fn verify_compact_sponsor_signature_rejects_signer_mismatch() {
+		// A well-formed 65-byte signature that recovers to some address must be
+		// rejected when that address is not the expected signer. Using an all-ones
+		// signature with v=27 recovers to *some* deterministic address that will
+		// not equal the zero-ish expected signer below.
+		let mut sig = vec![0x11u8; 65];
+		sig[64] = 27;
+		let err = verify_compact_sponsor_signature(
+			FixedBytes::from([0x99u8; 32]),
+			FixedBytes::from([0x11u8; 32]),
+			&Bytes::from(sig),
+			AlloyAddress::ZERO,
+		)
+		.expect_err("signer mismatch must be rejected");
+		match err {
+			APIError::BadRequest { message, .. } => {
+				assert!(
+					message.contains("does not match the order user")
+						|| message.contains("Failed to recover sponsor signer"),
+					"unexpected message: {message}"
+				);
+			},
+			other => panic!("unexpected error: {other:?}"),
+		}
 	}
 
 	#[test]
