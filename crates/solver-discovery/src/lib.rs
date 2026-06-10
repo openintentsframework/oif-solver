@@ -5,7 +5,9 @@
 //! on-chain event monitoring, off-chain APIs, or other intent implementations.
 
 use async_trait::async_trait;
-use solver_types::{ConfigSchema, ImplementationRegistry, Intent, NetworksConfig};
+use solver_types::{
+	api::PostOrderRequest, ConfigSchema, ImplementationRegistry, Intent, NetworksConfig,
+};
 use std::collections::HashMap;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -37,6 +39,40 @@ pub enum DiscoveryError {
 	ValidationError(String),
 }
 
+/// A successfully admitted in-process intent submission.
+#[derive(Debug, Clone)]
+pub struct IntentSubmission {
+	/// The computed order id for the submitted intent.
+	pub order_id: String,
+	/// The parsed order echoed back to the submitter (JSON form), when available.
+	pub order: Option<serde_json::Value>,
+	/// Human-readable status message.
+	pub message: String,
+}
+
+/// Error returned when an in-process intent submission is not admitted.
+#[derive(Debug, Error)]
+pub enum IntentSubmissionError {
+	/// The order failed parsing. Maps to HTTP 400 at the API layer.
+	#[error("{message}")]
+	Rejected {
+		message: String,
+		/// The parsed order, when parsing succeeded far enough to echo it.
+		order: Option<serde_json::Value>,
+	},
+	/// The submission pipeline is unavailable (monitoring not started, queue
+	/// full, or queue closed). Maps to HTTP 503 at the API layer.
+	#[error("{message}")]
+	Unavailable {
+		message: String,
+		order_id: Option<String>,
+		order: Option<serde_json::Value>,
+	},
+	/// The implementation does not accept direct submissions.
+	#[error("intent submission not supported by this discovery implementation")]
+	NotSupported,
+}
+
 /// Trait defining the interface for intent discovery implementations.
 ///
 /// This trait must be implemented by any discovery implementation that wants to
@@ -63,16 +99,24 @@ pub trait DiscoveryInterface: Send + Sync {
 	/// and release associated resources.
 	async fn stop_monitoring(&self) -> Result<(), DiscoveryError>;
 
-	/// Returns the URL for external API access if this discovery implementation provides one.
+	/// Submits an already-validated order to this discovery implementation, in-process.
 	///
-	/// This is primarily used by offchain discovery implementations that expose
-	/// an HTTP API for intent submission. Most implementations will return None.
+	/// # TRUST BOUNDARY — read before calling
+	/// This is a **trusted internal method, NOT a self-validating boundary.**
+	/// It does NOT verify the sponsor signature, allocator authorization, or
+	/// user balance/capacity. Callers MUST run full intake validation first —
+	/// in this codebase that is `solver-service`'s `validate_intent_request`
+	/// (sponsor EIP-712 sig, allocator auth, capacity). Calling this with
+	/// unvalidated input reopens audit findings C-02/C-04 (principal loss on
+	/// resource-lock fills). The only sanctioned caller is `POST /api/v1/orders`.
 	///
-	/// # Returns
-	/// * `Some(String)` - The URL for the discovery service API
-	/// * `None` - If this implementation doesn't provide an external API
-	fn get_url(&self) -> Option<String> {
-		None
+	/// Implementations that do not accept direct submissions return
+	/// `IntentSubmissionError::NotSupported`.
+	async fn submit_order(
+		&self,
+		_request: &PostOrderRequest,
+	) -> Result<IntentSubmission, IntentSubmissionError> {
+		Err(IntentSubmissionError::NotSupported)
 	}
 }
 
@@ -132,13 +176,19 @@ impl DiscoveryService {
 		self.implementations.get(name).map(|b| b.as_ref())
 	}
 
-	/// Gets the URL for a specific discovery implementation.
+	/// Submits an order to a specific discovery implementation, in-process.
 	///
-	/// Returns None if the implementation doesn't exist or doesn't provide a URL.
-	pub fn get_url(&self, implementation_name: &str) -> Option<String> {
-		self.implementations
-			.get(implementation_name)
-			.and_then(|impl_| impl_.get_url())
+	/// Returns `NotSupported` if the implementation doesn't exist or doesn't
+	/// accept direct submissions.
+	pub async fn submit_order(
+		&self,
+		implementation_name: &str,
+		request: &PostOrderRequest,
+	) -> Result<IntentSubmission, IntentSubmissionError> {
+		match self.implementations.get(implementation_name) {
+			Some(implementation) => implementation.submit_order(request).await,
+			None => Err(IntentSubmissionError::NotSupported),
+		}
 	}
 
 	/// Starts monitoring on all configured discovery implementations.
@@ -163,5 +213,38 @@ impl DiscoveryService {
 			implementation.stop_monitoring().await?;
 		}
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use alloy_primitives::Bytes;
+	use solver_types::api::{OifOrder, OrderPayload, SignatureType};
+
+	fn sample_request() -> PostOrderRequest {
+		PostOrderRequest {
+			order: OifOrder::OifResourceLockV0 {
+				payload: OrderPayload {
+					signature_type: SignatureType::Eip712,
+					domain: serde_json::json!({}),
+					primary_type: "BatchCompact".to_string(),
+					message: serde_json::json!({}),
+					types: None,
+				},
+			},
+			signature: Bytes::from(vec![0u8; 65]),
+			quote_id: None,
+			origin_submission: None,
+		}
+	}
+
+	#[tokio::test]
+	async fn submit_order_returns_not_supported_for_unknown_implementation() {
+		let service = DiscoveryService::new(HashMap::new());
+		let result = service
+			.submit_order("offchain_eip7683", &sample_request())
+			.await;
+		assert!(matches!(result, Err(IntentSubmissionError::NotSupported)));
 	}
 }

@@ -5169,18 +5169,14 @@ dependencies = [
  "alloy-transport-http",
  "alloy-transport-ws",
  "async-trait",
- "axum",
  "futures",
  "hex",
  "mockall",
- "reqwest",
  "serde",
  "serde_json",
  "solver-types",
  "thiserror 2.0.17",
  "tokio",
- "tower",
- "tower-http",
  "tracing",
 ]
 
@@ -5273,7 +5269,6 @@ dependencies = [
  "mockall",
  "once_cell",
  "regex",
- "reqwest",
  "rust_decimal",
  "rustls 0.23.31",
  "secp256k1 0.31.1",
@@ -5301,7 +5296,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "wiremock",
 ]
 
 [[package]]

@@ -23,8 +23,8 @@ paths:
         1. **Quote Acceptance**: Submit with quoteId and signature from a previously generated quote
         2. **Direct Submission**: Submit a complete order structure with signature
 
-        The endpoint validates the order, checks signatures (if required), and forwards
-        to the configured discovery service for execution.
+        The endpoint validates the order, checks signatures (if required), and submits
+        it in-process to the configured discovery service for execution.
 
         ## Authentication
 
@@ -140,17 +140,6 @@ paths:
                 orderId: null
                 status: "error"
                 message: "Intent submission service not configured"
-                order: null
-        "502":
-          description: Error forwarding to discovery service
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/PostOrderResponse"
-              example:
-                orderId: null
-                status: "error"
-                message: "Failed to submit intent: connection timeout"
                 order: null
 
   /orders/{id}:
