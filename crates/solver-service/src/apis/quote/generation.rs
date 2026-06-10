@@ -501,6 +501,29 @@ impl QuoteGenerator {
 		Ok((quote, settlement_name))
 	}
 
+	/// Rejects client-supplied resource-lock `params` that would otherwise be
+	/// silently ignored when constructing the signed message.
+	///
+	/// `None` and an empty JSON object (`{}`) are treated as "no params" and
+	/// accepted. Any other value (non-empty object, array, string, ...) is
+	/// rejected with [`QuoteError::InvalidRequest`].
+	fn reject_unexpected_lock_params(params: Option<&serde_json::Value>) -> Result<(), QuoteError> {
+		let is_empty = match params {
+			None | Some(serde_json::Value::Null) => true,
+			Some(serde_json::Value::Object(map)) => map.is_empty(),
+			Some(_) => false,
+		};
+		if is_empty {
+			Ok(())
+		} else {
+			Err(QuoteError::InvalidRequest(
+				"Unexpected resource-lock `params`: the signed lock message is built \
+				 server-side and does not accept client-supplied params"
+					.to_string(),
+			))
+		}
+	}
+
 	async fn generate_resource_lock_order(
 		&self,
 		request: &GetQuoteRequest,
@@ -509,17 +532,22 @@ impl QuoteGenerator {
 	) -> Result<OifOrder, QuoteError> {
 		use solver_types::LockKind;
 
-		let default_params = serde_json::json!({});
-		let params = lock.params.as_ref().unwrap_or(&default_params);
+		// C-06: the signed resource-lock message (e.g. BatchCompact) is constructed
+		// entirely server-side from the request and network config. Client-supplied
+		// `lock.params` carries no field that legitimately influences the message, and
+		// silently dropping it is unsafe: the client would believe its parameters took
+		// effect (arbiter, allocator tag, deadlines, ...) when they did not. Reject any
+		// non-empty params rather than ignore them. An absent or empty object is allowed.
+		Self::reject_unexpected_lock_params(lock.params.as_ref())?;
+
 		let (primary_type, message) = match &lock.kind {
 			LockKind::TheCompact => Ok((
 				"BatchCompact".to_string(),
-				self.build_compact_message(request, config, params).await?,
+				self.build_compact_message(request, config).await?,
 			)),
 			LockKind::Rhinestone => Ok((
 				"RhinestoneLock".to_string(),
-				self.build_rhinestone_message(request, config, params)
-					.await?,
+				self.build_rhinestone_message(request, config).await?,
 			)),
 		}?;
 
@@ -1127,7 +1155,6 @@ impl QuoteGenerator {
 		&self,
 		request: &GetQuoteRequest,
 		config: &Config,
-		_params: &serde_json::Value,
 	) -> Result<serde_json::Value, QuoteError> {
 		use alloy_primitives::{hex, U256};
 		use solver_types::utils::bytes20_to_alloy_address;
@@ -1352,7 +1379,6 @@ impl QuoteGenerator {
 		&self,
 		_request: &GetQuoteRequest,
 		_config: &Config,
-		_params: &serde_json::Value,
 	) -> Result<serde_json::Value, QuoteError> {
 		Err(QuoteError::UnsupportedSettlement(
 			"Rhinestone resource locks are not yet supported".to_string(),
@@ -2355,9 +2381,12 @@ mod tests {
 		let config = create_test_config();
 		let request = create_test_request();
 
+		// The signed BatchCompact message is built entirely server-side from the
+		// request and network config; `params` carries no legitimate field. Absent
+		// params must be accepted.
 		let lock = solver_types::AssetLockReference {
 			kind: solver_types::LockKind::TheCompact,
-			params: Some(serde_json::json!({"test": "value"})),
+			params: None,
 		};
 
 		let result = generator
@@ -2377,6 +2406,75 @@ mod tests {
 				// Expected if domain configuration is missing
 				assert!(matches!(e, QuoteError::InvalidRequest(_)));
 			},
+		}
+	}
+
+	#[tokio::test]
+	async fn test_generate_resource_lock_order_rejects_non_empty_params() {
+		// C-06: client-supplied `lock.params` are ignored when building the signed
+		// BatchCompact message. Silently dropping them is unsafe (the client believes
+		// they took effect), so non-empty params must be rejected at intake.
+		let settlement_service = create_test_settlement_service(true);
+		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(
+			HashMap::new(),
+			1,
+			60,
+			60,
+		));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let config = create_test_config();
+		let request = create_test_request();
+
+		let lock = solver_types::AssetLockReference {
+			kind: solver_types::LockKind::TheCompact,
+			params: Some(serde_json::json!({"arbiter": "0xdeadbeef"})),
+		};
+
+		let result = generator
+			.generate_resource_lock_order(&request, &config, &lock)
+			.await;
+
+		match result {
+			Err(QuoteError::InvalidRequest(msg)) => {
+				assert!(
+					msg.contains("params"),
+					"error should mention params, got: {msg}"
+				);
+			},
+			other => panic!("expected InvalidRequest rejecting params, got: {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_generate_resource_lock_order_accepts_empty_params_object() {
+		// An explicitly empty params object is equivalent to None and must be accepted.
+		let settlement_service = create_test_settlement_service(true);
+		let delivery_service = Arc::new(solver_delivery::DeliveryService::new(
+			HashMap::new(),
+			1,
+			60,
+			60,
+		));
+		let generator = QuoteGenerator::new(settlement_service, delivery_service);
+		let config = create_test_config();
+		let request = create_test_request();
+
+		let lock = solver_types::AssetLockReference {
+			kind: solver_types::LockKind::TheCompact,
+			params: Some(serde_json::json!({})),
+		};
+
+		let result = generator
+			.generate_resource_lock_order(&request, &config, &lock)
+			.await;
+
+		// Either succeeds, or fails for an unrelated config reason — but never with a
+		// params-rejection error.
+		if let Err(QuoteError::InvalidRequest(msg)) = &result {
+			assert!(
+				!msg.contains("params"),
+				"empty params must not be rejected, got: {msg}"
+			);
 		}
 	}
 
@@ -2476,7 +2574,6 @@ mod tests {
 		));
 		let generator = QuoteGenerator::new(settlement_service, delivery_service);
 		let request = create_test_request();
-		let params = serde_json::json!({"test": "value"});
 		let mut config = create_test_config();
 		let bsc_network = NetworkConfigBuilder::new()
 			.input_settler_address(
@@ -2490,9 +2587,7 @@ mod tests {
 
 		config.networks.insert(56, bsc_network);
 
-		let result = generator
-			.build_compact_message(&request, &config, &params)
-			.await;
+		let result = generator.build_compact_message(&request, &config).await;
 
 		assert!(result.is_ok());
 		let result_obj = result.unwrap();
@@ -2532,10 +2627,9 @@ mod tests {
 		let mut request = create_test_request();
 		let now = chrono::Utc::now().timestamp() as u64;
 		request.intent.min_valid_until = Some(now + 600);
-		let params = serde_json::json!({"test": "value"});
 
 		let result = generator
-			.build_compact_message(&request, &config, &params)
+			.build_compact_message(&request, &config)
 			.await
 			.expect("expected Compact message");
 		let expires = result["expires"]
@@ -3948,11 +4042,8 @@ mod tests {
 		let generator = create_test_generator();
 		let request = create_test_request();
 		let config = create_test_config();
-		let params = serde_json::json!({});
 
-		let result = generator
-			.build_rhinestone_message(&request, &config, &params)
-			.await;
+		let result = generator.build_rhinestone_message(&request, &config).await;
 
 		assert!(
 			matches!(result, Err(QuoteError::UnsupportedSettlement(msg)) if msg.contains("Rhinestone resource locks are not yet supported"))
@@ -4224,7 +4315,7 @@ mod tests {
 
 		let lock = solver_types::AssetLockReference {
 			kind: solver_types::LockKind::Rhinestone,
-			params: Some(serde_json::json!({"test": "value"})),
+			params: None,
 		};
 
 		let result = generator

@@ -61,6 +61,23 @@ pub async fn ensure_user_capacity_for_order(
 				if amount.is_zero() {
 					continue;
 				}
+				// TODO(C-06, part B): This `balanceOf(owner, id)` read is stateless. A
+				// single compact deposit can back multiple concurrent/sequential
+				// resource-lock orders that each pass this check, oversubscribing the
+				// deposit — every fill past the first is an unrecoverable loss because
+				// resource-lock prepare/escrow is skipped.
+				//
+				// The fix is an atomic per-(chain_id, owner, token_id) in-flight
+				// reservation: before admitting, check
+				//   balanceOf(owner, id) >= sum(existing_reservations) + amount
+				// then reserve `amount` atomically (CAS loop on
+				// `StorageInterface::compare_and_swap`, or a Redis INCRBY/Lua primitive),
+				// and release on terminal order transition. The reservation MUST be
+				// created here (intake) and released by the engine on confirmed claim
+				// (`OrderStatus::Finalized`) or definitive failure
+				// (`OrderStatus::Failed(..)`). See
+				// `docs/c06-resource-lock-reservation.md` for the full scheme, the
+				// atomic primitive, the release hooks, and the failure modes.
 				validate_compact_deposit_for_order(
 					solver,
 					config,
