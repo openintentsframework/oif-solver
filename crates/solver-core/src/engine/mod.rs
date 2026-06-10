@@ -240,6 +240,7 @@ impl SolverEngine {
 			storage.clone(),
 			state_machine.clone(),
 			event_bus.clone(),
+			dynamic_config.clone(),
 		));
 
 		let transaction_handler = Arc::new(TransactionHandler::new(
