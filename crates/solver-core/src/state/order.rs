@@ -5,7 +5,9 @@
 //! Also handles failure states and provides utilities for updating order fields.
 
 use once_cell::sync::Lazy;
-use solver_storage::{StorageIndexes, StorageService};
+use solver_storage::{
+	compact_reservations::CompactReservationStore, StorageIndexes, StorageService,
+};
 use solver_types::{Order, OrderStatus, StorageKey, TransactionType};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -128,11 +130,44 @@ impl OrderTransitionOutcome {
 /// Manages order state transitions and persistence
 pub struct OrderStateMachine {
 	storage: Arc<StorageService>,
+	/// Shared in-flight Compact-deposit reservation accounting.
+	///
+	/// MUST be the same instance the intake path (`IntentHandler`) reserves
+	/// through: `CompactReservationStore` holds per-lock-id mutex guards that
+	/// only serialize admissions when the SAME store instance is reused. A
+	/// fresh `::new()` per call would defeat the file-backend race fix.
+	compact_reservations: Arc<CompactReservationStore>,
 }
 
 impl OrderStateMachine {
 	pub fn new(storage: Arc<StorageService>) -> Self {
-		Self { storage }
+		let compact_reservations = Arc::new(CompactReservationStore::new(storage.clone()));
+		Self::with_compact_reservations(storage, compact_reservations)
+	}
+
+	/// Constructs a state machine sharing an existing reservation store.
+	///
+	/// Production wiring (`SolverEngine::new`) builds one
+	/// `Arc<CompactReservationStore>` and passes it here AND to `IntentHandler`
+	/// so reserve (intake) and release (terminal transition) serialize against
+	/// the same per-lock-id guards.
+	pub fn with_compact_reservations(
+		storage: Arc<StorageService>,
+		compact_reservations: Arc<CompactReservationStore>,
+	) -> Self {
+		Self {
+			storage,
+			compact_reservations,
+		}
+	}
+
+	/// The shared in-flight Compact-deposit reservation store.
+	///
+	/// `IntentHandler` clones this so intake reservation and terminal-state
+	/// release go through the SAME `CompactReservationStore` instance — the
+	/// per-lock-id mutex guards only serialize when the instance is shared.
+	pub fn compact_reservations(&self) -> Arc<CompactReservationStore> {
+		self.compact_reservations.clone()
 	}
 
 	/// Updates an order with a closure and persists it
@@ -267,6 +302,9 @@ impl OrderStateMachine {
 				.map_err(|e| OrderStateError::Storage(e.to_string()))?;
 
 			if swapped {
+				if should_release_compact_reservations(&order.status) {
+					self.release_compact_reservations(&order).await;
+				}
 				return Ok(OrderTransitionOutcome::Applied(order));
 			}
 		}
@@ -274,6 +312,25 @@ impl OrderStateMachine {
 		Err(OrderStateError::Storage(format!(
 			"CAS conflict after {ORDER_CAS_MAX_RETRIES} retries transitioning order {order_id}"
 		)))
+	}
+
+	/// Best-effort release of the compact deposit reservations taken at
+	/// intake for a resource-lock order reaching a terminal state.
+	///
+	/// Delegates to the shared
+	/// [`crate::handlers::compact_reservation::release_compact_reservations`];
+	/// failures only delay reuse of the deposit until the reservation lapses at
+	/// the order's `expires` timestamp, so they are logged, not propagated.
+	async fn release_compact_reservations(&self, order: &Order) {
+		if order.standard != "eip7683" {
+			return;
+		}
+		crate::handlers::compact_reservation::release_compact_reservations(
+			&self.compact_reservations,
+			order,
+			"terminal transition",
+		)
+		.await;
 	}
 
 	/// `current` is "at or past" `target` iff `current` is reachable from
@@ -399,6 +456,47 @@ pub(crate) fn is_terminal_status(status: &OrderStatus) -> bool {
 	matches!(status, OrderStatus::Finalized | OrderStatus::Failed(_, _))
 }
 
+/// Whether reaching `status` may safely release a resource-lock order's
+/// reserved Compact deposit.
+///
+/// A reservation must NOT be released while the solver might still need the
+/// origin deposit — either because the destination fill has committed (recovery
+/// must still claim) or because a fill tx the solver broadcast might yet land
+/// on-chain. Releasing in either case would let another order consume the same
+/// balance and oversubscribe the deposit (the exact C-06 failure mode).
+///
+/// Release policy: release ONLY on `Finalized`. Every `Failed(_)` variant holds
+/// the reservation and lets it lapse at the order's `expires` (the TTL
+/// backstop in `CompactReservationStore`).
+///
+/// - `Finalized` — the full lifecycle completed (the claim landed); the
+///   reservation is no longer needed.
+/// - `Failed(Fill)` is AMBIGUOUS and must NOT release. The engine
+///   (`engine/mod.rs`, the `OrderExecuting` arm) marks an order
+///   `Failed(Fill, ...)` whenever `OrderHandler::handle_execution` returns Err.
+///   That includes the window in `handle_execution` AFTER `delivery.deliver`
+///   has already broadcast the fill tx but a subsequent metadata write fails —
+///   either `set_transaction_hash` or the `OrderByTxHash` reverse-mapping
+///   `storage.store`. In that window the delivered fill tx may still mine
+///   successfully on-chain while the order is marked `Failed(Fill)`. Releasing
+///   then could admit another order against the same deposit before the first
+///   fill lands → oversubscription. So we cannot prove from `Failed(Fill)`
+///   alone that the deposit was never consumed; we hold the reservation.
+/// - `Failed(Prepare)` and all post-fill failures — `Failed(PostFill)`,
+///   `Failed(PreClaim)`, `Failed(Claim)` — are likewise held, for symmetry and
+///   safety: none of them can prove the fill never landed, and holding is never
+///   unsafe.
+///
+/// Trade-off: capacity for a failed order stays held until the order's
+/// `expires` timestamp instead of being freed immediately. This is deliberate.
+/// The reservation is keyed by `expires` and lapses on its own (no leak), so
+/// the only cost is delayed reuse of that specific deposit for the failed
+/// order's lifetime — which is strictly safe, whereas an early release on an
+/// ambiguous `Failed` is not.
+fn should_release_compact_reservations(status: &OrderStatus) -> bool {
+	matches!(status, OrderStatus::Finalized)
+}
+
 fn order_storage_indexes(order: &Order) -> StorageIndexes {
 	StorageIndexes::new()
 		.with_field(
@@ -423,9 +521,12 @@ fn stamp_updated_at(order: &mut Order) -> Result<(), OrderStateError> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use alloy_primitives::U256;
 	use solver_storage::{MockStorageInterface, StorageService};
 	use solver_types::{
-		utils::tests::builders::OrderBuilder, OrderStatus, TransactionHash, TransactionType,
+		standards::eip7683::{Eip7683OrderData, LockType},
+		utils::tests::builders::OrderBuilder,
+		OrderStatus, TransactionHash, TransactionType,
 	};
 	use std::collections::VecDeque;
 	use std::sync::{
@@ -441,6 +542,251 @@ mod tests {
 
 	fn create_test_order() -> Order {
 		OrderBuilder::new().with_id("test_order_1").build()
+	}
+
+	#[tokio::test]
+	async fn terminal_transition_releases_compact_reservation() {
+		use solver_storage::compact_reservations::{CompactReservationStore, DepositReservation};
+		use solver_types::standards::eip7683::GasLimitOverrides;
+
+		let storage = create_test_storage();
+		let state_machine = OrderStateMachine::new(storage.clone());
+		let reservations = CompactReservationStore::new(storage);
+
+		let user = "0x1234567890123456789012345678901234567890";
+		let token_id = U256::from(7u64);
+		let amount = U256::from(500u64);
+		let expires = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_secs()
+			+ 3600;
+
+		let deposit = DepositReservation {
+			chain_id: 1,
+			owner: user.to_string(),
+			token_id,
+			amount,
+			available_balance: amount,
+		};
+		reservations
+			.reserve_order("rl_order", expires, &[deposit.clone()])
+			.await
+			.unwrap();
+		// Deposit fully reserved: a second order must be rejected.
+		assert!(reservations
+			.reserve_order("rl_other", expires, &[deposit.clone()])
+			.await
+			.is_err());
+
+		let order_data = Eip7683OrderData {
+			user: user.to_string(),
+			nonce: U256::from(1u64),
+			origin_chain_id: U256::from(1u64),
+			expires: expires as u32,
+			fill_deadline: expires as u32,
+			input_oracle: user.to_string(),
+			inputs: vec![[token_id, amount]],
+			order_id: [0u8; 32],
+			gas_limit_overrides: GasLimitOverrides::default(),
+			outputs: vec![],
+			raw_order_data: None,
+			signature: None,
+			sponsor: None,
+			lock_type: Some(LockType::ResourceLock),
+		};
+		let order = OrderBuilder::new()
+			.with_id("rl_order")
+			.with_status(OrderStatus::Settled)
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.build();
+		state_machine.store_order(&order).await.unwrap();
+
+		state_machine
+			.transition_order_status("rl_order", OrderStatus::Finalized)
+			.await
+			.unwrap();
+
+		// The terminal transition released the reservation, freeing the
+		// deposit for the next order.
+		reservations
+			.reserve_order("rl_other", expires, &[deposit])
+			.await
+			.unwrap();
+	}
+
+	/// Builds a resource-lock order whose single input fully subscribes a
+	/// `token_id` deposit, plus the matching `DepositReservation`.
+	fn resource_lock_order_and_deposit(
+		order_id: &str,
+		status: OrderStatus,
+		expires: u64,
+	) -> (
+		Order,
+		solver_storage::compact_reservations::DepositReservation,
+	) {
+		use solver_storage::compact_reservations::DepositReservation;
+		use solver_types::standards::eip7683::GasLimitOverrides;
+
+		let user = "0x1234567890123456789012345678901234567890";
+		let token_id = U256::from(7u64);
+		let amount = U256::from(500u64);
+
+		let order_data = Eip7683OrderData {
+			user: user.to_string(),
+			nonce: U256::from(1u64),
+			origin_chain_id: U256::from(1u64),
+			expires: expires as u32,
+			fill_deadline: expires as u32,
+			input_oracle: user.to_string(),
+			inputs: vec![[token_id, amount]],
+			order_id: [0u8; 32],
+			gas_limit_overrides: GasLimitOverrides::default(),
+			outputs: vec![],
+			raw_order_data: None,
+			signature: None,
+			sponsor: None,
+			lock_type: Some(LockType::ResourceLock),
+		};
+		let order = OrderBuilder::new()
+			.with_id(order_id)
+			.with_status(status)
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.build();
+		let deposit = DepositReservation {
+			chain_id: 1,
+			owner: user.to_string(),
+			token_id,
+			amount,
+			available_balance: amount,
+		};
+		(order, deposit)
+	}
+
+	#[tokio::test]
+	async fn failed_post_fill_transition_does_not_release_compact_reservation() {
+		// Fix B: once the fill has committed, a post-fill failure must keep the
+		// deposit reserved so recovery can still claim. Releasing here would let
+		// another order consume the same balance and strand recovery.
+		use solver_storage::compact_reservations::CompactReservationStore;
+
+		let storage = create_test_storage();
+		let state_machine = OrderStateMachine::new(storage.clone());
+		let reservations = CompactReservationStore::new(storage);
+
+		let expires = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_secs()
+			+ 3600;
+
+		// Order is at `Executed` (fill already confirmed on-chain).
+		let (order, deposit) =
+			resource_lock_order_and_deposit("rl_pf", OrderStatus::Executed, expires);
+		reservations
+			.reserve_order("rl_pf", expires, &[deposit.clone()])
+			.await
+			.unwrap();
+		state_machine.store_order(&order).await.unwrap();
+
+		state_machine
+			.transition_order_status(
+				"rl_pf",
+				OrderStatus::Failed(TransactionType::PostFill, "boom".to_string()),
+			)
+			.await
+			.unwrap();
+
+		// The reservation must STILL be held: a competing order against the
+		// same fully-subscribed deposit must be rejected.
+		assert!(
+			reservations
+				.reserve_order("rl_other", expires, &[deposit])
+				.await
+				.is_err(),
+			"post-fill failure must not release the reservation"
+		);
+	}
+
+	#[tokio::test]
+	async fn failed_fill_transition_does_not_release_compact_reservation() {
+		// Fix 1 (C-06 round 2): `Failed(Fill)` is ambiguous — the engine sets it
+		// when `handle_execution` returns Err, which includes the window AFTER
+		// `delivery.deliver` has broadcast the fill tx but a later metadata write
+		// (`set_transaction_hash` / `OrderByTxHash`) fails. The delivered fill may
+		// still land on-chain, so releasing here could admit another order against
+		// the same deposit and oversubscribe it. The reservation must be HELD and
+		// allowed to lapse at the order's `expires` (the TTL backstop).
+		use solver_storage::compact_reservations::CompactReservationStore;
+
+		let storage = create_test_storage();
+		let state_machine = OrderStateMachine::new(storage.clone());
+		let reservations = CompactReservationStore::new(storage);
+
+		let expires = std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.unwrap()
+			.as_secs()
+			+ 3600;
+
+		// Order is at `Executing` (fill submitted but not confirmed).
+		let (order, deposit) =
+			resource_lock_order_and_deposit("rl_fail", OrderStatus::Executing, expires);
+		reservations
+			.reserve_order("rl_fail", expires, &[deposit.clone()])
+			.await
+			.unwrap();
+		state_machine.store_order(&order).await.unwrap();
+
+		state_machine
+			.transition_order_status(
+				"rl_fail",
+				OrderStatus::Failed(TransactionType::Fill, "reverted".to_string()),
+			)
+			.await
+			.unwrap();
+
+		// The reservation must STILL be held: a competing order against the same
+		// fully-subscribed deposit must be rejected, since the fill tx may have
+		// landed on-chain.
+		assert!(
+			reservations
+				.reserve_order("rl_other", expires, &[deposit])
+				.await
+				.is_err(),
+			"Failed(Fill) must not release the reservation: the fill tx may still land"
+		);
+	}
+
+	#[test]
+	fn should_release_compact_reservations_policy() {
+		// Fix 1 (C-06 round 2): release ONLY on `Finalized`. Every `Failed(_)`
+		// variant holds the reservation and lets it lapse at `expires`, because
+		// no failure status can prove the fill tx never landed on-chain.
+		assert!(should_release_compact_reservations(&OrderStatus::Finalized));
+		assert!(!should_release_compact_reservations(&OrderStatus::Failed(
+			TransactionType::Prepare,
+			"x".to_string()
+		)));
+		assert!(!should_release_compact_reservations(&OrderStatus::Failed(
+			TransactionType::Fill,
+			"x".to_string()
+		)));
+		assert!(!should_release_compact_reservations(&OrderStatus::Failed(
+			TransactionType::PostFill,
+			"x".to_string()
+		)));
+		assert!(!should_release_compact_reservations(&OrderStatus::Failed(
+			TransactionType::PreClaim,
+			"x".to_string()
+		)));
+		assert!(!should_release_compact_reservations(&OrderStatus::Failed(
+			TransactionType::Claim,
+			"x".to_string()
+		)));
+		// Non-terminal statuses never release.
+		assert!(!should_release_compact_reservations(&OrderStatus::Executed));
+		assert!(!should_release_compact_reservations(&OrderStatus::Settled));
 	}
 
 	#[tokio::test]

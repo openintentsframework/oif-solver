@@ -15,7 +15,10 @@ use solver_config::Config;
 use solver_delivery::DeliveryService;
 use solver_order::OrderService;
 use solver_settlement::admission::estimate_required_expiry_window_seconds;
-use solver_storage::StorageService;
+use solver_storage::{
+	compact_reservations::{CompactReservationStore, ReservationError},
+	StorageService,
+};
 use solver_types::{
 	current_timestamp, standards::eip7683::LockType, truncate_id, with_0x_prefix, Address,
 	DiscoveryEvent, Eip7683OrderData, ExecutionDecision, ExecutionParams, Intent, Order,
@@ -65,6 +68,15 @@ pub struct IntentHandler {
 	/// Denied Ethereum addresses (lowercase hex with 0x prefix).
 	/// Loaded once at startup from `config.solver.deny_list` if set.
 	denied_addresses: HashSet<String>,
+	/// Shared in-flight Compact-deposit reservation accounting.
+	///
+	/// Cloned from the `OrderStateMachine` passed to `new`, so intake
+	/// reservation here and terminal-state release in the state machine go
+	/// through the SAME `CompactReservationStore` instance. The store holds
+	/// per-lock-id mutex guards that only serialize concurrent admissions when
+	/// one instance is reused; a fresh `::new()` per reservation would defeat
+	/// the file-backend create-race fix.
+	compact_reservations: Arc<CompactReservationStore>,
 }
 
 impl IntentHandler {
@@ -95,6 +107,10 @@ impl IntentHandler {
 				panic!("Deny list is configured but could not be loaded (fail-closed): {e}");
 			},
 		};
+		// Share the SAME reservation store the state machine releases through,
+		// so intake reserve and terminal release serialize against one set of
+		// per-lock-id guards (Fix 2: a per-call `::new()` defeated this).
+		let compact_reservations = state_machine.compact_reservations();
 		Self {
 			order_service,
 			storage,
@@ -109,6 +125,7 @@ impl IntentHandler {
 				NonZeroUsize::new(10000).unwrap(),
 			))),
 			denied_addresses,
+			compact_reservations,
 		}
 	}
 
@@ -170,9 +187,8 @@ impl IntentHandler {
 			self.event_bus
 				.publish(SolverEvent::Discovery(DiscoveryEvent::IntentRejected {
 					intent_id: intent.id,
-					reason:
-						"ResourceLock orders are disabled by this solver until reservation support is implemented"
-							.to_string(),
+					reason: "ResourceLock orders are disabled by this solver configuration"
+						.to_string(),
 				}))
 				.ok();
 			return Ok(());
@@ -538,13 +554,50 @@ impl IntentHandler {
 					.build_execution_context(&intent)
 					.await
 					.map_err(|e| IntentError::Service(e.to_string()))?;
+
+				// Reserve the order's Compact deposits at the engine acceptance
+				// boundary, before the order is stored/executed or deferred.
+				// This is the single authoritative reservation point: it covers
+				// every intake path (HTTP /orders, discovery /intent, on-chain
+				// events), unlike a service-side reservation which only the
+				// /orders path would hit. A compact deposit's on-chain balance is
+				// not reduced until the origin claim lands, so without this two
+				// orders could draw on the same deposit. The reservation is keyed
+				// by the engine order id, expires at the order's `expires`, and is
+				// released on terminal states (see
+				// `OrderStateMachine::release_compact_reservations`).
+				if intent.lock_type == LockType::ResourceLock.as_str() {
+					match self.reserve_compact_deposits(&order).await {
+						Ok(true) => {},
+						Ok(false) => {
+							// No deposits to reserve (e.g. all-zero inputs); nothing held.
+						},
+						Err(reason) => {
+							tracing::warn!(
+								order_id = %order.id,
+								%reason,
+								"Intent rejected: compact deposit reservation failed"
+							);
+							self.event_bus
+								.publish(SolverEvent::Discovery(DiscoveryEvent::IntentRejected {
+									intent_id: intent.id,
+									reason,
+								}))
+								.ok();
+							return Ok(());
+						},
+					}
+				}
+
 				match self.order_service.should_execute(&order, &context).await {
 					ExecutionDecision::Execute(params) => {
 						order.execution_params = Some(params.clone());
-						self.state_machine
-							.store_order(&order)
-							.await
-							.map_err(|e| IntentError::Storage(e.to_string()))?;
+						if let Err(e) = self.state_machine.store_order(&order).await {
+							// Release the reservation we just took so the deposit
+							// is not stranded until expiry on a failed store.
+							self.release_compact_deposits(&order).await;
+							return Err(IntentError::Storage(e.to_string()));
+						}
 						self.event_bus
 							.publish(SolverEvent::Order(OrderEvent::Preparing {
 								intent: intent.clone(),
@@ -554,6 +607,9 @@ impl IntentHandler {
 							.ok();
 					},
 					ExecutionDecision::Skip(reason) => {
+						// The order will never be stored, so its reservation would
+						// otherwise linger until `expires`. Release it now.
+						self.release_compact_deposits(&order).await;
 						self.event_bus
 							.publish(SolverEvent::Order(OrderEvent::Skipped {
 								order_id: order.id,
@@ -562,10 +618,10 @@ impl IntentHandler {
 							.ok();
 					},
 					ExecutionDecision::Defer(duration) => {
-						self.state_machine
-							.store_order(&order)
-							.await
-							.map_err(|e| IntentError::Storage(e.to_string()))?;
+						if let Err(e) = self.state_machine.store_order(&order).await {
+							self.release_compact_deposits(&order).await;
+							return Err(IntentError::Storage(e.to_string()));
+						}
 						self.event_bus
 							.publish(SolverEvent::Order(OrderEvent::Deferred {
 								order_id: order.id,
@@ -590,6 +646,60 @@ impl IntentHandler {
 		}
 
 		Ok(())
+	}
+
+	/// Reserves the resource-lock order's Compact deposits.
+	///
+	/// Returns `Ok(true)` when at least one deposit was reserved, `Ok(false)`
+	/// when the order has nothing to reserve (no non-zero deposit inputs), and
+	/// `Err(reason)` when the deposit could not be derived (chain/config/RPC
+	/// failure) or the deposit is oversubscribed by other in-flight orders. The
+	/// caller maps `Err` to an `IntentRejected` rejection.
+	async fn reserve_compact_deposits(&self, order: &Order) -> Result<bool, String> {
+		let order_data: Eip7683OrderData = serde_json::from_value(order.data.clone())
+			.map_err(|e| format!("Failed to parse order data for compact reservation: {e}"))?;
+
+		let config = self.dynamic_config.read().await.clone();
+		let deposits = crate::handlers::compact_reservation::derive_compact_deposit_reservations(
+			&self.delivery,
+			&config,
+			&order_data,
+		)
+		.await?;
+
+		if deposits.is_empty() {
+			return Ok(false);
+		}
+
+		self.compact_reservations
+			.reserve_order(&order.id, u64::from(order_data.expires), &deposits)
+			.await
+			.map_err(|e| match e {
+				ReservationError::Oversubscribed { .. } => {
+					format!("Compact deposit oversubscribed by in-flight orders: {e}")
+				},
+				ReservationError::Storage(msg) => {
+					format!("Failed to reserve compact deposit: {msg}")
+				},
+			})?;
+		Ok(true)
+	}
+
+	/// Best-effort release of an order's Compact reservations.
+	///
+	/// Used on the engine-side intake paths that abandon an order after it was
+	/// reserved (Skip decision, or a storage failure when persisting). Delegates
+	/// to the shared
+	/// [`crate::handlers::compact_reservation::release_compact_reservations`];
+	/// failures only delay reuse of the deposit until the reservation lapses at
+	/// the order's `expires`, so they are logged, not propagated.
+	async fn release_compact_deposits(&self, order: &Order) {
+		crate::handlers::compact_reservation::release_compact_reservations(
+			&self.compact_reservations,
+			order,
+			"intake abandon",
+		)
+		.await;
 	}
 }
 
@@ -2769,5 +2879,422 @@ mod tests {
 		let recipient_addr = format!("0x{hex_str}");
 
 		assert!(set.contains(&recipient_addr));
+	}
+
+	// ===================== Fix A: engine-side compact reservations =====================
+
+	const RL_USER: &str = "0x1234567890123456789012345678901234567890";
+	const RL_COMPACT: &str = "0x3333333333333333333333333333333333333333";
+	const RL_CHAIN: u64 = 1;
+
+	/// Delivery stub whose `eth_call` returns a fixed `balanceOf` result. Used
+	/// to drive `derive_compact_deposit_reservations` in reservation tests.
+	struct BalanceDelivery {
+		balance: U256,
+	}
+
+	#[async_trait::async_trait]
+	impl solver_delivery::DeliveryInterface for BalanceDelivery {
+		fn config_schema(&self) -> Box<dyn solver_types::validation::ConfigSchema> {
+			unimplemented!()
+		}
+		async fn submit(
+			&self,
+			_: solver_types::Transaction,
+			_: Option<solver_delivery::TransactionTrackingWithConfig>,
+		) -> Result<solver_types::TransactionHash, solver_delivery::DeliveryError> {
+			unimplemented!()
+		}
+		async fn get_receipt(
+			&self,
+			_: &solver_types::TransactionHash,
+			_: u64,
+		) -> Result<solver_types::TransactionReceipt, solver_delivery::DeliveryError> {
+			unimplemented!()
+		}
+		async fn get_fee_params(
+			&self,
+			chain_id: u64,
+		) -> Result<solver_delivery::FeeParams, solver_delivery::DeliveryError> {
+			Ok(solver_delivery::FeeParams::legacy(chain_id, 1))
+		}
+		async fn get_balance(
+			&self,
+			_: &str,
+			_: Option<&str>,
+			_: u64,
+		) -> Result<String, solver_delivery::DeliveryError> {
+			unimplemented!()
+		}
+		async fn get_allowance(
+			&self,
+			_: &str,
+			_: &str,
+			_: &str,
+			_: u64,
+		) -> Result<String, solver_delivery::DeliveryError> {
+			unimplemented!()
+		}
+		async fn get_nonce(&self, _: &str, _: u64) -> Result<u64, solver_delivery::DeliveryError> {
+			unimplemented!()
+		}
+		async fn get_block_number(&self, _: u64) -> Result<u64, solver_delivery::DeliveryError> {
+			unimplemented!()
+		}
+		async fn estimate_gas(
+			&self,
+			_: solver_types::Transaction,
+		) -> Result<u64, solver_delivery::DeliveryError> {
+			unimplemented!()
+		}
+		async fn estimate_gas_with_overrides(
+			&self,
+			_: solver_types::Transaction,
+			_: alloy_rpc_types::state::StateOverride,
+		) -> Result<u64, solver_delivery::DeliveryError> {
+			unimplemented!()
+		}
+		async fn eth_call(
+			&self,
+			_: solver_types::Transaction,
+		) -> Result<alloy_primitives::Bytes, solver_delivery::DeliveryError> {
+			Ok(alloy_primitives::Bytes::from(
+				self.balance.to_be_bytes::<32>().to_vec(),
+			))
+		}
+		async fn tx_exists(
+			&self,
+			_: &solver_types::TransactionHash,
+			_: u64,
+		) -> Result<bool, solver_delivery::DeliveryError> {
+			Ok(false)
+		}
+		async fn get_logs(
+			&self,
+			_: u64,
+			_: solver_types::LogFilter,
+		) -> Result<Vec<solver_types::Log>, solver_delivery::DeliveryError> {
+			Ok(vec![])
+		}
+	}
+
+	fn rl_config(balance: U256) -> (Config, Arc<DeliveryService>) {
+		let network = solver_types::utils::tests::builders::NetworkConfigBuilder::new()
+			.the_compact_address_hex(RL_COMPACT)
+			.unwrap()
+			.build();
+		let networks = solver_types::utils::tests::builders::NetworksConfigBuilder::new()
+			.add_network(RL_CHAIN, network)
+			.build();
+		let config = ConfigBuilder::new().networks(networks).build();
+
+		let mut delivery_impls: HashMap<u64, Arc<dyn solver_delivery::DeliveryInterface>> =
+			HashMap::new();
+		delivery_impls.insert(RL_CHAIN, Arc::new(BalanceDelivery { balance }));
+		let delivery = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
+		(config, delivery)
+	}
+
+	fn rl_handler(
+		storage: Arc<StorageService>,
+		delivery: Arc<DeliveryService>,
+		config: Config,
+	) -> IntentHandler {
+		let order_service = Arc::new(OrderService::new(
+			HashMap::new(),
+			Box::new(MockExecutionStrategy::new()),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let cost_profit_service = create_mock_cost_profit_service();
+		let dynamic_config = Arc::new(RwLock::new(config.clone()));
+		IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			create_test_address(),
+			token_manager,
+			cost_profit_service,
+			dynamic_config,
+			&config,
+		)
+	}
+
+	fn rl_order(order_id: &str, token_id: U256, amount: U256) -> Order {
+		use solver_types::standards::eip7683::GasLimitOverrides;
+		let expires = (current_timestamp() as u32).saturating_add(3600);
+		let order_data = Eip7683OrderData {
+			user: RL_USER.to_string(),
+			nonce: U256::from(1u64),
+			origin_chain_id: U256::from(RL_CHAIN),
+			expires,
+			fill_deadline: expires,
+			input_oracle: RL_USER.to_string(),
+			inputs: vec![[token_id, amount]],
+			order_id: [0u8; 32],
+			gas_limit_overrides: GasLimitOverrides::default(),
+			outputs: vec![],
+			raw_order_data: None,
+			signature: None,
+			sponsor: None,
+			lock_type: Some(LockType::ResourceLock),
+		};
+		OrderBuilder::new()
+			.with_id(order_id.to_string())
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.build()
+	}
+
+	#[tokio::test]
+	async fn reserve_compact_deposits_records_reservation() {
+		// (a) An admitted resource-lock order holds a reservation against its
+		// Compact deposit.
+		use solver_storage::compact_reservations::{CompactReservationStore, DepositReservation};
+
+		let storage = Arc::new(StorageService::new(Box::new(
+			solver_storage::implementations::memory::MemoryStorage::new(),
+		)));
+		let token_id = U256::from(7u64);
+		let amount = U256::from(500u64);
+		let (config, delivery) = rl_config(amount);
+		let handler = rl_handler(storage.clone(), delivery, config);
+
+		let order = rl_order("rl-a", token_id, amount);
+		let reserved = handler.reserve_compact_deposits(&order).await.unwrap();
+		assert!(reserved, "expected a deposit to be reserved");
+
+		// The deposit is now fully subscribed: a direct second reservation
+		// against the same lock must be rejected.
+		let store = CompactReservationStore::new(storage);
+		let expires = current_timestamp().saturating_add(3600);
+		let err = store
+			.reserve_order(
+				"rl-other",
+				expires,
+				&[DepositReservation {
+					chain_id: RL_CHAIN,
+					owner: RL_USER.to_string(),
+					token_id,
+					amount,
+					available_balance: amount,
+				}],
+			)
+			.await
+			.unwrap_err();
+		assert!(matches!(
+			err,
+			solver_storage::compact_reservations::ReservationError::Oversubscribed { .. }
+		));
+	}
+
+	#[tokio::test]
+	async fn reserve_compact_deposits_rejects_oversubscription() {
+		// (b) A second order drawing on the same deposit is rejected once the
+		// deposit is fully subscribed.
+		let storage = Arc::new(StorageService::new(Box::new(
+			solver_storage::implementations::memory::MemoryStorage::new(),
+		)));
+		let token_id = U256::from(7u64);
+		let amount = U256::from(500u64);
+		let (config, delivery) = rl_config(amount);
+		let handler = rl_handler(storage, delivery, config);
+
+		handler
+			.reserve_compact_deposits(&rl_order("rl-a", token_id, amount))
+			.await
+			.unwrap();
+
+		let err = handler
+			.reserve_compact_deposits(&rl_order("rl-b", token_id, amount))
+			.await
+			.unwrap_err();
+		assert!(
+			err.contains("oversubscribed"),
+			"expected oversubscription rejection, got: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn release_compact_deposits_frees_capacity() {
+		// (c) Releasing a reservation (the Skip / error path) frees the deposit
+		// for the next order.
+		let storage = Arc::new(StorageService::new(Box::new(
+			solver_storage::implementations::memory::MemoryStorage::new(),
+		)));
+		let token_id = U256::from(7u64);
+		let amount = U256::from(500u64);
+		let (config, delivery) = rl_config(amount);
+		let handler = rl_handler(storage, delivery, config);
+
+		let order = rl_order("rl-a", token_id, amount);
+		handler.reserve_compact_deposits(&order).await.unwrap();
+
+		// Before release a competing order is rejected...
+		assert!(handler
+			.reserve_compact_deposits(&rl_order("rl-b", token_id, amount))
+			.await
+			.is_err());
+
+		// ...releasing rl-a frees the capacity.
+		handler.release_compact_deposits(&order).await;
+
+		handler
+			.reserve_compact_deposits(&rl_order("rl-b", token_id, amount))
+			.await
+			.unwrap();
+	}
+
+	#[tokio::test]
+	async fn reserve_compact_deposits_rejects_when_deposit_insufficient() {
+		// A deposit smaller than the order amount is rejected at reservation
+		// time (oversubscribed against a balance that cannot cover it).
+		let storage = Arc::new(StorageService::new(Box::new(
+			solver_storage::implementations::memory::MemoryStorage::new(),
+		)));
+		let token_id = U256::from(7u64);
+		let amount = U256::from(500u64);
+		let (config, delivery) = rl_config(U256::from(100u64)); // balance < amount
+		let handler = rl_handler(storage, delivery, config);
+
+		let err = handler
+			.reserve_compact_deposits(&rl_order("rl-a", token_id, amount))
+			.await
+			.unwrap_err();
+		assert!(
+			err.contains("oversubscribed"),
+			"expected oversubscription rejection, got: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn concurrent_reservations_through_shared_handler_never_oversubscribe_file_backend() {
+		// Fix 2 (C-06 round 2): the per-lock-id mutex guards in
+		// `CompactReservationStore` only serialize concurrent admissions when one
+		// store instance is reused. Production wires a single store into both the
+		// `IntentHandler` (reserve) and `OrderStateMachine` (release); a per-call
+		// `::new()` would give each admission a fresh guard map and reopen the
+		// non-atomic `set_nx` create race on the file backend.
+		//
+		// This drives concurrent `reserve_compact_deposits` through ONE handler
+		// (the production pattern) over the file backend. With sharing, exactly
+		// `balance / amount` admissions win; without it, the create race could
+		// admit more and oversubscribe.
+		use solver_storage::implementations::file::{FileStorage, TtlConfig};
+
+		let temp = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let token_id = U256::from(7u64);
+		let amount = U256::from(100u64);
+		let balance = U256::from(500u64);
+		let (config, delivery) = rl_config(balance);
+		// One handler == one shared reservation store, as in production.
+		let handler = Arc::new(rl_handler(storage, delivery, config));
+
+		let mut handles = Vec::new();
+		for i in 0..10 {
+			let handler = Arc::clone(&handler);
+			handles.push(tokio::spawn(async move {
+				handler
+					.reserve_compact_deposits(&rl_order(&format!("rl-{i}"), token_id, amount))
+					.await
+					.unwrap_or(false)
+			}));
+		}
+
+		let mut admitted = 0;
+		for handle in handles {
+			if handle.await.unwrap() {
+				admitted += 1;
+			}
+		}
+		// 500 / 100 = exactly 5 orders fit.
+		assert_eq!(
+			admitted, 5,
+			"shared store must serialize concurrent admissions; got {admitted} admitted"
+		);
+	}
+
+	#[tokio::test]
+	async fn handler_reserve_and_state_machine_release_share_one_store() {
+		// Fix 2: the reserve path (IntentHandler) and the terminal-state release
+		// path (OrderStateMachine) must operate on the SAME store. Build a state
+		// machine, derive a handler from it (as production does), reserve through
+		// the handler, then release through the state machine and confirm the
+		// capacity is freed — which only works if both share one instance over a
+		// CAS-backed store.
+		use solver_types::OrderStatus;
+
+		let storage = Arc::new(StorageService::new(Box::new(
+			solver_storage::implementations::memory::MemoryStorage::new(),
+		)));
+		let token_id = U256::from(7u64);
+		let amount = U256::from(500u64);
+		let (config, delivery) = rl_config(amount);
+
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::new(),
+			Box::new(MockExecutionStrategy::new()),
+		));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine.clone(),
+			EventBus::new(100),
+			delivery,
+			create_test_address(),
+			token_manager,
+			create_mock_cost_profit_service(),
+			Arc::new(RwLock::new(config.clone())),
+			&config,
+		);
+
+		// Reserve through the handler; the deposit is now fully subscribed.
+		let order = rl_order("rl-a", token_id, amount);
+		handler.reserve_compact_deposits(&order).await.unwrap();
+		assert!(handler
+			.reserve_compact_deposits(&rl_order("rl-b", token_id, amount))
+			.await
+			.is_err());
+
+		// Release through the state machine's terminal-status path (Finalized).
+		state_machine.store_order(&order).await.unwrap();
+		// Walk the order to Finalized so the release fires on the terminal hop.
+		for status in [
+			OrderStatus::Executing,
+			OrderStatus::Executed,
+			OrderStatus::Settled,
+			OrderStatus::Finalized,
+		] {
+			state_machine
+				.transition_order_status(&order.id, status)
+				.await
+				.unwrap();
+		}
+
+		// The deposit is free again because reserve and release shared one store.
+		handler
+			.reserve_compact_deposits(&rl_order("rl-b", token_id, amount))
+			.await
+			.unwrap();
 	}
 }

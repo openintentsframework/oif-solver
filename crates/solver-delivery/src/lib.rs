@@ -24,6 +24,9 @@ pub mod implementations {
 	}
 }
 
+pub mod compact;
+pub use compact::fetch_compact_balance;
+
 pub mod revert_classifier;
 pub use revert_classifier::{classify_revert, RevertClassification, StageCompleteReason};
 

@@ -14,6 +14,7 @@
 //! The [`nonce_store`] module provides nonce management for admin authentication
 //! with Redis-backed storage and TTL support.
 
+pub mod compact_reservations;
 pub mod config_store;
 pub mod nonce_store;
 pub mod readiness;
@@ -569,6 +570,21 @@ impl StorageService {
 		let bytes =
 			serde_json::to_vec(data).map_err(|e| StorageError::Serialization(e.to_string()))?;
 		self.backend.set_bytes(&key, bytes, indexes, None).await
+	}
+
+	/// Stores raw bytes only if the key does not already exist.
+	///
+	/// Returns `Ok(true)` if the value was stored, `Ok(false)` if the key
+	/// already exists. Atomicity follows the backend's `set_nx` guarantees.
+	pub async fn store_bytes_if_absent(
+		&self,
+		namespace: &str,
+		id: &str,
+		value: Vec<u8>,
+		ttl: Option<Duration>,
+	) -> Result<bool, StorageError> {
+		let key = format!("{namespace}:{id}");
+		self.backend.set_nx(&key, value, ttl).await
 	}
 
 	/// Atomically replaces raw bytes if the current bytes still match `expected`.

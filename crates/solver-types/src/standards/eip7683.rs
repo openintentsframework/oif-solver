@@ -383,6 +383,7 @@ pub mod interfaces {
 		interface ITheCompact {
 			function DOMAIN_SEPARATOR() external view returns (bytes32);
 			function getLockDetails(uint256 id) external view returns (address token, address allocator, uint8 resetPeriod, uint8 scope, bytes12 lockTag);
+			function balanceOf(address owner, uint256 id) external view returns (uint256);
 		}
 
 		/// IAllocator interface exposing the off-chain claim authorization predicate.
