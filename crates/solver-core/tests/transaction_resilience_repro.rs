@@ -8,14 +8,16 @@ use solver_core::{
 	EventBus,
 };
 use solver_delivery::{DeliveryService, MockDeliveryInterface};
+use solver_settlement::SettlementReadiness;
 use solver_settlement::{MockSettlementInterface, SettlementService};
 use solver_storage::{
 	implementations::file::{FileStorage, TtlConfig},
 	StorageService,
 };
 use solver_types::{
-	utils::tests::builders::OrderBuilder, Address, OrderStatus, Transaction,
-	TransactionAttemptStatus, TransactionHash, TransactionReceipt, TransactionType,
+	utils::tests::builders::OrderBuilder, Address, FillProof, OrderStatus, SettlementEvent,
+	SolverEvent, Transaction, TransactionAttemptStatus, TransactionHash, TransactionReceipt,
+	TransactionType,
 };
 
 fn file_storage() -> (Arc<StorageService>, tempfile::TempDir) {
@@ -48,6 +50,16 @@ fn receipt(hash: TransactionHash, success: bool) -> TransactionReceipt {
 		success,
 		block_timestamp: Some(456),
 		logs: vec![],
+	}
+}
+
+fn fill_proof(tx_hash: TransactionHash) -> FillProof {
+	FillProof {
+		tx_hash,
+		block_number: 12345,
+		attestation_data: Some(vec![0x01, 0x02, 0x03]),
+		filled_timestamp: 456,
+		oracle_address: "0x1234567890123456789012345678901234567890".to_string(),
 	}
 }
 
@@ -174,4 +186,159 @@ async fn transaction_resilience_reproves_atomic_fill_write_and_recovery_attempt_
 	assert_eq!(attempt.status, TransactionAttemptStatus::Confirmed);
 	assert_eq!(attempt.tx_hash, Some(recovered_hash));
 	assert!(attempt.receipt.is_some());
+}
+
+#[tokio::test]
+async fn recovery_replays_missing_confirmed_post_fill_callback() {
+	let (storage, _temp_dir) = file_storage();
+	let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+	let attempt_store = Arc::new(TransactionAttemptStore::new(storage.clone()));
+	let fill_hash = TransactionHash(vec![0x44; 32]);
+	let post_fill_hash = TransactionHash(vec![0x55; 32]);
+	let mut order = OrderBuilder::new()
+		.with_id("post-fill-callback-replay-order".to_string())
+		.with_status(OrderStatus::PostFilled)
+		.with_fill_tx_hash(Some(fill_hash))
+		.with_settlement_name(Some("eip7683"))
+		.build();
+	order.post_fill_tx_hash = Some(post_fill_hash.clone());
+	state_machine.store_order(&order).await.unwrap();
+
+	let mut mock_delivery = MockDeliveryInterface::new();
+	mock_delivery
+		.expect_get_receipt()
+		.with(
+			mockall::predicate::eq(post_fill_hash.clone()),
+			mockall::predicate::eq(137u64),
+		)
+		.times(1)
+		.returning(move |hash, _| {
+			let hash = hash.clone();
+			Box::pin(async move { Ok(receipt(hash, true)) })
+		});
+	let delivery = Arc::new(DeliveryService::new(
+		HashMap::from([(
+			137u64,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		)]),
+		1,
+		20,
+		60,
+	));
+
+	let mut mock_settlement = MockSettlementInterface::new();
+	mock_settlement
+		.expect_recover_post_fill_state()
+		.with(mockall::predicate::always())
+		.times(1)
+		.returning(|_| Box::pin(async move { Ok(false) }));
+	mock_settlement
+		.expect_handle_transaction_confirmed()
+		.withf(|_, tx_type, receipt| *tx_type == TransactionType::PostFill && receipt.success)
+		.times(1)
+		.returning(|_, _, _| Box::pin(async move { Ok(()) }));
+	let settlement = Arc::new(SettlementService::new(
+		HashMap::from([(
+			"eip7683".to_string(),
+			Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+		)]),
+		"eip7683".to_string(),
+		20,
+	));
+	let recovery = RecoveryService::new(
+		storage.clone(),
+		state_machine.clone(),
+		delivery,
+		settlement,
+		EventBus::new(100),
+		attempt_store,
+		Arc::new(HashMap::new()),
+	);
+
+	let (report, _orphaned) = recovery.recover_state().await.unwrap();
+	assert_eq!(report.total_orders, 1);
+	assert_eq!(report.reconciled_orders, 1);
+}
+
+#[tokio::test]
+async fn recovery_reemits_pre_claim_ready_for_settled_order_with_confirmed_post_fill_receipt() {
+	let (storage, _temp_dir) = file_storage();
+	let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+	let attempt_store = Arc::new(TransactionAttemptStore::new(storage.clone()));
+	let fill_hash = TransactionHash(vec![0x66; 32]);
+	let post_fill_hash = TransactionHash(vec![0x77; 32]);
+	let fill_proof = fill_proof(fill_hash.clone());
+	let mut order = OrderBuilder::new()
+		.with_id("settled-pre-claim-recovery-order".to_string())
+		.with_status(OrderStatus::Settled)
+		.with_fill_tx_hash(Some(fill_hash))
+		.with_fill_proof(Some(fill_proof))
+		.with_settlement_name(Some("eip7683"))
+		.build();
+	order.post_fill_tx_hash = Some(post_fill_hash.clone());
+	state_machine.store_order(&order).await.unwrap();
+
+	let mut mock_delivery = MockDeliveryInterface::new();
+	mock_delivery
+		.expect_get_receipt()
+		.with(
+			mockall::predicate::eq(post_fill_hash.clone()),
+			mockall::predicate::eq(137u64),
+		)
+		.times(1)
+		.returning(move |hash, _| {
+			let hash = hash.clone();
+			Box::pin(async move { Ok(receipt(hash, true)) })
+		});
+	let delivery = Arc::new(DeliveryService::new(
+		HashMap::from([(
+			137u64,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		)]),
+		1,
+		20,
+		60,
+	));
+
+	let mut mock_settlement = MockSettlementInterface::new();
+	mock_settlement
+		.expect_recover_post_fill_state()
+		.times(1)
+		.returning(|_| Box::pin(async move { Ok(true) }));
+	mock_settlement
+		.expect_handle_transaction_confirmed()
+		.times(0);
+	mock_settlement
+		.expect_readiness()
+		.times(1)
+		.returning(|_, _| Box::pin(async move { SettlementReadiness::Ready }));
+	let settlement = Arc::new(SettlementService::new(
+		HashMap::from([(
+			"eip7683".to_string(),
+			Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+		)]),
+		"eip7683".to_string(),
+		20,
+	));
+	let event_bus = EventBus::new(100);
+	let mut receiver = event_bus.subscribe();
+	let recovery = RecoveryService::new(
+		storage.clone(),
+		state_machine.clone(),
+		delivery,
+		settlement,
+		event_bus,
+		attempt_store,
+		Arc::new(HashMap::new()),
+	);
+
+	recovery.recover_state().await.unwrap();
+
+	let event = receiver.recv().await.unwrap();
+	match event {
+		SolverEvent::Settlement(SettlementEvent::PreClaimReady { order_id }) => {
+			assert_eq!(order_id, order.id);
+		},
+		other => panic!("expected PreClaimReady, got {other:?}"),
+	}
 }

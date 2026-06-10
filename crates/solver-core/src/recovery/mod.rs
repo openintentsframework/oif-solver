@@ -896,6 +896,55 @@ impl RecoveryService {
 		}
 	}
 
+	async fn replay_confirmed_settlement_callback_if_needed(
+		&self,
+		order: &Order,
+		tx_type: TransactionType,
+		receipt: &TransactionReceipt,
+	) {
+		match tx_type {
+			TransactionType::PostFill => match self.settlement.recover_post_fill_state(order).await
+			{
+				Ok(true) => return,
+				Ok(false) => {},
+				Err(e) => {
+					tracing::warn!(
+						order_id = %order.id,
+						error = %e,
+						"Could not check recovered post-fill settlement state; continuing recovery"
+					);
+					return;
+				},
+			},
+			TransactionType::PreClaim => {},
+			_ => return,
+		}
+
+		match self.settlement.find_settlement_for_order(order) {
+			Ok(settlement) => {
+				if let Err(e) = settlement
+					.handle_transaction_confirmed(order, tx_type, receipt)
+					.await
+				{
+					tracing::warn!(
+						order_id = %order.id,
+						tx_type = ?tx_type,
+						error = %e,
+						"Could not replay confirmed settlement callback; continuing recovery"
+					);
+				}
+			},
+			Err(e) => {
+				tracing::warn!(
+					order_id = %order.id,
+					tx_type = ?tx_type,
+					error = %e,
+					"Could not find settlement for confirmed callback replay; continuing recovery"
+				);
+			},
+		}
+	}
+
 	/// Reconciles an order with blockchain state.
 	///
 	/// This method checks the actual status of transactions on the blockchain
@@ -999,6 +1048,12 @@ impl RecoveryService {
 							&receipt,
 						)
 						.await;
+						self.replay_confirmed_settlement_callback_if_needed(
+							&order,
+							TransactionType::PreClaim,
+							&receipt,
+						)
+						.await;
 						return Ok((
 							order.clone(),
 							ReconcileResult::NeedsClaim {
@@ -1057,6 +1112,12 @@ impl RecoveryService {
 							&order.id,
 							TransactionType::PostFill,
 							&post_fill_tx,
+							&receipt,
+						)
+						.await;
+						self.replay_confirmed_settlement_callback_if_needed(
+							&order,
+							TransactionType::PostFill,
 							&receipt,
 						)
 						.await;

@@ -34,6 +34,10 @@ pub enum SettlementError {
 	Storage(String),
 	#[error("Service error: {0}")]
 	Service(String),
+	#[error("Delivery error: {0}")]
+	Delivery(#[from] solver_delivery::DeliveryError),
+	#[error("Settlement service error: {0}")]
+	SettlementService(#[from] solver_settlement::SettlementError),
 	#[error("State error: {0}")]
 	State(String),
 	/// Transient delivery failure caused by the signer being short on
@@ -44,6 +48,35 @@ pub enum SettlementError {
 	/// preserved for diagnostics.
 	#[error("Insufficient native gas: {0}")]
 	InsufficientNativeGas(Box<solver_delivery::InsufficientNativeGasInfo>),
+}
+
+fn map_delivery_error(error: solver_delivery::DeliveryError) -> SettlementError {
+	match error {
+		solver_delivery::DeliveryError::InsufficientNativeGas(info) => {
+			SettlementError::InsufficientNativeGas(info)
+		},
+		other => SettlementError::Delivery(other),
+	}
+}
+
+fn map_settlement_service_error(error: solver_settlement::SettlementError) -> SettlementError {
+	SettlementError::SettlementService(error)
+}
+
+#[derive(Debug, Error)]
+#[error("Claim batch failed for order {order_id}: {error}")]
+pub struct ClaimBatchError {
+	pub order_id: String,
+	pub error: SettlementError,
+}
+
+impl ClaimBatchError {
+	fn new(order_id: &str, error: SettlementError) -> Self {
+		Self {
+			order_id: order_id.to_string(),
+			error,
+		}
+	}
 }
 
 /// Handler for processing settlement operations.
@@ -129,7 +162,7 @@ impl SettlementHandler {
 			.settlement
 			.recover_post_fill_state(&order)
 			.await
-			.map_err(|e| SettlementError::Service(e.to_string()))?;
+			.map_err(map_settlement_service_error)?;
 		if recovered {
 			tracing::info!(
 				order_id = %truncate_id(&order_id),
@@ -156,14 +189,14 @@ impl SettlementHandler {
 			.delivery
 			.get_receipt(&fill_tx_hash, chain_id)
 			.await
-			.map_err(|e| SettlementError::Service(format!("Failed to get fill receipt: {e}")))?;
+			.map_err(map_delivery_error)?;
 
 		// Generate post-fill transaction
 		let post_fill_tx = self
 			.settlement
 			.generate_post_fill_transaction(&order, &receipt)
 			.await
-			.map_err(|e| SettlementError::Service(e.to_string()))?;
+			.map_err(map_settlement_service_error)?;
 
 		match post_fill_tx {
 			Some(post_fill_tx) => {
@@ -264,15 +297,7 @@ impl SettlementHandler {
 					.delivery
 					.deliver(post_fill_tx.clone(), Some(tracking))
 					.await
-					.map_err(|e| match e {
-						// Preserve the typed transient-failure variant so the
-						// engine's PostFillReady handler can distinguish it
-						// from a permanent failure without string matching.
-						solver_delivery::DeliveryError::InsufficientNativeGas(info) => {
-							SettlementError::InsufficientNativeGas(info)
-						},
-						other => SettlementError::Service(other.to_string()),
-					})?;
+					.map_err(map_delivery_error)?;
 
 				// Store tx hash
 				self.state_machine
@@ -353,7 +378,7 @@ impl SettlementHandler {
 			.settlement
 			.generate_pre_claim_transaction(&order, &fill_proof)
 			.await
-			.map_err(|e| SettlementError::Service(e.to_string()))?;
+			.map_err(map_settlement_service_error)?;
 
 		match pre_claim_tx {
 			Some(pre_claim_tx) => {
@@ -454,7 +479,7 @@ impl SettlementHandler {
 					.delivery
 					.deliver(pre_claim_tx.clone(), Some(tracking))
 					.await
-					.map_err(|e| SettlementError::Service(e.to_string()))?;
+					.map_err(map_delivery_error)?;
 
 				// Store tx hash
 				self.state_machine
@@ -505,27 +530,34 @@ impl SettlementHandler {
 	pub async fn process_claim_batch(
 		&self,
 		batch: &mut Vec<String>,
-	) -> Result<(), SettlementError> {
-		for order_id in batch.drain(..) {
+	) -> Result<(), ClaimBatchError> {
+		let order_ids = std::mem::take(batch);
+		for order_id in order_ids {
 			// Retrieve order
 			let order: Order = self
 				.storage
 				.retrieve(StorageKey::Orders.as_str(), &order_id)
 				.await
-				.map_err(|e| SettlementError::Storage(e.to_string()))?;
+				.map_err(|e| {
+					ClaimBatchError::new(&order_id, SettlementError::Storage(e.to_string()))
+				})?;
 
 			// Retrieve fill proof (already validated when ClaimReady was emitted)
-			let fill_proof = order
-				.fill_proof
-				.clone()
-				.ok_or_else(|| SettlementError::Service("Order missing fill proof".to_string()))?;
+			let fill_proof = order.fill_proof.clone().ok_or_else(|| {
+				ClaimBatchError::new(
+					&order_id,
+					SettlementError::Service("Order missing fill proof".to_string()),
+				)
+			})?;
 
 			// Generate claim transaction
 			let claim_tx = self
 				.order_service
 				.generate_claim_transaction(&order, &fill_proof)
 				.await
-				.map_err(|e| SettlementError::Service(e.to_string()))?;
+				.map_err(|e| {
+					ClaimBatchError::new(&order_id, SettlementError::Service(e.to_string()))
+				})?;
 
 			// Submit claim transaction through delivery service with monitoring
 			let event_bus = self.event_bus.clone();
@@ -624,7 +656,7 @@ impl SettlementHandler {
 				.delivery
 				.deliver(claim_tx.clone(), Some(tracking))
 				.await
-				.map_err(|e| SettlementError::Service(e.to_string()))?;
+				.map_err(|e| ClaimBatchError::new(&order_id, map_delivery_error(e)))?;
 
 			self.event_bus
 				.publish(SolverEvent::Delivery(DeliveryEvent::TransactionPending {
@@ -639,7 +671,9 @@ impl SettlementHandler {
 			self.state_machine
 				.set_transaction_hash(&order.id, claim_tx_hash.clone(), TransactionType::Claim)
 				.await
-				.map_err(|e| SettlementError::State(e.to_string()))?;
+				.map_err(|e| {
+					ClaimBatchError::new(&order_id, SettlementError::State(e.to_string()))
+				})?;
 
 			// Store reverse mapping: tx_hash -> order_id
 			self.storage
@@ -650,7 +684,9 @@ impl SettlementHandler {
 					None,
 				)
 				.await
-				.map_err(|e| SettlementError::Storage(e.to_string()))?;
+				.map_err(|e| {
+					ClaimBatchError::new(&order_id, SettlementError::Storage(e.to_string()))
+				})?;
 		}
 		Ok(())
 	}
@@ -660,14 +696,14 @@ impl SettlementHandler {
 mod tests {
 	use super::*;
 	use mockall::predicate::*;
-	use solver_delivery::{DeliveryService, MockDeliveryInterface};
+	use solver_delivery::{DeliveryError, DeliveryService, MockDeliveryInterface};
 	use solver_order::{MockOrderInterface, OrderService};
 	use solver_settlement::{MockSettlementInterface, SettlementService};
 	use solver_storage::{MockStorageInterface, StorageError, StorageService};
 	use solver_types::utils::tests::builders::{
 		OrderBuilder, TransactionBuilder, TransactionReceiptBuilder,
 	};
-	use solver_types::{Order, Transaction, TransactionHash, TransactionReceipt};
+	use solver_types::{FillProof, Order, Transaction, TransactionHash, TransactionReceipt};
 	use std::collections::HashMap;
 	use std::sync::Arc;
 	use tokio::sync::broadcast;
@@ -678,6 +714,16 @@ mod tests {
 
 	fn create_test_receipt() -> TransactionReceipt {
 		TransactionReceiptBuilder::new().build()
+	}
+
+	fn create_test_fill_proof() -> FillProof {
+		FillProof {
+			tx_hash: TransactionHash(vec![0x11; 32]),
+			block_number: 100,
+			attestation_data: Some(vec![0x42]),
+			filled_timestamp: 1_700_000_000,
+			oracle_address: "0x1234567890123456789012345678901234567890".to_string(),
+		}
 	}
 
 	fn create_test_transaction() -> Transaction {
@@ -825,7 +871,154 @@ mod tests {
 		let mut batch = vec!["nonexistent_order".to_string()];
 		let result = handler.process_claim_batch(&mut batch).await;
 		assert!(result.is_err());
-		assert!(matches!(result.unwrap_err(), SettlementError::Storage(_)));
+		let error = result.unwrap_err();
+		assert_eq!(error.order_id, "nonexistent_order");
+		assert!(matches!(error.error, SettlementError::Storage(_)));
+	}
+
+	#[tokio::test]
+	async fn pre_claim_ready_preserves_insufficient_native_gas_as_transient() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(1)
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_standard("eip7683")
+							.with_fill_proof(Some(create_test_fill_proof()))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+			},
+			|mock_settlement| {
+				mock_settlement
+					.expect_generate_pre_claim_transaction()
+					.times(1)
+					.returning(|_, _| Box::pin(async move { Ok(Some(create_test_transaction())) }));
+			},
+			|mock_delivery| {
+				mock_delivery.expect_submit().times(1).returning(|_, _| {
+					Box::pin(async move {
+						Err(DeliveryError::InsufficientNativeGas(Box::new(
+							solver_delivery::InsufficientNativeGasInfo {
+								chain_id: 137,
+								signer: "0x0000000000000000000000000000000000000001".to_string(),
+								balance_wei: "0".to_string(),
+								required_wei: "1".to_string(),
+								shortfall_wei: "1".to_string(),
+								gas_limit: Some(21_000),
+								max_fee_per_gas: Some(1),
+								gas_price: None,
+								value_wei: "0".to_string(),
+							},
+						)))
+					})
+				});
+			},
+			|_| {},
+		)
+		.await;
+
+		let result = handler
+			.handle_pre_claim_ready("test_order_123".to_string())
+			.await;
+
+		assert!(matches!(
+			result.unwrap_err(),
+			SettlementError::InsufficientNativeGas(_)
+		));
+	}
+
+	#[tokio::test]
+	async fn post_fill_ready_preserves_receipt_network_error_as_delivery_error() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(1)
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_standard("eip7683")
+							.with_fill_tx_hash(Some(TransactionHash(vec![0x11; 32])))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+			},
+			|mock_settlement| {
+				mock_settlement
+					.expect_recover_post_fill_state()
+					.times(1)
+					.returning(|_| Box::pin(async move { Ok(false) }));
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_receipt()
+					.with(eq(TransactionHash(vec![0x11; 32])), eq(137u64))
+					.times(1)
+					.returning(|_, _| {
+						Box::pin(async move { Err(DeliveryError::Network("rpc down".into())) })
+					});
+			},
+			|_| {},
+		)
+		.await;
+
+		let result = handler
+			.handle_post_fill_ready("test_order_123".to_string())
+			.await;
+
+		assert!(matches!(
+			result.unwrap_err(),
+			SettlementError::Delivery(DeliveryError::Network(_))
+		));
+	}
+
+	#[tokio::test]
+	async fn pre_claim_ready_preserves_settlement_service_error() {
+		let (handler, _) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.times(1)
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_standard("eip7683")
+							.with_fill_proof(Some(create_test_fill_proof()))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+			},
+			|mock_settlement| {
+				mock_settlement
+					.expect_generate_pre_claim_transaction()
+					.times(1)
+					.returning(|_, _| {
+						Box::pin(async move {
+							Err(solver_settlement::SettlementError::ProverUnavailable(
+								"prover down".to_string(),
+							))
+						})
+					});
+			},
+			|_| {},
+			|_| {},
+		)
+		.await;
+
+		let result = handler
+			.handle_pre_claim_ready("test_order_123".to_string())
+			.await;
+
+		assert!(matches!(
+			result.unwrap_err(),
+			SettlementError::SettlementService(
+				solver_settlement::SettlementError::ProverUnavailable(_)
+			)
+		));
 	}
 
 	#[tokio::test]
@@ -1032,7 +1225,10 @@ mod tests {
 			.await;
 
 		assert!(result.is_err());
-		assert!(matches!(result.unwrap_err(), SettlementError::Service(_)));
+		assert!(matches!(
+			result.unwrap_err(),
+			SettlementError::SettlementService(_)
+		));
 	}
 
 	#[tokio::test]
