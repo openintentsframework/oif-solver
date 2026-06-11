@@ -163,8 +163,8 @@ pub async fn validate_allocator_authorization(
 		})?;
 		if reset_secs <= required_reset_secs {
 			return Err(validation_error(format!(
-					"ResourceLock input reset period ({reset_secs}s) does not exceed the {required_reset_label} ({required_reset_secs}s)"
-				)));
+				"ResourceLock input reset period ({reset_secs}s) does not exceed the {required_reset_label} ({required_reset_secs}s)"
+			)));
 		}
 
 		match resolved {
