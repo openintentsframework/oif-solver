@@ -787,9 +787,8 @@ async fn validate_intent_request(
 		{
 			return Err(APIError::BadRequest {
 				error_type: ApiErrorType::OrderValidationFailed,
-				message:
-					"ResourceLock orders are disabled by this solver until reservation support is implemented"
-						.to_string(),
+				message: "ResourceLock orders are disabled by this solver configuration"
+					.to_string(),
 				details: None,
 			});
 		}
@@ -817,6 +816,12 @@ async fn validate_intent_request(
 	}
 
 	{
+		// Fast intake rejection: confirm the user can fund the order (wallet
+		// balance for escrow flows, or TheCompact deposit balance for resource
+		// locks) before forwarding to discovery. The authoritative in-flight
+		// reservation against the Compact deposit is taken later, at the engine
+		// acceptance boundary in `IntentHandler::handle`, so it covers every
+		// intake path — not just HTTP /orders.
 		let config = state.config.read().await;
 		ensure_user_capacity_for_order(state.solver.as_ref(), &config, lock_type, &standard_order)
 			.await?;
@@ -899,7 +904,9 @@ async fn validate_intent_request(
 		Err(e) => tracing::error!("Order validation failed: {:?}", e),
 	}
 
-	result
+	let order = result?;
+
+	Ok(order)
 }
 
 /// Submits a validated order to the configured discovery implementation, in-process.
