@@ -41,10 +41,6 @@
       "timeout_seconds": 30,
       "max_request_size": 1048576
     },
-    "discovery_api": {
-      "host": "127.0.0.1",
-      "port": 8081
-    },
     "auth": {
       "enabled": false,
       "jwt_secret_env": "JWT_SECRET",

@@ -226,8 +226,6 @@ generate_main_config() {
     local ttl_order_by_tx_hash=$(get_config ".storage.file.ttl_order_by_tx_hash" "86400")
 
     local onchain_polling=$(get_config ".discovery.onchain.polling_interval_secs" "0")
-    local discovery_api_host=$(get_config ".api.discovery_api.host" "127.0.0.1")
-    local discovery_api_port=$(get_config ".api.discovery_api.port" "8081")
 
     local pricing_primary=$(get_config ".pricing.primary" "coingecko")
     local coingecko_cache=$(get_config ".pricing.coingecko.cache_duration_seconds" "60")
@@ -279,8 +277,6 @@ generate_main_config() {
         --arg origin_token_address "$origin_token_address" \
         --arg dest_token_address "$dest_token_address" \
         --argjson onchain_polling "$onchain_polling" \
-        --arg discovery_api_host "$discovery_api_host" \
-        --argjson discovery_api_port "$discovery_api_port" \
         --argjson max_gas_price_gwei "$max_gas_price_gwei" \
         --arg pricing_primary "$pricing_primary" \
         --argjson coingecko_cache "$coingecko_cache" \
@@ -376,8 +372,6 @@ generate_main_config() {
                         polling_interval_secs: $onchain_polling
                     },
                     offchain_eip7683: {
-                        api_host: $discovery_api_host,
-                        api_port: $discovery_api_port,
                         network_ids: [$origin_id, $dest_id]
                     }
                 }

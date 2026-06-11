@@ -855,14 +855,14 @@ sequenceDiagram
         SettlerEscrow-->>Solver: bytes32 orderId
     end
 
-    Note over Solver,Discovery: Forward to Discovery Service
-    Solver->>Discovery: POST /intent {order, signature, quote_id?, origin_submission?}
+    Note over Solver,Discovery: Submit to Discovery Service (in-process)
+    Solver->>Discovery: submit_order(order, signature, quote_id?) [in-process call]
     alt Discovery Success
-        Discovery-->>Solver: PostOrderResponse {status: "received", order_id}
-        Solver-->>Client: 200 OK + PostOrderResponse
+        Discovery-->>Solver: IntentSubmission {order_id}
+        Solver-->>Client: 200 OK + PostOrderResponse {status: "received", order_id}
     else Discovery Error
-        Discovery-->>Solver: PostOrderResponse {status: "error", message}
-        Solver-->>Client: 400/500 + PostOrderResponse
+        Discovery-->>Solver: IntentSubmissionError
+        Solver-->>Client: 400/503 + PostOrderResponse {status, message}
     end
 ```
 

@@ -1513,7 +1513,6 @@ fn build_discovery_config_from_operator(chain_ids: &[u64]) -> Result<DiscoveryCo
 
 	let network_ids_array =
 		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect());
-	let offchain_api_port = parse_u16_env_var("OFFCHAIN_DISCOVERY_API_PORT", 8081)?;
 
 	// Onchain discovery - polls chain for new orders
 	let onchain_config = json_object(vec![
@@ -1522,12 +1521,8 @@ fn build_discovery_config_from_operator(chain_ids: &[u64]) -> Result<DiscoveryCo
 	]);
 	implementations.insert("onchain_eip7683".to_string(), onchain_config);
 
-	// Offchain discovery - receives orders via HTTP API from aggregators
-	let offchain_config = json_object(vec![
-		("api_host", serde_json::Value::String("0.0.0.0".to_string())),
-		("api_port", int(offchain_api_port as i64)),
-		("network_ids", network_ids_array),
-	]);
+	// Offchain discovery - ingests orders in-process via the public /orders API
+	let offchain_config = json_object(vec![("network_ids", network_ids_array)]);
 	implementations.insert("offchain_eip7683".to_string(), offchain_config);
 
 	Ok(DiscoveryConfig { implementations })
@@ -6779,26 +6774,13 @@ mod tests {
 
 		let onchain = discovery.implementations.get("onchain_eip7683").unwrap();
 		assert!(onchain.get("polling_interval_secs").is_some());
-	}
 
-	#[test]
-	#[serial]
-	fn test_build_discovery_config_from_operator_uses_env_port_override() {
-		let key = "OFFCHAIN_DISCOVERY_API_PORT";
-		let original = std::env::var(key).ok();
-		std::env::set_var(key, "8082");
-
-		let chain_ids = vec![1, 10];
-		let discovery = build_discovery_config_from_operator(&chain_ids).unwrap();
+		// Offchain ingests in-process via /orders; it carries only network_ids
+		// (no api_host/api_port — the HTTP listener was removed in C-04).
 		let offchain = discovery.implementations.get("offchain_eip7683").unwrap();
-		let api_port = offchain.get("api_port").unwrap().as_i64().unwrap();
-
-		assert_eq!(api_port, 8082);
-
-		std::env::remove_var(key);
-		if let Some(val) = original {
-			std::env::set_var(key, val);
-		}
+		assert!(offchain.get("network_ids").is_some());
+		assert!(offchain.get("api_host").is_none());
+		assert!(offchain.get("api_port").is_none());
 	}
 
 	#[test]
