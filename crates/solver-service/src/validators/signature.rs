@@ -8,14 +8,16 @@ use crate::eip712::{
 };
 use alloy_primitives::{Address as AlloyAddress, Bytes};
 use async_trait::async_trait;
+use solver_config::Config;
 use solver_delivery::DeliveryService;
+use solver_settlement::{estimate_required_expiry_window_for_route, RouteExpiryInputs};
 use solver_types::{
 	api::PostOrderRequest,
 	standards::eip7683::{
 		compact_signatures::decode_compact_signatures,
 		interfaces::StandardOrder as OifStandardOrder, LockType,
 	},
-	APIError, ApiErrorType, NetworksConfig,
+	APIError, ApiErrorType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,7 +32,7 @@ pub trait OrderSignatureValidator: Send + Sync {
 	async fn validate_signature(
 		&self,
 		intent: &PostOrderRequest,
-		networks_config: &NetworksConfig,
+		config: &Config,
 		delivery_service: &Arc<DeliveryService>,
 	) -> Result<(), APIError>;
 }
@@ -48,7 +50,7 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 	async fn validate_signature(
 		&self,
 		intent: &PostOrderRequest,
-		networks_config: &NetworksConfig,
+		config: &Config,
 		delivery_service: &Arc<DeliveryService>,
 	) -> Result<(), APIError> {
 		use alloy_sol_types::SolType;
@@ -66,7 +68,8 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 
 		let origin_chain_id = standard_order.originChainId.to::<u64>();
 		let network =
-			networks_config
+			config
+				.networks
 				.get(&origin_chain_id)
 				.ok_or_else(|| APIError::BadRequest {
 					error_type: ApiErrorType::OrderValidationFailed,
@@ -133,6 +136,33 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 		// 5. Validate allocator authorization for the decoded allocatorData (pC-02).
 		//    `struct_hash` is the BatchCompact claim hash the allocator authorizes;
 		//    `contract_address` is the InputSettlerCompact (the finalise arbiter).
+		let route_inputs = RouteExpiryInputs {
+			input_oracle: solver_types::Address(standard_order.inputOracle.as_slice().to_vec()),
+			origin_chain_id,
+			output_chain_ids: standard_order
+				.outputs
+				.iter()
+				.map(|output| output.chainId.to::<u64>())
+				.collect(),
+		};
+		let route_required_reset_secs = match estimate_required_expiry_window_for_route(
+			&route_inputs,
+			&config.settlement.implementations,
+			config.settlement.settlement_poll_interval_seconds,
+			None,
+		) {
+			Some((window, _breakdown)) => window,
+			None => {
+				tracing::warn!(
+					origin_chain_id,
+					input_oracle = ?route_inputs.input_oracle,
+					output_chain_ids = ?route_inputs.output_chain_ids,
+					"No settlement expiry estimate matched ResourceLock route; route reset-period floor is disabled. Configure intent_min_expiry_seconds for this settlement route to enforce the floor"
+				);
+				0
+			},
+		};
+
 		crate::validators::compact_allocator::validate_allocator_authorization(
 			&standard_order,
 			&decoded.allocator_data,
@@ -142,6 +172,7 @@ impl OrderSignatureValidator for Eip7683SignatureValidator {
 			network.allocator_address.as_ref(),
 			delivery_service,
 			origin_chain_id,
+			route_required_reset_secs,
 		)
 		.await?;
 		tracing::debug!("Compact allocator authorization validated");
@@ -171,7 +202,7 @@ impl SignatureValidationService {
 		&self,
 		standard: &str,
 		intent: &PostOrderRequest,
-		networks_config: &NetworksConfig,
+		config: &Config,
 		delivery_service: &Arc<DeliveryService>,
 	) -> Result<(), APIError> {
 		let validator = self
@@ -184,7 +215,7 @@ impl SignatureValidationService {
 			})?;
 
 		validator
-			.validate_signature(intent, networks_config, delivery_service)
+			.validate_signature(intent, config, delivery_service)
 			.await
 	}
 
@@ -211,6 +242,7 @@ mod tests {
 	use alloy_sol_types::SolType;
 	use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 	use serde_json::json;
+	use solver_config::ConfigBuilder;
 	use solver_delivery::{
 		DeliveryError, DeliveryInterface, DeliveryService, MockDeliveryInterface,
 	};
@@ -226,7 +258,7 @@ mod tests {
 	#[derive(Clone)]
 	struct SignatureFixture {
 		intent: PostOrderRequest,
-		networks: NetworksConfig,
+		config: Config,
 		delivery: Arc<DeliveryService>,
 		chain_id: u64,
 	}
@@ -500,10 +532,11 @@ mod tests {
 		networks.insert(chain_id, network_config);
 
 		let delivery = compact_delivery(chain_id, domain_separator, lock_allocator(), true);
+		let config = ConfigBuilder::new().networks(networks).build();
 
 		SignatureFixture {
 			intent,
-			networks,
+			config,
 			delivery,
 			chain_id,
 		}
@@ -525,7 +558,7 @@ mod tests {
 			.validate_signature(
 				"eip7683",
 				&fixture.intent,
-				&fixture.networks,
+				&fixture.config,
 				&fixture.delivery,
 			)
 			.await
@@ -546,7 +579,7 @@ mod tests {
 			.validate_signature(
 				"eip7683",
 				&fixture.intent,
-				&fixture.networks,
+				&fixture.config,
 				&fixture.delivery,
 			)
 			.await;
@@ -577,7 +610,7 @@ mod tests {
 
 		let service = SignatureValidationService::new();
 		let result = service
-			.validate_signature("eip7683", &fixture.intent, &fixture.networks, &delivery)
+			.validate_signature("eip7683", &fixture.intent, &fixture.config, &delivery)
 			.await;
 
 		assert!(matches!(
@@ -590,6 +623,7 @@ mod tests {
 	async fn validate_signature_rejects_missing_input_settler_compact_address() {
 		let mut fixture = build_signature_fixture();
 		fixture
+			.config
 			.networks
 			.get_mut(&fixture.chain_id)
 			.expect("network")
@@ -600,7 +634,7 @@ mod tests {
 			.validate_signature(
 				"eip7683",
 				&fixture.intent,
-				&fixture.networks,
+				&fixture.config,
 				&fixture.delivery,
 			)
 			.await;
@@ -619,7 +653,7 @@ mod tests {
 			.validate_signature(
 				"unknown",
 				&fixture.intent,
-				&fixture.networks,
+				&fixture.config,
 				&fixture.delivery,
 			)
 			.await;
@@ -634,13 +668,9 @@ mod tests {
 		let fixture = build_signature_fixture();
 		let service = SignatureValidationService::new();
 		let empty_networks = NetworksConfig::new();
+		let empty_config = ConfigBuilder::new().networks(empty_networks).build();
 		let result = service
-			.validate_signature(
-				"eip7683",
-				&fixture.intent,
-				&empty_networks,
-				&fixture.delivery,
-			)
+			.validate_signature("eip7683", &fixture.intent, &empty_config, &fixture.delivery)
 			.await;
 		assert!(matches!(
 			result,
@@ -651,13 +681,13 @@ mod tests {
 	#[tokio::test]
 	async fn validate_signature_errors_when_compact_address_missing() {
 		let fixture = build_signature_fixture();
-		let mut networks = fixture.networks.clone();
-		if let Some(network) = networks.get_mut(&fixture.chain_id) {
+		let mut config = fixture.config.clone();
+		if let Some(network) = config.networks.get_mut(&fixture.chain_id) {
 			network.the_compact_address = None;
 		}
 		let service = SignatureValidationService::new();
 		let result = service
-			.validate_signature("eip7683", &fixture.intent, &networks, &fixture.delivery)
+			.validate_signature("eip7683", &fixture.intent, &config, &fixture.delivery)
 			.await;
 		assert!(matches!(
 			result,
@@ -678,7 +708,7 @@ mod tests {
 			.validate_signature(
 				"eip7683",
 				&fixture.intent,
-				&fixture.networks,
+				&fixture.config,
 				&failing_delivery,
 			)
 			.await;
@@ -697,7 +727,7 @@ mod tests {
 			.validate_signature(
 				"eip7683",
 				&fixture.intent,
-				&fixture.networks,
+				&fixture.config,
 				&fixture.delivery,
 			)
 			.await;

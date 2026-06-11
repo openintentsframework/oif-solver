@@ -4,7 +4,7 @@
 //! and fill transactions, updating order state and publishing appropriate events.
 
 use crate::engine::event_bus::EventBus;
-use crate::handlers::forced_withdrawal::ensure_no_forced_withdrawal;
+use crate::handlers::forced_withdrawal::ensure_resource_locks_claimable;
 use crate::state::transaction_attempt::TransactionAttemptStore;
 use crate::state::OrderStateMachine;
 use alloy_primitives::hex;
@@ -257,6 +257,11 @@ impl OrderHandler {
 	async fn check_forced_withdrawal_before_fill(&self, order: &Order) -> Result<(), OrderError> {
 		let order_data: Eip7683OrderData = match serde_json::from_value(order.data.clone()) {
 			Ok(data) => data,
+			Err(e) if order.standard == "eip7683" => {
+				return Err(OrderError::Service(format!(
+					"Failed to parse EIP-7683 order data before ResourceLock guard: {e}"
+				)));
+			},
 			// Non-7683 orders carry no resource lock; nothing to guard.
 			Err(_) => return Ok(()),
 		};
@@ -265,7 +270,8 @@ impl OrderHandler {
 			return Ok(());
 		}
 
-		let origin_chain_id = order_data.origin_chain_id.to::<u64>();
+		let origin_chain_id = u64::try_from(order_data.origin_chain_id)
+			.map_err(|_| OrderError::Service("Invalid origin chain ID".to_string()))?;
 
 		// Resolve TheCompact on the origin chain from current (hot-reloadable) config.
 		let the_compact_address = {
@@ -283,14 +289,13 @@ impl OrderHandler {
 
 		let sponsor = hex_to_alloy_address(&order_data.user)
 			.map_err(|e| OrderError::Service(format!("Invalid sponsor address: {e}")))?;
-		let lock_ids: Vec<_> = order_data.inputs.iter().map(|input| input[0]).collect();
 
-		ensure_no_forced_withdrawal(
+		ensure_resource_locks_claimable(
 			&self.delivery,
 			&the_compact_address,
 			origin_chain_id,
 			sponsor,
-			&lock_ids,
+			&order_data.inputs,
 		)
 		.await
 		.map_err(|e| OrderError::Service(e.to_string()))
@@ -953,6 +958,39 @@ mod tests {
 			OrderError::Service(msg) => assert!(msg.contains("Fill error")),
 			_ => panic!("Expected Service error"),
 		}
+	}
+
+	#[tokio::test]
+	async fn malformed_eip7683_order_data_rejected_before_fill_generation() {
+		let order = OrderBuilder::new()
+			.with_standard("eip7683")
+			.with_data(serde_json::json!({
+				"lock_type": "resource_lock",
+				"origin_chain_id": "137"
+			}))
+			.build();
+		let params = create_test_execution_params();
+
+		let (handler, _event_rx) = create_test_handler_with_mocks(
+			|mock_order| {
+				mock_order.expect_generate_fill_transaction().times(0);
+			},
+			|mock_delivery| {
+				mock_delivery.expect_submit().times(0);
+			},
+			|_mock_storage| {},
+		)
+		.await;
+
+		let err = handler
+			.handle_execution(order, params)
+			.await
+			.expect_err("malformed EIP-7683 data must fail before fill generation");
+
+		assert!(matches!(
+			err,
+			OrderError::Service(msg) if msg.contains("Failed to parse EIP-7683 order data")
+		));
 	}
 
 	/// (C-03) A ResourceLock order whose input lock has an *enabled* forced

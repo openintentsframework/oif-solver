@@ -94,6 +94,9 @@ async fn resolve_allocator(
 ///   `TheCompact.batchClaim` during finalisation).
 /// - `configured_allocator`, when present (`network.allocator_address`), pins the
 ///   allocator the solver expects; a mismatch is rejected.
+/// - `route_required_reset_secs` is the route-level minimum settlement window
+///   needed after fill. It closes the gap where a signed order sets a far-future
+///   fill deadline but a narrow `expires - fillDeadline` interval.
 #[allow(clippy::too_many_arguments)]
 pub async fn validate_allocator_authorization(
 	order: &OifStandardOrder,
@@ -104,6 +107,7 @@ pub async fn validate_allocator_authorization(
 	configured_allocator: Option<&Address>,
 	delivery: &Arc<DeliveryService>,
 	chain_id: u64,
+	route_required_reset_secs: u64,
 ) -> Result<(), APIError> {
 	if order.inputs.is_empty() {
 		return Err(validation_error(
@@ -111,17 +115,25 @@ pub async fn validate_allocator_authorization(
 		));
 	}
 
-	// (C-02) The lock's reset period must outlast the window between filling the
-	// destination output and claiming the input; otherwise the user could force-
-	// withdraw the input after the solver has filled. Use the signed order's own
-	// fill-to-claim window: `expires - fillDeadline`.
-	let required_reset_secs =
+	// (C-02/C-03) The lock's reset period must outlast the window between filling
+	// the destination output and claiming the input; otherwise the user could
+	// force-withdraw after the solver has filled. Use the stricter of the signed
+	// order's `expires - fillDeadline` window and the route-level settlement
+	// window. The latter prevents an order from using a far-future fill deadline
+	// with a narrow signed interval to understate actual fill-to-claim latency.
+	let signed_fill_to_claim_secs =
 		u64::from(order.expires).saturating_sub(u64::from(order.fillDeadline));
-	if required_reset_secs == 0 {
+	if signed_fill_to_claim_secs == 0 {
 		return Err(validation_error(
 			"ResourceLock order is malformed: expires must exceed fillDeadline",
 		));
 	}
+	let required_reset_secs = signed_fill_to_claim_secs.max(route_required_reset_secs);
+	let required_reset_label = if route_required_reset_secs > signed_fill_to_claim_secs {
+		"route settlement window"
+	} else {
+		"fill-to-claim window"
+	};
 
 	// (C-02) ResourceLock orders require a solver-trusted allocator. Allocator
 	// registration in The Compact is permissionless, so without pinning, a user
@@ -151,8 +163,8 @@ pub async fn validate_allocator_authorization(
 		})?;
 		if reset_secs <= required_reset_secs {
 			return Err(validation_error(format!(
-				"ResourceLock input reset period ({reset_secs}s) does not exceed the fill-to-claim window ({required_reset_secs}s)"
-			)));
+					"ResourceLock input reset period ({reset_secs}s) does not exceed the {required_reset_label} ({required_reset_secs}s)"
+				)));
 		}
 
 		match resolved {
@@ -334,6 +346,7 @@ mod tests {
 			Some(&trusted()),
 			&d,
 			CHAIN,
+			0,
 		)
 		.await
 		.expect("trusted allocator + authorized + sufficient reset period should pass");
@@ -352,6 +365,7 @@ mod tests {
 			None,
 			&d,
 			CHAIN,
+			0,
 		)
 		.await
 		.expect_err("ResourceLock order without a configured trusted allocator must be rejected");
@@ -374,6 +388,7 @@ mod tests {
 			Some(&configured),
 			&d,
 			CHAIN,
+			0,
 		)
 		.await
 		.expect_err("allocator not matching configured allocator must be rejected");
@@ -395,6 +410,7 @@ mod tests {
 			Some(&trusted()),
 			&d,
 			CHAIN,
+			0,
 		)
 		.await
 		.expect_err("unauthorized allocator data must be rejected");
@@ -423,6 +439,7 @@ mod tests {
 			Some(&trusted()),
 			&d,
 			CHAIN,
+			0,
 		)
 		.await
 		.expect_err("mixed allocators must be rejected");
@@ -444,6 +461,7 @@ mod tests {
 			Some(&trusted()),
 			&d,
 			CHAIN,
+			0,
 		)
 		.await
 		.expect_err("order with no inputs must be rejected");
@@ -465,6 +483,7 @@ mod tests {
 			Some(&trusted()),
 			&d,
 			CHAIN,
+			0,
 		)
 		.await
 		.expect_err("reset period below the fill-to-claim window must be rejected");
@@ -488,11 +507,34 @@ mod tests {
 			Some(&trusted()),
 			&d,
 			CHAIN,
+			0,
 		)
 		.await
 		.expect_err("reset period equal to the window must be rejected (does not exceed)");
 		assert!(
 			matches!(err, APIError::BadRequest { message, .. } if message.contains("reset period"))
+		);
+	}
+
+	#[tokio::test]
+	async fn reset_period_below_route_window_rejected() {
+		let order = order_with_inputs(&[id_from(1)]);
+		let d = delivery(|_| allocator(0xA1), RESET_TEN_MINUTES, true);
+		let err = validate_allocator_authorization(
+			&order,
+			&Bytes::new(),
+			claim_hash(),
+			arbiter(),
+			&the_compact(),
+			Some(&trusted()),
+			&d,
+			CHAIN,
+			3_600,
+		)
+		.await
+		.expect_err("reset period below the route settlement window must be rejected");
+		assert!(
+			matches!(err, APIError::BadRequest { message, .. } if message.contains("route settlement window"))
 		);
 	}
 
@@ -510,6 +552,7 @@ mod tests {
 			Some(&trusted()),
 			&d,
 			CHAIN,
+			0,
 		)
 		.await
 		.expect_err("order whose expires does not exceed fillDeadline must be rejected");

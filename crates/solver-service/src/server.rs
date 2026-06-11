@@ -811,7 +811,7 @@ async fn validate_intent_request(
 		let config = state.config.read().await;
 		state
 			.signature_validation
-			.validate_signature(standard, intent, &config.networks, state.solver.delivery())
+			.validate_signature(standard, intent, &config, state.solver.delivery())
 			.await?;
 	}
 

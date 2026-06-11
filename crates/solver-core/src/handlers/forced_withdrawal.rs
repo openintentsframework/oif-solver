@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address as AlloyAddress, U256};
 use alloy_sol_types::SolCall;
-use solver_delivery::DeliveryService;
+use solver_delivery::{fetch_compact_balance, DeliveryService};
 use solver_types::{standards::eip7683::interfaces::ITheCompact, Address, Transaction};
 
 /// `ForcedWithdrawalStatus` enum value meaning no forced withdrawal is pending or
@@ -42,8 +42,15 @@ pub enum ForcedWithdrawalError {
 	/// A lock reports a non-`Disabled` forced-withdrawal status.
 	#[error("ResourceLock input {lock_id} has forced withdrawal active (status {status}); refusing to fill")]
 	Active { lock_id: U256, status: u8 },
+	/// The lock balance is no longer sufficient to cover the order input.
+	#[error("ResourceLock input {lock_id} balance {available} is below required amount {required}; refusing to fill")]
+	InsufficientBalance {
+		lock_id: U256,
+		required: U256,
+		available: U256,
+	},
 	/// The on-chain query or its decoding failed; fail closed rather than fill blind.
-	#[error("Failed to query TheCompact.getForcedWithdrawalStatus: {0}")]
+	#[error("Failed to query TheCompact resource lock state: {0}")]
 	Query(String),
 }
 
@@ -106,6 +113,56 @@ pub async fn ensure_no_forced_withdrawal(
 	Ok(())
 }
 
+/// Just-in-time ResourceLock claimability check performed immediately before a
+/// destination fill is released.
+///
+/// This composes two origin-chain reads per non-zero input: the forced-withdrawal
+/// status must still be `Disabled`, and `balanceOf(sponsor, id)` must still cover
+/// the amount the solver expects to claim.
+pub async fn ensure_resource_locks_claimable(
+	delivery: &Arc<DeliveryService>,
+	the_compact_address: &Address,
+	origin_chain_id: u64,
+	sponsor: AlloyAddress,
+	inputs: &[[U256; 2]],
+) -> Result<(), ForcedWithdrawalError> {
+	let lock_ids: Vec<_> = inputs.iter().map(|input| input[0]).collect();
+	ensure_no_forced_withdrawal(
+		delivery,
+		the_compact_address,
+		origin_chain_id,
+		sponsor,
+		&lock_ids,
+	)
+	.await?;
+
+	for &[lock_id, required] in inputs {
+		if required.is_zero() {
+			continue;
+		}
+
+		let available = fetch_compact_balance(
+			delivery.as_ref(),
+			origin_chain_id,
+			the_compact_address.clone(),
+			sponsor,
+			lock_id,
+		)
+		.await
+		.map_err(ForcedWithdrawalError::Query)?;
+
+		if available < required {
+			return Err(ForcedWithdrawalError::InsufficientBalance {
+				lock_id,
+				required,
+				available,
+			});
+		}
+	}
+
+	Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -139,6 +196,10 @@ mod tests {
 		alloy_primitives::Bytes::from(out)
 	}
 
+	fn encode_u256(value: U256) -> alloy_primitives::Bytes {
+		alloy_primitives::Bytes::from(value.to_be_bytes::<32>().to_vec())
+	}
+
 	/// Delivery mock: `getForcedWithdrawalStatus(account, id)` resolves its return
 	/// tuple via `status_for(id)`.
 	fn delivery(
@@ -154,6 +215,37 @@ mod tests {
 					id_bytes.copy_from_slice(&tx.data[36..68]);
 					let (status, at) = status_for(U256::from_be_bytes(id_bytes));
 					encode_status(status, at)
+				},
+				_ => alloy_primitives::Bytes::from(vec![0u8; 64]),
+			};
+			Box::pin(async move { Ok(resp) })
+		});
+		let mut impls: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+		impls.insert(CHAIN, Arc::new(mock) as Arc<dyn DeliveryInterface>);
+		Arc::new(DeliveryService::new(impls, 1, 30, 60))
+	}
+
+	/// Delivery mock for the full pre-fill ResourceLock guard:
+	/// `getForcedWithdrawalStatus(account, id)` resolves via `status_for(id)`, and
+	/// `balanceOf(account, id)` resolves via `balance_for(id)`.
+	fn delivery_with_balances(
+		status_for: impl Fn(U256) -> (u8, u64) + Send + Sync + 'static,
+		balance_for: impl Fn(U256) -> U256 + Send + Sync + 'static,
+	) -> Arc<DeliveryService> {
+		let mut mock = MockDeliveryInterface::new();
+		mock.expect_eth_call().returning(move |tx| {
+			let selector = tx.data.get(0..4).map(|s| [s[0], s[1], s[2], s[3]]);
+			let resp = match selector {
+				Some(s) if s == ITheCompact::getForcedWithdrawalStatusCall::SELECTOR => {
+					let mut id_bytes = [0u8; 32];
+					id_bytes.copy_from_slice(&tx.data[36..68]);
+					let (status, at) = status_for(U256::from_be_bytes(id_bytes));
+					encode_status(status, at)
+				},
+				Some(s) if s == ITheCompact::balanceOfCall::SELECTOR => {
+					let mut id_bytes = [0u8; 32];
+					id_bytes.copy_from_slice(&tx.data[36..68]);
+					encode_u256(balance_for(U256::from_be_bytes(id_bytes)))
 				},
 				_ => alloy_primitives::Bytes::from(vec![0u8; 64]),
 			};
@@ -214,5 +306,37 @@ mod tests {
 				.await
 				.expect_err("a single active lock in the batch must reject the fill");
 		assert!(matches!(err, ForcedWithdrawalError::Active { .. }));
+	}
+
+	#[tokio::test]
+	async fn insufficient_compact_balance_rejected_before_fill() {
+		let d = delivery_with_balances(|_| (0u8, 0), |_| U256::from(999u64));
+		let err = ensure_resource_locks_claimable(
+			&d,
+			&the_compact(),
+			CHAIN,
+			sponsor(),
+			&[[id_from(1), U256::from(1000u64)]],
+		)
+		.await
+		.expect_err("insufficient JIT balance must reject the fill");
+		assert!(matches!(
+			err,
+			ForcedWithdrawalError::InsufficientBalance { .. }
+		));
+	}
+
+	#[tokio::test]
+	async fn disabled_forced_withdrawal_and_sufficient_balance_passes() {
+		let d = delivery_with_balances(|_| (0u8, 0), |_| U256::from(1000u64));
+		ensure_resource_locks_claimable(
+			&d,
+			&the_compact(),
+			CHAIN,
+			sponsor(),
+			&[[id_from(1), U256::from(1000u64)]],
+		)
+		.await
+		.expect("disabled forced withdrawal plus sufficient balance should pass");
 	}
 }
