@@ -312,6 +312,12 @@ fn encode_fill_description(
 	Ok(payload)
 }
 
+fn transaction_receipt_from_alloy(
+	receipt: &alloy_rpc_types::TransactionReceipt,
+) -> TransactionReceipt {
+	TransactionReceipt::from(receipt)
+}
+
 sol! {
 	interface IHyperlaneOracle {
 		// Submit cross-chain message with gas payment
@@ -933,6 +939,89 @@ impl HyperlaneSettlement {
 		!self.get_output_oracles(dest_chain).is_empty()
 			&& !self.get_input_oracles(origin_chain).is_empty()
 	}
+
+	async fn track_post_fill_submission_from_receipt(
+		&self,
+		order: &Order,
+		receipt: &TransactionReceipt,
+	) -> Result<(), SettlementError> {
+		if self
+			.message_tracker
+			.get_message_id(&order.id)
+			.await
+			.is_some()
+		{
+			return Ok(());
+		}
+
+		let origin_chain = order
+			.input_chains
+			.first()
+			.map(|c| c.chain_id)
+			.ok_or_else(|| SettlementError::ValidationFailed("No input chains".into()))?;
+		let dest_chain = order
+			.output_chains
+			.first()
+			.map(|c| c.chain_id)
+			.ok_or_else(|| SettlementError::ValidationFailed("No output chains".into()))?;
+
+		// Extract message ID from Dispatch event logs
+		let message_id = self.extract_message_id_from_logs(&receipt.logs)?;
+
+		// Need to get the fill transaction to extract solver and timestamp
+		let dest_provider = self.providers.get(&dest_chain).ok_or_else(|| {
+			SettlementError::ValidationFailed(format!("No provider for chain {dest_chain}"))
+		})?;
+
+		let fill_tx_hash = order.fill_tx_hash.as_ref().ok_or_else(|| {
+			SettlementError::ValidationFailed(
+				"Missing fill transaction hash: required for Hyperlane post-fill processing"
+					.to_string(),
+			)
+		})?;
+
+		let fill_receipt = dest_provider
+			.get_transaction_receipt(FixedBytes::<32>::from_slice(&fill_tx_hash.0))
+			.await
+			.map_err(|e| {
+				SettlementError::ValidationFailed(format!("Failed to get fill receipt: {e}"))
+			})?
+			.ok_or_else(|| {
+				SettlementError::ValidationFailed("Fill transaction not found".to_string())
+			})?;
+		let fill_receipt = transaction_receipt_from_alloy(&fill_receipt);
+
+		let order_id_bytes =
+			order_id_to_bytes32(&order.id).map_err(SettlementError::ValidationFailed)?;
+		let (solver_id, timestamp) =
+			extract_fill_details_from_logs(&fill_receipt.logs, order, &order_id_bytes, dest_chain)?;
+
+		// Compute payload hash once and store it
+		let payload_hash = self.compute_payload_hash(order, solver_id, timestamp)?;
+
+		// Store in message tracker with all details for later use
+		// PostFill happens on dest_chain, message goes from dest_chain to origin_chain
+		self.message_tracker
+			.track_submission(
+				order.id.clone(),
+				message_id,
+				dest_chain,   // origin_chain in submission = where message originates from
+				origin_chain, // destination_chain in submission = where message goes to
+				receipt.hash.clone(),
+				U256::ZERO, // TODO: Gas payment would be calculated from actual receipt
+				payload_hash,
+				solver_id,
+				timestamp,
+			)
+			.await?;
+
+		tracing::info!(
+			message_id = %hex::encode(message_id),
+			"Hyperlane message tracked"
+		);
+
+		Ok(())
+	}
 }
 
 /// Configuration schema for HyperlaneSettlement
@@ -1113,20 +1202,70 @@ impl SettlementInterface for HyperlaneSettlement {
 			.header
 			.timestamp;
 
-		// Check if we have a tracked message for this order
-		let message_id = self
-			.message_tracker
-			.get_message_id(&order.id)
-			.await
-			.map(hex::encode);
+		// Check if we have a tracked message for this order. If the solver
+		// restarted after PostFill confirmed, rebuild the tracker from receipts
+		// before returning proof data.
+		let mut message_id = self.message_tracker.get_message_id(&order.id).await;
+		if message_id.is_none() && order.post_fill_tx_hash.is_some() {
+			self.recover_post_fill_state(order).await?;
+			message_id = self.message_tracker.get_message_id(&order.id).await;
+		}
 
 		Ok(FillProof {
 			tx_hash: tx_hash.clone(),
 			block_number: tx_block,
 			oracle_address: with_0x_prefix(&hex::encode(&oracle_address.0)),
-			attestation_data: message_id.map(|id| id.into_bytes()),
+			attestation_data: message_id.map(|id| hex::encode(id).into_bytes()),
 			filled_timestamp: block_timestamp,
 		})
+	}
+
+	async fn recover_post_fill_state(&self, order: &Order) -> Result<bool, SettlementError> {
+		if self
+			.message_tracker
+			.get_message_id(&order.id)
+			.await
+			.is_some()
+		{
+			return Ok(true);
+		}
+
+		let post_fill_tx_hash = match order.post_fill_tx_hash.as_ref() {
+			Some(tx_hash) => tx_hash,
+			None => return Ok(false),
+		};
+		let dest_chain = order
+			.output_chains
+			.first()
+			.map(|c| c.chain_id)
+			.ok_or_else(|| SettlementError::ValidationFailed("No output chains".into()))?;
+		let provider = self.providers.get(&dest_chain).ok_or_else(|| {
+			SettlementError::ValidationFailed(format!("No provider for chain {dest_chain}"))
+		})?;
+
+		let receipt = provider
+			.get_transaction_receipt(FixedBytes::<32>::from_slice(&post_fill_tx_hash.0))
+			.await
+			.map_err(|e| {
+				SettlementError::ValidationFailed(format!("Failed to get post-fill receipt: {e}"))
+			})?
+			.ok_or_else(|| {
+				SettlementError::ValidationFailed("Post-fill transaction not found".to_string())
+			})?;
+
+		if !receipt.status() {
+			return Ok(false);
+		}
+
+		let receipt = transaction_receipt_from_alloy(&receipt);
+		self.track_post_fill_submission_from_receipt(order, &receipt)
+			.await?;
+
+		Ok(self
+			.message_tracker
+			.get_message_id(&order.id)
+			.await
+			.is_some())
 	}
 
 	async fn can_claim(&self, order: &Order, fill_proof: &FillProof) -> bool {
@@ -1314,90 +1453,8 @@ impl SettlementInterface for HyperlaneSettlement {
 	) -> Result<(), SettlementError> {
 		// Only handle PostFill transactions for Hyperlane message tracking
 		if matches!(tx_type, TransactionType::PostFill) {
-			let origin_chain = order
-				.input_chains
-				.first()
-				.map(|c| c.chain_id)
-				.ok_or_else(|| SettlementError::ValidationFailed("No input chains".into()))?;
-			let dest_chain = order
-				.output_chains
-				.first()
-				.map(|c| c.chain_id)
-				.ok_or_else(|| SettlementError::ValidationFailed("No output chains".into()))?;
-
-			// Extract message ID from Dispatch event logs
-			let message_id = self.extract_message_id_from_logs(&receipt.logs)?;
-
-			// Need to get the fill transaction to extract solver and timestamp
-			let dest_provider = self.providers.get(&dest_chain).ok_or_else(|| {
-				SettlementError::ValidationFailed(format!("No provider for chain {dest_chain}"))
-			})?;
-
-			let fill_tx_hash = order.fill_tx_hash.as_ref().ok_or_else(|| {
-				SettlementError::ValidationFailed(
-					"Missing fill transaction hash: required for Hyperlane post-fill processing"
-						.to_string(),
-				)
-			})?;
-
-			let fill_receipt = dest_provider
-				.get_transaction_receipt(FixedBytes::<32>::from_slice(&fill_tx_hash.0))
-				.await
-				.map_err(|e| {
-					SettlementError::ValidationFailed(format!("Failed to get fill receipt: {e}"))
-				})?
-				.ok_or_else(|| {
-					SettlementError::ValidationFailed("Fill transaction not found".to_string())
-				})?;
-
-			// Extract solver and timestamp from fill logs
-			let logs: Vec<solver_types::Log> = fill_receipt
-				.inner
-				.logs()
-				.iter()
-				.map(|log| solver_types::Log {
-					address: solver_types::Address(log.address().0 .0.to_vec()),
-					topics: log
-						.topics()
-						.iter()
-						.map(|t| solver_types::H256(t.0))
-						.collect(),
-					data: log.data().data.to_vec(),
-					transaction_hash: log
-						.transaction_hash
-						.map(|h| solver_types::TransactionHash(h.0.to_vec())),
-					block_number: log.block_number,
-				})
-				.collect();
-
-			let order_id_bytes =
-				order_id_to_bytes32(&order.id).map_err(SettlementError::ValidationFailed)?;
-			let (solver_id, timestamp) =
-				extract_fill_details_from_logs(&logs, order, &order_id_bytes, dest_chain)?;
-
-			// Compute payload hash once and store it
-			let payload_hash = self.compute_payload_hash(order, solver_id, timestamp)?;
-
-			// Store in message tracker with all details for later use
-			// PostFill happens on dest_chain, message goes from dest_chain to origin_chain
-			self.message_tracker
-				.track_submission(
-					order.id.clone(),
-					message_id,
-					dest_chain,   // origin_chain in submission = where message originates from
-					origin_chain, // destination_chain in submission = where message goes to
-					receipt.hash.clone(),
-					U256::ZERO, // TODO: Gas payment would be calculated from actual receipt
-					payload_hash,
-					solver_id,
-					timestamp,
-				)
+			self.track_post_fill_submission_from_receipt(order, receipt)
 				.await?;
-
-			tracing::info!(
-				message_id = %hex::encode(message_id),
-				"Hyperlane message tracked"
-			);
 		}
 		Ok(())
 	}
@@ -1475,7 +1532,7 @@ mod tests {
 	use solver_types::utils::tests::builders::{
 		Eip7683OrderDataBuilder, MandateOutputBuilder, OrderBuilder,
 	};
-	use wiremock::matchers::method;
+	use wiremock::matchers::{body_string_contains, method};
 	use wiremock::{Mock, MockServer, ResponseTemplate};
 
 	fn test_storage() -> Arc<StorageService> {
@@ -1638,6 +1695,172 @@ mod tests {
 		};
 
 		event.encode_data()
+	}
+
+	fn hex_hash(bytes: &[u8]) -> String {
+		format!("0x{}", hex::encode(bytes))
+	}
+
+	fn make_dispatch_id_log(message_id: [u8; 32]) -> solver_types::Log {
+		solver_types::Log {
+			address: solver_types::Address(vec![0x44; 20]),
+			topics: vec![
+				solver_types::H256(keccak256("DispatchId(bytes32)").0),
+				solver_types::H256(message_id),
+			],
+			data: vec![],
+			..Default::default()
+		}
+	}
+
+	fn make_output_filled_log(
+		emitter: &[u8; 20],
+		order_id: [u8; 32],
+		solver: [u8; 32],
+		timestamp: u32,
+		output: &MandateOutput,
+	) -> solver_types::Log {
+		solver_types::Log {
+			address: solver_types::Address(emitter.to_vec()),
+			topics: vec![
+				solver_types::H256(
+					<solver_types::standards::eip7683::interfaces::OutputFilled
+						as alloy_sol_types::SolEvent>::SIGNATURE_HASH.0,
+				),
+				solver_types::H256(order_id),
+			],
+			data: encode_output_filled_data(order_id, solver, timestamp, output, output.amount),
+			..Default::default()
+		}
+	}
+
+	fn make_hyperlane_recovery_order(
+		order_id: [u8; 32],
+		origin_chain: u64,
+		dest_chain: u64,
+		fill_tx_hash: TransactionHash,
+		post_fill_tx_hash: TransactionHash,
+	) -> (Order, MandateOutput, [u8; 20]) {
+		let output_settler = [0xAA; 20];
+		let mut settler_bytes32 = [0u8; 32];
+		settler_bytes32[12..32].copy_from_slice(&output_settler);
+
+		let output = make_mandate_output(
+			[0x44; 32],
+			settler_bytes32,
+			dest_chain,
+			[0x22; 32],
+			U256::from(1000u64),
+			[0x33; 32],
+		);
+		let order = OrderBuilder::new()
+			.with_id(format!("0x{}", hex::encode(order_id)))
+			.with_input_chain_ids(vec![origin_chain])
+			.with_output_chains(vec![solver_types::order::ChainSettlerInfo {
+				chain_id: dest_chain,
+				settler_address: solver_types::Address(output_settler.to_vec()),
+			}])
+			.with_data(make_eip7683_order_data_for_binding(
+				&solver_types::Address(vec![0x33; 20]),
+				vec![output.clone()],
+			))
+			.with_fill_tx_hash(Some(fill_tx_hash))
+			.with_post_fill_tx_hash(Some(post_fill_tx_hash))
+			.build();
+
+		(order, output, output_settler)
+	}
+
+	fn make_receipt_json(
+		tx_hash: &TransactionHash,
+		block_number: u64,
+		success: bool,
+		logs: &[solver_types::Log],
+	) -> serde_json::Value {
+		let status_hex = if success { "0x1" } else { "0x0" };
+		serde_json::json!({
+			"transactionHash": hex_hash(&tx_hash.0),
+			"transactionIndex": "0x0",
+			"blockHash": "0x0000000000000000000000000000000000000000000000000000000000000002",
+			"blockNumber": format!("0x{block_number:x}"),
+			"from": "0x0000000000000000000000000000000000000003",
+			"to": "0x0000000000000000000000000000000000000004",
+			"cumulativeGasUsed": "0x0",
+			"gasUsed": "0x0",
+			"effectiveGasPrice": "0x0",
+			"logs": logs.iter().enumerate().map(|(idx, log)| serde_json::json!({
+				"address": with_0x_prefix(&hex::encode(&log.address.0)),
+				"topics": log.topics.iter().map(|topic| hex_hash(&topic.0)).collect::<Vec<_>>(),
+				"data": with_0x_prefix(&hex::encode(&log.data)),
+				"blockHash": "0x0000000000000000000000000000000000000000000000000000000000000002",
+				"blockNumber": format!("0x{block_number:x}"),
+				"transactionHash": hex_hash(&tx_hash.0),
+				"transactionIndex": "0x0",
+				"logIndex": format!("0x{idx:x}"),
+				"removed": false,
+			})).collect::<Vec<_>>(),
+			"logsBloom": format!("0x{}", "0".repeat(512)),
+			"status": status_hex,
+			"type": "0x2",
+		})
+	}
+
+	fn make_block_json(block_number: u64, timestamp: u64) -> serde_json::Value {
+		serde_json::json!({
+			"number": format!("0x{block_number:x}"),
+			"hash": "0x0000000000000000000000000000000000000000000000000000000000000002",
+			"parentHash": "0x0000000000000000000000000000000000000000000000000000000000000001",
+			"sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+			"miner": "0x0000000000000000000000000000000000000003",
+			"stateRoot": "0x0000000000000000000000000000000000000000000000000000000000000004",
+			"transactionsRoot": "0x0000000000000000000000000000000000000000000000000000000000000005",
+			"receiptsRoot": "0x0000000000000000000000000000000000000000000000000000000000000006",
+			"logsBloom": format!("0x{}", "0".repeat(512)),
+			"difficulty": "0x0",
+			"totalDifficulty": "0x0",
+			"extraData": "0x",
+			"size": "0x0",
+			"gasLimit": "0x1c9c380",
+			"gasUsed": "0x0",
+			"timestamp": format!("0x{timestamp:x}"),
+			"transactions": [],
+			"uncles": [],
+			"baseFeePerGas": "0x0",
+			"mixHash": "0x0000000000000000000000000000000000000000000000000000000000000007",
+			"nonce": "0x0000000000000000",
+		})
+	}
+
+	async fn mount_receipt_mock(
+		server: &MockServer,
+		tx_hash: &TransactionHash,
+		receipt: serde_json::Value,
+	) {
+		Mock::given(method("POST"))
+			.and(body_string_contains(
+				"\"method\":\"eth_getTransactionReceipt\"",
+			))
+			.and(body_string_contains(hex_hash(&tx_hash.0)))
+			.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+				"jsonrpc": "2.0",
+				"id": 1,
+				"result": receipt,
+			})))
+			.mount(server)
+			.await;
+	}
+
+	async fn mount_block_mock(server: &MockServer, block_number: u64, block: serde_json::Value) {
+		Mock::given(method("POST"))
+			.and(body_string_contains("\"method\":\"eth_getBlockByNumber\""))
+			.and(body_string_contains(format!("0x{block_number:x}")))
+			.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+				"jsonrpc": "2.0",
+				"id": 1,
+				"result": block,
+			})))
+			.mount(server)
+			.await;
 	}
 
 	#[test]
@@ -2073,6 +2296,180 @@ mod tests {
 		);
 		assert_eq!(decoded.payloads.len(), 1);
 		assert_eq!(decoded.payloads[0].as_ref(), expected_payload.as_slice());
+	}
+
+	#[tokio::test]
+	async fn hyperlane_recover_post_fill_state_rebuilds_tracker_from_post_fill_receipt() {
+		let server = MockServer::start().await;
+		let origin_chain = 1u64;
+		let dest_chain = 2u64;
+		let fill_tx_hash = TransactionHash(vec![0xfa; 32]);
+		let post_fill_tx_hash = TransactionHash(vec![0xfb; 32]);
+		let order_id = [0x42; 32];
+		let (order, output, output_settler) = make_hyperlane_recovery_order(
+			order_id,
+			origin_chain,
+			dest_chain,
+			fill_tx_hash.clone(),
+			post_fill_tx_hash.clone(),
+		);
+		let expected_message_id = [0x66; 32];
+		let fill_log =
+			make_output_filled_log(&output_settler, order_id, [0x77; 32], 123u32, &output);
+		let post_fill_log = make_dispatch_id_log(expected_message_id);
+		mount_receipt_mock(
+			&server,
+			&fill_tx_hash,
+			make_receipt_json(&fill_tx_hash, 7, true, &[fill_log]),
+		)
+		.await;
+		mount_receipt_mock(
+			&server,
+			&post_fill_tx_hash,
+			make_receipt_json(&post_fill_tx_hash, 8, true, &[post_fill_log]),
+		)
+		.await;
+
+		let provider = ProviderBuilder::new()
+			.connect_http(server.uri().parse().expect("valid RPC URL"))
+			.erased();
+		let settlement = test_hyperlane_settlement_with_providers(
+			OracleConfig {
+				input_oracles: HashMap::from([(
+					origin_chain,
+					vec![solver_types::Address(vec![0x33; 20])],
+				)]),
+				output_oracles: HashMap::from([(
+					dest_chain,
+					vec![solver_types::Address(vec![0x44; 20])],
+				)]),
+				routes: HashMap::from([(origin_chain, vec![dest_chain])]),
+				selection_strategy: OracleSelectionStrategy::First,
+			},
+			HashMap::from([(dest_chain, provider)]),
+		);
+
+		assert!(settlement.recover_post_fill_state(&order).await.unwrap());
+		assert_eq!(
+			settlement.message_tracker.get_message_id(&order.id).await,
+			Some(expected_message_id)
+		);
+	}
+
+	#[tokio::test]
+	async fn hyperlane_get_attestation_recovers_missing_message_tracker() {
+		let server = MockServer::start().await;
+		let origin_chain = 1u64;
+		let dest_chain = 2u64;
+		let fill_tx_hash = TransactionHash(vec![0xfa; 32]);
+		let post_fill_tx_hash = TransactionHash(vec![0xfb; 32]);
+		let order_id = [0x43; 32];
+		let (order, output, output_settler) = make_hyperlane_recovery_order(
+			order_id,
+			origin_chain,
+			dest_chain,
+			fill_tx_hash.clone(),
+			post_fill_tx_hash.clone(),
+		);
+		let expected_message_id = [0x67; 32];
+		let fill_log =
+			make_output_filled_log(&output_settler, order_id, [0x78; 32], 124u32, &output);
+		let post_fill_log = make_dispatch_id_log(expected_message_id);
+		mount_receipt_mock(
+			&server,
+			&fill_tx_hash,
+			make_receipt_json(&fill_tx_hash, 7, true, &[fill_log]),
+		)
+		.await;
+		mount_receipt_mock(
+			&server,
+			&post_fill_tx_hash,
+			make_receipt_json(&post_fill_tx_hash, 8, true, &[post_fill_log]),
+		)
+		.await;
+		mount_block_mock(&server, 7, make_block_json(7, 1_700_000_000)).await;
+
+		let provider = ProviderBuilder::new()
+			.connect_http(server.uri().parse().expect("valid RPC URL"))
+			.erased();
+		let settlement = test_hyperlane_settlement_with_providers(
+			OracleConfig {
+				input_oracles: HashMap::from([(
+					origin_chain,
+					vec![solver_types::Address(vec![0x33; 20])],
+				)]),
+				output_oracles: HashMap::from([(
+					dest_chain,
+					vec![solver_types::Address(vec![0x44; 20])],
+				)]),
+				routes: HashMap::from([(origin_chain, vec![dest_chain])]),
+				selection_strategy: OracleSelectionStrategy::First,
+			},
+			HashMap::from([(dest_chain, provider)]),
+		);
+
+		let proof = settlement
+			.get_attestation(&order, &fill_tx_hash)
+			.await
+			.unwrap();
+
+		assert_eq!(
+			proof.attestation_data,
+			Some(hex::encode(expected_message_id).into_bytes())
+		);
+		assert_eq!(
+			settlement.message_tracker.get_message_id(&order.id).await,
+			Some(expected_message_id)
+		);
+	}
+
+	#[tokio::test]
+	async fn hyperlane_post_fill_callback_is_noop_when_tracker_already_populated() {
+		let origin_chain = 1u64;
+		let dest_chain = 2u64;
+		let order = test_order_with_chains(origin_chain, dest_chain);
+		let expected_message_id = [0x68; 32];
+		let settlement = test_hyperlane_settlement_with_providers(
+			OracleConfig {
+				input_oracles: HashMap::new(),
+				output_oracles: HashMap::new(),
+				routes: HashMap::new(),
+				selection_strategy: OracleSelectionStrategy::First,
+			},
+			HashMap::new(),
+		);
+		settlement
+			.message_tracker
+			.track_submission(
+				order.id.clone(),
+				expected_message_id,
+				dest_chain,
+				origin_chain,
+				TransactionHash(vec![0xfb; 32]),
+				U256::ZERO,
+				[0x55; 32],
+				[0x77; 32],
+				123u32,
+			)
+			.await
+			.unwrap();
+		let receipt = TransactionReceipt {
+			hash: TransactionHash(vec![0xfb; 32]),
+			block_number: 8,
+			success: true,
+			logs: vec![make_dispatch_id_log([0x99; 32])],
+			block_timestamp: None,
+		};
+
+		settlement
+			.handle_transaction_confirmed(&order, TransactionType::PostFill, &receipt)
+			.await
+			.unwrap();
+
+		assert_eq!(
+			settlement.message_tracker.get_message_id(&order.id).await,
+			Some(expected_message_id)
+		);
 	}
 
 	#[tokio::test]

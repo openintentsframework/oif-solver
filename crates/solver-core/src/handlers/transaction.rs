@@ -202,15 +202,13 @@ impl TransactionHandler {
 		// after persisting the chain-confirmed stage. A transient callback failure
 		// must not erase the fact that the transaction succeeded on-chain.
 		if let Some(order) = settlement_callback_order {
-			if let Ok(settlement) = self.settlement.find_settlement_for_order(&order) {
-				settlement
-					.handle_transaction_confirmed(&order, tx_type, &receipt)
-					.await
-					.map_err(|source| TransactionError::SettlementCallback {
-						stage: tx_type,
-						source,
-					})?;
-			}
+			self.settlement
+				.handle_transaction_confirmed(&order, tx_type, &receipt)
+				.await
+				.map_err(|source| TransactionError::SettlementCallback {
+					stage: tx_type,
+					source,
+				})?;
 		}
 
 		Ok(())

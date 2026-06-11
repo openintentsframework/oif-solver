@@ -557,6 +557,29 @@ impl SettlementService {
 			.await
 	}
 
+	/// Notify the order-bound settlement that a lifecycle transaction was confirmed.
+	pub async fn handle_transaction_confirmed(
+		&self,
+		order: &Order,
+		tx_type: TransactionType,
+		receipt: &TransactionReceipt,
+	) -> Result<(), SettlementError> {
+		if !matches!(
+			tx_type,
+			TransactionType::PostFill | TransactionType::PreClaim
+		) {
+			return Ok(());
+		}
+
+		if let Ok(implementation) = self.find_settlement_for_order(order) {
+			implementation
+				.handle_transaction_confirmed(order, tx_type, receipt)
+				.await?;
+		}
+
+		Ok(())
+	}
+
 	/// Returns typed settlement readiness for an order/fill pair.
 	pub async fn readiness(&self, order: &Order, fill_proof: &FillProof) -> SettlementReadiness {
 		match self.find_settlement_for_order(order) {
