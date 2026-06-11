@@ -4,9 +4,11 @@
 //! and fill transactions, updating order state and publishing appropriate events.
 
 use crate::engine::event_bus::EventBus;
+use crate::handlers::forced_withdrawal::ensure_resource_locks_claimable;
 use crate::state::transaction_attempt::TransactionAttemptStore;
 use crate::state::OrderStateMachine;
 use alloy_primitives::hex;
+use solver_config::Config;
 use solver_delivery::{
 	DeliveryService, RevertClassification, TransactionAttemptRecorder, TransactionMonitoringEvent,
 	TransactionTracking,
@@ -14,11 +16,13 @@ use solver_delivery::{
 use solver_order::OrderService;
 use solver_storage::StorageService;
 use solver_types::{
-	truncate_id, DeliveryEvent, ExecutionParams, Order, OrderEvent, OrderStatus, SolverEvent,
+	standards::eip7683::LockType, truncate_id, utils::conversion::hex_to_alloy_address,
+	DeliveryEvent, Eip7683OrderData, ExecutionParams, Order, OrderEvent, OrderStatus, SolverEvent,
 	StorageKey, TransactionType,
 };
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::RwLock;
 use tracing::instrument;
 
 /// Errors that can occur during order processing.
@@ -46,6 +50,9 @@ pub struct OrderHandler {
 	storage: Arc<StorageService>,
 	state_machine: Arc<OrderStateMachine>,
 	event_bus: EventBus,
+	/// Dynamic config, read just-in-time so Admin API hot-reloads
+	/// (e.g. toggling `resource_lock_enabled`) take effect on the next fill.
+	dynamic_config: Arc<RwLock<Config>>,
 }
 
 impl OrderHandler {
@@ -55,6 +62,7 @@ impl OrderHandler {
 		storage: Arc<StorageService>,
 		state_machine: Arc<OrderStateMachine>,
 		event_bus: EventBus,
+		dynamic_config: Arc<RwLock<Config>>,
 	) -> Self {
 		Self {
 			order_service,
@@ -62,6 +70,7 @@ impl OrderHandler {
 			storage,
 			state_machine,
 			event_bus,
+			dynamic_config,
 		}
 	}
 
@@ -238,6 +247,60 @@ impl OrderHandler {
 		Ok(())
 	}
 
+	/// (C-03) Reject ResourceLock fills whose input locks have a pending or enabled
+	/// forced withdrawal on TheCompact, checked just before the fill is released.
+	///
+	/// No-op for non-ResourceLock orders. When ResourceLock support is disabled this
+	/// path should not be reached (intake gates it), but we still treat a ResourceLock
+	/// order arriving here as in-scope and fail closed if its compact address is
+	/// missing or the on-chain query fails.
+	async fn check_forced_withdrawal_before_fill(&self, order: &Order) -> Result<(), OrderError> {
+		let order_data: Eip7683OrderData = match serde_json::from_value(order.data.clone()) {
+			Ok(data) => data,
+			Err(e) if order.standard == "eip7683" => {
+				return Err(OrderError::Service(format!(
+					"Failed to parse EIP-7683 order data before ResourceLock guard: {e}"
+				)));
+			},
+			// Non-7683 orders carry no resource lock; nothing to guard.
+			Err(_) => return Ok(()),
+		};
+
+		if !matches!(order_data.lock_type, Some(LockType::ResourceLock)) {
+			return Ok(());
+		}
+
+		let origin_chain_id = u64::try_from(order_data.origin_chain_id)
+			.map_err(|_| OrderError::Service("Invalid origin chain ID".to_string()))?;
+
+		// Resolve TheCompact on the origin chain from current (hot-reloadable) config.
+		let the_compact_address = {
+			let config = self.dynamic_config.read().await;
+			config
+				.networks
+				.get(&origin_chain_id)
+				.and_then(|n| n.the_compact_address.clone())
+				.ok_or_else(|| {
+					OrderError::Service(format!(
+						"ResourceLock fill aborted: TheCompact address not configured for origin chain {origin_chain_id}"
+					))
+				})?
+		};
+
+		let sponsor = hex_to_alloy_address(&order_data.user)
+			.map_err(|e| OrderError::Service(format!("Invalid sponsor address: {e}")))?;
+
+		ensure_resource_locks_claimable(
+			&self.delivery,
+			&the_compact_address,
+			origin_chain_id,
+			sponsor,
+			&order_data.inputs,
+		)
+		.await
+		.map_err(|e| OrderError::Service(e.to_string()))
+	}
+
 	/// Handles order execution by generating and submitting a fill transaction.
 	#[instrument(skip_all, fields(order_id = %truncate_id(&order.id)))]
 	pub async fn handle_execution(
@@ -245,6 +308,12 @@ impl OrderHandler {
 		order: Order,
 		params: ExecutionParams,
 	) -> Result<(), OrderError> {
+		// (C-03) Just-in-time forced-withdrawal guard for ResourceLock orders. This is
+		// the last solver-controlled point before the destination fill is released, so
+		// it catches a sponsor who enabled (or began) a forced withdrawal before the
+		// order was submitted — a case the intake-time reset-period floor cannot see.
+		self.check_forced_withdrawal_before_fill(&order).await?;
+
 		// Generate fill transaction
 		let tx = self
 			.order_service
@@ -431,6 +500,26 @@ mod tests {
 		F2: FnOnce(&mut MockDeliveryInterface),
 		F3: FnOnce(&mut MockStorageInterface),
 	{
+		create_test_handler_with_config(
+			setup_order,
+			setup_delivery,
+			setup_storage,
+			solver_config::ConfigBuilder::new().build(),
+		)
+		.await
+	}
+
+	async fn create_test_handler_with_config<F1, F2, F3>(
+		setup_order: F1,
+		setup_delivery: F2,
+		setup_storage: F3,
+		config: solver_config::Config,
+	) -> (OrderHandler, broadcast::Receiver<SolverEvent>)
+	where
+		F1: FnOnce(&mut MockOrderInterface),
+		F2: FnOnce(&mut MockDeliveryInterface),
+		F3: FnOnce(&mut MockStorageInterface),
+	{
 		let mut mock_order = MockOrderInterface::new();
 		let mut mock_delivery = MockDeliveryInterface::new();
 		let mut mock_storage = MockStorageInterface::new();
@@ -467,7 +556,14 @@ mod tests {
 		let event_bus = EventBus::new(100);
 		let event_rx = event_bus.subscribe();
 
-		let handler = OrderHandler::new(order_service, delivery, storage, state_machine, event_bus);
+		let handler = OrderHandler::new(
+			order_service,
+			delivery,
+			storage,
+			state_machine,
+			event_bus,
+			Arc::new(RwLock::new(config)),
+		);
 
 		(handler, event_rx)
 	}
@@ -861,6 +957,132 @@ mod tests {
 		match result.unwrap_err() {
 			OrderError::Service(msg) => assert!(msg.contains("Fill error")),
 			_ => panic!("Expected Service error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn malformed_eip7683_order_data_rejected_before_fill_generation() {
+		let order = OrderBuilder::new()
+			.with_standard("eip7683")
+			.with_data(serde_json::json!({
+				"lock_type": "resource_lock",
+				"origin_chain_id": "137"
+			}))
+			.build();
+		let params = create_test_execution_params();
+
+		let (handler, _event_rx) = create_test_handler_with_mocks(
+			|mock_order| {
+				mock_order.expect_generate_fill_transaction().times(0);
+			},
+			|mock_delivery| {
+				mock_delivery.expect_submit().times(0);
+			},
+			|_mock_storage| {},
+		)
+		.await;
+
+		let err = handler
+			.handle_execution(order, params)
+			.await
+			.expect_err("malformed EIP-7683 data must fail before fill generation");
+
+		assert!(matches!(
+			err,
+			OrderError::Service(msg) if msg.contains("Failed to parse EIP-7683 order data")
+		));
+	}
+
+	/// (C-03) A ResourceLock order whose input lock has an *enabled* forced
+	/// withdrawal must be rejected before the destination fill is released: the
+	/// sponsor can pull the locked input out from under the solver's claim.
+	///
+	/// The guard runs before `generate_fill_transaction`, so neither fill
+	/// generation nor delivery is exercised (`.times(0)`).
+	#[tokio::test]
+	async fn forced_withdrawal_enabled_resource_lock_rejected_before_fill() {
+		use alloy_sol_types::SolCall;
+		use solver_types::networks::{NetworkConfig, NetworkType, RpcEndpoint};
+		use solver_types::standards::eip7683::interfaces::ITheCompact;
+		use solver_types::standards::eip7683::LockType;
+		use solver_types::Address;
+
+		const ORIGIN_CHAIN: u64 = 137;
+		let the_compact = Address(vec![0x88u8; 20]);
+
+		// ResourceLock order with a single input lock; sponsor is `user`.
+		let lock_id = U256::from(0xABCDu64);
+		let order_data = serde_json::json!({
+			"user": "0x2222222222222222222222222222222222222222",
+			"nonce": "1",
+			"origin_chain_id": ORIGIN_CHAIN.to_string(),
+			"expires": 1_700_000_600u32,
+			"fill_deadline": 1_700_000_000u32,
+			"input_oracle": "0x3333333333333333333333333333333333333333",
+			"inputs": [[lock_id.to_string(), "1000"]],
+			"order_id": vec![0u8; 32],
+			"gas_limit_overrides": {},
+			"outputs": [],
+			"lock_type": LockType::ResourceLock,
+		});
+		let order = OrderBuilder::new().with_data(order_data).build();
+
+		// Config: origin chain network advertises TheCompact.
+		let network = NetworkConfig {
+			name: None,
+			network_type: NetworkType::default(),
+			rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
+			input_settler_address: Address(vec![0x11u8; 20]),
+			output_settler_address: Address(vec![0x22u8; 20]),
+			tokens: vec![],
+			input_settler_compact_address: Some(Address(vec![0x44u8; 20])),
+			the_compact_address: Some(the_compact),
+			allocator_address: Some(Address(vec![0xA1u8; 20])),
+		};
+		let config = solver_config::ConfigBuilder::new()
+			.networks(HashMap::from([(ORIGIN_CHAIN, network)]))
+			.build();
+
+		let params = create_test_execution_params();
+
+		let (handler, _event_rx) = create_test_handler_with_config(
+			|mock_order| {
+				// Fill generation must NOT run — the guard aborts first.
+				mock_order.expect_generate_fill_transaction().times(0);
+			},
+			|mock_delivery| {
+				// `getForcedWithdrawalStatus` reports Enabled (status 2).
+				mock_delivery.expect_eth_call().returning(|tx| {
+					let selector = tx.data.get(0..4).map(|s| [s[0], s[1], s[2], s[3]]);
+					let resp = match selector {
+						Some(s) if s == ITheCompact::getForcedWithdrawalStatusCall::SELECTOR => {
+							let mut out = vec![0u8; 64];
+							out[31] = 2; // ForcedWithdrawalStatus::Enabled
+							alloy_primitives::Bytes::from(out)
+						},
+						_ => alloy_primitives::Bytes::from(vec![0u8; 64]),
+					};
+					Box::pin(async move { Ok(resp) })
+				});
+				// No fill is submitted.
+				mock_delivery.expect_submit().times(0);
+			},
+			|_mock_storage| {},
+			config,
+		)
+		.await;
+
+		let result = handler.handle_execution(order, params).await;
+
+		let err = result.expect_err("enabled forced withdrawal must abort the fill");
+		match err {
+			OrderError::Service(msg) => {
+				assert!(
+					msg.contains("forced withdrawal"),
+					"unexpected error message: {msg}"
+				);
+			},
+			other => panic!("expected Service error, got {other:?}"),
 		}
 	}
 
