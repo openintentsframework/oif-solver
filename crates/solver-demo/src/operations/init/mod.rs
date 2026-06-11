@@ -716,8 +716,6 @@ fn generate_demo_config(
 					"polling_interval_secs": 0
 				},
 				"offchain_eip7683": {
-					"api_host": "127.0.0.1",
-					"api_port": 8081,
 					"network_ids": [first_chain]
 				}
 			}

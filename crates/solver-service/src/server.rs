@@ -57,10 +57,8 @@ pub struct AppState {
 	/// Shared runtime config that gets hot-reloaded by admin API.
 	/// Always use this for reading current config (tokens, networks, etc.).
 	pub config: Arc<RwLock<Config>>,
-	/// HTTP client for forwarding requests.
-	pub http_client: reqwest::Client,
-	/// Discovery service URL for forwarding orders (if configured).
-	pub discovery_url: Option<String>,
+	/// Discovery implementation that ingests orders submitted via /orders (if configured).
+	pub discovery_impl: Option<String>,
 	/// JWT service for authentication (if configured).
 	pub jwt_service: Option<Arc<JwtService>>,
 	/// Dedicated nonce store for SIWE authentication (if configured).
@@ -140,27 +138,16 @@ pub async fn start_server(
 	// Get a snapshot for reading config values during setup
 	let config = solver.config().clone();
 
-	// Create a reusable HTTP client with connection pooling
-	let http_client = reqwest::Client::builder()
-		.pool_idle_timeout(std::time::Duration::from_secs(90))
-		.pool_max_idle_per_host(10)
-		.timeout(std::time::Duration::from_secs(30))
-		.build()?;
-
-	// Extract discovery service URL once during startup
-	let discovery_url = api_config
+	// Resolve which discovery implementation ingests orders submitted via /orders.
+	// Orders are submitted in-process; there is no HTTP forward.
+	let discovery_impl = api_config
 		.implementations
 		.discovery
-		.as_ref()
-		.and_then(|discovery_impl| {
-			solver.discovery().get_url(discovery_impl).map(|url| {
-				// Format as complete URL with /intent endpoint
-				format!("http://{url}/intent")
-			})
-		});
+		.clone()
+		.filter(|name| solver.discovery().get(name).is_some());
 
-	if let Some(ref url) = discovery_url {
-		tracing::info!("Orders will be forwarded to discovery service at: {}", url);
+	if let Some(ref name) = discovery_impl {
+		tracing::info!("Orders will be submitted in-process to discovery implementation: {name}");
 	} else {
 		tracing::warn!("No offchain_eip7683 discovery source configured - /orders endpoint will not be available");
 	}
@@ -325,8 +312,7 @@ pub async fn start_server(
 	let app_state = AppState {
 		solver,
 		config: dynamic_config,
-		http_client,
-		discovery_url,
+		discovery_impl,
 		jwt_service: jwt_service.clone(),
 		siwe_nonce_store,
 		signature_validation,
@@ -675,13 +661,16 @@ async fn handle_order(
 		Err(api_error) => return api_error.into_response(),
 	};
 
-	// Validate the PostOrderRequest
+	// Validate the PostOrderRequest. LOAD-BEARING: this runs sponsor-signature,
+	// allocator-authorization, and capacity checks BEFORE submit_order_to_discovery,
+	// which is a trusted enqueue primitive that does not re-validate. Removing this
+	// reopens C-02/C-04.
 	match validate_intent_request(&intent_request, &state, standard).await {
 		Ok(order) => order,
 		Err(api_error) => return api_error.into_response(),
 	};
 
-	forward_to_discovery_service(&state, &intent_request).await
+	submit_order_to_discovery(&state, &intent_request).await
 }
 
 /// Extracts a PostOrderRequest from the incoming payload.
@@ -920,15 +909,19 @@ async fn validate_intent_request(
 	Ok(order)
 }
 
-async fn forward_to_discovery_service(
+/// Submits a validated order to the configured discovery implementation, in-process.
+///
+/// Callers MUST run `validate_intent_request` first — `submit_order` is a trusted
+/// enqueue primitive that does not re-validate (see its trait doc).
+async fn submit_order_to_discovery(
 	state: &AppState,
 	intent: &PostOrderRequest,
 ) -> axum::response::Response {
+	use solver_discovery::IntentSubmissionError;
 	use solver_types::{PostOrderResponse, PostOrderResponseStatus};
 
-	// Check if discovery URL is configured
-	let forward_url = match &state.discovery_url {
-		Some(url) => url,
+	let implementation = match &state.discovery_impl {
+		Some(name) => name,
 		None => {
 			tracing::warn!("offchain_eip7683 discovery source not configured");
 			let response = PostOrderResponse {
@@ -941,59 +934,56 @@ async fn forward_to_discovery_service(
 		},
 	};
 
-	// Forward the request
 	match state
-		.http_client
-		.post(forward_url)
-		.json(intent)
-		.send()
+		.solver
+		.discovery()
+		.submit_order(implementation, intent)
 		.await
 	{
-		Ok(response) => {
-			let status = response.status();
-
-			// Try to parse as PostOrderResponse first
-			match response.json::<PostOrderResponse>().await {
-				Ok(post_order_response) => {
-					// Convert reqwest status to axum status
-					let axum_status = if status.is_success() {
-						StatusCode::OK
-					} else if status.is_client_error() {
-						StatusCode::BAD_REQUEST
-					} else {
-						StatusCode::from_u16(status.as_u16())
-							.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
-					};
-					(axum_status, Json(post_order_response)).into_response()
-				},
-				Err(e) => {
-					tracing::warn!(
-						"Failed to parse response from discovery API as PostOrderResponse: {}",
-						e
-					);
-					// Return an error response
-					let response = PostOrderResponse {
-						order_id: None,
-						status: PostOrderResponseStatus::Error,
-						message: Some(
-							"Failed to parse response from discovery service".to_string(),
-						),
-						order: None,
-					};
-					(StatusCode::BAD_GATEWAY, Json(response)).into_response()
-				},
-			}
-		},
-		Err(e) => {
-			tracing::warn!("Failed to forward request to discovery API: {}", e);
-			let response = PostOrderResponse {
+		Ok(submission) => (
+			StatusCode::OK,
+			Json(PostOrderResponse {
+				order_id: Some(submission.order_id),
+				status: PostOrderResponseStatus::Received,
+				message: Some(submission.message),
+				order: submission.order,
+			}),
+		)
+			.into_response(),
+		Err(IntentSubmissionError::Rejected { message, order }) => (
+			StatusCode::BAD_REQUEST,
+			Json(PostOrderResponse {
+				order_id: None,
+				status: PostOrderResponseStatus::Rejected,
+				message: Some(message),
+				order,
+			}),
+		)
+			.into_response(),
+		Err(IntentSubmissionError::Unavailable {
+			message,
+			order_id,
+			order,
+		}) => (
+			StatusCode::SERVICE_UNAVAILABLE,
+			Json(PostOrderResponse {
+				order_id,
+				status: PostOrderResponseStatus::Error,
+				message: Some(message),
+				order,
+			}),
+		)
+			.into_response(),
+		Err(IntentSubmissionError::NotSupported) => (
+			StatusCode::SERVICE_UNAVAILABLE,
+			Json(PostOrderResponse {
 				order_id: None,
 				status: PostOrderResponseStatus::Error,
-				message: Some(format!("Failed to submit intent: {e}")),
+				message: Some("Intent submission service not configured".to_string()),
 				order: None,
-			};
-			(StatusCode::BAD_GATEWAY, Json(response)).into_response()
-		},
+			}),
+		)
+			.into_response(),
 	}
 }
 
@@ -1005,7 +995,6 @@ mod tests {
 	use alloy_sol_types::{SolCall, SolType};
 	use axum::body::{self, Body};
 	use axum::http::{Request, StatusCode};
-	use reqwest::Client;
 	use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 	use serde_json::{json, to_value};
 	use solver_account::AccountService;
@@ -1041,15 +1030,18 @@ mod tests {
 	use std::sync::Arc;
 	use std::time::Duration;
 	use tower::ServiceExt;
-	use wiremock::matchers::{method, path};
-	use wiremock::{Mock, MockServer, ResponseTemplate};
+
+	fn empty_discovery() -> Arc<DiscoveryService> {
+		Arc::new(DiscoveryService::new(HashMap::new()))
+	}
 
 	async fn build_test_solver_engine() -> Arc<SolverEngine> {
-		build_test_solver_engine_with_allocator_authorized(true).await
+		build_test_solver_engine_with_allocator_authorized(true, empty_discovery()).await
 	}
 
 	async fn build_test_solver_engine_with_allocator_authorized(
 		allocator_authorized: bool,
+		discovery: Arc<DiscoveryService>,
 	) -> Arc<SolverEngine> {
 		let config: Config = serde_json::from_value(json!({
 			"solver": {
@@ -1144,7 +1136,6 @@ mod tests {
 		let mut delivery_implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
 		delivery_implementations.insert(1, Arc::new(mock_delivery) as Arc<dyn DeliveryInterface>);
 		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 1, 10, 60));
-		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
 
 		let strategy_config = serde_json::Value::Object(serde_json::Map::new());
 		let strategy =
@@ -1189,6 +1180,7 @@ mod tests {
 	async fn build_test_solver_engine_with_delivery(
 		config: Config,
 		delivery_implementations: HashMap<u64, Arc<dyn DeliveryInterface>>,
+		discovery: Arc<DiscoveryService>,
 	) -> Arc<SolverEngine> {
 		let storage = Arc::new(StorageService::new(Box::new(MemoryStorage::new())));
 
@@ -1203,7 +1195,6 @@ mod tests {
 		let solver_address = Address(vec![0x11; 20]);
 
 		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 1, 10, 60));
-		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
 
 		let strategy_config = serde_json::Value::Object(serde_json::Map::new());
 		let strategy =
@@ -1325,16 +1316,16 @@ mod tests {
 		mock_delivery.expect_eth_call().times(0);
 		let mut delivery_impls: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
 		delivery_impls.insert(1, Arc::new(mock_delivery) as Arc<dyn DeliveryInterface>);
-		let solver = build_test_solver_engine_with_delivery(config.clone(), delivery_impls).await;
-		let http_client = Client::builder()
-			.no_proxy()
-			.build()
-			.expect("failed to build client");
+		let solver = build_test_solver_engine_with_delivery(
+			config.clone(),
+			delivery_impls,
+			empty_discovery(),
+		)
+		.await;
 		let state = AppState {
 			solver,
 			config: Arc::new(RwLock::new(config)),
-			http_client,
-			discovery_url: None,
+			discovery_impl: None,
 			jwt_service: None,
 			siwe_nonce_store: None,
 			signature_validation: Arc::new(SignatureValidationService::new()),
@@ -1377,16 +1368,16 @@ mod tests {
 		});
 		let mut delivery_impls: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
 		delivery_impls.insert(1, Arc::new(mock_delivery) as Arc<dyn DeliveryInterface>);
-		let solver = build_test_solver_engine_with_delivery(config.clone(), delivery_impls).await;
-		let http_client = Client::builder()
-			.no_proxy()
-			.build()
-			.expect("failed to build client");
+		let solver = build_test_solver_engine_with_delivery(
+			config.clone(),
+			delivery_impls,
+			empty_discovery(),
+		)
+		.await;
 		let state = AppState {
 			solver,
 			config: Arc::new(RwLock::new(config)),
-			http_client,
-			discovery_url: None,
+			discovery_impl: None,
 			jwt_service: None,
 			siwe_nonce_store: None,
 			signature_validation: Arc::new(SignatureValidationService::new()),
@@ -1428,40 +1419,91 @@ mod tests {
 		Bytes::from(out)
 	}
 
-	async fn build_test_app_state(discovery_url: Option<String>) -> AppState {
+	async fn build_test_app_state(discovery_impl: Option<String>) -> AppState {
 		let solver = build_test_solver_engine().await;
-		build_test_app_state_with_solver(discovery_url, solver).await
+		build_test_app_state_with_solver(discovery_impl, solver).await
 	}
 
 	async fn build_test_app_state_with_allocator_authorized(
-		discovery_url: Option<String>,
+		discovery_impl: Option<String>,
 		allocator_authorized: bool,
+		discovery: Arc<DiscoveryService>,
 	) -> AppState {
-		let solver = build_test_solver_engine_with_allocator_authorized(allocator_authorized).await;
-		build_test_app_state_with_solver(discovery_url, solver).await
+		let solver =
+			build_test_solver_engine_with_allocator_authorized(allocator_authorized, discovery)
+				.await;
+		build_test_app_state_with_solver(discovery_impl, solver).await
+	}
+
+	/// Builds an AppState whose engine holds the given discovery service, with
+	/// `discovery_impl` naming which implementation `/orders` submits to.
+	async fn build_test_app_state_with_discovery(
+		discovery_impl: Option<String>,
+		discovery: Arc<DiscoveryService>,
+	) -> AppState {
+		let solver = build_test_solver_engine_with_allocator_authorized(true, discovery).await;
+		build_test_app_state_with_solver(discovery_impl, solver).await
 	}
 
 	async fn build_test_app_state_with_solver(
-		discovery_url: Option<String>,
+		discovery_impl: Option<String>,
 		solver: Arc<SolverEngine>,
 	) -> AppState {
 		let config = solver.config().clone();
 		let dynamic_config = Arc::new(RwLock::new(config));
 
-		let http_client = Client::builder()
-			.no_proxy()
-			.build()
-			.expect("failed to build client");
-
 		AppState {
 			solver,
 			config: dynamic_config,
-			http_client,
-			discovery_url,
+			discovery_impl,
 			jwt_service: None,
 			siwe_nonce_store: None,
 			signature_validation: Arc::new(SignatureValidationService::new()),
 		}
+	}
+
+	/// A `DiscoveryInterface` stub for /orders tests: counts submit_order calls
+	/// and either accepts (returning `accept_order_id`) or reports NotSupported.
+	struct StubDiscovery {
+		calls: Arc<std::sync::atomic::AtomicUsize>,
+		accept_order_id: Option<String>,
+	}
+
+	#[async_trait::async_trait]
+	impl solver_discovery::DiscoveryInterface for StubDiscovery {
+		fn config_schema(&self) -> Box<dyn solver_types::ConfigSchema> {
+			unimplemented!("not exercised by these tests")
+		}
+		async fn start_monitoring(
+			&self,
+			_sender: tokio::sync::mpsc::Sender<solver_types::Intent>,
+		) -> Result<(), solver_discovery::DiscoveryError> {
+			Ok(())
+		}
+		async fn stop_monitoring(&self) -> Result<(), solver_discovery::DiscoveryError> {
+			Ok(())
+		}
+		async fn submit_order(
+			&self,
+			_request: &PostOrderRequest,
+		) -> Result<solver_discovery::IntentSubmission, solver_discovery::IntentSubmissionError> {
+			self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+			match &self.accept_order_id {
+				Some(id) => Ok(solver_discovery::IntentSubmission {
+					order_id: id.clone(),
+					order: None,
+					message: "ok".to_string(),
+				}),
+				None => Err(solver_discovery::IntentSubmissionError::NotSupported),
+			}
+		}
+	}
+
+	fn stub_discovery_service(stub: StubDiscovery) -> Arc<DiscoveryService> {
+		let mut impls: HashMap<String, Box<dyn solver_discovery::DiscoveryInterface>> =
+			HashMap::new();
+		impls.insert("offchain_eip7683".to_string(), Box::new(stub));
+		Arc::new(DiscoveryService::new(impls))
 	}
 
 	fn test_auth_config() -> AuthConfig {
@@ -1496,8 +1538,8 @@ mod tests {
 		build_public_api_routes(&api_config, jwt_service.as_ref()).with_state(state)
 	}
 
-	async fn build_intake_disabled_test_app_state(discovery_url: Option<String>) -> AppState {
-		let state = build_test_app_state(discovery_url).await;
+	async fn build_intake_disabled_test_app_state(discovery_impl: Option<String>) -> AppState {
+		let state = build_test_app_state(discovery_impl).await;
 		state.config.write().await.solver.ingress_mode =
 			solver_config::SolverIngressMode::IntakeDisabled;
 		state
@@ -2122,10 +2164,9 @@ mod tests {
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
-	async fn forward_to_discovery_service_returns_service_unavailable_when_missing_url() {
+	async fn submit_order_returns_service_unavailable_when_discovery_not_configured() {
 		let state = build_test_app_state(None).await;
-		let response =
-			super::forward_to_discovery_service(&state, &sample_post_order_request()).await;
+		let response = super::submit_order_to_discovery(&state, &sample_post_order_request()).await;
 
 		assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
@@ -2177,16 +2218,16 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn handle_order_rejects_shifted_compact_signature_before_discovery_forwarding() {
-		let mock_server = MockServer::start().await;
-		Mock::given(method("POST"))
-			.and(path("/intent"))
-			.respond_with(ResponseTemplate::new(200))
-			.expect(0)
-			.mount(&mock_server)
-			.await;
-
-		let discovery_url = format!("{}/intent", mock_server.uri());
-		let state = build_test_app_state(Some(discovery_url)).await;
+		let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let stub = StubDiscovery {
+			calls: calls.clone(),
+			accept_order_id: Some("should-not-be-used".to_string()),
+		};
+		let state = build_test_app_state_with_discovery(
+			Some("offchain_eip7683".to_string()),
+			stub_discovery_service(stub),
+		)
+		.await;
 		let payload = to_value(sample_resource_lock_request_with_shifted_signature())
 			.expect("serialize request");
 
@@ -2199,21 +2240,26 @@ mod tests {
 		let parsed: ErrorResponse = serde_json::from_slice(&body_bytes).expect("parse body");
 		assert_eq!(parsed.error, "ORDER_VALIDATION_FAILED");
 		assert!(parsed.message.contains("Compact"));
+		assert_eq!(
+			calls.load(std::sync::atomic::Ordering::SeqCst),
+			0,
+			"order must not reach discovery"
+		);
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn handle_order_rejects_unauthorized_compact_allocator_data_before_forwarding() {
-		let mock_server = MockServer::start().await;
-		Mock::given(method("POST"))
-			.and(path("/intent"))
-			.respond_with(ResponseTemplate::new(200))
-			.expect(0)
-			.mount(&mock_server)
-			.await;
-
-		let discovery_url = format!("{}/intent", mock_server.uri());
-		let state =
-			build_test_app_state_with_allocator_authorized(Some(discovery_url), false).await;
+		let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let stub = StubDiscovery {
+			calls: calls.clone(),
+			accept_order_id: Some("should-not-be-used".to_string()),
+		};
+		let state = build_test_app_state_with_allocator_authorized(
+			Some("offchain_eip7683".to_string()),
+			false,
+			stub_discovery_service(stub),
+		)
+		.await;
 		let payload = to_value(sample_resource_lock_request_with_allocator_data(
 			b"garbage allocator data",
 		))
@@ -2230,31 +2276,27 @@ mod tests {
 		// Proves the order reached the allocator-authorization check (isClaimAuthorized),
 		// not an earlier gate (trusted-allocator pin / reset period / malformed window).
 		assert!(parsed.message.contains("did not authorize"));
+		assert_eq!(
+			calls.load(std::sync::atomic::Ordering::SeqCst),
+			0,
+			"order must not reach discovery"
+		);
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
-	async fn forward_to_discovery_service_succeeds_with_valid_backend() {
-		let mock_server = MockServer::start().await;
-
-		let expected_response = PostOrderResponse {
-			order_id: Some("order-123".to_string()),
-			status: PostOrderResponseStatus::Received,
-			message: Some("ok".to_string()),
-			order: None,
+	async fn submit_order_succeeds_with_accepting_discovery() {
+		let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let stub = StubDiscovery {
+			calls: calls.clone(),
+			accept_order_id: Some("order-123".to_string()),
 		};
+		let state = build_test_app_state_with_discovery(
+			Some("offchain_eip7683".to_string()),
+			stub_discovery_service(stub),
+		)
+		.await;
 
-		Mock::given(method("POST"))
-			.and(path("/intent"))
-			.respond_with(ResponseTemplate::new(200).set_body_json(&expected_response))
-			.expect(1)
-			.mount(&mock_server)
-			.await;
-
-		let discovery_url = format!("{}/intent", mock_server.uri());
-		let state = build_test_app_state(Some(discovery_url)).await;
-
-		let response =
-			super::forward_to_discovery_service(&state, &sample_post_order_request()).await;
+		let response = super::submit_order_to_discovery(&state, &sample_post_order_request()).await;
 
 		assert_eq!(response.status(), StatusCode::OK);
 
@@ -2264,37 +2306,7 @@ mod tests {
 		let parsed: PostOrderResponse = serde_json::from_slice(&body_bytes).expect("parse body");
 		assert_eq!(parsed.status, PostOrderResponseStatus::Received);
 		assert_eq!(parsed.order_id.as_deref(), Some("order-123"));
-	}
-
-	#[tokio::test(flavor = "multi_thread")]
-	async fn forward_to_discovery_service_returns_bad_gateway_on_invalid_payload() {
-		let mock_server = MockServer::start().await;
-
-		Mock::given(method("POST"))
-			.and(path("/intent"))
-			.respond_with(ResponseTemplate::new(200).set_body_string("not-json"))
-			.expect(1)
-			.mount(&mock_server)
-			.await;
-
-		let discovery_url = format!("{}/intent", mock_server.uri());
-		let state = build_test_app_state(Some(discovery_url)).await;
-
-		let response =
-			super::forward_to_discovery_service(&state, &sample_post_order_request()).await;
-
-		assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-
-		let body_bytes = body::to_bytes(response.into_body(), usize::MAX)
-			.await
-			.expect("body");
-		let parsed: PostOrderResponse = serde_json::from_slice(&body_bytes).expect("parse body");
-		assert_eq!(parsed.status, PostOrderResponseStatus::Error);
-		assert!(parsed
-			.message
-			.as_deref()
-			.unwrap_or_default()
-			.contains("Failed to parse response from discovery service"));
+		assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

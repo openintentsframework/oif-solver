@@ -54,8 +54,6 @@
   "discovery": {
     "implementations": {
       "offchain_eip7683": {
-        "api_host": "127.0.0.1",
-        "api_port": 8081,
         "network_ids": [
           31337
         ]
