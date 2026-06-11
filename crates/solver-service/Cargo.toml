@@ -34,7 +34,6 @@ hex = "0.4"
 jsonwebtoken = "9.3.1"
 once_cell = "1.20"
 regex = "1.10"
-reqwest = "0.12"
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 rust_decimal = { workspace = true }
 secp256k1 = { version = "0.31", features = ["recovery"] }
@@ -70,4 +69,3 @@ solver-settlement = { path = "../solver-settlement", features = ["testing"] }
 solver-storage = { path = "../solver-storage", features = ["testing"] }
 tempfile = { workspace = true }
 tokio = { workspace = true }
-wiremock = "0.5"

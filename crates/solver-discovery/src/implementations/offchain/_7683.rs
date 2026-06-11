@@ -1,58 +1,42 @@
-//! ERC-7683 Off-chain Intent Discovery API Implementation
+//! ERC-7683 Off-chain Intent Discovery Implementation
 //!
-//! This module implements an HTTP API server that accepts ERC-7683 cross-chain intents
-//! directly from users or other systems. It provides an endpoint for receiving
-//! gasless cross-chain orders that follow the ERC-7683 standard.
-//!
-//! The API is exposed directly from the discovery module rather than solver-service for several key reasons:
-//!
-//! 1. **Consistency**: Discovery is the entry point for ALL intents - both on-chain and off-chain
-//! 2. **Single Responsibility**: Each module has a clear purpose:
-//!    - solver-discovery: Intent ingestion and lifecycle management
-//!    - solver-service: Solver orchestration, health, metrics, quotes
-//! 3. **Extensibility**: Provides a pattern for custom discovery implementations (e.g., webhooks, other APIs)
-//! 4. **Independence**: Discovery can be deployed/scaled separately from the solver service
-//! 5. **Source of Truth**: Discovery owns the intent lifecycle and should expose intent-related endpoints
+//! This module accepts ERC-7683 cross-chain intents in-process via `submit_order`,
+//! which is called by solver-service's `POST /api/v1/orders` handler AFTER it runs
+//! full intake validation (sponsor signature, allocator authorization, capacity).
+//! There is no separately bindable HTTP server or port; off-chain intake shares the
+//! solver's public API surface.
 //!
 //! ## Overview
 //!
-//! The off-chain discovery service runs an HTTP API server that:
-//! - Accepts EIP-7683 gasless cross-chain orders via POST requests
-//! - Validates order parameters and signatures
-//! - Converts orders to the internal Intent format
-//! - Broadcasts discovered intents to the solver system
+//! `submit_order`:
+//! - Parses an already-validated EIP-7683 order into a `StandardOrder`
+//! - Computes the order ID by calling the settler contract
+//! - Converts the order to the internal Intent format
+//! - Enqueues the intent to the solver engine via the monitoring channel
 //!
-//! ## API Endpoint
+//! ## Trust boundary
 //!
-//! - `POST /intent` - Submit a new cross-chain order
+//! `submit_order` does NOT re-validate signatures, allocator authorization, or
+//! balances — callers must validate first (see the `DiscoveryInterface::submit_order`
+//! doc). The only sanctioned caller is `POST /api/v1/orders`.
 //!
 //! ## Configuration
 //!
-//! The service requires the following configuration:
-//! - `api_host` - The host address to bind the API server (default: "0.0.0.0")
-//! - `api_port` - The port to listen on (default: 8080)
-//! - `rpc_url` - Ethereum RPC URL for calling settler contracts
+//! - `network_ids` - List of chain IDs this discovery source supports
+//! - RPC URLs are resolved from the global networks configuration
 //!
 //! ## Order Flow
 //!
-//! 1. User submits a `GaslessCrossChainOrder` to the API endpoint
-//! 2. The service validates the order deadlines and signature
-//! 3. Order ID is computed by calling the settler contract
-//! 4. Order data is parsed to extract inputs/outputs
-//! 5. The order is converted to an Intent and broadcast to solvers
+//! 1. solver-service validates the order and calls `submit_order` in-process
+//! 2. Order ID is computed by calling the settler contract
+//! 3. Order data is parsed to extract inputs/outputs
+//! 4. The order is converted to an Intent and enqueued to the solver engine
 
-use crate::{DiscoveryError, DiscoveryInterface};
+use crate::{DiscoveryError, DiscoveryInterface, IntentSubmission, IntentSubmissionError};
 use alloy_primitives::{Address as AlloyAddress, Bytes, U256};
 use alloy_provider::DynProvider;
 use alloy_sol_types::SolType;
 use async_trait::async_trait;
-use axum::{
-	extract::State,
-	http::StatusCode,
-	response::{IntoResponse, Json},
-	routing::post,
-	Router,
-};
 use hex;
 use serde::{Deserialize, Serialize};
 use serde_json;
@@ -61,23 +45,16 @@ use solver_types::{
 	api::PostOrderRequest,
 	bytes32_to_address, create_http_provider, current_timestamp, normalize_bytes32_address,
 	standards::eip7683::{
-		compact_claims::compute_batch_compact_claim_hash,
-		compact_signatures::decode_compact_signatures,
-		interfaces::{
-			IAllocator, IInputSettlerCompact, IInputSettlerEscrow, ITheCompact, SolMandateOutput,
-			StandardOrder,
-		},
+		interfaces::{IInputSettlerCompact, IInputSettlerEscrow, SolMandateOutput, StandardOrder},
 		GasLimitOverrides, LockType, MandateOutput,
 	},
 	with_0x_prefix, ConfigSchema, Eip7683OrderData, Field, FieldType, ImplementationRegistry,
 	Intent, IntentMetadata, NetworksConfig, ProviderError, Schema,
 };
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
-use tower_http::cors::CorsLayer;
 
 /// API representation of StandardOrder for JSON deserialization.
 ///
@@ -212,80 +189,22 @@ where
 	Ok(bytes)
 }
 
-/// Status enum for intent submission responses.
-///
-/// Distinguishes between successful receipt and validation failures at the discovery stage.
-/// Note: Full validation (oracle routes, etc.) happens asynchronously after receipt.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum IntentResponseStatus {
-	/// Intent received and passed basic validation, queued for full validation
-	Received,
-	/// Intent rejected due to validation failure
-	Rejected,
-	/// Intent processing encountered an error
-	Error,
-}
-
-/// API response for intent submission.
-///
-/// Returned by the POST /intent endpoint to indicate submission status.
-///
-/// # Fields
-///
-/// * `order_id` - The assigned order identifier if received (optional)
-/// * `status` - Status enum indicating if intent was received or rejected
-/// * `message` - Optional message for additional details on status
-/// * `order` - The submitted EIP-712 typed data order (parsed StandardOrder as JSON)
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct IntentResponse {
-	#[serde(rename = "orderId")]
-	order_id: Option<String>,
-	status: IntentResponseStatus,
-	message: Option<String>,
-	order: Option<serde_json::Value>,
-}
-
-/// Shared state for the API server.
-///
-/// Contains all the dependencies needed by API request handlers.
-/// This state is cloned for each request (all fields are cheaply cloneable).
-///
-/// # Fields
-///
-/// * `intent_sender` - Channel to broadcast discovered intents to the solver system
-/// * `providers` - RPC providers for interacting with on-chain contracts
-/// * `networks` - Networks configuration for settler lookups
-#[derive(Clone)]
-struct ApiState {
-	/// Channel to send discovered intents
-	intent_sender: mpsc::Sender<Intent>,
-	/// RPC providers for each supported network
-	providers: HashMap<u64, DynProvider>,
-	/// Networks configuration for settler lookups
-	networks: NetworksConfig,
-}
-
 /// EIP-7683 offchain discovery implementation.
 ///
-/// This struct implements the `DiscoveryInterface` trait to provide
-/// off-chain intent discovery through an HTTP API server. It listens
-/// for incoming EIP-7683 orders and converts them to the internal
-/// Intent format for processing by the solver system.
+/// This struct implements the `DiscoveryInterface` trait to provide off-chain
+/// intent discovery. Orders are submitted in-process via `submit_order` (called
+/// by solver-service's `/api/v1/orders` after validation) and converted to the
+/// internal Intent format for processing by the solver system.
 #[derive(Debug)]
 pub struct Eip7683OffchainDiscovery {
-	/// API server configuration
-	api_host: String,
-	api_port: u16,
 	/// RPC providers for each supported network
 	providers: HashMap<u64, DynProvider>,
 	/// Networks configuration for settler lookups
 	networks: NetworksConfig,
-	/// Flag indicating if the server is running
+	/// Flag indicating if the implementation is active
 	is_running: Arc<AtomicBool>,
-	/// Channel for signaling server shutdown
-	shutdown_signal: Arc<Mutex<Option<mpsc::Sender<()>>>>,
+	/// In-process intent submission channel, set while monitoring is active.
+	intent_sender: Arc<Mutex<Option<mpsc::Sender<Intent>>>>,
 }
 
 impl Eip7683OffchainDiscovery {
@@ -293,8 +212,6 @@ impl Eip7683OffchainDiscovery {
 	///
 	/// # Arguments
 	///
-	/// * `api_host` - The host address to bind the API server
-	/// * `api_port` - The port number to listen on
 	/// * `network_ids` - List of network IDs this discovery source supports
 	/// * `networks` - Networks configuration with RPC URLs
 	///
@@ -306,12 +223,7 @@ impl Eip7683OffchainDiscovery {
 	///
 	/// Returns `DiscoveryError::Connection` if any RPC URL cannot be parsed.
 	/// Returns `DiscoveryError::ValidationError` if networks config is invalid.
-	pub fn new(
-		api_host: String,
-		api_port: u16,
-		network_ids: Vec<u64>,
-		networks: &NetworksConfig,
-	) -> Result<Self, DiscoveryError> {
+	pub fn new(network_ids: Vec<u64>, networks: &NetworksConfig) -> Result<Self, DiscoveryError> {
 		// Validate networks config has at least one network
 		if networks.is_empty() {
 			return Err(DiscoveryError::ValidationError(
@@ -350,12 +262,10 @@ impl Eip7683OffchainDiscovery {
 		}
 
 		Ok(Self {
-			api_host,
-			api_port,
 			providers,
 			networks: networks.clone(),
 			is_running: Arc::new(AtomicBool::new(false)),
-			shutdown_signal: Arc::new(Mutex::new(None)),
+			intent_sender: Arc::new(Mutex::new(None)),
 		})
 	}
 
@@ -576,417 +486,6 @@ impl Eip7683OffchainDiscovery {
 			},
 		}
 	}
-
-	/// Main API server task.
-	///
-	/// Runs the HTTP server that listens for intent submissions.
-	/// The server supports graceful shutdown via the shutdown channel.
-	///
-	/// # Arguments
-	///
-	/// * `api_host` - Host address to bind to
-	/// * `api_port` - Port number to listen on
-	/// * `intent_sender` - Channel to send discovered intents
-	/// * `providers` - RPC providers for contract calls
-	/// * `networks` - Networks configuration for settler lookups
-	/// * `shutdown_rx` - Channel to receive shutdown signal
-	///
-	/// # Errors
-	///
-	/// Returns an error if:
-	/// - The address cannot be parsed
-	/// - The TCP listener cannot bind to the address
-	/// - The server encounters a fatal error
-	async fn run_server(
-		api_host: String,
-		api_port: u16,
-		intent_sender: mpsc::Sender<Intent>,
-		providers: HashMap<u64, DynProvider>,
-		networks: NetworksConfig,
-		mut shutdown_rx: mpsc::Receiver<()>,
-	) -> Result<(), String> {
-		let state = ApiState {
-			intent_sender,
-			providers,
-			networks,
-		};
-
-		let app = Router::new()
-			.route("/intent", post(handle_intent_submission))
-			.layer(CorsLayer::permissive())
-			.with_state(state);
-
-		let addr = format!("{api_host}:{api_port}")
-			.parse::<SocketAddr>()
-			.map_err(|e| format!("Invalid address '{api_host}:{api_port}': {e}"))?;
-
-		let listener = tokio::net::TcpListener::bind(addr)
-			.await
-			.map_err(|e| format!("Failed to bind address {addr}: {e}"))?;
-
-		tracing::info!("EIP-7683 offchain discovery API listening on {}", addr);
-
-		axum::serve(listener, app)
-			.with_graceful_shutdown(async move {
-				let _ = shutdown_rx.recv().await;
-				tracing::info!("Shutting down API server");
-			})
-			.await
-			.map_err(|e| format!("Server error: {e}"))?;
-
-		Ok(())
-	}
-}
-
-/// Map The Compact `ResetPeriod` enum (`uint8`, from `getLockDetails`) to seconds.
-/// Returns `None` for an unrecognized value (treated as un-validatable ⇒ reject).
-fn reset_period_seconds(reset_period: u8) -> Option<u64> {
-	Some(match reset_period {
-		0 => 1,         // OneSecond
-		1 => 15,        // FifteenSeconds
-		2 => 60,        // OneMinute
-		3 => 600,       // TenMinutes
-		4 => 3_900,     // OneHourAndFiveMinutes
-		5 => 86_400,    // OneDay
-		6 => 608_400,   // SevenDaysAndOneHour
-		7 => 2_592_000, // ThirtyDays
-		_ => return None,
-	})
-}
-
-async fn validate_resource_lock_allocator_authorization(
-	order: &StandardOrder,
-	allocator_data: &Bytes,
-	providers: &HashMap<u64, DynProvider>,
-	networks: &NetworksConfig,
-) -> Result<(), DiscoveryError> {
-	let origin_chain_id = order.originChainId.to::<u64>();
-	let network = networks.get(&origin_chain_id).ok_or_else(|| {
-		DiscoveryError::ValidationError(format!(
-			"Chain ID {} not found in networks configuration",
-			order.originChainId
-		))
-	})?;
-	let provider = providers.get(&origin_chain_id).ok_or_else(|| {
-		DiscoveryError::ValidationError(format!(
-			"No RPC provider configured for chain ID {origin_chain_id}"
-		))
-	})?;
-
-	let the_compact_address = network
-		.the_compact_address
-		.as_ref()
-		.ok_or_else(|| {
-			DiscoveryError::ValidationError(format!(
-				"No TheCompact address found for chain ID {origin_chain_id}"
-			))
-		})
-		.and_then(|addr| {
-			if addr.0.len() == 20 {
-				Ok(AlloyAddress::from_slice(&addr.0))
-			} else {
-				Err(DiscoveryError::ValidationError(
-					"Invalid TheCompact address length".to_string(),
-				))
-			}
-		})?;
-	let arbiter = network
-		.input_settler_compact_address
-		.as_ref()
-		.ok_or_else(|| {
-			DiscoveryError::ValidationError(format!(
-				"No input settler compact address found for chain ID {origin_chain_id}"
-			))
-		})
-		.and_then(|addr| {
-			if addr.0.len() == 20 {
-				Ok(AlloyAddress::from_slice(&addr.0))
-			} else {
-				Err(DiscoveryError::ValidationError(
-					"Invalid input settler compact address length".to_string(),
-				))
-			}
-		})?;
-
-	if order.inputs.is_empty() {
-		return Err(DiscoveryError::ValidationError(
-			"ResourceLock order has no inputs to authorize against an allocator".to_string(),
-		));
-	}
-
-	// (C-02) The lock's reset period must outlast the fill-to-claim window the
-	// signed order allows (`expires - fillDeadline`); otherwise the user could
-	// force-withdraw the input after the solver fills the output.
-	let required_reset_secs =
-		u64::from(order.expires).saturating_sub(u64::from(order.fillDeadline));
-	if required_reset_secs == 0 {
-		return Err(DiscoveryError::ValidationError(
-			"ResourceLock order is malformed: expires must exceed fillDeadline".to_string(),
-		));
-	}
-
-	// (C-02) ResourceLock orders require a solver-trusted allocator. Allocator
-	// registration in The Compact is permissionless, so without pinning, a user
-	// could resolve to an allocator they control, authorize the claim at intake,
-	// then refuse it after the fill.
-	let expected = match network.allocator_address.as_ref() {
-		Some(addr) if addr.0.len() == 20 => AlloyAddress::from_slice(&addr.0),
-		Some(_) => {
-			return Err(DiscoveryError::ValidationError(
-				"Invalid configured allocator address length".to_string(),
-			));
-		},
-		None => {
-			return Err(DiscoveryError::ValidationError(
-				"ResourceLock orders require a configured trusted allocator (allocator_address); refusing to fill"
-					.to_string(),
-			));
-		},
-	};
-
-	let compact = ITheCompact::new(the_compact_address, provider);
-	let mut resolved_allocator: Option<AlloyAddress> = None;
-	for input in &order.inputs {
-		let details = compact.getLockDetails(input[0]).call().await.map_err(|e| {
-			DiscoveryError::Connection(format!("Failed to query TheCompact.getLockDetails: {e}"))
-		})?;
-
-		let reset_secs = reset_period_seconds(details.resetPeriod).ok_or_else(|| {
-			DiscoveryError::ValidationError(format!(
-				"ResourceLock input lock has an unrecognized reset period ({})",
-				details.resetPeriod
-			))
-		})?;
-		if reset_secs <= required_reset_secs {
-			return Err(DiscoveryError::ValidationError(format!(
-				"ResourceLock input reset period ({reset_secs}s) does not exceed the fill-to-claim window ({required_reset_secs}s)"
-			)));
-		}
-
-		match resolved_allocator {
-			None => resolved_allocator = Some(details.allocator),
-			Some(existing) if existing != details.allocator => {
-				return Err(DiscoveryError::ValidationError(
-					"ResourceLock inputs resolve to multiple allocators".to_string(),
-				));
-			},
-			Some(_) => {},
-		}
-	}
-	let allocator = resolved_allocator.expect("inputs is non-empty");
-
-	if allocator != expected {
-		return Err(DiscoveryError::ValidationError(
-			"ResourceLock inputs use an allocator that differs from the configured allocator_address"
-				.to_string(),
-		));
-	}
-
-	let claim_hash = compute_batch_compact_claim_hash(order, arbiter).map_err(|e| {
-		DiscoveryError::ValidationError(format!("Failed to compute Compact claim hash: {e}"))
-	})?;
-	let allocator_contract = IAllocator::new(allocator, provider);
-	let authorized = allocator_contract
-		.isClaimAuthorized(
-			claim_hash,
-			arbiter,
-			order.user,
-			order.nonce,
-			U256::from(order.expires),
-			order.inputs.clone(),
-			allocator_data.clone(),
-		)
-		.call()
-		.await
-		.map_err(|e| {
-			DiscoveryError::Connection(format!("Allocator isClaimAuthorized call failed: {e}"))
-		})?;
-
-	if !authorized {
-		return Err(DiscoveryError::ValidationError(
-			"Allocator did not authorize the provided allocatorData".to_string(),
-		));
-	}
-
-	Ok(())
-}
-/// Handles intent submission requests.
-///
-/// This is the main request handler for the POST /intent endpoint.
-/// It validates the incoming order, converts it to an Intent, and
-/// broadcasts it to the solver system.
-///
-/// # Arguments
-///
-/// * `state` - Shared API state containing dependencies
-/// * `request` - The intent submission request
-///
-/// # Returns
-///
-/// Returns an HTTP response with:
-/// - 200 OK with order_id on success
-/// - 400 Bad Request if validation fails
-/// - 500 Internal Server Error if processing fails
-///
-/// # Response Format
-///
-/// ```json
-/// {
-///   "order_id": "0x...",
-///   "status": "success" | "error",
-///   "message": "optional error message"
-/// }
-/// ```
-async fn handle_intent_submission(
-	State(state): State<ApiState>,
-	Json(request): Json<PostOrderRequest>,
-) -> impl IntoResponse {
-	// Convert OifOrder to StandardOrder
-	let order = match StandardOrder::try_from(&request.order) {
-		Ok(order) => order,
-		Err(e) => {
-			tracing::warn!(error = %e, "Failed to convert OifOrder to StandardOrder");
-			return (
-				StatusCode::BAD_REQUEST,
-				Json(IntentResponse {
-					order_id: None,
-					status: IntentResponseStatus::Rejected,
-					message: Some(format!("Failed to convert order: {e}")),
-					order: None,
-				}),
-			)
-				.into_response();
-		},
-	};
-
-	// Serialize the parsed order once for all responses
-	let order_json = match serde_json::to_value(ApiStandardOrder::from(&order)) {
-		Ok(json) => Some(json),
-		Err(e) => {
-			tracing::warn!(error = %e, "Failed to serialize order");
-			None
-		},
-	};
-
-	let signature = request.signature;
-
-	// Extract sponsor from the order using our new helper
-	let sponsor = match request.order.extract_sponsor(Some(&signature)) {
-		Ok(sponsor) => sponsor,
-		Err(e) => {
-			tracing::warn!(error = %e, "Failed to extract sponsor from order");
-			return (
-				StatusCode::BAD_REQUEST,
-				Json(IntentResponse {
-					order_id: None,
-					status: IntentResponseStatus::Rejected,
-					message: Some(format!("Failed to extract sponsor: {e}")),
-					order: order_json,
-				}),
-			)
-				.into_response();
-		},
-	};
-
-	// Derive lock type from the order
-	let lock_type = LockType::from(&request.order);
-
-	if matches!(lock_type, LockType::ResourceLock) {
-		let decoded = match decode_compact_signatures(&signature) {
-			Ok(decoded) => decoded,
-			Err(e) => {
-				tracing::warn!(error = %e, "Failed to decode Compact signature payload");
-				return (
-					StatusCode::BAD_REQUEST,
-					Json(IntentResponse {
-						order_id: None,
-						status: IntentResponseStatus::Rejected,
-						message: Some(e.to_string()),
-						order: order_json.clone(),
-					}),
-				)
-					.into_response();
-			},
-		};
-		if let Err(e) = validate_resource_lock_allocator_authorization(
-			&order,
-			&decoded.allocator_data,
-			&state.providers,
-			&state.networks,
-		)
-		.await
-		{
-			tracing::warn!(error = %e, "Failed to validate Compact allocator authorization");
-			return (
-				StatusCode::BAD_REQUEST,
-				Json(IntentResponse {
-					order_id: None,
-					status: IntentResponseStatus::Rejected,
-					message: Some(e.to_string()),
-					order: order_json.clone(),
-				}),
-			)
-				.into_response();
-		}
-	}
-
-	// Convert to intent
-	match Eip7683OffchainDiscovery::order_to_intent(
-		&order,
-		&sponsor,
-		&signature,
-		lock_type,
-		&state.providers,
-		&state.networks,
-		request.quote_id,
-	)
-	.await
-	{
-		Ok(intent) => {
-			let order_id = intent.id.clone();
-
-			// Send intent through channel
-			if let Err(e) = enqueue_intent(&state.intent_sender, intent) {
-				tracing::warn!(error = %e, "Failed to send intent to solver channel");
-				return (
-					StatusCode::SERVICE_UNAVAILABLE,
-					Json(IntentResponse {
-						order_id: Some(order_id),
-						status: IntentResponseStatus::Error,
-						message: Some(format!("Failed to process intent: {e}")),
-						order: order_json.clone(),
-					}),
-				)
-					.into_response();
-			}
-
-			(
-				StatusCode::ACCEPTED,
-				Json(IntentResponse {
-					order_id: Some(order_id),
-					status: IntentResponseStatus::Received,
-					message: Some(
-						"Basic validation passed, pending profitability validation and oracle route validation".to_string(),
-					),
-					order: order_json,
-				}),
-			)
-				.into_response()
-		},
-		Err(e) => {
-			tracing::warn!(error = %e, "Failed to convert order to intent");
-			(
-				StatusCode::BAD_REQUEST,
-				Json(IntentResponse {
-					order_id: None,
-					status: IntentResponseStatus::Rejected,
-					message: Some(e.to_string()),
-					order: order_json,
-				}),
-			)
-				.into_response()
-		},
-	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1014,16 +513,14 @@ fn enqueue_intent(
 	})
 }
 
-/// Configuration schema for EIP-7683 off-chain discovery service.
+/// Configuration schema for EIP-7683 off-chain discovery.
 ///
-/// This schema validates the configuration for the off-chain discovery API,
+/// This schema validates the configuration for the off-chain discovery source,
 /// ensuring all required fields are present and have valid values.
 ///
 /// # Required Fields
 ///
-/// - `api_host` - Host address for the API server (e.g., "127.0.0.1" or "0.0.0.0")
-/// - `api_port` - Port number for the API server (1-65535)
-/// - `network_ids` - List of network IDs this discovery service monitors
+/// - `network_ids` - List of network IDs this discovery source monitors
 pub struct Eip7683OffchainDiscoverySchema;
 
 impl Eip7683OffchainDiscoverySchema {
@@ -1040,23 +537,13 @@ impl ConfigSchema for Eip7683OffchainDiscoverySchema {
 	fn validate(&self, config: &serde_json::Value) -> Result<(), solver_types::ValidationError> {
 		let schema = Schema::new(
 			// Required fields
-			vec![
-				Field::new("api_host", FieldType::String),
-				Field::new(
-					"api_port",
-					FieldType::Integer {
-						min: Some(1),
-						max: Some(65535),
-					},
-				),
-				Field::new(
-					"network_ids",
-					FieldType::Array(Box::new(FieldType::Integer {
-						min: Some(1),
-						max: None,
-					})),
-				),
-			],
+			vec![Field::new(
+				"network_ids",
+				FieldType::Array(Box::new(FieldType::Integer {
+					min: Some(1),
+					max: None,
+				})),
+			)],
 			vec![],
 		);
 
@@ -1075,22 +562,9 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 			return Err(DiscoveryError::AlreadyMonitoring);
 		}
 
-		let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-		*self.shutdown_signal.lock().await = Some(shutdown_tx);
-
-		// Spawn API server task
-		let api_host = self.api_host.clone();
-		let api_port = self.api_port;
-		let providers = self.providers.clone();
-		let networks = self.networks.clone();
-
-		tokio::spawn(async move {
-			if let Err(e) =
-				Self::run_server(api_host, api_port, sender, providers, networks, shutdown_rx).await
-			{
-				tracing::error!("API server error: {}", e);
-			}
-		});
+		// Stash the sender so in-process submit_order can enqueue intents.
+		// There is no HTTP server to spawn; off-chain intake is in-process.
+		*self.intent_sender.lock().await = Some(sender);
 
 		self.is_running.store(true, Ordering::SeqCst);
 		Ok(())
@@ -1101,16 +575,95 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 			return Ok(());
 		}
 
-		if let Some(shutdown_tx) = self.shutdown_signal.lock().await.take() {
-			let _ = shutdown_tx.send(()).await;
-		}
-
+		*self.intent_sender.lock().await = None;
 		self.is_running.store(false, Ordering::SeqCst);
 		Ok(())
 	}
 
-	fn get_url(&self) -> Option<String> {
-		Some(format!("{}:{}", self.api_host, self.api_port))
+	async fn submit_order(
+		&self,
+		request: &PostOrderRequest,
+	) -> Result<IntentSubmission, IntentSubmissionError> {
+		let order = StandardOrder::try_from(&request.order).map_err(|e| {
+			tracing::warn!(error = %e, "Failed to convert OifOrder to StandardOrder");
+			IntentSubmissionError::Rejected {
+				message: format!("Failed to convert order: {e}"),
+				order: None,
+			}
+		})?;
+
+		// Serialize the parsed order once so every outcome can echo it.
+		let order_json = match serde_json::to_value(ApiStandardOrder::from(&order)) {
+			Ok(json) => Some(json),
+			Err(e) => {
+				tracing::warn!(error = %e, "Failed to serialize order");
+				None
+			},
+		};
+
+		let signature = &request.signature;
+
+		let sponsor = request
+			.order
+			.extract_sponsor(Some(signature))
+			.map_err(|e| {
+				tracing::warn!(error = %e, "Failed to extract sponsor from order");
+				IntentSubmissionError::Rejected {
+					message: format!("Failed to extract sponsor: {e}"),
+					order: order_json.clone(),
+				}
+			})?;
+
+		let lock_type = LockType::from(&request.order);
+
+		// NOTE: no allocator-authorization or compact-signature decode here —
+		// solver-service's validate_intent_request ran them before this call
+		// (see the TRUST BOUNDARY doc on the trait method). compact_allocator.rs
+		// is the single allocator-auth implementation.
+
+		let intent = Self::order_to_intent(
+			&order,
+			&sponsor,
+			signature,
+			lock_type,
+			&self.providers,
+			&self.networks,
+			request.quote_id.clone(),
+		)
+		.await
+		.map_err(|e| {
+			tracing::warn!(error = %e, "Failed to convert order to intent");
+			IntentSubmissionError::Rejected {
+				message: e.to_string(),
+				order: order_json.clone(),
+			}
+		})?;
+
+		let order_id = intent.id.clone();
+
+		let sender = self.intent_sender.lock().await.clone();
+		let sender = sender.ok_or_else(|| IntentSubmissionError::Unavailable {
+			message: "Intent submission is not running".to_string(),
+			order_id: Some(order_id.clone()),
+			order: order_json.clone(),
+		})?;
+
+		enqueue_intent(&sender, intent).map_err(|e| {
+			tracing::warn!(error = %e, "Failed to send intent to solver channel");
+			IntentSubmissionError::Unavailable {
+				message: format!("Failed to process intent: {e}"),
+				order_id: Some(order_id.clone()),
+				order: order_json.clone(),
+			}
+		})?;
+
+		Ok(IntentSubmission {
+			order_id,
+			order: order_json,
+			message:
+				"Basic validation passed, pending profitability validation and oracle route validation"
+					.to_string(),
+		})
 	}
 }
 
@@ -1134,8 +687,6 @@ impl DiscoveryInterface for Eip7683OffchainDiscovery {
 /// Expected configuration format:
 /// ```json
 /// {
-///   "api_host": "0.0.0.0",
-///   "api_port": 8081,
 ///   "network_ids": [1, 10, 137]
 /// }
 /// ```
@@ -1153,17 +704,6 @@ pub fn create_discovery(
 	Eip7683OffchainDiscoverySchema::validate_config(config)
 		.map_err(|e| DiscoveryError::ValidationError(format!("Invalid configuration: {e}")))?;
 
-	let api_host = config
-		.get("api_host")
-		.and_then(|v| v.as_str())
-		.unwrap_or("0.0.0.0")
-		.to_string();
-
-	let api_port = config
-		.get("api_port")
-		.and_then(|v| v.as_i64())
-		.unwrap_or(8081) as u16;
-
 	// Get network_ids from config, or default to all networks
 	let network_ids = config
 		.get("network_ids")
@@ -1175,10 +715,9 @@ pub fn create_discovery(
 		})
 		.unwrap_or_else(|| networks.keys().cloned().collect());
 
-	let discovery = Eip7683OffchainDiscovery::new(api_host, api_port, network_ids, networks)
-		.map_err(|e| {
-			DiscoveryError::Connection(format!("Failed to create offchain discovery service: {e}"))
-		})?;
+	let discovery = Eip7683OffchainDiscovery::new(network_ids, networks).map_err(|e| {
+		DiscoveryError::Connection(format!("Failed to create offchain discovery service: {e}"))
+	})?;
 
 	Ok(Box::new(discovery))
 }
@@ -1202,7 +741,6 @@ mod tests {
 	use super::*;
 	use alloy_primitives::{Address as AlloyAddress, Bytes, U256};
 	use alloy_provider::{mock::Asserter, Provider, ProviderBuilder};
-	use axum::body;
 	use serde_json::json;
 	use solver_types::api::{OifOrder, OrderPayload, PostOrderRequest, SignatureType};
 	use solver_types::{
@@ -1257,22 +795,6 @@ mod tests {
 		let padding = (32 - (bytes.len() % 32)) % 32;
 		encoded.extend(std::iter::repeat_n(0u8, padding));
 		encoded
-	}
-
-	fn shifted_compact_signature(valid_sponsor_sig: &[u8]) -> Bytes {
-		let fake_fixed_offset_tail = padded_bytes(valid_sponsor_sig);
-		let actual_sponsor_sig = vec![0x44u8; valid_sponsor_sig.len()];
-		let actual_sponsor_offset = 64 + fake_fixed_offset_tail.len();
-		let actual_sponsor_tail = padded_bytes(&actual_sponsor_sig);
-		let allocator_offset = actual_sponsor_offset + actual_sponsor_tail.len();
-
-		let mut shifted_payload = Vec::new();
-		shifted_payload.extend_from_slice(&abi_word(actual_sponsor_offset));
-		shifted_payload.extend_from_slice(&abi_word(allocator_offset));
-		shifted_payload.extend_from_slice(&fake_fixed_offset_tail);
-		shifted_payload.extend_from_slice(&actual_sponsor_tail);
-		shifted_payload.extend_from_slice(&padded_bytes(&[]));
-		Bytes::from(shifted_payload)
 	}
 
 	fn compact_signature(sponsor_sig: &[u8], allocator_data: &[u8]) -> Bytes {
@@ -1332,38 +854,113 @@ mod tests {
 		}
 	}
 
-	fn resource_lock_request_with_shifted_signature() -> PostOrderRequest {
-		resource_lock_request(shifted_compact_signature(&[0x11u8; 65]))
-	}
-
-	fn resource_lock_request_with_allocator_data(
-		allocator_data: &'static [u8],
-	) -> PostOrderRequest {
-		resource_lock_request(compact_signature(&[0x11u8; 65], allocator_data))
-	}
-
-	fn encode_lock_details(allocator: AlloyAddress) -> Bytes {
-		let mut out = vec![0u8; 160];
-		out[44..64].copy_from_slice(allocator.as_slice());
-		out[95] = 5; // resetPeriod = OneDay (86_400s), exceeds the test fill-to-claim window
-		Bytes::from(out)
-	}
-
-	fn encode_bool(value: bool) -> Bytes {
-		let mut out = vec![0u8; 32];
-		if value {
-			out[31] = 1;
-		}
-		Bytes::from(out)
-	}
-
-	fn mocked_provider_with_allocator_authorized(authorized: bool) -> DynProvider {
+	/// Provider that answers the single `orderIdentifier` call `order_to_intent`
+	/// makes (returns a bytes32). This is the only on-chain call left in the
+	/// lean `submit_order` path now that allocator-auth moved out.
+	fn mocked_provider_with_order_id(order_id: [u8; 32]) -> DynProvider {
 		let asserter = Asserter::new();
-		asserter.push_success(&encode_lock_details(AlloyAddress::from([0xA1u8; 20])));
-		asserter.push_success(&encode_bool(authorized));
+		asserter.push_success(&Bytes::from(order_id.to_vec()));
 		ProviderBuilder::new()
 			.connect_mocked_client(asserter)
 			.erased()
+	}
+
+	/// Constructs an `Eip7683OffchainDiscovery` directly (test-only) with the
+	/// given providers and optional intent sender.
+	fn test_discovery_with_providers(
+		providers: HashMap<u64, DynProvider>,
+		intent_sender: Option<mpsc::Sender<Intent>>,
+	) -> Eip7683OffchainDiscovery {
+		Eip7683OffchainDiscovery {
+			providers,
+			networks: create_test_networks_config(),
+			is_running: Arc::new(AtomicBool::new(false)),
+			intent_sender: Arc::new(Mutex::new(intent_sender)),
+		}
+	}
+
+	/// (request, providers) that clear submit_order's lean pipeline, so any
+	/// failure after this point is a sender-stage (Unavailable) failure, not
+	/// Rejected. Mocks ONLY the orderIdentifier call.
+	fn fully_admittable_request_and_providers() -> (PostOrderRequest, HashMap<u64, DynProvider>) {
+		let request = resource_lock_request(compact_signature(&[0x11u8; 65], b""));
+		let mut providers = HashMap::new();
+		providers.insert(1u64, mocked_provider_with_order_id([0xABu8; 32]));
+		(request, providers)
+	}
+
+	#[tokio::test]
+	async fn submit_order_succeeds_and_enqueues_when_pipeline_valid() {
+		// Positive control: proves the fixture really clears the pipeline, so
+		// the two failure tests below fail at the sender stage and nowhere else.
+		let (request, providers) = fully_admittable_request_and_providers();
+		let (tx, mut rx) = mpsc::channel(16);
+		let discovery = test_discovery_with_providers(providers, Some(tx));
+
+		let submission = discovery
+			.submit_order(&request)
+			.await
+			.expect("should be admitted");
+
+		assert!(!submission.order_id.is_empty());
+		let intent = rx.try_recv().expect("intent must be enqueued");
+		assert_eq!(intent.id, submission.order_id);
+	}
+
+	#[tokio::test]
+	async fn submit_order_unavailable_when_monitoring_not_started() {
+		let (request, providers) = fully_admittable_request_and_providers();
+		let discovery = test_discovery_with_providers(providers, None);
+
+		let result = discovery.submit_order(&request).await;
+
+		match result {
+			Err(IntentSubmissionError::Unavailable {
+				message, order_id, ..
+			}) => {
+				assert!(
+					message.contains("not running"),
+					"unexpected message: {message}"
+				);
+				assert!(order_id.is_some(), "order id is known by the sender stage");
+			},
+			other => panic!("expected Unavailable (missing sender), got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn submit_order_unavailable_when_queue_full() {
+		let (request, providers) = fully_admittable_request_and_providers();
+		// Capacity-1 channel, pre-filled: enqueue_intent must hit TrySendError::Full.
+		let (tx, _rx) = mpsc::channel(1);
+		tx.try_send(Intent {
+			id: "already-queued".to_string(),
+			source: "test".to_string(),
+			standard: "eip7683".to_string(),
+			metadata: IntentMetadata {
+				requires_auction: false,
+				exclusive_until: None,
+				discovered_at: current_timestamp(),
+			},
+			data: json!({}),
+			order_bytes: Bytes::new(),
+			quote_id: None,
+			lock_type: "permit2_escrow".to_string(),
+		})
+		.expect("first intent should fill queue");
+		let discovery = test_discovery_with_providers(providers, Some(tx));
+
+		let result = discovery.submit_order(&request).await;
+
+		match result {
+			Err(IntentSubmissionError::Unavailable { message, .. }) => {
+				assert!(
+					message.contains("Failed to process intent"),
+					"unexpected message: {message}"
+				);
+			},
+			other => panic!("expected Unavailable (queue full), got {other:?}"),
+		}
 	}
 
 	#[test]
@@ -1371,13 +968,9 @@ mod tests {
 		let networks = create_test_networks_config();
 		let network_ids = vec![1];
 
-		let discovery =
-			Eip7683OffchainDiscovery::new("127.0.0.1".to_string(), 8080, network_ids, &networks);
+		let discovery = Eip7683OffchainDiscovery::new(network_ids, &networks);
 
 		assert!(discovery.is_ok());
-		let discovery = discovery.unwrap();
-		assert_eq!(discovery.api_host, "127.0.0.1");
-		assert_eq!(discovery.api_port, 8080);
 	}
 
 	#[test]
@@ -1385,8 +978,7 @@ mod tests {
 		let networks = HashMap::new(); // Empty networks
 		let network_ids = vec![1];
 
-		let result =
-			Eip7683OffchainDiscovery::new("127.0.0.1".to_string(), 8080, network_ids, &networks);
+		let result = Eip7683OffchainDiscovery::new(network_ids, &networks);
 
 		assert!(result.is_err());
 		matches!(result.unwrap_err(), DiscoveryError::ValidationError(_));
@@ -1463,23 +1055,6 @@ mod tests {
 	}
 
 	#[test]
-	fn test_intent_response_serialization() {
-		let response = IntentResponse {
-			order_id: Some("0x123".to_string()),
-			status: IntentResponseStatus::Received,
-			message: Some("Success".to_string()),
-			order: Some(json!({"test": "data"})),
-		};
-
-		let serialized = serde_json::to_string(&response);
-		assert!(serialized.is_ok());
-
-		let json_str = serialized.unwrap();
-		assert!(json_str.contains("orderId"));
-		assert!(json_str.contains("received"));
-	}
-
-	#[test]
 	fn test_config_schema_validation_success() {
 		let config = serde_json::Value::Object({
 			let mut table = serde_json::Map::new();
@@ -1508,26 +1083,6 @@ mod tests {
 				serde_json::Value::String("127.0.0.1".to_string()),
 			);
 			// Missing api_port and network_ids
-			table
-		});
-
-		let result = Eip7683OffchainDiscoverySchema::validate_config(&config);
-		assert!(result.is_err());
-	}
-
-	#[test]
-	fn test_config_schema_validation_invalid_port() {
-		let config = serde_json::Value::Object({
-			let mut table = serde_json::Map::new();
-			table.insert(
-				"api_host".to_string(),
-				serde_json::Value::String("127.0.0.1".to_string()),
-			);
-			table.insert("api_port".to_string(), serde_json::Value::from(70000)); // Invalid port > 65535
-			table.insert(
-				"network_ids".to_string(),
-				serde_json::Value::Array(vec![serde_json::Value::from(1)]),
-			);
 			table
 		});
 
@@ -1582,13 +1137,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_discovery_interface_start_stop() {
 		let networks = create_test_networks_config();
-		let discovery = Eip7683OffchainDiscovery::new(
-			"127.0.0.1".to_string(),
-			0, // Use port 0 to let OS assign a free port
-			vec![1],
-			&networks,
-		)
-		.unwrap();
+		let discovery = Eip7683OffchainDiscovery::new(vec![1], &networks).unwrap();
 
 		let (tx, _rx) = mpsc::channel(16);
 
@@ -1606,8 +1155,7 @@ mod tests {
 	#[tokio::test]
 	async fn test_discovery_interface_already_monitoring() {
 		let networks = create_test_networks_config();
-		let discovery =
-			Eip7683OffchainDiscovery::new("127.0.0.1".to_string(), 0, vec![1], &networks).unwrap();
+		let discovery = Eip7683OffchainDiscovery::new(vec![1], &networks).unwrap();
 
 		let (tx1, _rx1) = mpsc::channel(16);
 		let (tx2, _rx2) = mpsc::channel(16);
@@ -1622,132 +1170,6 @@ mod tests {
 
 		// Cleanup
 		discovery.stop_monitoring().await.unwrap();
-	}
-
-	#[test]
-	fn test_get_url() {
-		let networks = create_test_networks_config();
-		let discovery =
-			Eip7683OffchainDiscovery::new("127.0.0.1".to_string(), 8080, vec![1], &networks)
-				.unwrap();
-
-		let url = discovery.get_url();
-		assert_eq!(url, Some("127.0.0.1:8080".to_string()));
-	}
-
-	#[tokio::test]
-	async fn test_handle_intent_submission_rejects_shifted_compact_signature() {
-		use axum::extract::State;
-		use axum::Json;
-
-		let (tx, _rx) = mpsc::channel(16);
-		let state = ApiState {
-			intent_sender: tx,
-			providers: HashMap::new(),
-			networks: create_test_networks_config(),
-		};
-
-		let response = handle_intent_submission(
-			State(state),
-			Json(resource_lock_request_with_shifted_signature()),
-		)
-		.await
-		.into_response();
-
-		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-		let body_bytes = body::to_bytes(response.into_body(), usize::MAX)
-			.await
-			.expect("body");
-		let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).expect("parse body");
-		assert_eq!(
-			parsed.get("status").and_then(|v| v.as_str()),
-			Some("rejected")
-		);
-		assert!(parsed
-			.get("message")
-			.and_then(|v| v.as_str())
-			.unwrap_or_default()
-			.contains("Compact"));
-	}
-
-	#[tokio::test]
-	async fn test_handle_intent_submission_rejects_unauthorized_compact_allocator_data() {
-		use axum::extract::State;
-		use axum::Json;
-
-		let (tx, _rx) = mpsc::channel(16);
-		let mut providers = HashMap::new();
-		providers.insert(1, mocked_provider_with_allocator_authorized(false));
-		// Pin the trusted allocator to the one the lock resolves to (0xA1..) so the
-		// order reaches the allocator-authorization check rather than rejecting at
-		// the missing-trusted-allocator gate.
-		let mut networks = create_test_networks_config();
-		networks
-			.get_mut(&1)
-			.expect("chain 1 network config")
-			.allocator_address = Some(solver_types::account::Address(vec![0xA1u8; 20]));
-		let state = ApiState {
-			intent_sender: tx,
-			providers,
-			networks,
-		};
-
-		let response = handle_intent_submission(
-			State(state),
-			Json(resource_lock_request_with_allocator_data(
-				b"garbage allocator data",
-			)),
-		)
-		.await
-		.into_response();
-
-		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-		let body_bytes = body::to_bytes(response.into_body(), usize::MAX)
-			.await
-			.expect("body");
-		let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).expect("parse body");
-		assert_eq!(
-			parsed.get("status").and_then(|v| v.as_str()),
-			Some("rejected")
-		);
-		// Proves the order reached the allocator-authorization check (isClaimAuthorized),
-		// not an earlier gate (trusted-allocator pin / reset period / malformed window).
-		assert!(parsed
-			.get("message")
-			.and_then(|v| v.as_str())
-			.unwrap_or_default()
-			.contains("did not authorize"));
-	}
-
-	#[tokio::test]
-	async fn test_handle_intent_submission_invalid_order() {
-		use axum::extract::State;
-		use axum::Json;
-
-		let (tx, _rx) = mpsc::channel(16);
-		let state = ApiState {
-			intent_sender: tx,
-			providers: HashMap::new(),
-			networks: create_test_networks_config(),
-		};
-
-		// Create invalid request with malformed OifOrder
-		// Using OifGenericV0 with invalid data that will fail StandardOrder conversion
-		let invalid_request = PostOrderRequest {
-			order: OifOrder::OifGenericV0 {
-				payload: serde_json::json!({
-					"invalid": "data_that_cannot_be_converted_to_standard_order"
-				}),
-			},
-			signature: Bytes::from_static(b"signature"),
-			quote_id: None,
-			origin_submission: None,
-		};
-
-		let response = handle_intent_submission(State(state), Json(invalid_request)).await;
-
-		// Should return BAD_REQUEST status due to parsing failure
-		assert_eq!(response.into_response().status(), StatusCode::BAD_REQUEST);
 	}
 
 	#[tokio::test]
