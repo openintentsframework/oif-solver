@@ -383,6 +383,12 @@ pub mod interfaces {
 		interface ITheCompact {
 			function DOMAIN_SEPARATOR() external view returns (bytes32);
 			function getLockDetails(uint256 id) external view returns (address token, address allocator, uint8 resetPeriod, uint8 scope, bytes12 lockTag);
+			function balanceOf(address owner, uint256 id) external view returns (uint256);
+			/// Forced-withdrawal status of a resource lock for a given account.
+			/// `status` is the `ForcedWithdrawalStatus` enum (Disabled=0, Pending=1,
+			/// Enabled=2); `forcedWithdrawalAvailableAt` is when tokens become
+			/// withdrawable while `Pending` (or became withdrawable while `Enabled`).
+			function getForcedWithdrawalStatus(address account, uint256 id) external view returns (uint8 status, uint256 forcedWithdrawalAvailableAt);
 		}
 
 		/// IAllocator interface exposing the off-chain claim authorization predicate.

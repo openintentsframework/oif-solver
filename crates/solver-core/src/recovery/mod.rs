@@ -896,6 +896,55 @@ impl RecoveryService {
 		}
 	}
 
+	async fn replay_confirmed_settlement_callback_if_needed(
+		&self,
+		order: &Order,
+		tx_type: TransactionType,
+		receipt: &TransactionReceipt,
+	) {
+		match tx_type {
+			TransactionType::PostFill => match self.settlement.recover_post_fill_state(order).await
+			{
+				Ok(true) => return,
+				Ok(false) => {},
+				Err(e) => {
+					tracing::warn!(
+						order_id = %order.id,
+						error = %e,
+						"Could not check recovered post-fill settlement state; continuing recovery"
+					);
+					return;
+				},
+			},
+			TransactionType::PreClaim => {},
+			_ => return,
+		}
+
+		match self.settlement.find_settlement_for_order(order) {
+			Ok(settlement) => {
+				if let Err(e) = settlement
+					.handle_transaction_confirmed(order, tx_type, receipt)
+					.await
+				{
+					tracing::warn!(
+						order_id = %order.id,
+						tx_type = ?tx_type,
+						error = %e,
+						"Could not replay confirmed settlement callback; continuing recovery"
+					);
+				}
+			},
+			Err(e) => {
+				tracing::warn!(
+					order_id = %order.id,
+					tx_type = ?tx_type,
+					error = %e,
+					"Could not find settlement for confirmed callback replay; continuing recovery"
+				);
+			},
+		}
+	}
+
 	/// Reconciles an order with blockchain state.
 	///
 	/// This method checks the actual status of transactions on the blockchain
@@ -999,6 +1048,12 @@ impl RecoveryService {
 							&receipt,
 						)
 						.await;
+						self.replay_confirmed_settlement_callback_if_needed(
+							&order,
+							TransactionType::PreClaim,
+							&receipt,
+						)
+						.await;
 						return Ok((
 							order.clone(),
 							ReconcileResult::NeedsClaim {
@@ -1057,6 +1112,12 @@ impl RecoveryService {
 							&order.id,
 							TransactionType::PostFill,
 							&post_fill_tx,
+							&receipt,
+						)
+						.await;
+						self.replay_confirmed_settlement_callback_if_needed(
+							&order,
+							TransactionType::PostFill,
 							&receipt,
 						)
 						.await;
@@ -2876,6 +2937,169 @@ mod tests {
 			ReconcileResult::NeedsMonitoring => {},
 			other => panic!("Expected NeedsMonitoring, got {other:?}"),
 		}
+	}
+
+	#[tokio::test]
+	async fn recovered_post_fill_replays_settlement_callback_before_monitoring() {
+		let mut mock_delivery = MockDeliveryInterface::new();
+		let mut mock_settlement = MockSettlementInterface::new();
+		let mut order = create_test_order_with_status(OrderStatus::Executed);
+		order.fill_tx_hash = Some(TransactionHash(vec![0xbb; 32]));
+		order.post_fill_tx_hash = Some(TransactionHash(vec![0xdd; 32]));
+		order.settlement_name = Some("eip7683".to_string());
+
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(TransactionHash(vec![0xdd; 32])), eq(137u64))
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async {
+					Ok(solver_types::TransactionReceipt {
+						hash: TransactionHash(vec![0xdd; 32]),
+						block_number: 12345,
+						success: true,
+						block_timestamp: None,
+						logs: vec![],
+					})
+				})
+			});
+
+		mock_settlement
+			.expect_recover_post_fill_state()
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+		mock_settlement
+			.expect_handle_transaction_confirmed()
+			.withf(|_, tx_type, receipt| {
+				*tx_type == TransactionType::PostFill
+					&& receipt.hash == TransactionHash(vec![0xdd; 32])
+					&& receipt.success
+			})
+			.times(1)
+			.returning(|_, _, _| Box::pin(async move { Ok(()) }));
+
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				137u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			20,
+			60,
+		));
+		let storage = Arc::new(StorageService::new(Box::new(MockStorageInterface::new())));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let settlement = Arc::new(SettlementService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]),
+			String::new(),
+			20,
+		));
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
+		let recovery_service = RecoveryService::new(
+			storage,
+			state_machine,
+			delivery,
+			settlement,
+			EventBus::new(100),
+			attempt_store,
+			empty_networks_config(),
+		);
+
+		let (_, result) = recovery_service
+			.reconcile_with_blockchain(&order)
+			.await
+			.unwrap();
+
+		assert!(matches!(result, ReconcileResult::NeedsMonitoring));
+	}
+
+	#[tokio::test]
+	async fn recovered_post_fill_callback_failure_continues_to_monitoring() {
+		let mut mock_delivery = MockDeliveryInterface::new();
+		let mut mock_settlement = MockSettlementInterface::new();
+		let mut order = create_test_order_with_status(OrderStatus::Executed);
+		order.fill_tx_hash = Some(TransactionHash(vec![0xbb; 32]));
+		order.post_fill_tx_hash = Some(TransactionHash(vec![0xdd; 32]));
+		order.settlement_name = Some("eip7683".to_string());
+
+		mock_delivery
+			.expect_get_receipt()
+			.with(eq(TransactionHash(vec![0xdd; 32])), eq(137u64))
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async {
+					Ok(solver_types::TransactionReceipt {
+						hash: TransactionHash(vec![0xdd; 32]),
+						block_number: 12345,
+						success: true,
+						block_timestamp: None,
+						logs: vec![],
+					})
+				})
+			});
+
+		mock_settlement
+			.expect_recover_post_fill_state()
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+		mock_settlement
+			.expect_handle_transaction_confirmed()
+			.withf(|_, tx_type, receipt| {
+				*tx_type == TransactionType::PostFill
+					&& receipt.hash == TransactionHash(vec![0xdd; 32])
+					&& receipt.success
+			})
+			.times(1)
+			.returning(|_, _, _| {
+				Box::pin(async move {
+					Err(solver_settlement::SettlementError::ValidationFailed(
+						"callback down".to_string(),
+					))
+				})
+			});
+
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				137u64,
+				Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			20,
+			60,
+		));
+		let storage = Arc::new(StorageService::new(Box::new(MockStorageInterface::new())));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let settlement = Arc::new(SettlementService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]),
+			String::new(),
+			20,
+		));
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
+		let recovery_service = RecoveryService::new(
+			storage,
+			state_machine,
+			delivery,
+			settlement,
+			EventBus::new(100),
+			attempt_store,
+			empty_networks_config(),
+		);
+
+		let (_, result) = recovery_service
+			.reconcile_with_blockchain(&order)
+			.await
+			.unwrap();
+
+		// A transient callback failure must not block recovery: the stage is
+		// already confirmed on-chain, and the Hyperlane get_attestation fallback
+		// retries the tracker rebuild during settlement monitoring.
+		assert!(matches!(result, ReconcileResult::NeedsMonitoring));
 	}
 
 	#[tokio::test]

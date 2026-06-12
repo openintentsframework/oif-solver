@@ -33,7 +33,7 @@ use solver_settlement::SettlementService;
 use solver_storage::StorageService;
 use solver_types::{
 	truncate_id, Address, DeliveryEvent, Intent, Order, OrderEvent, SettlementEvent, SolverEvent,
-	StorageKey,
+	StorageKey, TransactionType,
 };
 use std::future::Future;
 use std::sync::Arc;
@@ -122,23 +122,52 @@ pub struct SolverEngine {
 /// submitting claim transactions to reduce gas costs.
 static CLAIM_BATCH: usize = 1;
 
-/// Returns true when the settlement error represents a transient post-fill
-/// failure — one that may succeed on a later attempt without any code or
-/// order changes. Marking such orders as `Failed` would lock in a real loss
-/// because the Fill has already settled on chain; only the claim half
-/// remains, and it just needs another attempt with a healthier signer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettlementFailurePolicy {
+	RetryLater,
+	FailOrder,
+}
+
+/// Classifies settlement-stage failures without relying on formatted strings.
 ///
-/// Matches on the typed `SettlementError` variant rather than substring on
-/// a formatted message — drift in any error's `Display` impl would silently
-/// flip transient-recovery behavior to permanent-failure.
-///
-/// Currently identifies:
-/// - `InsufficientNativeGas` — signer balance changes outside the solver's view.
-fn is_transient_postfill_error(error: &crate::handlers::settlement::SettlementError) -> bool {
-	matches!(
-		error,
-		crate::handlers::settlement::SettlementError::InsufficientNativeGas(_)
-	)
+/// A retryable result means the order should stay in its current non-terminal
+/// state so startup recovery can re-drive the stage. Permanent failures are
+/// the only errors that should transition already-filled orders to `Failed`.
+fn settlement_failure_policy(
+	_stage: TransactionType,
+	error: &crate::handlers::settlement::SettlementError,
+) -> SettlementFailurePolicy {
+	use crate::handlers::settlement::SettlementError;
+	use solver_delivery::DeliveryError;
+	use solver_settlement::SettlementError as SettlementServiceError;
+
+	match error {
+		SettlementError::InsufficientNativeGas(_) => SettlementFailurePolicy::RetryLater,
+		SettlementError::Delivery(delivery_error) => match delivery_error {
+			DeliveryError::Network(_) => SettlementFailurePolicy::RetryLater,
+			DeliveryError::TransactionFailed(_) => SettlementFailurePolicy::FailOrder,
+			DeliveryError::NonceTooLow(_) => SettlementFailurePolicy::RetryLater,
+			DeliveryError::InsufficientNativeGas(_) => SettlementFailurePolicy::RetryLater,
+			DeliveryError::NoImplementationAvailable => SettlementFailurePolicy::RetryLater,
+			DeliveryError::ReplacementUnderpriced { .. } => SettlementFailurePolicy::RetryLater,
+		},
+		SettlementError::SettlementService(settlement_error) => match settlement_error {
+			SettlementServiceError::ValidationFailed(_) => SettlementFailurePolicy::FailOrder,
+			SettlementServiceError::InvalidProof => SettlementFailurePolicy::FailOrder,
+			SettlementServiceError::FillMismatch => SettlementFailurePolicy::FailOrder,
+			SettlementServiceError::ProofGenerationFailed { .. } => {
+				SettlementFailurePolicy::RetryLater
+			},
+			SettlementServiceError::FinalityNotReached { .. } => {
+				SettlementFailurePolicy::RetryLater
+			},
+			SettlementServiceError::ProverUnavailable(_) => SettlementFailurePolicy::RetryLater,
+			SettlementServiceError::SlotDerivationMismatch => SettlementFailurePolicy::FailOrder,
+		},
+		SettlementError::Storage(_) | SettlementError::Service(_) | SettlementError::State(_) => {
+			SettlementFailurePolicy::FailOrder
+		},
+	}
 }
 
 impl SolverEngine {
@@ -211,6 +240,7 @@ impl SolverEngine {
 			storage.clone(),
 			state_machine.clone(),
 			event_bus.clone(),
+			dynamic_config.clone(),
 		));
 
 		let transaction_handler = Arc::new(TransactionHandler::new(
@@ -622,18 +652,28 @@ impl SolverEngine {
 							// Note: This may trigger OrderEvent::Executing which will be serialized separately
 							self.spawn_handler(&general_semaphore, move |engine| async move {
 								let order_id_clone = order_id.clone();
-								if let Err(e) = engine.transaction_handler.handle_confirmed(order_id, tx_hash, tx_type, receipt).await {
-									let error_msg = format!("Failed to handle transaction confirmation: {e}");
-									// Attempt to mark order as failed with the transaction type from the event
-									if let Err(state_err) = engine.state_machine
-										.transition_order_status(&order_id_clone, solver_types::OrderStatus::Failed(tx_type, error_msg.clone()))
-										.await
-									{
-										tracing::error!("Failed to mark order as failed: {}", state_err);
+								match engine.transaction_handler.handle_confirmed(order_id, tx_hash, tx_type, receipt).await {
+									Ok(()) => Ok(()),
+									Err(crate::handlers::transaction::TransactionError::SettlementCallback { stage, source }) => {
+										engine.handle_settlement_stage_error(
+											&order_id_clone,
+											stage,
+											"TransactionConfirmed",
+											crate::handlers::settlement::SettlementError::SettlementService(source),
+										).await
+									},
+									Err(e) => {
+										let error_msg = format!("Failed to handle transaction confirmation: {e}");
+										// Attempt to mark order as failed with the transaction type from the event
+										if let Err(state_err) = engine.state_machine
+											.transition_order_status(&order_id_clone, solver_types::OrderStatus::Failed(tx_type, error_msg.clone()))
+											.await
+										{
+											tracing::error!("Failed to mark order as failed: {}", state_err);
+										}
+										Err(EngineError::Service(error_msg))
 									}
-									return Err(EngineError::Service(error_msg));
 								}
-								Ok(())
 							})
 							.await;
 						}
@@ -666,33 +706,12 @@ impl SolverEngine {
 							self.spawn_handler(&transaction_semaphore, move |engine| async move {
 								let order_id_clone = order_id.clone();
 								if let Err(e) = engine.settlement_handler.handle_post_fill_ready(order_id).await {
-									// Discriminate transient errors from permanent ones via
-									// the typed SettlementError variant — string-matching on
-									// a formatted message is brittle to Display drift.
-									// `InsufficientNativeGas` is the textbook transient: balance
-									// changes outside the solver's view, and marking Failed here
-									// would lock in a real loss (Fill already settled on chain;
-									// we just need to top up to claim). Leave the order in
-									// `Executed` so the next restart's recovery retries.
-									if is_transient_postfill_error(&e) {
-										let error_msg = format!("Failed to handle PostFillReady: {e}");
-										tracing::warn!(
-											order_id = %order_id_clone,
-											error = %error_msg,
-											"PostFill failed with a transient error; leaving order \
-											in Executed for the next recovery cycle to retry"
-										);
-										return Err(EngineError::Service(error_msg));
-									}
-									let error_msg = format!("Failed to handle PostFillReady: {e}");
-									// Permanent failure → mark order Failed.
-									if let Err(state_err) = engine.state_machine
-										.transition_order_status(&order_id_clone, solver_types::OrderStatus::Failed(solver_types::TransactionType::PostFill, error_msg.clone()))
-										.await
-									{
-										tracing::error!("Failed to mark order as failed: {}", state_err);
-									}
-									return Err(EngineError::Service(error_msg));
+									return engine.handle_settlement_stage_error(
+										&order_id_clone,
+										TransactionType::PostFill,
+										"PostFillReady",
+										e,
+									).await;
 								}
 								Ok(())
 							})
@@ -704,15 +723,12 @@ impl SolverEngine {
 							self.spawn_handler(&transaction_semaphore, move |engine| async move {
 								let order_id_clone = order_id.clone();
 								if let Err(e) = engine.settlement_handler.handle_pre_claim_ready(order_id).await {
-									let error_msg = format!("Failed to handle PreClaimReady: {e}");
-									// Attempt to mark order as failed
-									if let Err(state_err) = engine.state_machine
-										.transition_order_status(&order_id_clone, solver_types::OrderStatus::Failed(solver_types::TransactionType::PreClaim, error_msg.clone()))
-										.await
-									{
-										tracing::error!("Failed to mark order as failed: {}", state_err);
-									}
-									return Err(EngineError::Service(error_msg));
+									return engine.handle_settlement_stage_error(
+										&order_id_clone,
+										TransactionType::PreClaim,
+										"PreClaimReady",
+										e,
+									).await;
 								}
 								Ok(())
 							})
@@ -746,17 +762,12 @@ impl SolverEngine {
 								// Claim sends a transaction - use transaction semaphore
 								self.spawn_handler(&transaction_semaphore, move |engine| async move {
 									if let Err(e) = engine.settlement_handler.process_claim_batch(&mut batch).await {
-										let error_msg = format!("Failed to process claim batch: {e}");
-										// Attempt to mark all orders in batch as failed
-										for order_id in batch.iter() {
-											if let Err(state_err) = engine.state_machine
-												.transition_order_status(order_id, solver_types::OrderStatus::Failed(solver_types::TransactionType::Claim, error_msg.clone()))
-												.await
-											{
-												tracing::error!("Failed to mark order {} as failed: {}", order_id, state_err);
-											}
-										}
-										return Err(EngineError::Service(error_msg));
+										return engine.handle_settlement_stage_error(
+											&e.order_id,
+											TransactionType::Claim,
+											"ClaimReady",
+											e.error,
+										).await;
 									}
 									Ok(())
 								})
@@ -909,6 +920,39 @@ impl SolverEngine {
 		Arc::clone(&self.startup_readiness)
 	}
 
+	async fn handle_settlement_stage_error(
+		&self,
+		order_id: &str,
+		tx_type: TransactionType,
+		context: &str,
+		error: crate::handlers::settlement::SettlementError,
+	) -> Result<(), EngineError> {
+		let error_msg = format!("Failed to handle {context}: {error}");
+		match settlement_failure_policy(tx_type, &error) {
+			SettlementFailurePolicy::RetryLater => {
+				tracing::warn!(
+					order_id = %order_id,
+					tx_type = ?tx_type,
+					error = %error_msg,
+					"Settlement stage failed with a transient error; leaving order retryable"
+				);
+			},
+			SettlementFailurePolicy::FailOrder => {
+				if let Err(state_err) = self
+					.state_machine
+					.transition_order_status(
+						order_id,
+						solver_types::OrderStatus::Failed(tx_type, error_msg.clone()),
+					)
+					.await
+				{
+					tracing::error!("Failed to mark order as failed: {}", state_err);
+				}
+			},
+		}
+		Err(EngineError::Service(error_msg))
+	}
+
 	/// Helper method to spawn handler tasks with semaphore-based concurrency control.
 	///
 	/// This method:
@@ -943,12 +987,13 @@ mod tests {
 	use crate::engine::event_bus::EventBus;
 	use solver_account::AccountService;
 	use solver_config::{Config, ConfigBuilder};
-	use solver_delivery::DeliveryService;
+	use solver_delivery::{DeliveryError, DeliveryService, InsufficientNativeGasInfo};
 	use solver_discovery::DiscoveryService;
 	use solver_order::OrderService;
 	use solver_settlement::SettlementService;
 	use solver_storage::StorageService;
-	use solver_types::Address;
+	use solver_types::utils::tests::builders::OrderBuilder;
+	use solver_types::{Address, OrderStatus, TransactionType};
 	use std::sync::Arc;
 	use tokio::sync::Semaphore;
 
@@ -1242,6 +1287,249 @@ mod tests {
 			handler_error.to_string(),
 			"Handler error: test handler error"
 		);
+	}
+
+	fn insufficient_native_gas_error() -> crate::handlers::settlement::SettlementError {
+		crate::handlers::settlement::SettlementError::InsufficientNativeGas(Box::new(
+			InsufficientNativeGasInfo {
+				chain_id: 1,
+				signer: "0x0000000000000000000000000000000000000001".to_string(),
+				balance_wei: "0".to_string(),
+				required_wei: "1".to_string(),
+				shortfall_wei: "1".to_string(),
+				gas_limit: Some(21_000),
+				max_fee_per_gas: Some(1),
+				gas_price: None,
+				value_wei: "0".to_string(),
+			},
+		))
+	}
+
+	async fn create_test_engine() -> SolverEngine {
+		let (
+			dynamic_config,
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+		) = create_mock_services().await;
+
+		SolverEngine::new(
+			dynamic_config,
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+			None,
+		)
+	}
+
+	#[test]
+	fn settlement_policy_retries_transient_delivery_errors() {
+		let errors = vec![
+			crate::handlers::settlement::SettlementError::Delivery(DeliveryError::Network(
+				"rpc down".to_string(),
+			)),
+			crate::handlers::settlement::SettlementError::Delivery(DeliveryError::NonceTooLow(
+				"nonce drift".to_string(),
+			)),
+			crate::handlers::settlement::SettlementError::Delivery(
+				DeliveryError::ReplacementUnderpriced {
+					hint: "raise fee".to_string(),
+				},
+			),
+			crate::handlers::settlement::SettlementError::Delivery(
+				DeliveryError::NoImplementationAvailable,
+			),
+			insufficient_native_gas_error(),
+			crate::handlers::settlement::SettlementError::SettlementService(
+				solver_settlement::SettlementError::FinalityNotReached {
+					required_blocks: 10,
+					current_blocks: 3,
+				},
+			),
+			crate::handlers::settlement::SettlementError::SettlementService(
+				solver_settlement::SettlementError::ProverUnavailable("down".to_string()),
+			),
+			crate::handlers::settlement::SettlementError::SettlementService(
+				solver_settlement::SettlementError::ProofGenerationFailed {
+					source_chain: 1,
+					reason: "rpc down".to_string(),
+				},
+			),
+		];
+
+		for error in errors {
+			for stage in [
+				TransactionType::PostFill,
+				TransactionType::PreClaim,
+				TransactionType::Claim,
+			] {
+				assert_eq!(
+					settlement_failure_policy(stage, &error),
+					SettlementFailurePolicy::RetryLater,
+					"expected {error:?} at {stage:?} to be retryable"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn settlement_policy_fails_permanent_settlement_errors() {
+		let errors = vec![
+			crate::handlers::settlement::SettlementError::SettlementService(
+				solver_settlement::SettlementError::ValidationFailed("bad config".to_string()),
+			),
+			crate::handlers::settlement::SettlementError::SettlementService(
+				solver_settlement::SettlementError::InvalidProof,
+			),
+			crate::handlers::settlement::SettlementError::SettlementService(
+				solver_settlement::SettlementError::FillMismatch,
+			),
+			crate::handlers::settlement::SettlementError::SettlementService(
+				solver_settlement::SettlementError::SlotDerivationMismatch,
+			),
+			crate::handlers::settlement::SettlementError::Delivery(
+				DeliveryError::TransactionFailed("reverted".to_string()),
+			),
+			crate::handlers::settlement::SettlementError::Storage("storage down".to_string()),
+			crate::handlers::settlement::SettlementError::State("cas failed".to_string()),
+			crate::handlers::settlement::SettlementError::Service("missing proof".to_string()),
+		];
+
+		for error in errors {
+			assert_eq!(
+				settlement_failure_policy(TransactionType::PreClaim, &error),
+				SettlementFailurePolicy::FailOrder,
+				"expected {error:?} to be permanent"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn post_fill_ready_transient_error_leaves_order_executed() {
+		let engine = create_test_engine().await;
+		let order = OrderBuilder::new()
+			.with_id("post-fill-transient-order".to_string())
+			.with_status(OrderStatus::Executed)
+			.build();
+		engine.state_machine.store_order(&order).await.unwrap();
+
+		let result = engine
+			.handle_settlement_stage_error(
+				&order.id,
+				TransactionType::PostFill,
+				"PostFillReady",
+				crate::handlers::settlement::SettlementError::Delivery(DeliveryError::Network(
+					"rpc down".to_string(),
+				)),
+			)
+			.await;
+
+		assert!(result.is_err());
+		let stored = engine.state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(stored.status, OrderStatus::Executed);
+	}
+
+	#[tokio::test]
+	async fn pre_claim_ready_transient_error_leaves_order_settled() {
+		let engine = create_test_engine().await;
+		let order = OrderBuilder::new()
+			.with_id("pre-claim-transient-order".to_string())
+			.with_status(OrderStatus::Settled)
+			.build();
+		engine.state_machine.store_order(&order).await.unwrap();
+
+		let result = engine
+			.handle_settlement_stage_error(
+				&order.id,
+				TransactionType::PreClaim,
+				"PreClaimReady",
+				insufficient_native_gas_error(),
+			)
+			.await;
+
+		assert!(result.is_err());
+		let stored = engine.state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(stored.status, OrderStatus::Settled);
+	}
+
+	#[tokio::test]
+	async fn claim_ready_transient_error_leaves_order_retryable() {
+		let engine = create_test_engine().await;
+		let order = OrderBuilder::new()
+			.with_id("claim-transient-order".to_string())
+			.with_status(OrderStatus::PreClaimed)
+			.build();
+		engine.state_machine.store_order(&order).await.unwrap();
+
+		let result = engine
+			.handle_settlement_stage_error(
+				&order.id,
+				TransactionType::Claim,
+				"ClaimReady",
+				crate::handlers::settlement::SettlementError::Delivery(
+					DeliveryError::NoImplementationAvailable,
+				),
+			)
+			.await;
+
+		assert!(result.is_err());
+		let stored = engine.state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(stored.status, OrderStatus::PreClaimed);
+	}
+
+	#[tokio::test]
+	async fn claim_ready_permanent_error_fails_only_affected_order() {
+		let engine = create_test_engine().await;
+		let affected = OrderBuilder::new()
+			.with_id("claim-permanent-order".to_string())
+			.with_status(OrderStatus::PreClaimed)
+			.build();
+		let unaffected = OrderBuilder::new()
+			.with_id("claim-unaffected-order".to_string())
+			.with_status(OrderStatus::PreClaimed)
+			.build();
+		engine.state_machine.store_order(&affected).await.unwrap();
+		engine.state_machine.store_order(&unaffected).await.unwrap();
+
+		let result = engine
+			.handle_settlement_stage_error(
+				&affected.id,
+				TransactionType::Claim,
+				"ClaimReady",
+				crate::handlers::settlement::SettlementError::SettlementService(
+					solver_settlement::SettlementError::InvalidProof,
+				),
+			)
+			.await;
+
+		assert!(result.is_err());
+		let affected = engine.state_machine.get_order(&affected.id).await.unwrap();
+		assert!(matches!(
+			affected.status,
+			OrderStatus::Failed(TransactionType::Claim, _)
+		));
+		let unaffected = engine
+			.state_machine
+			.get_order(&unaffected.id)
+			.await
+			.unwrap();
+		assert_eq!(unaffected.status, OrderStatus::PreClaimed);
 	}
 
 	#[tokio::test]

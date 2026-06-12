@@ -27,6 +27,12 @@ pub enum TransactionError {
 	Storage(String),
 	#[error("State error: {0}")]
 	State(String),
+	#[error("Settlement callback failed for {stage:?}: {source}")]
+	SettlementCallback {
+		stage: TransactionType,
+		#[source]
+		source: solver_settlement::SettlementError,
+	},
 	#[error("Service error: {0}")]
 	Service(String),
 }
@@ -161,29 +167,17 @@ impl TransactionHandler {
 			return Ok(());
 		}
 
-		// Retrieve the order for settlement callback
+		// Retrieve the order for confirmation handling.
 		let order: Order = self
 			.storage
 			.retrieve(StorageKey::Orders.as_str(), &order_id)
 			.await
 			.map_err(|e| TransactionError::Storage(e.to_string()))?;
-
-		// For PostFill and PreClaim, call settlement callback BEFORE other processing
-		// This allows Hyperlane to extract and store message IDs from receipts
-		if matches!(
+		let settlement_callback_order = matches!(
 			tx_type,
 			TransactionType::PostFill | TransactionType::PreClaim
-		) {
-			// Call settlement-specific handler
-			if let Ok(settlement) = self.settlement.find_settlement_for_order(&order) {
-				settlement
-					.handle_transaction_confirmed(&order, tx_type, &receipt)
-					.await
-					.map_err(|e: solver_settlement::SettlementError| {
-						TransactionError::Service(format!("Settlement callback failed: {e}"))
-					})?;
-			}
-		}
+		)
+		.then(|| order.clone());
 
 		// Handle based on transaction type
 		match tx_type {
@@ -202,6 +196,19 @@ impl TransactionHandler {
 			TransactionType::Claim => {
 				self.handle_claim_confirmed(tx_hash, order).await?;
 			},
+		}
+
+		// For PostFill and PreClaim, run settlement-specific receipt post-processing
+		// after persisting the chain-confirmed stage. A transient callback failure
+		// must not erase the fact that the transaction succeeded on-chain.
+		if let Some(order) = settlement_callback_order {
+			self.settlement
+				.handle_transaction_confirmed(&order, tx_type, &receipt)
+				.await
+				.map_err(|source| TransactionError::SettlementCallback {
+					stage: tx_type,
+					source,
+				})?;
 		}
 
 		Ok(())
@@ -490,7 +497,7 @@ mod tests {
 	use crate::state::OrderStateMachine;
 	use alloy_primitives::U256;
 	use mockall::predicate::*;
-	use solver_settlement::SettlementService;
+	use solver_settlement::{MockSettlementInterface, SettlementError, SettlementService};
 	use solver_storage::{MockStorageInterface, StorageService};
 	use solver_types::utils::tests::builders::{OrderBuilder, TransactionReceiptBuilder};
 	use solver_types::{
@@ -577,6 +584,36 @@ mod tests {
 			Arc::new(SettlementService::new(HashMap::new(), String::new(), 20)),
 			event_bus,
 		);
+
+		(handler, receiver, state_machine)
+	}
+
+	async fn create_memory_handler_with_order_and_settlement(
+		order: Order,
+		mock_settlement: MockSettlementInterface,
+	) -> (
+		TransactionHandler,
+		broadcast::Receiver<SolverEvent>,
+		Arc<OrderStateMachine>,
+	) {
+		let storage_impl = solver_storage::implementations::memory::MemoryStorage::new();
+		let storage = Arc::new(StorageService::new(Box::new(storage_impl)));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let receiver = event_bus.subscribe();
+
+		state_machine.store_order(&order).await.unwrap();
+
+		let settlement = Arc::new(SettlementService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]),
+			"eip7683".to_string(),
+			20,
+		));
+		let handler =
+			TransactionHandler::new(storage, state_machine.clone(), settlement, event_bus);
 
 		(handler, receiver, state_machine)
 	}
@@ -974,6 +1011,48 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn post_fill_confirmed_transient_callback_error_persists_confirmation_first() {
+		let mut order = create_test_order(true);
+		order.status = OrderStatus::Executed;
+		order.settlement_name = Some("eip7683".to_string());
+		let tx_hash = create_test_tx_hash();
+		let receipt = create_test_receipt(true);
+
+		let mut mock_settlement = MockSettlementInterface::new();
+		mock_settlement
+			.expect_handle_transaction_confirmed()
+			.withf(|_, tx_type, _| *tx_type == TransactionType::PostFill)
+			.times(1)
+			.returning(|_, _, _| {
+				Box::pin(
+					async move { Err(SettlementError::ProverUnavailable("rpc timeout".into())) },
+				)
+			});
+		let (handler, _receiver, state_machine) =
+			create_memory_handler_with_order_and_settlement(order.clone(), mock_settlement).await;
+
+		let result = handler
+			.handle_confirmed(
+				order.id.clone(),
+				tx_hash.clone(),
+				TransactionType::PostFill,
+				receipt,
+			)
+			.await;
+
+		assert!(matches!(
+			result,
+			Err(TransactionError::SettlementCallback {
+				stage: TransactionType::PostFill,
+				..
+			})
+		));
+		let updated_order = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(updated_order.status, OrderStatus::PostFilled);
+		assert_eq!(updated_order.post_fill_tx_hash, Some(tx_hash));
+	}
+
+	#[tokio::test]
 	async fn test_handle_post_fill_confirmed_missing_fill_tx_hash() {
 		let mut order = create_test_order(true);
 		order.fill_tx_hash = None; // Remove fill tx hash
@@ -1033,6 +1112,48 @@ mod tests {
 
 		// Verify order status was updated to PreClaimed
 		let updated_order = state_machine.get_order(&order_for_state.id).await.unwrap();
+		assert_eq!(updated_order.status, OrderStatus::PreClaimed);
+		assert_eq!(updated_order.pre_claim_tx_hash, Some(tx_hash));
+	}
+
+	#[tokio::test]
+	async fn pre_claim_confirmed_transient_callback_error_persists_confirmation_first() {
+		let tx_hash = create_test_tx_hash();
+		let mut order = create_test_order(true);
+		order.status = OrderStatus::Settled;
+		order.settlement_name = Some("eip7683".to_string());
+		let receipt = create_test_receipt(true);
+
+		let mut mock_settlement = MockSettlementInterface::new();
+		mock_settlement
+			.expect_handle_transaction_confirmed()
+			.withf(|_, tx_type, _| *tx_type == TransactionType::PreClaim)
+			.times(1)
+			.returning(|_, _, _| {
+				Box::pin(
+					async move { Err(SettlementError::ProverUnavailable("rpc timeout".into())) },
+				)
+			});
+		let (handler, _receiver, state_machine) =
+			create_memory_handler_with_order_and_settlement(order.clone(), mock_settlement).await;
+
+		let result = handler
+			.handle_confirmed(
+				order.id.clone(),
+				tx_hash.clone(),
+				TransactionType::PreClaim,
+				receipt,
+			)
+			.await;
+
+		assert!(matches!(
+			result,
+			Err(TransactionError::SettlementCallback {
+				stage: TransactionType::PreClaim,
+				..
+			})
+		));
+		let updated_order = state_machine.get_order(&order.id).await.unwrap();
 		assert_eq!(updated_order.status, OrderStatus::PreClaimed);
 		assert_eq!(updated_order.pre_claim_tx_hash, Some(tx_hash));
 	}

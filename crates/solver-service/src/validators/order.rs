@@ -4,9 +4,9 @@
 //! It validates the order and ensures the user has sufficient capacity to fill the order.
 
 use alloy_primitives::{hex, Address as AlloyAddress, U256};
-use alloy_sol_types::SolCall;
 use solver_config::Config;
 use solver_core::SolverEngine;
+use solver_delivery::fetch_compact_balance;
 use solver_types::{
 	standards::eip7683::{
 		interfaces::StandardOrder, LockType, MAX_STANDARD_ORDER_INPUTS, MAX_STANDARD_ORDER_OUTPUTS,
@@ -15,14 +15,14 @@ use solver_types::{
 };
 use std::convert::TryFrom;
 
-mod interfaces {
-	use alloy_sol_types::sol;
-
-	sol! {
-		function balanceOf(address owner, uint256 id) external view returns (uint256);
-	}
-}
-
+/// Validates the user can fund the order as a fast intake-rejection check.
+///
+/// For escrow flows this checks the user's wallet token balance; for
+/// resource-lock orders it checks the on-chain TheCompact deposit balance. This
+/// is a stateless sufficiency check only — it does NOT reserve the deposit
+/// against other in-flight orders. The authoritative in-flight reservation is
+/// taken at the engine acceptance boundary (`IntentHandler::handle`), which
+/// covers every intake path rather than just HTTP `/orders`.
 pub async fn ensure_user_capacity_for_order(
 	solver: &SolverEngine,
 	config: &Config,
@@ -178,48 +178,19 @@ async fn validate_compact_deposit_for_order(
 				details: None,
 			})?;
 
-	let call_data = interfaces::balanceOfCall {
-		owner: *user,
-		id: token_id,
-	}
-	.abi_encode();
-
-	let tx = solver_types::Transaction {
-		to: Some(compact_address.clone()),
-		data: call_data,
-		value: U256::ZERO,
+	let balance = fetch_compact_balance(
+		solver.delivery(),
 		chain_id,
-		nonce: None,
-		gas_limit: None,
-		gas_price: None,
-		max_fee_per_gas: None,
-		max_priority_fee_per_gas: None,
-	};
-
-	let response = solver
-		.delivery()
-		.contract_call(chain_id, tx)
-		.await
-		.map_err(|e| APIError::BadRequest {
-			error_type: ApiErrorType::OrderValidationFailed,
-			message: format!("Failed to query TheCompact deposit: {e}"),
-			details: None,
-		})?;
-
-	if response.len() != 32 {
-		return Err(APIError::BadRequest {
-			error_type: ApiErrorType::OrderValidationFailed,
-			message: format!(
-				"Unexpected TheCompact balanceOf response length: expected 32 bytes, got {}",
-				response.len()
-			),
-			details: None,
-		});
-	}
-
-	let mut balance_buf = [0u8; 32];
-	balance_buf.copy_from_slice(response.as_ref());
-	let balance = U256::from_be_bytes(balance_buf);
+		compact_address.clone(),
+		*user,
+		token_id,
+	)
+	.await
+	.map_err(|message| APIError::BadRequest {
+		error_type: ApiErrorType::OrderValidationFailed,
+		message,
+		details: None,
+	})?;
 
 	if balance < required_amount {
 		return Err(APIError::BadRequest {
@@ -587,14 +558,16 @@ mod tests {
 		let config = build_config(TEST_CHAIN_ID, TEST_COMPACT);
 		let solver = build_solver_engine(config.clone(), delivery_map);
 
-		assert!(super::ensure_user_capacity_for_order(
+		// The fast intake capacity check passes; it no longer reserves the
+		// deposit (the authoritative reservation moved to the engine boundary).
+		super::ensure_user_capacity_for_order(
 			&solver,
 			&config,
 			LockType::ResourceLock,
 			&standard_order,
 		)
 		.await
-		.is_ok());
+		.unwrap();
 	}
 
 	#[tokio::test]

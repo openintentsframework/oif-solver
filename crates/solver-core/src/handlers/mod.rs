@@ -4,6 +4,8 @@
 //! lifecycle: intent discovery, order preparation and execution, transaction
 //! monitoring, and settlement claiming.
 
+pub mod compact_reservation;
+pub mod forced_withdrawal;
 pub mod intent;
 pub mod order;
 pub mod settlement;
