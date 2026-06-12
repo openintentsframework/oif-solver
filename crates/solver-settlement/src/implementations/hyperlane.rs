@@ -4,6 +4,10 @@
 //! messaging protocol for oracle attestations.
 
 use crate::{
+	implementations::fill_description::{
+		encode_fill_description, extract_verified_fill_from_logs,
+		payload_hash as verified_payload_hash, VerifiedFill,
+	},
 	utils::{
 		address_to_bytes32, check_is_proven, create_providers_for_chains, parse_address_table,
 		parse_oracle_config, SettlementMessageTracker,
@@ -18,9 +22,8 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use solver_storage::StorageService;
 use solver_types::{
-	order_id_to_bytes32, with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, InteropAddress,
-	NetworksConfig, Order, OrderOutput, Schema, Transaction, TransactionHash, TransactionReceipt,
-	TransactionType,
+	order_id_to_bytes32, with_0x_prefix, ConfigSchema, Field, FieldType, FillProof, NetworksConfig,
+	Order, Schema, Transaction, TransactionHash, TransactionReceipt, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,209 +58,13 @@ fn keccak256(data: &str) -> FixedBytes<32> {
 	FixedBytes::<32>::from_slice(&result)
 }
 
-/// Hyperlane-compatible output representation
-struct HyperlaneOutput {
-	token: [u8; 32],
-	amount: U256,
-	recipient: [u8; 32],
-	call: Vec<u8>,
-	context: Vec<u8>,
-}
-
-/// Convert InteropAddress to bytes32 for Hyperlane
-fn interop_address_to_bytes32(addr: &InteropAddress) -> [u8; 32] {
-	let mut bytes32 = [0u8; 32];
-
-	// Get the raw bytes from the InteropAddress
-	let raw_bytes = addr.to_bytes();
-
-	// For Ethereum addresses (20 bytes), right-align in 32 bytes
-	if let Ok(eth_addr) = addr.ethereum_address() {
-		// Put the 20-byte Ethereum address in the last 20 bytes of the 32-byte array
-		bytes32[12..].copy_from_slice(eth_addr.as_slice());
-	} else {
-		// For other address formats, use the raw bytes right-aligned
-		let len = raw_bytes.len().min(32);
-		bytes32[32 - len..].copy_from_slice(&raw_bytes[..len]);
-	}
-
-	bytes32
-}
-
-/// Convert an OrderOutput to Hyperlane-compatible format
-fn order_output_to_hyperlane(output: &OrderOutput) -> HyperlaneOutput {
-	let asset = &output.asset;
-	let receiver = &output.receiver;
-	let amount = output.amount;
-
-	HyperlaneOutput {
-		token: interop_address_to_bytes32(asset),
-		amount,
-		recipient: interop_address_to_bytes32(receiver),
-		call: output
-			.calldata
-			.as_ref()
-			.and_then(|s| hex::decode(s.trim_start_matches("0x")).ok())
-			.unwrap_or_default(),
-		context: vec![], // Empty context for generic orders
-	}
-}
-
-/// Extract output details from order data using OrderParsable
-fn extract_output_details(order: &Order) -> Result<HyperlaneOutput, SettlementError> {
-	// Parse order data using the OrderParsable trait
-	let parsed_order = order.parse_order_data().map_err(|e| {
-		SettlementError::ValidationFailed(format!("Failed to parse order data: {e}"))
-	})?;
-
-	// Get requested outputs
-	let outputs = parsed_order.parse_requested_outputs();
-
-	// Get the first output
-	let first_output = outputs
-		.first()
-		.ok_or_else(|| SettlementError::ValidationFailed("No outputs found in order".into()))?;
-
-	// Convert to Hyperlane format
-	Ok(order_output_to_hyperlane(first_output))
-}
-
-/// Extract (solver, timestamp) from OutputFilled logs.
+/// Encode a placeholder FillDescription for post-fill fee quotes.
 ///
-/// Verifies that the log was emitted by the order's expected output settler for the
-/// destination chain AND that the decoded MandateOutput matches the order's output.
-/// Rejects forged logs emitted by malicious contracts in the same fill transaction.
-fn extract_fill_details_from_logs(
-	logs: &[solver_types::Log],
-	order: &solver_types::Order,
-	order_id: &[u8; 32],
-	dest_chain: u64,
-) -> Result<([u8; 32], u32), SettlementError> {
-	use alloy_sol_types::SolEvent;
-	use solver_types::standards::eip7683::interfaces::OutputFilled;
-
-	// 1. Resolve the expected output and emitter from the order.
-	let order_data: solver_types::standards::eip7683::Eip7683OrderData =
-		serde_json::from_value(order.data.clone()).map_err(|e| {
-			SettlementError::ValidationFailed(format!("Failed to parse order_data: {e}"))
-		})?;
-
-	let matched: Vec<&_> = order_data
-		.outputs
-		.iter()
-		.filter(|o| o.chain_id == alloy_primitives::U256::from(dest_chain))
-		.collect();
-	if matched.is_empty() {
-		return Err(SettlementError::ValidationFailed(format!(
-			"Order has no output on destination chain {dest_chain}"
-		)));
-	}
-	if matched.len() > 1 {
-		return Err(SettlementError::ValidationFailed(format!(
-			"Order has multiple outputs on destination chain {dest_chain}; unsupported"
-		)));
-	}
-	let expected_output = matched[0];
-
-	// 2. Convert the signed bytes32 settler to a 20-byte EVM address.
-	if expected_output.settler[0..12].iter().any(|b| *b != 0) {
-		return Err(SettlementError::ValidationFailed(
-			"Order output settler is not a left-padded EVM address".to_string(),
-		));
-	}
-	let mut expected_addr = [0u8; 20];
-	expected_addr.copy_from_slice(&expected_output.settler[12..32]);
-	let expected_emitter = solver_types::Address(expected_addr.to_vec());
-
-	// 3. Filter logs by emitter AND topic match, then decode and compare MandateOutput.
-	for log in logs {
-		if log.address != expected_emitter {
-			continue;
-		}
-		if log.topics.len() < 2 {
-			continue;
-		}
-		if log.topics[0].0 != OutputFilled::SIGNATURE_HASH.0 {
-			continue;
-		}
-		if log.topics[1].0 != *order_id {
-			continue;
-		}
-
-		// Decode the non-indexed payload via the sol!-generated event type.
-		// In alloy-sol-types 1.x, `abi_decode_data_validate(data)` performs the
-		// validated decode and returns a tuple matching the event's non-indexed
-		// params: (solver, timestamp, output, finalAmount).
-		match <OutputFilled as SolEvent>::abi_decode_data_validate(&log.data) {
-			Ok((solver_b32, timestamp, sol_output, final_amount)) => {
-				// Compare the decoded SolMandateOutput against the order's MandateOutput.
-				let oracle_match = sol_output.oracle.0 == expected_output.oracle;
-				let settler_match = sol_output.settler.0 == expected_output.settler;
-				let chain_match = sol_output.chainId == expected_output.chain_id;
-				let token_match = sol_output.token.0 == expected_output.token;
-				let amount_match = sol_output.amount == expected_output.amount;
-				let recipient_match = sol_output.recipient.0 == expected_output.recipient;
-				let call_match =
-					sol_output.callbackData.as_ref() == expected_output.call.as_slice();
-				let context_match =
-					sol_output.context.as_ref() == expected_output.context.as_slice();
-
-				if oracle_match
-					&& settler_match
-					&& chain_match && token_match
-					&& amount_match && recipient_match
-					&& call_match && context_match
-				{
-					// Surface divergence between the chain-settled `finalAmount` and the
-					// order-requested MandateOutput.amount. Today the shipped settlers
-					// always emit `finalAmount == amount`, so this is a forward-looking
-					// guard against partial-fill / fee-deducting settlers: if the chain
-					// settled a different amount than what we'd build the attestation
-					// payload from, we reject the log rather than silently building a
-					// wrong payload.
-					if final_amount != sol_output.amount {
-						tracing::warn!(
-							order_id = %order.id,
-							log_emitter = %log.address,
-							expected = %sol_output.amount,
-							actual = %final_amount,
-							"OutputFilled finalAmount diverged from MandateOutput.amount; skipping log",
-						);
-						continue;
-					}
-					return Ok((solver_b32.0, timestamp));
-				}
-				// Mismatched payload — keep looking; another log might match.
-				continue;
-			},
-			Err(e) => {
-				tracing::warn!(
-					error = %e,
-					log_emitter = %log.address,
-					"OutputFilled ABI decode failed; skipping log",
-				);
-				continue;
-			},
-		}
-	}
-
-	Err(SettlementError::ValidationFailed(
-		"no matching OutputFilled log emitted by expected settler".to_string(),
-	))
-}
-
-/// Encode FillDescription according to MandateOutputEncodingLib
-/// Layout:
-/// - solver (32 bytes)
-/// - orderId (32 bytes)
-/// - timestamp (4 bytes)
-/// - token (32 bytes)
-/// - amount (32 bytes)
-/// - recipient (32 bytes)
-/// - call length (2 bytes) + call data
-/// - context length (2 bytes) + context data
+/// This preserves the pre-existing quote-time behavior: callers only have a
+/// PostFillFeeParams projection, not a verified fill receipt with full output
+/// context.
 #[allow(clippy::too_many_arguments)]
-fn encode_fill_description(
+fn encode_quote_fill_description(
 	solver_identifier: [u8; 32],
 	order_id: [u8; 32],
 	timestamp: u32,
@@ -267,49 +74,23 @@ fn encode_fill_description(
 	call_data: Vec<u8>,
 	context: Vec<u8>,
 ) -> Result<Vec<u8>, SettlementError> {
-	// Check length constraints
-	if call_data.len() > u16::MAX as usize {
-		return Err(SettlementError::ValidationFailed(
-			"Call data too large".into(),
-		));
-	}
-	if context.len() > u16::MAX as usize {
-		return Err(SettlementError::ValidationFailed(
-			"Context data too large".into(),
-		));
-	}
-
-	let mut payload =
-		Vec::with_capacity(32 + 32 + 4 + 32 + 32 + 32 + 2 + call_data.len() + 2 + context.len());
-
-	// Solver identifier (32 bytes)
-	payload.extend_from_slice(&solver_identifier);
-
-	// Order ID (32 bytes)
-	payload.extend_from_slice(&order_id);
-
-	// Timestamp (4 bytes) - uint32 big endian
-	payload.extend_from_slice(&timestamp.to_be_bytes());
-
-	// Token (32 bytes)
-	payload.extend_from_slice(&token);
-
-	// Amount (32 bytes) - big endian
-	let amount_bytes = amount.to_be_bytes::<32>();
-	payload.extend_from_slice(&amount_bytes);
-
-	// Recipient (32 bytes)
-	payload.extend_from_slice(&recipient);
-
-	// Call length (2 bytes) and call data
-	payload.extend_from_slice(&(call_data.len() as u16).to_be_bytes());
-	payload.extend_from_slice(&call_data);
-
-	// Context length (2 bytes) and context
-	payload.extend_from_slice(&(context.len() as u16).to_be_bytes());
-	payload.extend_from_slice(&context);
-
-	Ok(payload)
+	encode_fill_description(
+		&VerifiedFill {
+			solver_identifier,
+			timestamp,
+			output: solver_types::standards::eip7683::MandateOutput {
+				oracle: [0u8; 32],
+				settler: [0u8; 32],
+				chain_id: U256::ZERO,
+				token,
+				amount,
+				recipient,
+				call: call_data,
+				context,
+			},
+		},
+		order_id,
+	)
 }
 
 sol! {
@@ -601,40 +382,6 @@ impl HyperlaneSettlement {
 			)));
 		}
 		Ok(output_oracle)
-	}
-
-	/// Compute the payload hash that will be checked with isProven
-	fn compute_payload_hash(
-		&self,
-		order: &Order,
-		solver_identifier: [u8; 32],
-		timestamp: u32,
-	) -> Result<[u8; 32], SettlementError> {
-		// Extract output details from order
-		let output = extract_output_details(order)?;
-		let order_id_bytes =
-			order_id_to_bytes32(&order.id).map_err(SettlementError::ValidationFailed)?;
-
-		// Encode the FillDescription payload
-		let payload = encode_fill_description(
-			solver_identifier,
-			order_id_bytes,
-			timestamp,
-			output.token,
-			output.amount,
-			output.recipient,
-			output.call,
-			output.context,
-		)?;
-
-		// Hash the payload (matches oracle's storage)
-		let mut hasher = Keccak256::new();
-		hasher.update(&payload);
-		let hash = hasher.finalize();
-
-		let mut result = [0u8; 32];
-		result.copy_from_slice(&hash);
-		Ok(result)
 	}
 
 	/// Check if a payload has been proven on the oracle
@@ -1018,7 +765,7 @@ impl SettlementInterface for HyperlaneSettlement {
 			.select_oracle(&self.get_input_oracles(params.origin_chain_id), None)
 			.ok_or_else(|| SettlementError::ValidationFailed("No input oracle".into()))?;
 
-		let fill_description = encode_fill_description(
+		let fill_description = encode_quote_fill_description(
 			[0u8; 32],
 			[0u8; 32],
 			0,
@@ -1219,30 +966,17 @@ impl SettlementInterface for HyperlaneSettlement {
 		let oracle_address = self.validate_bound_output_oracle(order, dest_chain)?;
 		let recipient_oracle = self.validate_bound_input_oracle(order, origin_chain)?;
 
-		// Extract fill details from order
-		let output = extract_output_details(order)?;
-
 		// Convert order ID to bytes32
 		let order_id_bytes =
 			order_id_to_bytes32(&order.id).map_err(SettlementError::ValidationFailed)?;
 
-		// Extract solver and timestamp from OutputFilled event
-		let (solver_identifier, fill_timestamp) =
-			extract_fill_details_from_logs(&fill_receipt.logs, order, &order_id_bytes, dest_chain)?;
+		let verified_fill =
+			extract_verified_fill_from_logs(&fill_receipt.logs, order, order_id_bytes, dest_chain)?;
 
 		// Create FillDescription payload
 		// Note: The oracle and settler are NOT part of the FillDescription.
 		// They are reconstructed by the contract from msg.sender and address(this)
-		let fill_description = encode_fill_description(
-			solver_identifier,
-			order_id_bytes,
-			fill_timestamp, // Using timestamp from OutputFilled event
-			output.token,
-			output.amount,
-			output.recipient,
-			output.call,
-			output.context,
-		)?;
+		let fill_description = encode_fill_description(&verified_fill, order_id_bytes)?;
 
 		// Create payloads array with single FillDescription
 		let payloads = vec![fill_description];
@@ -1372,11 +1106,11 @@ impl SettlementInterface for HyperlaneSettlement {
 
 			let order_id_bytes =
 				order_id_to_bytes32(&order.id).map_err(SettlementError::ValidationFailed)?;
-			let (solver_id, timestamp) =
-				extract_fill_details_from_logs(&logs, order, &order_id_bytes, dest_chain)?;
+			let verified_fill =
+				extract_verified_fill_from_logs(&logs, order, order_id_bytes, dest_chain)?;
 
 			// Compute payload hash once and store it
-			let payload_hash = self.compute_payload_hash(order, solver_id, timestamp)?;
+			let payload_hash = verified_payload_hash(&verified_fill, order_id_bytes)?;
 
 			// Store in message tracker with all details for later use
 			// PostFill happens on dest_chain, message goes from dest_chain to origin_chain
@@ -1389,8 +1123,8 @@ impl SettlementInterface for HyperlaneSettlement {
 					receipt.hash.clone(),
 					U256::ZERO, // TODO: Gas payment would be calculated from actual receipt
 					payload_hash,
-					solver_id,
-					timestamp,
+					verified_fill.solver_identifier,
+					verified_fill.timestamp,
 				)
 				.await?;
 
@@ -1641,6 +1375,67 @@ mod tests {
 	}
 
 	#[test]
+	fn hyperlane_payload_hash_includes_output_context() {
+		let order_id: [u8; 32] = [0x42; 32];
+		let solver = [0x77u8; 32];
+		let timestamp = 1_700_000_000u32;
+		let amount = alloy_primitives::U256::from(1000u64);
+
+		let mut settler = [0u8; 32];
+		settler[12..32].copy_from_slice(&[0xAA; 20]);
+		let mut token = [0u8; 32];
+		token[12..32].copy_from_slice(&[0xBB; 20]);
+		let mut recipient = [0u8; 32];
+		recipient[12..32].copy_from_slice(&[0xCC; 20]);
+
+		let mut output = make_mandate_output([0x11; 32], settler, 137, token, amount, recipient);
+		output.context = vec![0x00];
+		let order = build_test_order_for_emitter_tests(order_id, 1, 137, output.clone());
+
+		let verified_fill = VerifiedFill {
+			solver_identifier: solver,
+			timestamp,
+			output: output.clone(),
+		};
+		let expected_payload = encode_fill_description(&verified_fill, order_id).unwrap();
+		let expected_hash = verified_payload_hash(&verified_fill, order_id).unwrap();
+		let omitted_context_fill = VerifiedFill {
+			output: make_mandate_output([0x11; 32], settler, 137, token, amount, recipient),
+			..verified_fill.clone()
+		};
+		let omitted_context_hash = verified_payload_hash(&omitted_context_fill, order_id).unwrap();
+
+		let log_data = encode_output_filled_data(order_id, solver, timestamp, &output, amount);
+		let log = solver_types::Log {
+			address: solver_types::Address(vec![0xAA; 20]),
+			topics: vec![
+				solver_types::H256(
+					<solver_types::standards::eip7683::interfaces::OutputFilled
+						as alloy_sol_types::SolEvent>::SIGNATURE_HASH.0,
+				),
+				solver_types::H256(order_id),
+			],
+			data: log_data,
+			..Default::default()
+		};
+		let extracted_fill =
+			extract_verified_fill_from_logs(&[log], &order, order_id, 137).unwrap();
+		let actual_payload = encode_fill_description(&extracted_fill, order_id).unwrap();
+		let actual_hash = verified_payload_hash(&extracted_fill, order_id).unwrap();
+
+		assert_eq!(actual_payload, expected_payload);
+		assert_ne!(
+			expected_hash, omitted_context_hash,
+			"test setup must make non-empty context change the payload hash"
+		);
+
+		assert_eq!(
+			actual_hash, expected_hash,
+			"Hyperlane payload hash must include non-empty MandateOutput context; actual matches the empty-context hash"
+		);
+	}
+
+	#[test]
 	fn test_validate_bound_input_oracle_success() {
 		let input_oracle = solver_types::Address(vec![0x33; 20]);
 		let order = OrderBuilder::new()
@@ -1792,7 +1587,7 @@ mod tests {
 			..Default::default()
 		};
 
-		let result = extract_fill_details_from_logs(&[forged_log], &order, &order_id, 137);
+		let result = extract_verified_fill_from_logs(&[forged_log], &order, order_id, 137);
 		assert!(
 			result.is_err(),
 			"forged log from wrong emitter should be rejected"
@@ -1845,7 +1640,7 @@ mod tests {
 			..Default::default()
 		};
 
-		let result = extract_fill_details_from_logs(&[log], &order, &order_id, 137);
+		let result = extract_verified_fill_from_logs(&[log], &order, order_id, 137);
 		assert!(
 			result.is_err(),
 			"log with mismatched MandateOutput should be rejected"
@@ -1893,10 +1688,11 @@ mod tests {
 			..Default::default()
 		};
 
-		let (solver, ts) = extract_fill_details_from_logs(&[log], &order, &order_id, 137)
+		let fill = extract_verified_fill_from_logs(&[log], &order, order_id, 137)
 			.expect("matching log should be accepted");
-		assert_eq!(solver, expected_solver);
-		assert_eq!(ts, expected_timestamp);
+		assert_eq!(fill.solver_identifier, expected_solver);
+		assert_eq!(fill.timestamp, expected_timestamp);
+		assert_eq!(fill.output.amount, output.amount);
 	}
 
 	// ── can_claim route-awareness helpers ─────────────────────────────────────
@@ -2034,7 +1830,7 @@ mod tests {
 			output_call: vec![0xab, 0xcd],
 			source_settler: solver_types::Address(vec![0x55; 20]),
 		};
-		let expected_payload = encode_fill_description(
+		let expected_payload = encode_quote_fill_description(
 			[0u8; 32],
 			[0u8; 32],
 			0,
@@ -2151,7 +1947,7 @@ mod tests {
 			..Default::default()
 		};
 
-		let result = extract_fill_details_from_logs(&[log], &order, &order_id, 137);
+		let result = extract_verified_fill_from_logs(&[log], &order, order_id, 137);
 		assert!(
 			result.is_err(),
 			"log with finalAmount != MandateOutput.amount must be rejected",
