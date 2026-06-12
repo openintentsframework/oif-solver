@@ -21,6 +21,7 @@ use thiserror::Error;
 pub mod implementations {
 	pub mod broadcaster;
 	pub mod direct;
+	pub(crate) mod fill_description;
 	pub mod hyperlane;
 }
 
