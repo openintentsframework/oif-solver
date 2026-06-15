@@ -673,6 +673,8 @@ pub enum ApiErrorType {
 	QuoteNotFound,
 	QuoteProcessingFailed,
 	QuoteConversionFailed,
+	/// The submitted order does not match the order the quote priced (H-07).
+	QuoteOrderMismatch,
 	MissingSignature,
 	InvalidRequest,
 	UnsupportedAsset,

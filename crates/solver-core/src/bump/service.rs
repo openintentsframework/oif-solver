@@ -1408,6 +1408,7 @@ mod tests {
 				adjusted_amounts: std::collections::HashMap::new(),
 			},
 			settlement_name: None,
+			binding: None,
 		};
 		storage
 			.store(StorageKey::Quotes.as_str(), quote_id, &stored, None)

@@ -1016,13 +1016,16 @@ mod tests {
 		SignatureType,
 	};
 	use solver_types::networks::RpcEndpoint;
+	use solver_types::oracle::{OracleInfo, OracleRoutes};
 	use solver_types::standards::eip7683::interfaces::ITheCompact::DOMAIN_SEPARATORCall;
 	use solver_types::standards::eip7683::interfaces::{
 		IAllocator, ITheCompact, SolMandateOutput, StandardOrder as OifStandardOrder,
 	};
 	use solver_types::utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder};
 	use solver_types::{
-		APIError, Address, ApiErrorType, AuthConfig, AuthScope, ErrorResponse, SecretString,
+		APIError, Address, ApiErrorType, AuthConfig, AuthScope, CostBreakdown, CostContext,
+		ErrorResponse, FailureHandlingMode, InteropAddress, Quote, QuotePreview, SecretString,
+		StorageKey, StoredQuote, SwapType,
 	};
 	use std::collections::HashMap;
 	use std::convert::TryFrom;
@@ -1234,6 +1237,134 @@ mod tests {
 		);
 
 		Arc::new(engine)
+	}
+
+	async fn build_quote_redemption_test_app_state() -> AppState {
+		let origin_network = NetworkConfigBuilder::new()
+			.input_settler_address_hex("0x0000000000000000000000000000000000000011")
+			.unwrap()
+			.output_settler_address_hex("0x0000000000000000000000000000000000000022")
+			.unwrap()
+			.add_rpc_endpoint(RpcEndpoint::http_only("http://localhost:8545".to_string()))
+			.build();
+		let output_network = NetworkConfigBuilder::new()
+			.input_settler_address_hex("0x0000000000000000000000000000000000000011")
+			.unwrap()
+			.output_settler_address_hex("0x4444444444444444444444444444444444444444")
+			.unwrap()
+			.add_rpc_endpoint(RpcEndpoint::http_only("http://localhost:8547".to_string()))
+			.build();
+		let networks = NetworksConfigBuilder::new()
+			.add_network(1, origin_network)
+			.add_network(42161, output_network)
+			.build();
+		let config = ConfigBuilder::new().networks(networks).build();
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_balance()
+			.returning(|_, _, _| Box::pin(async { Ok("1000000000000000000000".to_string()) }));
+		mock_delivery.expect_eth_call().returning(|_| {
+			Box::pin(async { Ok(Bytes::from(FixedBytes::from([0x99u8; 32]).to_vec())) })
+		});
+		let mut delivery_implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+		delivery_implementations.insert(1, Arc::new(mock_delivery) as Arc<dyn DeliveryInterface>);
+
+		let mut supported_routes = HashMap::new();
+		supported_routes.insert(
+			OracleInfo {
+				chain_id: 1,
+				oracle: Address(vec![0x22; 20]),
+			},
+			vec![OracleInfo {
+				chain_id: 42161,
+				oracle: Address(vec![0x33; 20]),
+			}],
+		);
+		let oracle_routes = OracleRoutes { supported_routes };
+		let order_impl = solver_order::implementations::standards::_7683::Eip7683OrderImpl::new(
+			config.networks.clone(),
+			oracle_routes,
+		)
+		.expect("EIP-7683 order implementation");
+		let mut order_implementations: HashMap<String, Box<dyn solver_order::OrderInterface>> =
+			HashMap::new();
+		order_implementations.insert("eip7683".to_string(), Box::new(order_impl));
+
+		let storage = Arc::new(StorageService::new(Box::new(MemoryStorage::new())));
+		let account_config: serde_json::Value = json!({
+			"private_key": "0x1234567890123456789012345678901234567890123456789012345678901234"
+		});
+		let account_impl = solver_account::implementations::local::create_account(&account_config)
+			.await
+			.expect("failed to create account impl");
+		let account = Arc::new(AccountService::new(account_impl));
+		let solver_address = Address(vec![0x11; 20]);
+		let delivery = Arc::new(DeliveryService::new(delivery_implementations, 1, 10, 60));
+		let discovery = empty_discovery();
+		let strategy_config = serde_json::Value::Object(serde_json::Map::new());
+		let strategy =
+			solver_order::implementations::strategies::simple::create_strategy(&strategy_config)
+				.expect("failed to create order strategy");
+		let order = Arc::new(OrderService::new(order_implementations, strategy));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 10));
+		let pricing_impl = create_mock_pricing(&serde_json::Value::Object(serde_json::Map::new()))
+			.expect("failed to create mock pricing");
+		let pricing = Arc::new(PricingService::new(pricing_impl, Vec::new()));
+		let event_bus = EventBus::new(10);
+		let token_manager = Arc::new(TokenManager::new(
+			config.networks.clone(),
+			delivery.clone(),
+			account.clone(),
+		));
+
+		let dynamic_config = Arc::new(RwLock::new(config.clone()));
+		let solver = Arc::new(SolverEngine::new(
+			dynamic_config,
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+			None,
+		));
+
+		build_test_app_state_with_solver(None, solver).await
+	}
+
+	fn empty_cost_context() -> CostContext {
+		CostContext {
+			cost_breakdown: CostBreakdown {
+				gas_open: rust_decimal::Decimal::ZERO,
+				gas_fill: rust_decimal::Decimal::ZERO,
+				gas_post_fill: rust_decimal::Decimal::ZERO,
+				gas_pre_claim: rust_decimal::Decimal::ZERO,
+				gas_claim: rust_decimal::Decimal::ZERO,
+				gas_buffer: rust_decimal::Decimal::ZERO,
+				settlement_fee: rust_decimal::Decimal::ZERO,
+				settlement_fee_buffer: rust_decimal::Decimal::ZERO,
+				rate_buffer: rust_decimal::Decimal::ZERO,
+				base_price: rust_decimal::Decimal::ZERO,
+				min_profit: rust_decimal::Decimal::ZERO,
+				operational_cost: rust_decimal::Decimal::ZERO,
+				subtotal: rust_decimal::Decimal::ZERO,
+				total: rust_decimal::Decimal::ZERO,
+				currency: "USD".to_string(),
+			},
+			execution_costs_by_chain: HashMap::new(),
+			liquidity_cost_adjustment: rust_decimal::Decimal::ZERO,
+			protocol_fees: HashMap::new(),
+			swap_type: SwapType::ExactInput,
+			cost_amounts_in_tokens: HashMap::new(),
+			swap_amounts: HashMap::new(),
+			adjusted_amounts: HashMap::new(),
+		}
 	}
 
 	fn resource_lock_config_for_signature_order() -> Config {
@@ -1789,6 +1920,9 @@ mod tests {
 		witness_user: &str,
 		secret: &SecretKey,
 	) -> PostOrderRequest {
+		let now = solver_types::current_timestamp();
+		let fill_deadline = now + 1_800;
+		let expires = now + 3_600;
 		let payload = OrderPayload {
 			signature_type: SignatureType::Eip712,
 			domain: json!({
@@ -1798,22 +1932,22 @@ mod tests {
 			}),
 			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
 			message: json!({
-				"permitted": [{
-					"token": "0x0000000000000000000000000000000000000033",
-					"amount": "1000"
-				}],
-				"spender": "0x0000000000000000000000000000000000000011",
-				"nonce": "1",
-				"deadline": "1700000100",
-				"witness": {
-					"user": witness_user,
-					"expires": 1700000000u64,
-					"inputOracle": "0x2222222222222222222222222222222222222222",
-					"outputs": [{
-						"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
-						"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
-						"chainId": 42161,
-						"token": "0x0000000000000000000000000000000000000000000000000000000000000033",
+					"permitted": [{
+						"token": "0x0000000000000000000000000000000000000033",
+						"amount": "1000"
+					}],
+					"spender": "0x0000000000000000000000000000000000000011",
+					"nonce": "1",
+					"deadline": fill_deadline.to_string(),
+					"witness": {
+						"user": witness_user,
+						"expires": expires,
+						"inputOracle": "0x2222222222222222222222222222222222222222",
+						"outputs": [{
+							"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
+							"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
+							"chainId": 42161,
+							"token": "0x0000000000000000000000000000000000000000000000000000000000000033",
 						"amount": "900",
 						"recipient": "0x0000000000000000000000005555555555555555555555555555555555555555",
 						"callbackData": "0x",
@@ -1829,6 +1963,69 @@ mod tests {
 				payload: payload.clone(),
 			},
 			signature: sign_permit2_payload(&payload, secret),
+			quote_id: None,
+			origin_submission: None,
+		}
+	}
+
+	fn sample_eip3009_request() -> PostOrderRequest {
+		let now = solver_types::current_timestamp();
+		let fill_deadline = now + 1_800;
+		let expires = now + 3_600;
+		let user = InteropAddress::new_ethereum(1, AlloyAddress::from([0x11; 20])).to_string();
+		let input_asset =
+			InteropAddress::new_ethereum(1, AlloyAddress::from([0x33; 20])).to_string();
+		let output_asset =
+			InteropAddress::new_ethereum(42161, AlloyAddress::from([0x33; 20])).to_string();
+		let receiver =
+			InteropAddress::new_ethereum(42161, AlloyAddress::from([0x55; 20])).to_string();
+
+		PostOrderRequest {
+			order: OifOrder::Oif3009V0 {
+				payload: OrderPayload {
+					signature_type: SignatureType::Eip712,
+					domain: json!({
+						"name": "USDC",
+						"version": "2",
+						"chainId": 1,
+						"verifyingContract": "0x0000000000000000000000000000000000000033"
+					}),
+					primary_type: "ReceiveWithAuthorization".to_string(),
+					message: json!({
+						"from": "0x1111111111111111111111111111111111111111",
+						"to": "0x0000000000000000000000000000000000000011",
+						"value": "1000",
+						"validAfter": 0,
+						"validBefore": fill_deadline,
+						"nonce": "0x1111111111111111111111111111111111111111111111111111111111111111"
+					}),
+					types: None,
+				},
+				metadata: json!({
+					"domain_separator": "0x1111111111111111111111111111111111111111111111111111111111111111",
+					"user": user,
+					"nonce": 1,
+					"originChainId": 1,
+					"expires": expires,
+					"fillDeadline": fill_deadline,
+					"inputOracle": "0x2222222222222222222222222222222222222222",
+					"inputs": [{
+						"chainId": 1,
+						"asset": input_asset,
+						"amount": "1000",
+						"user": user
+					}],
+					"outputs": [{
+						"chainId": 42161,
+						"asset": output_asset,
+						"amount": "900",
+						"receiver": receiver,
+						"oracle": "0x3333333333333333333333333333333333333333",
+						"settler": "0x4444444444444444444444444444444444444444"
+					}]
+				}),
+			},
+			signature: Bytes::from(vec![0xAB; 65]),
 			quote_id: None,
 			origin_submission: None,
 		}
@@ -2364,6 +2561,77 @@ mod tests {
 				..
 			}
 		));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn quote_acceptance_validation_populates_lock_type_for_gate_binding() {
+		let state = build_quote_redemption_test_app_state().await;
+		let secret = SecretKey::from_byte_array([0x31u8; 32]).expect("valid secret");
+		let cases = [
+			(
+				"permit2",
+				sample_permit2_request_with_witness_user(
+					"0x1111111111111111111111111111111111111111",
+					&secret,
+				),
+				"permit2_escrow",
+			),
+			("eip3009", sample_eip3009_request(), "eip3009_escrow"),
+		];
+
+		for (case_name, quoted_request, expected_flow) in cases {
+			let quote_id = format!("quote-lock-type-population-{case_name}");
+			let quote = Quote {
+				order: quoted_request.order.clone(),
+				failure_handling: FailureHandlingMode::RefundAutomatic,
+				partial_fill: false,
+				valid_until: 4_102_444_800,
+				eta: Some(60),
+				quote_id: quote_id.clone(),
+				provider: Some("test_solver".to_string()),
+				preview: QuotePreview {
+					inputs: vec![],
+					outputs: vec![],
+				},
+			};
+			let stored_quote = StoredQuote {
+				quote,
+				cost_context: empty_cost_context(),
+				settlement_name: None,
+				binding: None,
+			};
+			state
+				.solver
+				.storage()
+				.store(StorageKey::Quotes.as_str(), &quote_id, &stored_quote, None)
+				.await
+				.expect("store quote");
+
+			let payload = json!({
+				"quoteId": quote_id,
+				"signature": format!("0x{}", hex::encode(quoted_request.signature.as_ref())),
+			});
+			let redeemed = super::extract_intent_request(payload, &state, "eip7683")
+				.await
+				.expect("quote acceptance should reconstruct request");
+
+			assert_eq!(redeemed.quote_id.as_deref(), Some(quote_id.as_str()));
+			assert_eq!(redeemed.order.flow_key().as_deref(), Some(expected_flow));
+
+			let validated_order = super::validate_intent_request(&redeemed, &state, "eip7683")
+				.await
+				.expect("redeemed quote should validate");
+			let parsed = validated_order
+				.parse_order_data()
+				.expect("validated order data should parse");
+
+			assert_eq!(
+				parsed.parse_lock_type().as_deref(),
+				Some(expected_flow),
+				"quote redemption must populate Order.data.lock_type for {case_name} so \
+				 the profitability gate recomputes the same binding flow that storage used",
+			);
+		}
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

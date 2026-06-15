@@ -17,6 +17,14 @@ pub struct StoredQuote {
 	/// Settlement implementation name selected at quote time.
 	#[serde(skip_serializing_if = "Option::is_none", default)]
 	pub settlement_name: Option<String>,
+	/// Canonical economic binding to the order this quote priced (audit finding
+	/// H-07). The profitability gate honors `cost_context` only when this matches
+	/// the binding recomputed from the submitted order, so a `quote_id` cannot
+	/// unlock cheaper stored economics for an unrelated order. `None` for legacy
+	/// records or orders that cannot be projected (e.g. generic orders); see
+	/// [`crate::quote_binding::quote_order_binding`].
+	#[serde(skip_serializing_if = "Option::is_none", default)]
+	pub binding: Option<alloy_primitives::B256>,
 }
 
 /// Storage keys for different data collections.
