@@ -8,6 +8,7 @@ mod chain_evidence;
 
 use crate::bump::lineage::{lineage_components, lineage_tip};
 use crate::engine::event_bus::EventBus;
+use crate::order_preparation::order_requires_preparation;
 use crate::state::order::{
 	FAILED_STATUS_KIND_INDEX_VALUE, FINALIZED_STATUS_KIND_INDEX_VALUE, STATUS_KIND_INDEX_FIELD,
 };
@@ -18,9 +19,9 @@ use solver_delivery::DeliveryService;
 use solver_settlement::{SettlementReadiness, SettlementService};
 use solver_storage::{QueryFilter, StorageService};
 use solver_types::{
-	with_0x_prefix, DeliveryEvent, Intent, Order, OrderEvent, OrderStatus, SettlementEvent,
-	SolverEvent, StorageKey, TransactionAttempt, TransactionAttemptStatus, TransactionHash,
-	TransactionReceipt, TransactionType,
+	standards::eip7683::Eip7683OrderData, with_0x_prefix, DeliveryEvent, Intent, IntentMetadata,
+	Order, OrderEvent, OrderStatus, SettlementEvent, SolverEvent, StorageKey, TransactionAttempt,
+	TransactionAttemptStatus, TransactionHash, TransactionReceipt, TransactionType,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -45,6 +46,8 @@ pub enum RecoveryError {
 /// comparing its stored state with the actual blockchain state during recovery.
 #[derive(Debug)]
 enum ReconcileResult {
+	/// Off-chain escrow order needs origin-chain prepare/openFor before fill.
+	NeedsPrepare,
 	/// Order needs initial execution (no transactions yet)
 	NeedsExecution,
 	/// Prepare confirmed, needs fill transaction
@@ -1315,8 +1318,13 @@ impl RecoveryService {
 			StageResolution::NotFound => { /* fall through to NeedsExecution */ },
 		}
 
-		// No transactions yet, needs execution
-		Ok((order, ReconcileResult::NeedsExecution))
+		// No transactions yet. Off-chain escrow orders must be opened on the
+		// origin chain before any destination fill can be submitted.
+		if order_requires_preparation(&order) && order.prepare_tx_hash.is_none() {
+			Ok((order, ReconcileResult::NeedsPrepare))
+		} else {
+			Ok((order, ReconcileResult::NeedsExecution))
+		}
 	}
 
 	/// Ensures the order is in the correct state based on reconciliation result.
@@ -1334,14 +1342,16 @@ impl RecoveryService {
 	/// The updated order with the correct status, or the original if update fails
 	async fn ensure_correct_state(&self, order: Order, result: &ReconcileResult) -> Order {
 		let target_status = match result {
+			ReconcileResult::NeedsPrepare => {
+				// Preserve the persisted state. In particular, do not force Pending
+				// back to Created; Pending -> Created is not a valid state-machine edge.
+				order.status.clone()
+			},
 			ReconcileResult::NeedsExecution => {
-				// No transactions yet, should be in Created or Executing (for on-chain)
-				if order.prepare_tx_hash.is_none() && order.execution_params.is_some() {
-					// On-chain intent with execution params, should be Executing
+				if !order_requires_preparation(&order) && order.execution_params.is_some() {
 					OrderStatus::Executing
 				} else {
-					// Off-chain intent, should stay in Created
-					OrderStatus::Created
+					order.status.clone()
 				}
 			},
 			ReconcileResult::NeedsFill => {
@@ -1423,6 +1433,32 @@ impl RecoveryService {
 		}
 	}
 
+	fn recovery_intent_for_prepare(order: &Order) -> Option<Intent> {
+		let order_data: Eip7683OrderData = serde_json::from_value(order.data.clone()).ok()?;
+		let raw_order_data = order_data.raw_order_data.as_ref()?;
+		let lock_type = order_data.lock_type?;
+		let order_bytes = alloy_primitives::Bytes::from(
+			hex::decode(solver_types::without_0x_prefix(raw_order_data)).ok()?,
+		);
+
+		// `handle_preparation` consumes only `source`; remaining fields keep the
+		// transient recovery intent complete for event consumers.
+		Some(Intent {
+			id: order.id.clone(),
+			source: "off-chain".to_string(),
+			standard: order.standard.clone(),
+			metadata: IntentMetadata {
+				requires_auction: false,
+				exclusive_until: None,
+				discovered_at: solver_types::current_timestamp(),
+			},
+			data: order.data.clone(),
+			order_bytes,
+			quote_id: order.quote_id.clone(),
+			lock_type: lock_type.to_string(),
+		})
+	}
+
 	/// Publishes appropriate event based on reconciliation result.
 	///
 	/// This method converts the reconciliation result into the appropriate
@@ -1437,6 +1473,29 @@ impl RecoveryService {
 		// First ensure the order is in the correct state
 		let order = self.ensure_correct_state(order, &result).await;
 		match result {
+			ReconcileResult::NeedsPrepare => {
+				let Some(params) = order.execution_params.clone() else {
+					tracing::error!(
+						"Order {} missing execution params, cannot resume preparation",
+						order.id
+					);
+					return;
+				};
+				let Some(intent) = Self::recovery_intent_for_prepare(&order) else {
+					tracing::error!(
+						"Order {} missing recovery intent data, cannot resume preparation",
+						order.id
+					);
+					return;
+				};
+				self.event_bus
+					.publish(SolverEvent::Order(OrderEvent::Preparing {
+						intent,
+						order,
+						params,
+					}))
+					.ok();
+			},
 			ReconcileResult::NeedsExecution => {
 				// Order needs initial execution
 				if let Some(params) = order.execution_params.clone() {
@@ -1757,7 +1816,8 @@ mod tests {
 		MockStorageInterface,
 	};
 	use solver_types::{
-		utils::tests::builders::{IntentBuilder, OrderBuilder},
+		standards::eip7683::LockType,
+		utils::tests::builders::{Eip7683OrderDataBuilder, IntentBuilder, OrderBuilder},
 		Address, ExecutionParams, FillProof, Transaction, TransactionAttempt,
 		TransactionAttemptStatus, TransactionHash,
 	};
@@ -1843,6 +1903,52 @@ mod tests {
 				gas_price: alloy_primitives::U256::from(1000000000u64),
 				priority_fee: Some(alloy_primitives::U256::from(1000000u64)),
 			}))
+			.build()
+	}
+
+	fn offchain_escrow_order_with_status(status: OrderStatus) -> Order {
+		let order_data = Eip7683OrderDataBuilder::new()
+			.lock_type(LockType::Permit2Escrow)
+			.raw_order_data("0x1234")
+			.sponsor("0x1111111111111111111111111111111111111111")
+			.signature("0xabcdef")
+			.build();
+
+		OrderBuilder::new()
+			.with_status(status)
+			.with_data(serde_json::to_value(order_data).unwrap())
+			.with_execution_params(Some(ExecutionParams {
+				gas_price: alloy_primitives::U256::from(1000000000u64),
+				priority_fee: Some(alloy_primitives::U256::from(1000000u64)),
+			}))
+			.with_prepare_tx_hash(None)
+			.with_fill_tx_hash(None)
+			.with_post_fill_tx_hash(None)
+			.with_pre_claim_tx_hash(None)
+			.with_claim_tx_hash(None)
+			.build()
+	}
+
+	fn resource_lock_order_with_status(status: OrderStatus) -> Order {
+		let order_data = Eip7683OrderDataBuilder::new()
+			.lock_type(LockType::ResourceLock)
+			.raw_order_data("0x1234")
+			.sponsor("0x1111111111111111111111111111111111111111")
+			.signature("0xabcdef")
+			.build();
+
+		OrderBuilder::new()
+			.with_status(status)
+			.with_data(serde_json::to_value(order_data).unwrap())
+			.with_execution_params(Some(ExecutionParams {
+				gas_price: alloy_primitives::U256::from(1000000000u64),
+				priority_fee: Some(alloy_primitives::U256::from(1000000u64)),
+			}))
+			.with_prepare_tx_hash(None)
+			.with_fill_tx_hash(None)
+			.with_post_fill_tx_hash(None)
+			.with_pre_claim_tx_hash(None)
+			.with_claim_tx_hash(None)
 			.build()
 	}
 
@@ -3571,6 +3677,96 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn publish_recovery_event_needs_prepare_emits_preparing() {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let order = offchain_escrow_order_with_status(OrderStatus::Pending);
+		let expected_params = order.execution_params.clone().unwrap();
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		state_machine.store_order(&order).await.unwrap();
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
+
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+			empty_networks_config(),
+		);
+
+		recovery_service
+			.publish_recovery_event(order.clone(), ReconcileResult::NeedsPrepare)
+			.await;
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Preparing {
+				intent,
+				order: event_order,
+				params,
+			}) => {
+				assert_eq!(intent.source, "off-chain");
+				assert_eq!(event_order.id, order.id);
+				assert_eq!(event_order.status, OrderStatus::Pending);
+				assert_eq!(params.gas_price, expected_params.gas_price);
+				assert_eq!(params.priority_fee, expected_params.priority_fee);
+			},
+			_ => panic!("Expected Order::Preparing event"),
+		}
+	}
+
+	#[tokio::test]
+	async fn publish_recovery_event_needs_execution_for_no_prepare_order() {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let order = resource_lock_order_with_status(OrderStatus::Created);
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		state_machine.store_order(&order).await.unwrap();
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
+
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+			empty_networks_config(),
+		);
+
+		recovery_service
+			.publish_recovery_event(order.clone(), ReconcileResult::NeedsExecution)
+			.await;
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Executing {
+				order: event_order,
+				params: _,
+			}) => {
+				assert_eq!(event_order.id, order.id);
+			},
+			_ => panic!("Expected Order::Executing event"),
+		}
+	}
+
+	#[tokio::test]
 	async fn test_publish_recovery_event_needs_pre_claim_waiting_starts_monitoring() {
 		let mut mock_settlement = MockSettlementInterface::new();
 		let mut order = create_test_order_with_status(OrderStatus::Executed);
@@ -4598,6 +4794,87 @@ mod tests {
 			.unwrap();
 		// All chain probes returned empty, fall through all stages → NeedsExecution.
 		assert!(matches!(result, ReconcileResult::NeedsExecution));
+	}
+
+	#[tokio::test]
+	async fn reconcile_offchain_escrow_without_prepare_needs_prepare() {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let attempt_store = Arc::new(TransactionAttemptStore::new(storage.clone()));
+
+		let order = offchain_escrow_order_with_status(OrderStatus::Pending);
+		state_machine.store_order(&order).await.unwrap();
+
+		let mut networks_map = solver_types::NetworksConfig::new();
+		networks_map.insert(
+			1,
+			test_network_config(Address(vec![0xcc; 20]), Address(vec![0xaa; 20])),
+		);
+		networks_map.insert(
+			137,
+			test_network_config(Address(vec![0xcc; 20]), Address(vec![0xaa; 20])),
+		);
+		let networks = Arc::new(networks_map);
+
+		let mut mock_delivery_1 = MockDeliveryInterface::new();
+		mock_delivery_1
+			.expect_get_block_number()
+			.with(eq(1u64))
+			.times(2)
+			.returning(|_| Box::pin(async move { Ok(20_000_000u64) }));
+		mock_delivery_1
+			.expect_get_logs()
+			.times(4)
+			.returning(|_, _| Box::pin(async move { Ok(vec![]) }));
+
+		let mut mock_delivery_137 = MockDeliveryInterface::new();
+		mock_delivery_137
+			.expect_get_block_number()
+			.with(eq(137u64))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(1_000_000u64) }));
+		mock_delivery_137
+			.expect_get_logs()
+			.times(1)
+			.returning(|_, _| Box::pin(async move { Ok(vec![]) }));
+
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([
+				(
+					1u64,
+					Arc::new(mock_delivery_1) as Arc<dyn solver_delivery::DeliveryInterface>,
+				),
+				(
+					137u64,
+					Arc::new(mock_delivery_137) as Arc<dyn solver_delivery::DeliveryInterface>,
+				),
+			]),
+			1,
+			20,
+			60,
+		));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			EventBus::new(100),
+			attempt_store,
+			networks,
+		);
+
+		let (_repaired, result) = recovery_service
+			.reconcile_with_blockchain(&order)
+			.await
+			.unwrap();
+
+		assert!(matches!(result, ReconcileResult::NeedsPrepare));
 	}
 
 	#[tokio::test]

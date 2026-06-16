@@ -5,6 +5,7 @@
 
 use crate::engine::event_bus::EventBus;
 use crate::handlers::forced_withdrawal::ensure_resource_locks_claimable;
+use crate::order_preparation::order_requires_preparation;
 use crate::state::transaction_attempt::TransactionAttemptStore;
 use crate::state::OrderStateMachine;
 use alloy_primitives::hex;
@@ -308,6 +309,13 @@ impl OrderHandler {
 		order: Order,
 		params: ExecutionParams,
 	) -> Result<(), OrderError> {
+		if order_requires_preparation(&order) && order.prepare_tx_hash.is_none() {
+			return Err(OrderError::Service(format!(
+				"Order {} requires preparation before fill, but prepare_tx_hash is missing",
+				order.id
+			)));
+		}
+
 		// (C-03) Just-in-time forced-withdrawal guard for ResourceLock orders. This is
 		// the last solver-controlled point before the destination fill is released, so
 		// it catches a sponsor who enabled (or began) a forced withdrawal before the
@@ -459,7 +467,9 @@ mod tests {
 	use solver_delivery::{DeliveryService, MockDeliveryInterface};
 	use solver_order::{MockOrderInterface, OrderService};
 	use solver_storage::{MockStorageInterface, StorageService};
-	use solver_types::utils::tests::builders::{OrderBuilder, TransactionBuilder};
+	use solver_types::utils::tests::builders::{
+		Eip7683OrderDataBuilder, OrderBuilder, TransactionBuilder,
+	};
 	use solver_types::{
 		ExecutionParams, Order, SolverEvent, Transaction, TransactionHash, TransactionType,
 	};
@@ -488,6 +498,104 @@ mod tests {
 
 	fn create_test_tx_hash() -> TransactionHash {
 		TransactionHash(vec![0xab; 32])
+	}
+
+	fn eip7683_order_with_lock(
+		lock_type: LockType,
+		offchain_fields: bool,
+		prepare_tx_hash: Option<TransactionHash>,
+	) -> Order {
+		let mut order_data = Eip7683OrderDataBuilder::new()
+			.lock_type(lock_type)
+			.raw_order_data("0x1234");
+
+		if offchain_fields {
+			order_data = order_data
+				.sponsor("0x1111111111111111111111111111111111111111")
+				.signature("0xabcdef");
+		}
+
+		OrderBuilder::new()
+			.with_data(serde_json::to_value(order_data.build()).unwrap())
+			.with_prepare_tx_hash(prepare_tx_hash)
+			.build()
+	}
+
+	async fn assert_handle_execution_succeeds(order: Order) {
+		let params = create_test_execution_params();
+		let fill_tx = create_test_transaction();
+		let fill_tx_hash = create_test_tx_hash();
+		let order_clone = order.clone();
+		let fill_tx_clone = fill_tx.clone();
+		let fill_tx_hash_clone = fill_tx_hash.clone();
+
+		let (handler, mut event_rx) = create_test_handler_with_mocks(
+			|mock_order| {
+				let fill_tx_clone = fill_tx_clone.clone();
+				mock_order
+					.expect_generate_fill_transaction()
+					.times(1)
+					.returning(move |_, _| {
+						let tx = fill_tx_clone.clone();
+						Box::pin(async move { Ok(tx) })
+					});
+			},
+			|mock_delivery| {
+				let fill_tx_hash_clone = fill_tx_hash_clone.clone();
+				mock_delivery
+					.expect_submit()
+					.times(1)
+					.returning(move |_tx, _tracking| {
+						let hash = fill_tx_hash_clone.clone();
+						Box::pin(async move { Ok(hash) })
+					});
+			},
+			|mock_storage| {
+				let order_clone = order_clone.clone();
+				mock_storage
+					.expect_set_bytes()
+					.times(1)
+					.returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+
+				mock_storage
+					.expect_exists()
+					.returning(|_| Box::pin(async { Ok(true) }));
+
+				mock_storage.expect_get_bytes().returning(move |_| {
+					let order = order_clone.clone();
+					Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+				});
+
+				mock_storage
+					.expect_compare_and_swap_with_indexes()
+					.times(1)
+					.returning(|_, _, _, _, _| Box::pin(async { Ok(true) }));
+			},
+		)
+		.await;
+
+		let result = handler.handle_execution(order.clone(), params).await;
+		assert!(result.is_ok());
+
+		let event = tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv())
+			.await
+			.expect("Should receive event")
+			.expect("Event should be valid");
+
+		match event {
+			SolverEvent::Delivery(DeliveryEvent::TransactionPending {
+				order_id,
+				tx_hash,
+				tx_type,
+				tx_chain_id,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(tx_hash, fill_tx_hash);
+				assert_eq!(tx_type, TransactionType::Fill);
+				assert_eq!(tx_chain_id, fill_tx.chain_id);
+			},
+			_ => panic!("Expected TransactionPending event"),
+		}
 	}
 
 	async fn create_test_handler_with_mocks<F1, F2, F3>(
@@ -957,6 +1065,164 @@ mod tests {
 		match result.unwrap_err() {
 			OrderError::Service(msg) => assert!(msg.contains("Fill error")),
 			_ => panic!("Expected Service error"),
+		}
+	}
+
+	#[tokio::test]
+	async fn handle_execution_rejects_offchain_escrow_without_prepare_hash() {
+		let order = eip7683_order_with_lock(LockType::Permit2Escrow, true, None);
+		let params = create_test_execution_params();
+
+		let (handler, _event_rx) = create_test_handler_with_mocks(
+			|mock_order| {
+				mock_order.expect_generate_fill_transaction().times(0);
+			},
+			|mock_delivery| {
+				mock_delivery.expect_submit().times(0);
+			},
+			|_mock_storage| {},
+		)
+		.await;
+
+		let err = handler
+			.handle_execution(order, params)
+			.await
+			.expect_err("off-chain escrow order without prepare hash must not fill");
+
+		assert!(matches!(
+			err,
+			OrderError::Service(msg)
+				if msg.contains("requires preparation") && msg.contains("prepare_tx_hash")
+		));
+	}
+
+	#[tokio::test]
+	async fn handle_execution_allows_offchain_escrow_with_prepare_hash() {
+		let order = eip7683_order_with_lock(
+			LockType::Permit2Escrow,
+			true,
+			Some(TransactionHash(vec![0xcd; 32])),
+		);
+
+		assert_handle_execution_succeeds(order).await;
+	}
+
+	#[tokio::test]
+	async fn handle_execution_allows_onchain_escrow_without_prepare_hash() {
+		let order = eip7683_order_with_lock(LockType::Permit2Escrow, false, None);
+
+		assert_handle_execution_succeeds(order).await;
+	}
+
+	#[tokio::test]
+	async fn handle_execution_allows_resource_lock_without_prepare_hash() {
+		use solver_types::networks::{NetworkConfig, NetworkType, RpcEndpoint};
+		use solver_types::Address;
+
+		let order_data = Eip7683OrderDataBuilder::new()
+			.origin_chain_id(U256::from(137))
+			.inputs(vec![[U256::from(1000), U256::ZERO]])
+			.lock_type(LockType::ResourceLock)
+			.raw_order_data("0x1234")
+			.sponsor("0x1111111111111111111111111111111111111111")
+			.signature("0xabcdef")
+			.build();
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(order_data).unwrap())
+			.with_prepare_tx_hash(None)
+			.build();
+		let params = create_test_execution_params();
+		let fill_tx = create_test_transaction();
+		let fill_tx_hash = create_test_tx_hash();
+		let order_clone = order.clone();
+		let fill_tx_clone = fill_tx.clone();
+		let fill_tx_hash_clone = fill_tx_hash.clone();
+
+		let network = NetworkConfig {
+			name: None,
+			network_type: NetworkType::default(),
+			rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
+			input_settler_address: Address(vec![0x11u8; 20]),
+			output_settler_address: Address(vec![0x22u8; 20]),
+			tokens: vec![],
+			input_settler_compact_address: Some(Address(vec![0x44u8; 20])),
+			the_compact_address: Some(Address(vec![0x88u8; 20])),
+			allocator_address: Some(Address(vec![0xA1u8; 20])),
+		};
+		let config = solver_config::ConfigBuilder::new()
+			.networks(HashMap::from([(137, network)]))
+			.build();
+
+		let (handler, mut event_rx) = create_test_handler_with_config(
+			|mock_order| {
+				let fill_tx_clone = fill_tx_clone.clone();
+				mock_order
+					.expect_generate_fill_transaction()
+					.times(1)
+					.returning(move |_, _| {
+						let tx = fill_tx_clone.clone();
+						Box::pin(async move { Ok(tx) })
+					});
+			},
+			|mock_delivery| {
+				let fill_tx_hash_clone = fill_tx_hash_clone.clone();
+				mock_delivery.expect_eth_call().times(1).returning(|_| {
+					Box::pin(async { Ok(alloy_primitives::Bytes::from(vec![0u8; 64])) })
+				});
+				mock_delivery
+					.expect_submit()
+					.times(1)
+					.returning(move |_tx, _tracking| {
+						let hash = fill_tx_hash_clone.clone();
+						Box::pin(async move { Ok(hash) })
+					});
+			},
+			|mock_storage| {
+				let order_clone = order_clone.clone();
+				mock_storage
+					.expect_set_bytes()
+					.times(1)
+					.returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+
+				mock_storage
+					.expect_exists()
+					.returning(|_| Box::pin(async { Ok(true) }));
+
+				mock_storage.expect_get_bytes().returning(move |_| {
+					let order = order_clone.clone();
+					Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+				});
+
+				mock_storage
+					.expect_compare_and_swap_with_indexes()
+					.times(1)
+					.returning(|_, _, _, _, _| Box::pin(async { Ok(true) }));
+			},
+			config,
+		)
+		.await;
+
+		let result = handler.handle_execution(order.clone(), params).await;
+		assert!(result.is_ok());
+
+		let event = tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv())
+			.await
+			.expect("Should receive event")
+			.expect("Event should be valid");
+
+		match event {
+			SolverEvent::Delivery(DeliveryEvent::TransactionPending {
+				order_id,
+				tx_hash,
+				tx_type,
+				tx_chain_id,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(tx_hash, fill_tx_hash);
+				assert_eq!(tx_type, TransactionType::Fill);
+				assert_eq!(tx_chain_id, fill_tx.chain_id);
+			},
+			_ => panic!("Expected TransactionPending event"),
 		}
 	}
 
