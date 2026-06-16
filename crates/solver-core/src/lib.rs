@@ -10,6 +10,7 @@ pub mod bump;
 pub mod engine;
 pub mod handlers;
 pub mod monitoring;
+pub(crate) mod order_preparation;
 pub mod recovery;
 pub mod state;
 
