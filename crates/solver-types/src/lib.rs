@@ -51,6 +51,8 @@ pub mod versioned;
 pub mod costs;
 /// Pricing oracle types for currency conversion.
 pub mod pricing;
+/// Canonical economic binding between a stored quote and the order it priced (H-07).
+pub mod quote_binding;
 
 // Re-export all types for convenient access
 pub use account::*;
@@ -80,6 +82,7 @@ pub use provider::{
 	create_http_provider, create_http_providers, create_ws_provider, create_ws_providers,
 	ensure_rustls_crypto_provider, ProviderError,
 };
+pub use quote_binding::{quote_order_binding, QUOTE_BINDING_VERSION};
 pub use registry::ImplementationRegistry;
 pub use secret_string::SecretString;
 pub use seed_overrides::{AccountOverride, NetworkOverride, SeedOverrides, Token};

@@ -268,6 +268,30 @@ fn quote_cost_profit_service(solver: &SolverEngine) -> Arc<CostProfitService> {
 ///
 /// Each quote is stored together with its cost context as a StoredQuote record.
 /// Storage errors are logged but do not fail the request.
+/// Compute the H-07 economic binding for a generated quote, derived from the order
+/// it priced. The profitability gate recomputes this from the submitted order and
+/// honors the stored cost context only on a match.
+///
+/// Returns `None` when the quote's order cannot be projected to a canonical
+/// `StandardOrder` (e.g. generic orders); the gate then judges such an order on the
+/// freshly recomputed breakdown rather than the stored one.
+fn binding_for_quote(quote: &Quote) -> Option<alloy_primitives::B256> {
+	use solver_types::order::OrderParsable;
+	use solver_types::standards::eip7683::{interfaces::StandardOrder, Eip7683OrderData};
+
+	let standard = StandardOrder::try_from(&quote.order).ok()?;
+	let order_data = Eip7683OrderData::from(standard);
+	Some(solver_types::quote_order_binding(
+		order_data.origin_chain_id(),
+		// Flow key derived explicitly from the quote's order variant (not via the
+		// lossy `From<StandardOrder>`, which drops the lock type). `OifOrder::flow_key`
+		// and the gate's `parse_lock_type` produce identical strings by construction.
+		quote.order.flow_key().as_deref(),
+		&order_data.parse_available_inputs(),
+		&order_data.parse_requested_outputs(),
+	))
+}
+
 async fn store_quotes(
 	solver: &SolverEngine,
 	quotes: &[(Quote, Option<String>)],
@@ -290,11 +314,15 @@ async fn store_quotes(
 			Duration::from_secs(1)
 		};
 
-		// Create combined structure with quote and cost context
+		// Create combined structure with quote and cost context. The economic
+		// binding (H-07) pins this quote's stored cost to the order it priced, so
+		// the profitability gate cannot be tricked into applying it to a different,
+		// loss-making order that merely presents this quote's id.
 		let quote_with_context = StoredQuote {
 			quote: quote.clone(),
 			cost_context: cost_context.clone(),
 			settlement_name: settlement_name.clone(),
+			binding: binding_for_quote(quote),
 		};
 
 		// Store the combined structure in a single I/O operation
@@ -444,6 +472,8 @@ mod tests {
 	use solver_pricing::PricingService;
 	use solver_settlement::{MockSettlementInterface, SettlementInterface, SettlementService};
 	use solver_storage::{implementations::memory::MemoryStorage, StorageService};
+	use solver_types::order::OrderParsable;
+	use solver_types::standards::eip7683::{interfaces::StandardOrder, Eip7683OrderData, LockType};
 	use solver_types::{
 		current_timestamp, oif_versions, parse_address, Address, AuthScheme, CostBreakdown,
 		CostContext, FailureHandlingMode, GetQuoteRequest, IntentRequest, IntentType,
@@ -949,6 +979,277 @@ mod tests {
 		}
 	}
 
+	fn quote_with_order(order: OifOrder) -> Quote {
+		Quote {
+			order,
+			failure_handling: FailureHandlingMode::RefundAutomatic,
+			partial_fill: false,
+			valid_until: current_timestamp() + 300,
+			eta: Some(60),
+			quote_id: TEST_QUOTE_ID.to_string(),
+			provider: Some("test_solver".to_string()),
+			preview: QuotePreview {
+				inputs: vec![],
+				outputs: vec![],
+			},
+		}
+	}
+
+	fn valid_permit2_quote() -> Quote {
+		quote_with_order(OifOrder::OifEscrowV0 {
+			payload: OrderPayload {
+				signature_type: SignatureType::Eip712,
+				domain: serde_json::json!({
+					"name": "Permit2",
+					"chainId": 1,
+					"verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+				}),
+				primary_type: "PermitBatchWitnessTransferFrom".to_string(),
+				message: serde_json::json!({
+					"permitted": [{
+						"token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+						"amount": "1000"
+					}],
+					"nonce": "1",
+					"deadline": "2",
+					"witness": {
+						"user": "0x1111111111111111111111111111111111111111",
+						"expires": 3,
+						"inputOracle": "0x2222222222222222222222222222222222222222",
+						"outputs": [{
+							"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
+							"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
+							"chainId": 137,
+							"token": "0x000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+							"amount": "900",
+							"recipient": "0x0000000000000000000000005555555555555555555555555555555555555555",
+							"callbackData": "0x",
+							"context": "0x"
+						}]
+					}
+				}),
+				types: None,
+			},
+		})
+	}
+
+	fn valid_eip3009_quote() -> Quote {
+		let user = InteropAddress::new_ethereum(1, AlloyAddress::from([0x11; 20])).to_string();
+		let input_asset =
+			InteropAddress::new_ethereum(1, AlloyAddress::from([0xA0; 20])).to_string();
+		let output_asset =
+			InteropAddress::new_ethereum(137, AlloyAddress::from([0xB0; 20])).to_string();
+		let receiver =
+			InteropAddress::new_ethereum(137, AlloyAddress::from([0x55; 20])).to_string();
+
+		quote_with_order(OifOrder::Oif3009V0 {
+			payload: OrderPayload {
+				signature_type: SignatureType::Eip712,
+				domain: serde_json::json!({
+					"name": "USDC",
+					"version": "2",
+					"chainId": 1,
+					"verifyingContract": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+				}),
+				primary_type: "ReceiveWithAuthorization".to_string(),
+				message: serde_json::json!({
+					"from": "0x1111111111111111111111111111111111111111",
+					"to": "0x2222222222222222222222222222222222222222",
+					"value": "1000",
+					"validAfter": 0,
+					"validBefore": 2,
+					"nonce": "0x1111111111111111111111111111111111111111111111111111111111111111"
+				}),
+				types: None,
+			},
+			metadata: serde_json::json!({
+				"domain_separator": "0x1111111111111111111111111111111111111111111111111111111111111111",
+				"user": user,
+				"nonce": 1,
+				"originChainId": 1,
+				"expires": 3,
+				"fillDeadline": 2,
+				"inputOracle": "0x2222222222222222222222222222222222222222",
+				"inputs": [{
+					"chainId": 1,
+					"asset": input_asset,
+					"amount": "1000",
+					"user": user
+				}],
+				"outputs": [{
+					"chainId": 137,
+					"asset": output_asset,
+					"amount": "900",
+					"receiver": receiver,
+					"oracle": "0x3333333333333333333333333333333333333333",
+					"settler": "0x4444444444444444444444444444444444444444"
+				}]
+			}),
+		})
+	}
+
+	fn valid_resource_lock_quote() -> Quote {
+		quote_with_order(OifOrder::OifResourceLockV0 {
+			payload: OrderPayload {
+				signature_type: SignatureType::Eip712,
+				domain: serde_json::json!({
+					"name": "The Compact",
+					"version": "1",
+					"chainId": 1,
+					"verifyingContract": "0x6666666666666666666666666666666666666666"
+				}),
+				primary_type: "BatchCompact".to_string(),
+				message: serde_json::json!({
+					"sponsor": "0x1111111111111111111111111111111111111111",
+					"nonce": "1",
+					"expires": "3",
+					"commitments": [{
+						"lockTag": "0x0102030405060708090a0b0c",
+						"token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+						"amount": "1000"
+					}],
+					"mandate": {
+						"fillDeadline": "2",
+						"inputOracle": "0x2222222222222222222222222222222222222222",
+						"outputs": [{
+							"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
+							"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
+							"chainId": 137,
+							"token": "0x000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+							"amount": "900",
+							"recipient": "0x0000000000000000000000005555555555555555555555555555555555555555",
+							"callbackData": "0x",
+							"context": "0x"
+						}]
+					}
+				}),
+				types: None,
+			},
+		})
+	}
+
+	fn gate_binding_for_quote_order(quote: &Quote, lock_type: LockType) -> alloy_primitives::B256 {
+		let standard = StandardOrder::try_from(&quote.order).expect("valid StandardOrder");
+		let mut order_data = Eip7683OrderData::from(standard);
+		order_data.lock_type = Some(lock_type);
+		let parsed_lock_type = order_data.parse_lock_type();
+		let inputs = order_data.parse_available_inputs();
+		let outputs = order_data.parse_requested_outputs();
+
+		assert!(
+			!inputs.is_empty(),
+			"gate-side derivation must parse non-empty inputs for {lock_type:?}"
+		);
+		assert!(
+			!outputs.is_empty(),
+			"gate-side derivation must parse non-empty outputs for {lock_type:?}"
+		);
+
+		solver_types::quote_order_binding(
+			order_data.origin_chain_id(),
+			parsed_lock_type.as_deref(),
+			&inputs,
+			&outputs,
+		)
+	}
+
+	/// H-07 store↔gate agreement: the binding's flow key is derived on the **store**
+	/// side via `OifOrder::flow_key()` (`binding_for_quote`) but on the **gate** side
+	/// via `Eip7683OrderData::parse_lock_type()`, i.e. `LockType`'s `Display`
+	/// (`Display` delegates to `as_str`). These two independent derivations must
+	/// produce identical strings for every concrete order variant, or a legitimate
+	/// quote redemption false-rejects at the profitability gate (a fail-closed
+	/// outage). The gate's own tests build the stored binding with the gate-side
+	/// derivation, so they cannot catch a store↔gate divergence; this pins it.
+	#[test]
+	fn flow_key_agrees_with_gate_lock_type_for_all_variants() {
+		use solver_types::standards::eip7683::LockType;
+
+		fn empty_payload() -> OrderPayload {
+			OrderPayload {
+				signature_type: SignatureType::Eip712,
+				domain: serde_json::json!({}),
+				primary_type: "Order".to_string(),
+				message: serde_json::json!({}),
+				types: Some(serde_json::json!({})),
+			}
+		}
+
+		// (order variant, the LockType the gate derives via `parse_lock_type`)
+		let cases = [
+			(
+				OifOrder::OifEscrowV0 {
+					payload: empty_payload(),
+				},
+				LockType::Permit2Escrow,
+			),
+			(
+				OifOrder::Oif3009V0 {
+					payload: empty_payload(),
+					metadata: serde_json::json!({}),
+				},
+				LockType::Eip3009Escrow,
+			),
+			(
+				OifOrder::OifResourceLockV0 {
+					payload: empty_payload(),
+				},
+				LockType::ResourceLock,
+			),
+		];
+
+		for (order, gate_lock_type) in cases {
+			// Gate side computes `parse_lock_type()` == `lock_type.to_string()`.
+			// Store side computes `flow_key()`. They MUST match.
+			assert_eq!(
+				order.flow_key().as_deref(),
+				Some(gate_lock_type.to_string().as_str()),
+				"store-side flow_key() must equal gate-side parse_lock_type() for \
+				 {gate_lock_type:?}; a divergence false-rejects every redemption of \
+				 this variant",
+			);
+		}
+
+		// Generic orders intentionally carry no flow key and no economic binding;
+		// the gate falls back to the fresh breakdown on a `None` binding.
+		assert_eq!(
+			OifOrder::OifGenericV0 {
+				payload: serde_json::json!({})
+			}
+			.flow_key(),
+			None,
+		);
+	}
+
+	#[test]
+	fn binding_for_quote_matches_gate_derivation_for_all_concrete_flows() {
+		let cases = [
+			(valid_permit2_quote(), LockType::Permit2Escrow),
+			(valid_eip3009_quote(), LockType::Eip3009Escrow),
+			(valid_resource_lock_quote(), LockType::ResourceLock),
+		];
+
+		for (quote, lock_type) in cases {
+			let stored_binding = binding_for_quote(&quote).expect("quote binding");
+			let gate_binding = gate_binding_for_quote_order(&quote, lock_type);
+
+			assert_eq!(
+				stored_binding, gate_binding,
+				"store-side binding_for_quote() must match gate-side parse_lock_type() \
+					 derivation for {lock_type:?}",
+			);
+		}
+	}
+
+	#[test]
+	fn binding_for_quote_returns_none_for_generic_orders() {
+		let quote = quote_with_order(OifOrder::OifGenericV0 {
+			payload: serde_json::json!({}),
+		});
+
+		assert_eq!(binding_for_quote(&quote), None);
+	}
+
 	/// Creates a test cost context
 	fn create_test_cost_context() -> CostContext {
 		CostContext {
@@ -985,6 +1286,7 @@ mod tests {
 			quote: create_test_quote(),
 			cost_context: create_test_cost_context(),
 			settlement_name: None,
+			binding: None,
 		}
 	}
 

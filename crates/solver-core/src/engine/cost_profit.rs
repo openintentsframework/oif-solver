@@ -330,6 +330,21 @@ impl CostProfitService {
 		}
 	}
 
+	/// Retrieves the full stored quote record (cost context + economic binding) by
+	/// quote ID.
+	///
+	/// Used by the profitability gate to verify the submitted order against the
+	/// quote's economic binding (H-07) before honoring the stored cost context.
+	pub async fn get_stored_quote_by_quote_id(
+		&self,
+		quote_id: &str,
+	) -> Result<solver_types::StoredQuote, CostProfitError> {
+		self.storage_service
+			.retrieve::<solver_types::StoredQuote>(StorageKey::Quotes.as_str(), quote_id)
+			.await
+			.map_err(CostProfitError::Storage)
+	}
+
 	/// Calculate base swap amounts using pricing service exchange rates.
 	///
 	/// This method determines the required token amounts for a swap based on the swap type:
@@ -1413,28 +1428,7 @@ impl CostProfitService {
 		quote_id: Option<&str>,
 		intent_source: &str,
 	) -> Result<Decimal, APIError> {
-		// Retrieve the cost context if a quote ID is provided
-		let cost_context = if let Some(id) = quote_id {
-			match self.get_cost_context_by_quote_id(id).await {
-				Ok(ctx) => {
-					tracing::debug!(
-						"Cost context from quote generation: operational_cost=${:.2}, min_profit=${:.2}, total=${:.2}",
-						ctx.cost_breakdown.operational_cost,
-						ctx.cost_breakdown.min_profit,
-						ctx.cost_breakdown.total
-					);
-					Some(ctx)
-				},
-				Err(e) => {
-					tracing::warn!("Failed to retrieve cost context for quote {}: {}", id, e);
-					None
-				},
-			}
-		} else {
-			None
-		};
-
-		// Parse the order to get actual input/output amounts
+		// Parse the order first so a stored quote can be bound to it (H-07).
 		let order_parsed = order.parse_order_data().map_err(|e| APIError::BadRequest {
 			error_type: ApiErrorType::InvalidRequest,
 			message: format!("Failed to parse order data: {e}"),
@@ -1443,6 +1437,73 @@ impl CostProfitService {
 
 		let available_inputs = order_parsed.parse_available_inputs();
 		let requested_outputs = order_parsed.parse_requested_outputs();
+
+		// Retrieve the stored quote's cost context if a quote ID is provided, but
+		// honor it ONLY when its economic binding matches THIS order (H-07).
+		//
+		// A `quote_id` is otherwise an unaudienced bearer token: an unrelated,
+		// loss-making order presenting a cheap quote's id would be judged against
+		// that quote's (cheaper) stored operational cost and swap-type denominator,
+		// letting a loss-making fill clear the gate. The binding pins the economic
+		// identity of the order the quote priced, so a mismatch is rejected.
+		let cost_context = if let Some(id) = quote_id {
+			match self.get_stored_quote_by_quote_id(id).await {
+				Ok(stored) => match stored.binding {
+					Some(stored_binding) => {
+						let actual = solver_types::quote_order_binding(
+							order_parsed.origin_chain_id(),
+							order_parsed.parse_lock_type().as_deref(),
+							&available_inputs,
+							&requested_outputs,
+						);
+						if stored_binding == actual {
+							let ctx = stored.cost_context;
+							tracing::debug!(
+								"Cost context from quote generation: operational_cost=${:.2}, min_profit=${:.2}, total=${:.2}",
+								ctx.cost_breakdown.operational_cost,
+								ctx.cost_breakdown.min_profit,
+								ctx.cost_breakdown.total
+							);
+							Some(ctx)
+						} else {
+							// Fail closed: the order does not match the quote it
+							// references. This cannot happen on a legitimate
+							// redemption (the order is rebuilt from the stored
+							// quote), so a mismatch is anomalous and must not be
+							// priced on the stored economics.
+							tracing::warn!(
+								quote_id = %id,
+								expected_binding = %stored_binding,
+								actual_binding = %actual,
+								"Rejecting order: quote binding does not match submitted order (H-07)"
+							);
+							return Err(APIError::UnprocessableEntity {
+								error_type: ApiErrorType::QuoteOrderMismatch,
+								message: "Order does not match the quote it references".to_string(),
+								details: None,
+							});
+						}
+					},
+					None => {
+						// Legacy/unbindable quote record (e.g. stored before this
+						// change, or a generic order). Judge on the freshly
+						// recomputed breakdown, exactly like a direct submission.
+						// Scoped strictly to a missing binding — never a mismatch.
+						tracing::debug!(
+							"Quote {} has no economic binding; judging on freshly recomputed cost",
+							id
+						);
+						None
+					},
+				},
+				Err(e) => {
+					tracing::warn!("Failed to retrieve quote for {}: {}", id, e);
+					None
+				},
+			}
+		} else {
+			None
+		};
 
 		// Calculate actual USD values from the order amounts
 		let total_input_value_usd = self
@@ -3315,6 +3376,7 @@ mod tests {
 				adjusted_amounts: HashMap::new(),
 			},
 			settlement_name: None,
+			binding: None,
 		}
 	}
 
@@ -4548,6 +4610,7 @@ mod tests {
 			},
 			cost_context: create_cost_context_with_swap_type(SwapType::ExactInput),
 			settlement_name: None,
+			binding: Some(binding_for_order(&create_profitable_order())),
 		};
 
 		mock_storage
@@ -4618,6 +4681,7 @@ mod tests {
 			},
 			cost_context: create_cost_context_with_swap_type(SwapType::ExactOutput),
 			settlement_name: None,
+			binding: Some(binding_for_order(&create_profitable_order())),
 		};
 
 		mock_storage
@@ -7351,7 +7415,24 @@ mod tests {
 				adjusted_amounts: HashMap::new(),
 			},
 			settlement_name: None,
+			// Bind the stored quote to the canonical test order so the stored-cost
+			// path (binding matches) is exercised. Tests that need a mismatch or a
+			// legacy record override `binding` after calling this helper.
+			binding: Some(binding_for_order(&create_profitable_order())),
 		}
+	}
+
+	/// Recompute the H-07 economic binding for an order, exactly as the gate does.
+	fn binding_for_order(order: &Order) -> alloy_primitives::B256 {
+		let parsed = order
+			.parse_order_data()
+			.expect("parse order data for binding");
+		solver_types::quote_order_binding(
+			parsed.origin_chain_id(),
+			parsed.parse_lock_type().as_deref(),
+			&parsed.parse_available_inputs(),
+			&parsed.parse_requested_outputs(),
+		)
 	}
 
 	#[tokio::test]
@@ -7406,6 +7487,123 @@ mod tests {
 		assert!(
 			result.is_ok(),
 			"validator must use stored cost; got {result:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn validate_profitability_rejects_order_with_mismatched_quote_binding() {
+		// H-07 (RED before the binding check): a cheap quote's id stapled to a
+		// DIFFERENT order must not be priced on that quote's stored (cheaper)
+		// economics. The stored operational_cost ($0.044) would clear the 2% floor;
+		// the fresh one ($50) would not. Before the fix, the gate used the stored
+		// figure and ACCEPTED the loss-making order. After it, a binding that does
+		// not match the submitted order fails closed.
+		let quote_id = "test_quote_mismatched_binding";
+		let mut mock_storage = MockStorageInterface::new();
+		let mut stored =
+			stored_quote_with_operational_cost(quote_id, Decimal::from_str("0.044").unwrap());
+		// Pretend this quote priced a different order: a binding that cannot match
+		// the submitted `create_profitable_order()`.
+		stored.binding = Some(alloy_primitives::B256::repeat_byte(0xAB));
+		mock_storage
+			.expect_get_bytes()
+			.with(eq(format!("quotes:{quote_id}")))
+			.returning(move |_| {
+				let serialized = serde_json::to_vec(&stored).unwrap();
+				Box::pin(async move { Ok(serialized) })
+			});
+
+		let (pricing, delivery, token_manager, _) = setup_profitable_mocks().await;
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
+
+		let order = create_profitable_order();
+		let mut fresh_breakdown =
+			create_test_cost_breakdown_with_profit(Decimal::from_str("200.0").unwrap());
+		fresh_breakdown.operational_cost = Decimal::from_str("50.0").unwrap();
+		fresh_breakdown.gas_fill = Decimal::from_str("50.0").unwrap();
+
+		let result = service
+			.validate_profitability(
+				&order,
+				&fresh_breakdown,
+				Decimal::from_str("2.0").unwrap(),
+				Some(quote_id),
+				"off-chain",
+			)
+			.await;
+		assert!(
+			matches!(
+				result,
+				Err(APIError::UnprocessableEntity {
+					error_type: ApiErrorType::QuoteOrderMismatch,
+					..
+				})
+			),
+			"mismatched quote binding must fail closed; got {result:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn validate_profitability_falls_back_to_fresh_when_quote_binding_absent() {
+		// §4.2: a quote with no binding (legacy record / generic order) is judged
+		// on the freshly recomputed breakdown — like a direct submission — never on
+		// the stored cost. The fresh op cost ($50) fails the 2% floor, so the order
+		// is rejected for insufficient profitability (NOT a binding mismatch, and
+		// NOT accepted on the stored $0.044).
+		let quote_id = "test_quote_no_binding";
+		let mut mock_storage = MockStorageInterface::new();
+		let mut stored =
+			stored_quote_with_operational_cost(quote_id, Decimal::from_str("0.044").unwrap());
+		stored.binding = None;
+		mock_storage
+			.expect_get_bytes()
+			.with(eq(format!("quotes:{quote_id}")))
+			.returning(move |_| {
+				let serialized = serde_json::to_vec(&stored).unwrap();
+				Box::pin(async move { Ok(serialized) })
+			});
+
+		let (pricing, delivery, token_manager, _) = setup_profitable_mocks().await;
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let service = CostProfitService::new(
+			pricing,
+			delivery,
+			token_manager,
+			storage,
+			no_fee_settlement_service(),
+		);
+
+		let order = create_profitable_order();
+		let mut fresh_breakdown =
+			create_test_cost_breakdown_with_profit(Decimal::from_str("200.0").unwrap());
+		fresh_breakdown.operational_cost = Decimal::from_str("50.0").unwrap();
+		fresh_breakdown.gas_fill = Decimal::from_str("50.0").unwrap();
+
+		let result = service
+			.validate_profitability(
+				&order,
+				&fresh_breakdown,
+				Decimal::from_str("2.0").unwrap(),
+				Some(quote_id),
+				"off-chain",
+			)
+			.await;
+		assert!(
+			matches!(
+				result,
+				Err(APIError::UnprocessableEntity {
+					error_type: ApiErrorType::InsufficientProfitability,
+					..
+				})
+			),
+			"absent binding must judge on fresh breakdown (fail 2% floor); got {result:?}"
 		);
 	}
 
@@ -7561,6 +7759,7 @@ mod tests {
 			},
 			cost_context: stored_cost_context.clone(),
 			settlement_name: None,
+			binding: Some(binding_for_order(&create_profitable_order())),
 		};
 
 		// 3. Build a validator-side service whose storage returns the stored quote.
