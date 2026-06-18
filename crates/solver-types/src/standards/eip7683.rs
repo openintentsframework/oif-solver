@@ -198,6 +198,16 @@ pub const MAX_STANDARD_ORDER_INPUTS: usize = 16;
 /// Maximum number of StandardOrder outputs accepted before any RPC-backed validation.
 pub const MAX_STANDARD_ORDER_OUTPUTS: usize = 16;
 
+/// Maximum byte length of a single output's `callbackData` (`MandateOutput.call`)
+/// accepted before any RPC-backed validation.
+///
+/// 8 KiB comfortably exceeds any legitimate callback payload while bounding the
+/// size-blind open/claim calldata gas charged at quote/order time: static gas units
+/// are estimated independently of `callbackData` length, so an oversized callback would
+/// be underpriced (solver loss). The previous core guard allowed `u16::MAX` (64 KiB),
+/// far larger than any real payload needs.
+pub const MAX_CALLBACK_DATA_BYTES: usize = 8192;
+
 /// Implementation of OrderParsable for EIP-7683 orders
 #[cfg(feature = "oif-interfaces")]
 impl OrderParsable for Eip7683OrderData {
@@ -588,13 +598,22 @@ impl interfaces::StandardOrder {
 					.get("amount")
 					.and_then(|a| a.as_str())
 					.unwrap_or("0");
-				let token_str = output_obj.get("token").and_then(|t| t.as_str()).unwrap();
+				let token_str = output_obj
+					.get("token")
+					.and_then(|t| t.as_str())
+					.ok_or("Missing or invalid token in output")?;
 				let recipient_str = output_obj
 					.get("recipient")
 					.and_then(|r| r.as_str())
-					.unwrap();
-				let oracle_str = output_obj.get("oracle").and_then(|o| o.as_str()).unwrap();
-				let settler_str = output_obj.get("settler").and_then(|s| s.as_str()).unwrap();
+					.ok_or("Missing or invalid recipient in output")?;
+				let oracle_str = output_obj
+					.get("oracle")
+					.and_then(|o| o.as_str())
+					.ok_or("Missing or invalid oracle in output")?;
+				let settler_str = output_obj
+					.get("settler")
+					.and_then(|s| s.as_str())
+					.ok_or("Missing or invalid settler in output")?;
 				let callback_str = output_obj
 					.get("callbackData")
 					.and_then(|c| c.as_str())
@@ -969,13 +988,22 @@ impl interfaces::StandardOrder {
 						.get("amount")
 						.and_then(|a| a.as_str())
 						.unwrap_or("0");
-					let token_str = output_obj.get("token").and_then(|t| t.as_str()).unwrap();
+					let token_str = output_obj
+						.get("token")
+						.and_then(|t| t.as_str())
+						.ok_or("Missing or invalid token in output")?;
 					let recipient_str = output_obj
 						.get("recipient")
 						.and_then(|r| r.as_str())
-						.unwrap();
-					let oracle_str = output_obj.get("oracle").and_then(|o| o.as_str()).unwrap();
-					let settler_str = output_obj.get("settler").and_then(|s| s.as_str()).unwrap();
+						.ok_or("Missing or invalid recipient in output")?;
+					let oracle_str = output_obj
+						.get("oracle")
+						.and_then(|o| o.as_str())
+						.ok_or("Missing or invalid oracle in output")?;
+					let settler_str = output_obj
+						.get("settler")
+						.and_then(|s| s.as_str())
+						.ok_or("Missing or invalid settler in output")?;
 					let callback_str = output_obj
 						.get("callbackData")
 						.and_then(|c| c.as_str())
@@ -1299,6 +1327,84 @@ mod tests {
 		);
 		assert_eq!(standard_order.outputs.len(), 1);
 		assert_eq!(standard_order.outputs[0].chainId, U256::from(137u64));
+	}
+
+	#[cfg(feature = "oif-interfaces")]
+	#[test]
+	fn test_from_permit2_malformed_output_returns_err_not_panic() {
+		use crate::api::{OrderPayload, SignatureType};
+		use crate::OifOrder;
+		use std::convert::TryFrom;
+
+		// Build a base permit2 payload whose single output is malformed. The
+		// `make_payload` closure lets us swap in a different output object so we can
+		// exercise both the missing-field and wrong-type cases against the unauthenticated
+		// `StandardOrder::try_from` path. A crafted body must yield `Err`, never a panic.
+		let make_payload = |output: serde_json::Value| OrderPayload {
+			signature_type: SignatureType::Eip712,
+			domain: serde_json::json!({
+				"name": "Permit2",
+				"chainId": 1,
+				"verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+			}),
+			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
+			message: serde_json::json!({
+				"permitted": [
+					{
+						"token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+						"amount": "1000"
+					}
+				],
+				"nonce": "1",
+				"deadline": "2",
+				"witness": {
+					"user": "0x1111111111111111111111111111111111111111",
+					"expires": 3,
+					"inputOracle": "0x2222222222222222222222222222222222222222",
+					"outputs": [output]
+				}
+			}),
+			types: None,
+		};
+
+		// Case 1: `token` field entirely absent.
+		let missing_token = serde_json::json!({
+			"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
+			"chainId": 137,
+			"amount": "900",
+			"recipient": "0x0000000000000000000000005555555555555555555555555555555555555555",
+			"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
+			"callbackData": "0x",
+			"context": "0x"
+		});
+		let order = OifOrder::OifEscrowV0 {
+			payload: make_payload(missing_token),
+		};
+		let result = interfaces::StandardOrder::try_from(&order);
+		assert!(
+			result.is_err(),
+			"missing `token` should return Err, not panic"
+		);
+
+		// Case 2: `recipient` present but not a string.
+		let non_string_recipient = serde_json::json!({
+			"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
+			"chainId": 137,
+			"token": "0x000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+			"amount": "900",
+			"recipient": 12345,
+			"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
+			"callbackData": "0x",
+			"context": "0x"
+		});
+		let order = OifOrder::OifEscrowV0 {
+			payload: make_payload(non_string_recipient),
+		};
+		let result = interfaces::StandardOrder::try_from(&order);
+		assert!(
+			result.is_err(),
+			"non-string `recipient` should return Err, not panic"
+		);
 	}
 
 	#[cfg(feature = "oif-interfaces")]
