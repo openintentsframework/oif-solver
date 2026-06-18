@@ -131,6 +131,16 @@ impl TransactionHandler {
 				// a conflict, but always overwrite with the in-hand confirmed
 				// `observed_hash`: it is the canonical (chain-confirmed) tx for this
 				// stage, so recovery must resolve to it rather than a superseded hash.
+				//
+				// The overwrite is intentionally unconditional. `observed_hash` is
+				// the hash from an in-hand success receipt (this branch is reached
+				// only via `handle_confirmed`, past its `receipt.success` gate), and
+				// OIF on-chain idempotency guarantees exactly one confirmation per
+				// stage nonce. So `observed_hash` IS the confirmed-lineage hash;
+				// there is no other authoritative candidate to prefer, and the write
+				// re-points stored state at a chain-confirmed tx without triggering
+				// any new on-chain action — consistent with the idempotency
+				// invariant.
 				let prior_hash = Arc::new(std::sync::Mutex::new(None));
 				let prior_hash_for_update = prior_hash.clone();
 				self.state_machine

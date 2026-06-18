@@ -82,7 +82,13 @@ enum ReconcileResult {
 	Finalized,
 }
 
-fn choose_recovery_attempt_hash(
+/// Returns the hash of a `Confirmed`-lineage attempt for this stage, if any.
+///
+/// A confirmed-lineage hash is **authoritative**: the chain accepted exactly
+/// one transaction for the stage's nonce, and this is its hash. It outranks a
+/// possibly-stale order field, which may still point at a superseded
+/// replacement that confirmed while the solver was down.
+fn confirmed_recovery_attempt_hash(
 	attempts: &[TransactionAttempt],
 	tx_type: TransactionType,
 ) -> Option<TransactionHash> {
@@ -103,6 +109,25 @@ fn choose_recovery_attempt_hash(
 			}
 		}
 	}
+
+	None
+}
+
+fn choose_recovery_attempt_hash(
+	attempts: &[TransactionAttempt],
+	tx_type: TransactionType,
+) -> Option<TransactionHash> {
+	// A confirmed-lineage hash wins over any merely-pending tip.
+	if let Some(hash) = confirmed_recovery_attempt_hash(attempts, tx_type) {
+		return Some(hash);
+	}
+
+	let stage_attempts: Vec<TransactionAttempt> = attempts
+		.iter()
+		.filter(|attempt| attempt.tx_type == tx_type)
+		.cloned()
+		.collect();
+	let components = lineage_components(&stage_attempts);
 
 	components
 		.iter()
@@ -878,12 +903,31 @@ impl RecoveryService {
 		attempts: &[TransactionAttempt],
 		tx_type: TransactionType,
 	) -> StageResolution {
+		// Layer 0: authoritative confirmed-lineage hash.
+		//
+		// A same-nonce replacement may have confirmed while the solver was
+		// down, in which case the order field was never corrected live and
+		// still points at a superseded hash. The confirmed-lineage hash is
+		// the canonical on-chain transaction for the stage's nonce, so it
+		// outranks the order field for ALL stages (not just Fill). When it
+		// differs from the stale field, repair the field before returning.
+		// Only a CONFIRMED hash is authoritative here — a merely-pending
+		// ledger tip must never override a present field (handled by Layer 1
+		// taking precedence over the pending fallback below).
+		if let Some(tx_hash) = confirmed_recovery_attempt_hash(attempts, tx_type) {
+			if order_stage_hash(order, tx_type).as_ref() != Some(&tx_hash) {
+				self.write_repaired_hash(order, tx_type, tx_hash.clone())
+					.await;
+			}
+			return StageResolution::Hash(tx_hash);
+		}
+
 		// Layer 1: order field
 		if let Some(tx_hash) = order_stage_hash(order, tx_type) {
 			return StageResolution::Hash(tx_hash);
 		}
 
-		// Layer 2: attempt ledger fallback
+		// Layer 2: attempt ledger fallback (pending tip; no field present)
 		if let Some(tx_hash) = choose_recovery_attempt_hash(attempts, tx_type) {
 			self.write_repaired_hash(order, tx_type, tx_hash.clone())
 				.await;
@@ -2591,6 +2635,134 @@ mod tests {
 			other => panic!("expected Hash, got {:?}", std::mem::discriminant(&other)),
 		}
 		assert_eq!(order.fill_tx_hash, Some(recovered_hash));
+	}
+
+	#[tokio::test]
+	async fn resolve_stage_prefers_confirmed_lineage_over_stale_order_field_non_fill() {
+		// A same-nonce replacement confirmed while the solver was DOWN. The
+		// order field still holds the SUPERSEDED hash (never corrected live),
+		// but the attempt ledger holds the CONFIRMED replacement. Resolution
+		// must prefer the confirmed-lineage hash and repair the stale field —
+		// not return the stale hash (which would later 404 the receipt probe
+		// and stall a non-Fill stage forever).
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
+
+		let stale_hash = TransactionHash(vec![0xa1; 32]);
+		let confirmed_hash = TransactionHash(vec![0xc2; 32]);
+
+		let mut order = create_test_order_with_status(OrderStatus::Executed);
+		// Stale order-field hash for a NON-Fill stage (PostFill).
+		order.post_fill_tx_hash = Some(stale_hash.clone());
+		state_machine.store_order(&order).await.unwrap();
+
+		// Ledger lineage: superseded parent (stale) -> Confirmed replacement.
+		let mut superseded = sample_attempt(
+			"superseded",
+			TransactionType::PostFill,
+			TransactionAttemptStatus::Replaced,
+			Some(0xa1),
+			100,
+		);
+		let mut confirmed = sample_attempt(
+			"confirmed",
+			TransactionType::PostFill,
+			TransactionAttemptStatus::Confirmed,
+			Some(0xc2),
+			200,
+		);
+		confirmed.replacement_of = Some("superseded".to_string());
+		superseded.replaced_by = Some("confirmed".to_string());
+		let attempts = vec![superseded, confirmed];
+
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let event_bus = EventBus::new(100);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine.clone(),
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+			empty_networks_config(),
+		);
+
+		let resolution = recovery_service
+			.resolve_stage(&mut order, &attempts, TransactionType::PostFill)
+			.await;
+
+		match resolution {
+			StageResolution::Hash(h) => assert_eq!(
+				h, confirmed_hash,
+				"resolution must return the CONFIRMED replacement, not the stale order field"
+			),
+			other => panic!("expected Hash, got {:?}", std::mem::discriminant(&other)),
+		}
+		// The stale order field must be repaired to the confirmed hash, both
+		// in memory and in persisted storage.
+		assert_eq!(order.post_fill_tx_hash, Some(confirmed_hash.clone()));
+		let stored = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(stored.post_fill_tx_hash, Some(confirmed_hash));
+	}
+
+	#[tokio::test]
+	async fn resolve_stage_keeps_order_field_when_ledger_only_pending() {
+		// Guard against over-correction: a merely-PENDING ledger hash must NOT
+		// override a present order field. Only a CONFIRMED-lineage hash is
+		// authoritative over the field.
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
+
+		let field_hash = TransactionHash(vec![0xf0; 32]);
+
+		let mut order = create_test_order_with_status(OrderStatus::Executed);
+		order.post_fill_tx_hash = Some(field_hash.clone());
+
+		// Ledger has only a Broadcast (pending) attempt with a different hash.
+		let attempts = vec![sample_attempt(
+			"pending",
+			TransactionType::PostFill,
+			TransactionAttemptStatus::Broadcast,
+			Some(0xbb),
+			100,
+		)];
+
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let event_bus = EventBus::new(100);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine.clone(),
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+			empty_networks_config(),
+		);
+
+		let resolution = recovery_service
+			.resolve_stage(&mut order, &attempts, TransactionType::PostFill)
+			.await;
+
+		match resolution {
+			StageResolution::Hash(h) => assert_eq!(
+				h, field_hash,
+				"a pending ledger hash must not override the present order field"
+			),
+			other => panic!("expected Hash, got {:?}", std::mem::discriminant(&other)),
+		}
+		assert_eq!(order.post_fill_tx_hash, Some(field_hash));
 	}
 
 	#[tokio::test]
