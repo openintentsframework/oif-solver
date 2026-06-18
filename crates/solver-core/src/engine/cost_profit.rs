@@ -37,7 +37,10 @@ use solver_storage::StorageService;
 use solver_types::{
 	costs::{CostBreakdown, CostContext, TokenAmountInfo},
 	current_timestamp,
-	standards::eip7683::interfaces::{IOutputSettlerSimple, SolMandateOutput},
+	standards::eip7683::{
+		interfaces::{IOutputSettlerSimple, SolMandateOutput},
+		MAX_CALLBACK_DATA_BYTES,
+	},
 	utils::{conversion::ceil_dp, formatting::format_percentage},
 	APIError, Address, ApiErrorType, ExecutionParams, FillProof, GetQuoteRequest, InteropAddress,
 	Order, OrderInput, OrderOutput, StorageKey, SwapType, Transaction, TransactionHash,
@@ -1247,10 +1250,9 @@ impl CostProfitService {
 			));
 		}
 		let byte_len = hex_payload.len() / 2;
-		if byte_len > u16::MAX as usize {
+		if byte_len > MAX_CALLBACK_DATA_BYTES {
 			return Err(CostProfitError::Calculation(format!(
-				"Output callbackData is too large: {byte_len} bytes exceeds {} byte limit",
-				u16::MAX
+				"Output callbackData is too large: {byte_len} bytes exceeds {MAX_CALLBACK_DATA_BYTES} byte limit"
 			)));
 		}
 		alloy_primitives::hex::decode(hex_payload).map_err(|e| {
@@ -3140,6 +3142,34 @@ mod tests {
 	// Test price constants for consistent mock pricing across test functions
 	const ETH_USD_PRICE: f64 = 4000.0;
 	const USDC_USD_PRICE: f64 = 1.0;
+
+	#[test]
+	fn test_validate_callback_calldata_rejects_over_shared_limit() {
+		// A callback over MAX_CALLBACK_DATA_BYTES but under the old u16::MAX bound must
+		// now be rejected, proving the guard agrees with the shared constant.
+		let byte_len = MAX_CALLBACK_DATA_BYTES + 1;
+		assert!(
+			byte_len < u16::MAX as usize,
+			"test must sit below the old bound"
+		);
+		let hex_payload = format!("0x{}", "ab".repeat(byte_len));
+
+		let result = CostProfitService::validate_callback_calldata(Some(&hex_payload));
+		assert!(
+			matches!(result, Err(CostProfitError::Calculation(ref msg)) if msg.contains("too large")),
+			"oversized callbackData should be rejected: {result:?}"
+		);
+	}
+
+	#[test]
+	fn test_validate_callback_calldata_accepts_shared_limit() {
+		let hex_payload = format!("0x{}", "ab".repeat(MAX_CALLBACK_DATA_BYTES));
+		let result = CostProfitService::validate_callback_calldata(Some(&hex_payload));
+		assert!(
+			result.is_ok(),
+			"max-size callbackData should be accepted: {result:?}"
+		);
+	}
 
 	fn no_fee_settlement_service() -> Arc<solver_settlement::SettlementService> {
 		let mut mock = solver_settlement::MockSettlementInterface::new();

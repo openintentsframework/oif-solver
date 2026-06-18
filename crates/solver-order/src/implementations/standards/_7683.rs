@@ -16,7 +16,8 @@ use solver_types::{
 			IInputSettlerCompact, IInputSettlerEscrow, IOutputSettlerSimple, SolMandateOutput,
 			SolveParams, StandardOrder,
 		},
-		GasLimitOverrides, LockType, MAX_STANDARD_ORDER_INPUTS, MAX_STANDARD_ORDER_OUTPUTS,
+		GasLimitOverrides, LockType, MAX_CALLBACK_DATA_BYTES, MAX_STANDARD_ORDER_INPUTS,
+		MAX_STANDARD_ORDER_OUTPUTS,
 	},
 	utils::conversion::hex_to_alloy_address,
 	Address, ConfigSchema, Eip7683OrderData, ExecutionParams, FillProof, NetworksConfig, Order,
@@ -653,6 +654,16 @@ impl OrderInterface for Eip7683OrderImpl {
 			})?;
 
 			validate_supported_output_context(i, output.context.as_ref())?;
+
+			// Bound callbackData (MandateOutput.call) before any RPC/fill work. Size-blind
+			// static gas on the origin open/claim legs underprices large callbacks, so reject
+			// anything over MAX_CALLBACK_DATA_BYTES.
+			if output.callbackData.len() > MAX_CALLBACK_DATA_BYTES {
+				return Err(OrderError::ValidationFailed(format!(
+					"output[{i}] callbackData is too large: {} bytes exceeds {MAX_CALLBACK_DATA_BYTES} byte limit",
+					output.callbackData.len()
+				)));
+			}
 
 			// 1. Reject same-chain outputs (unsupported by current fill/claim builders).
 			if output_chain_id == origin_chain_id {
@@ -1401,6 +1412,45 @@ mod tests {
 		assert_eq!(validated_order.user, standard_order.user);
 		assert_eq!(validated_order.nonce, standard_order.nonce);
 		assert_eq!(validated_order.originChainId, standard_order.originChainId);
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_rejects_oversized_callback_data() {
+		use solver_types::standards::eip7683::MAX_CALLBACK_DATA_BYTES;
+
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		// One byte over the limit must be rejected before any RPC/fill work.
+		standard_order.outputs[0].callbackData = vec![0u8; MAX_CALLBACK_DATA_BYTES + 1].into();
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(
+			matches!(result, Err(OrderError::ValidationFailed(ref msg)) if msg.contains("callbackData")),
+			"oversized callbackData should be rejected: {result:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_accepts_max_callback_data() {
+		use solver_types::standards::eip7683::MAX_CALLBACK_DATA_BYTES;
+
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		standard_order.outputs[0].callbackData = vec![0u8; MAX_CALLBACK_DATA_BYTES].into();
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(
+			result.is_ok(),
+			"max-size callbackData should be accepted: {result:?}"
+		);
 	}
 
 	#[tokio::test]

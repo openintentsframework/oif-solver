@@ -17,7 +17,9 @@ use alloy_primitives::{Address as AlloyAddress, U256};
 use futures::future::try_join_all;
 use solver_core::SolverEngine;
 use solver_types::{
-	standards::eip7683::{MAX_STANDARD_ORDER_INPUTS, MAX_STANDARD_ORDER_OUTPUTS},
+	standards::eip7683::{
+		MAX_CALLBACK_DATA_BYTES, MAX_STANDARD_ORDER_INPUTS, MAX_STANDARD_ORDER_OUTPUTS,
+	},
 	AuthScheme, CostContext, GetQuoteRequest, IntentRequest, IntentType, InteropAddress,
 	NetworksConfig, QuoteError, SwapType, ValidatedQuoteContext,
 };
@@ -93,6 +95,19 @@ impl QuoteValidator {
 		for output in &intent.outputs {
 			Self::validate_interop_address(&output.receiver)?;
 			Self::validate_interop_address(&output.asset)?;
+
+			// Bound callbackData (MandateOutput.call) before any RPC/pricing work.
+			// Size-blind static gas on the origin open/claim legs underprices large
+			// callbacks, so reject anything over MAX_CALLBACK_DATA_BYTES up front.
+			if let Some(calldata) = &output.calldata {
+				let hex_payload = calldata.strip_prefix("0x").unwrap_or(calldata);
+				let byte_len = hex_payload.len() / 2;
+				if byte_len > MAX_CALLBACK_DATA_BYTES {
+					return Err(QuoteError::InvalidRequest(format!(
+						"Output callbackData is too large: {byte_len} bytes exceeds {MAX_CALLBACK_DATA_BYTES} byte limit"
+					)));
+				}
+			}
 		}
 
 		Ok(())
@@ -1086,6 +1101,38 @@ mod tests {
 		assert!(
 			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("inputs and outputs are required")),
 			"Should reject empty outputs: {result:?}"
+		);
+	}
+
+	#[test]
+	fn test_validate_intent_structure_rejects_oversized_callback_data() {
+		// A callback larger than MAX_CALLBACK_DATA_BYTES must be rejected at intent-structure
+		// validation, before any RPC/pricing work. Hex string of (MAX + 1) bytes.
+		let oversized_bytes = MAX_CALLBACK_DATA_BYTES + 1;
+		let oversized_hex = format!("0x{}", "ab".repeat(oversized_bytes));
+
+		let mut intent = create_exact_input_request(Some("1000000000000000000"), None);
+		intent.outputs[0].calldata = Some(oversized_hex);
+
+		let result = QuoteValidator::validate_intent_structure(&intent);
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("callbackData")),
+			"Should reject oversized callbackData before RPC work: {result:?}"
+		);
+	}
+
+	#[test]
+	fn test_validate_intent_structure_accepts_max_callback_data() {
+		// Exactly MAX_CALLBACK_DATA_BYTES must pass the size check.
+		let max_hex = format!("0x{}", "ab".repeat(MAX_CALLBACK_DATA_BYTES));
+
+		let mut intent = create_exact_input_request(Some("1000000000000000000"), None);
+		intent.outputs[0].calldata = Some(max_hex);
+
+		let result = QuoteValidator::validate_intent_structure(&intent);
+		assert!(
+			result.is_ok(),
+			"Max-size callbackData should pass: {result:?}"
 		);
 	}
 
