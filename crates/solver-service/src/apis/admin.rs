@@ -915,6 +915,32 @@ async fn ensure_new_token_approvals(
 	Ok(approvals_set)
 }
 
+/// Collects the set of configured settler addresses across all networks the
+/// `TokenManager` currently knows about.
+///
+/// This is the exact set the safe auto-approval path (`ensure_new_token_approvals`)
+/// is willing to grant allowances to: the non-zero input and output settler
+/// addresses on each network. The admin `approve` endpoint validates its
+/// admin-supplied `spender` against this set so a compromised admin key cannot
+/// grant an arbitrary attacker unlimited allowance — the same blast-radius
+/// reduction the withdrawal recipient allowlist provides for `handle_withdrawal`.
+async fn configured_settler_set(
+	token_manager: &TokenManager,
+) -> std::collections::HashSet<solver_types::Address> {
+	let zero_address = solver_types::Address(vec![0u8; 20]);
+	let networks = token_manager.get_networks().await;
+	let mut settlers = std::collections::HashSet::new();
+	for network in networks.values() {
+		if network.input_settler_address != zero_address {
+			settlers.insert(network.input_settler_address.clone());
+		}
+		if network.output_settler_address != zero_address {
+			settlers.insert(network.output_settler_address.clone());
+		}
+	}
+	settlers
+}
+
 /// PUT /api/v1/admin/fees
 ///
 /// Update fee configuration (gas buffer, minimum profitability, commission, rate buffer).
@@ -1256,6 +1282,26 @@ pub async fn handle_approve_tokens(
 	// 1. Parse amount and determine the scope
 	let approve = contents.to_eip712()?;
 	let spender = solver_types::Address::from(approve.spender);
+
+	// Spender allowlist: the spender MUST be one of the operator-configured
+	// input/output settlers — exactly the set the safe auto-approval path
+	// (`ensure_new_token_approvals`) is willing to grant allowances to. Without
+	// this guard a compromised admin key could `approve(attacker, U256::MAX)`
+	// for all tokens on all chains, bypassing the equivalent control the
+	// sibling `handle_withdrawal` enforces via its recipient allowlist. This
+	// also rejects the fully-wildcarded chainId=0 + token=0x0 + U256::MAX
+	// combination unless the spender is a configured settler.
+	let settlers = configured_settler_set(&state.token_manager).await;
+	if !settlers.contains(&spender) {
+		tracing::warn!(
+			admin = %hex::encode(&admin.0),
+			spender = %with_0x_prefix(&hex::encode(&spender.0)),
+			"Rejected token approval: spender is not a configured settler"
+		);
+		return Err(AdminAuthError::NotAuthorized(
+			"Approval spender is not a configured input/output settler".to_string(),
+		));
+	}
 
 	let token_filter = if contents.is_all_tokens() {
 		None
@@ -3189,6 +3235,178 @@ mod tests {
 		assert!(json.contains("\"success\":true"));
 		assert!(json.contains("\"approvedCount\":5"));
 		assert!(json.contains("\"chainsProcessed\":[1,10,137]"));
+	}
+
+	/// Build an admin state whose `TokenManager` knows a single chain (id 1)
+	/// with a configured input/output settler pair and one supported token.
+	/// `expect_submit` gates whether the mock delivery is allowed to submit an
+	/// on-chain approve transaction — set it to `false` to assert that a
+	/// rejected request never reaches the chain.
+	async fn create_admin_state_with_settler_network(expect_submit: bool) -> AdminApiState {
+		use solver_types::networks::RpcEndpoint;
+		use solver_types::{NetworkConfig as RuntimeNetworkConfig, TokenConfig};
+
+		let admin_alloy = alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: true,
+			recipient_allowlist: vec![],
+		};
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		// Allowance is queried before any approve to decide whether a tx is
+		// needed; report a non-matching allowance so a permitted spender would
+		// trigger exactly one submit.
+		mock_delivery
+			.expect_get_allowance()
+			.returning(|_, _, _, _| Box::pin(async { Ok("0".to_string()) }));
+		if expect_submit {
+			mock_delivery.expect_submit().returning(|_, _| {
+				Box::pin(async { Ok(solver_types::TransactionHash(vec![0x11; 32])) })
+			});
+		} else {
+			// The on-chain approve MUST NOT be attempted for a rejected request.
+			mock_delivery.expect_submit().times(0);
+		}
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+		implementations.insert(1, Arc::new(mock_delivery));
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 30, 60));
+
+		let operator_config = build_operator_config(admin_alloy, withdrawals);
+		let state = create_admin_state_with_operator_config(operator_config, delivery).await;
+
+		// Populate the TokenManager with a network carrying real settler
+		// addresses and a token, so the allowlist check has a settler set to
+		// validate against.
+		let mut networks = NetworksConfig::default();
+		networks.insert(
+			1,
+			RuntimeNetworkConfig {
+				name: Some("chain-1".to_string()),
+				network_type: solver_types::NetworkType::Parent,
+				rpc_urls: vec![RpcEndpoint {
+					http: Some("http://localhost:8545".to_string()),
+					ws: None,
+				}],
+				input_settler_address: solver_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: solver_address(
+					"0x2222222222222222222222222222222222222222",
+				),
+				tokens: vec![TokenConfig {
+					address: solver_address("0x5555555555555555555555555555555555555555"),
+					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
+					decimals: 6,
+				}],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		state.token_manager.update_networks(networks).await;
+
+		state
+	}
+
+	#[tokio::test]
+	async fn test_approve_non_settler_spender_is_rejected() {
+		// A compromised admin key signs an approve targeting an arbitrary
+		// (non-settler) spender. The withdrawal allowlist has a sibling control
+		// (recipient allowlist) — approvals must enforce an equivalent guard so
+		// the spender cannot be an attacker-chosen address. The request must be
+		// rejected BEFORE any on-chain approve is submitted.
+		let state = create_admin_state_with_settler_network(false).await;
+
+		let contents = ApproveTokensContents {
+			chain_id: 1,
+			token_address: alloy_address("0x5555555555555555555555555555555555555555"),
+			spender: alloy_address("0xdEAdBeEFdEadBEefDEAdbEEFdeadBEEFDEadBeeF"),
+			amount: "1000000".to_string(),
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let result = handle_approve_tokens(State(state), verified).await;
+		match result {
+			Err(AdminAuthError::NotAuthorized(msg)) => {
+				assert!(
+					msg.contains("settler"),
+					"expected settler message, got {msg}"
+				);
+			},
+			Err(other) => panic!("expected NotAuthorized(settler), got {other:?}"),
+			Ok(_) => panic!("non-settler spender approve must be rejected"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_approve_wildcard_non_settler_spender_is_rejected() {
+		// The fully-wildcarded scope (all chains + all tokens + max amount) to a
+		// non-settler spender is the worst case: a single signature granting an
+		// attacker unlimited allowance on every token/chain. It must be rejected.
+		let state = create_admin_state_with_settler_network(false).await;
+
+		let contents = ApproveTokensContents {
+			chain_id: 0,                         // all chains
+			token_address: zero_alloy_address(), // all tokens
+			spender: alloy_address("0xdEAdBeEFdEadBEefDEAdbEEFdeadBEEFDEadBeeF"),
+			amount: alloy_primitives::U256::MAX.to_string(),
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let result = handle_approve_tokens(State(state), verified).await;
+		match result {
+			Err(AdminAuthError::NotAuthorized(msg)) => {
+				assert!(
+					msg.contains("settler"),
+					"expected settler message, got {msg}"
+				);
+			},
+			Err(other) => panic!("expected NotAuthorized(settler), got {other:?}"),
+			Ok(_) => panic!("wildcard non-settler spender approve must be rejected"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_approve_configured_settler_spender_is_allowed() {
+		// The legitimate path: approving a configured settler (here the output
+		// settler) must still succeed and reach the chain.
+		let state = create_admin_state_with_settler_network(true).await;
+
+		let contents = ApproveTokensContents {
+			chain_id: 1,
+			token_address: alloy_address("0x5555555555555555555555555555555555555555"),
+			spender: alloy_address("0x2222222222222222222222222222222222222222"),
+			amount: "1000000".to_string(),
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let response = handle_approve_tokens(State(state), verified)
+			.await
+			.unwrap()
+			.0;
+		assert!(response.success);
+		assert_eq!(response.approved_count, 1);
 	}
 
 	#[test]
