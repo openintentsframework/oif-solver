@@ -95,12 +95,29 @@ impl TransactionHandler {
 		match stage_hash(order, tx_type) {
 			Some(stored_hash) if stored_hash == observed_hash => Ok(()),
 			Some(stored_hash) => {
+				let stored_hash = stored_hash.clone();
+				// A different confirmed tx landed for this stage (e.g. a same-nonce
+				// gas-bump replacement). The in-hand confirmation receipt proves
+				// `observed_hash` is the canonical tx, so overwrite the stored hash
+				// with it; otherwise recovery would resolve the stage to the
+				// superseded `stored_hash` whose receipt no longer exists and the
+				// order would stall forever. The overwrite always targets a
+				// chain-confirmed tx and produces no new on-chain action, so it is
+				// consistent with the OIF idempotency invariant.
+				let canonical_hash = observed_hash.clone();
+				self.state_machine
+					.update_order_with(order_id, |order| {
+						set_stage_hash(order, tx_type, canonical_hash.clone());
+					})
+					.await
+					.map_err(|e| TransactionError::State(e.to_string()))?;
+
 				self.event_bus
 					.publish(SolverEvent::Delivery(
 						DeliveryEvent::TransactionCanonicalHashConflict {
 							order_id: order_id.to_string(),
 							tx_type,
-							stored_hash: stored_hash.clone(),
+							stored_hash,
 							observed_hash: observed_hash.clone(),
 						},
 					))
@@ -109,24 +126,31 @@ impl TransactionHandler {
 			},
 			None => {
 				let repair_hash = observed_hash.clone();
-				let updated = self
-					.state_machine
+				// A concurrent write may have populated the stage hash between our
+				// read and this update. Capture whatever was there so we can report
+				// a conflict, but always overwrite with the in-hand confirmed
+				// `observed_hash`: it is the canonical (chain-confirmed) tx for this
+				// stage, so recovery must resolve to it rather than a superseded hash.
+				let prior_hash = Arc::new(std::sync::Mutex::new(None));
+				let prior_hash_for_update = prior_hash.clone();
+				self.state_machine
 					.update_order_with(order_id, |order| {
-						if stage_hash(order, tx_type).is_none() {
-							set_stage_hash(order, tx_type, repair_hash.clone());
-						}
+						*prior_hash_for_update.lock().unwrap() =
+							stage_hash(order, tx_type).cloned();
+						set_stage_hash(order, tx_type, repair_hash.clone());
 					})
 					.await
 					.map_err(|e| TransactionError::State(e.to_string()))?;
 
-				if let Some(stored_hash) = stage_hash(&updated, tx_type) {
-					if stored_hash != observed_hash {
+				let prior_hash = prior_hash.lock().unwrap().take();
+				if let Some(stored_hash) = prior_hash {
+					if &stored_hash != observed_hash {
 						self.event_bus
 							.publish(SolverEvent::Delivery(
 								DeliveryEvent::TransactionCanonicalHashConflict {
 									order_id: order_id.to_string(),
 									tx_type,
-									stored_hash: stored_hash.clone(),
+									stored_hash,
 									observed_hash: observed_hash.clone(),
 								},
 							))
@@ -931,8 +955,12 @@ mod tests {
 			.await
 			.unwrap();
 
+		// The in-hand confirmation receipt proves `observed_hash` is the canonical
+		// tx for this stage (e.g. a same-nonce gas-bump replacement landed). The
+		// handler must OVERWRITE the stored hash with the observed one so recovery
+		// resolves the stage to a tx whose receipt actually exists.
 		let updated_order = state_machine.get_order(&order.id).await.unwrap();
-		assert_eq!(updated_order.fill_tx_hash, Some(stored_hash.clone()));
+		assert_eq!(updated_order.fill_tx_hash, Some(observed_hash.clone()));
 		let events = drain_events(&mut receiver);
 		assert_eq!(
 			events
@@ -1413,9 +1441,11 @@ mod tests {
 
 	/// Regression for the AlreadyApplied-conflict branch on the Prepare stage.
 	/// An order already past Prepare with a stored `prepare_tx_hash` receives
-	/// a duplicate Prepare confirmation carrying a different hash. The
-	/// handler must emit `TransactionCanonicalHashConflict`, leave the stored
-	/// hash unchanged, and NOT re-publish `OrderEvent::Executing`.
+	/// a duplicate Prepare confirmation carrying a different hash (e.g. a
+	/// same-nonce gas-bump replacement landed). The handler must OVERWRITE the
+	/// stored hash with the observed (chain-confirmed) one, still emit
+	/// `TransactionCanonicalHashConflict`, and NOT re-publish
+	/// `OrderEvent::Executing`.
 	#[tokio::test]
 	async fn duplicate_prepare_confirmed_with_different_hash_emits_canonical_hash_conflict() {
 		let stored_hash = TransactionHash(vec![0x33; 32]);
@@ -1441,8 +1471,10 @@ mod tests {
 			.await
 			.unwrap();
 
+		// The in-hand confirmation receipt proves `observed_hash` is the canonical
+		// tx for this stage, so the handler must OVERWRITE the stored hash with it.
 		let updated_order = state_machine.get_order(&order.id).await.unwrap();
-		assert_eq!(updated_order.prepare_tx_hash, Some(stored_hash.clone()));
+		assert_eq!(updated_order.prepare_tx_hash, Some(observed_hash.clone()));
 		let events = drain_events(&mut receiver);
 		assert_eq!(
 			events
