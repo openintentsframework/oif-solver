@@ -44,6 +44,22 @@ use tracing::instrument;
 
 const INTENT_QUEUE_CAPACITY: usize = 1024;
 
+/// Upper bound on handler tasks that have been spawned but not yet completed.
+///
+/// `spawn_handler` acquires one of these permits BEFORE `tokio::spawn` and the
+/// spawned task holds it for its whole lifetime. This caps the number of
+/// in-flight (including parked) handler tasks, so a bounded intake — the H-09
+/// intent queue / event bus — cannot be drained into unlimited parked
+/// semaphore-waiter tasks (unbounded memory growth).
+///
+/// Sized to match `INTENT_QUEUE_CAPACITY`: the queue can hold at most that many
+/// pending items, so allowing the same number of concurrent handlers means the
+/// common path never blocks on this bound — backpressure only engages at true
+/// saturation. It is far above the single-permit `transaction_semaphore`, so a
+/// merely contended transaction permit never blocks dispatch (preserving the
+/// M-13 property that a held transaction permit cannot stall the event loop).
+const MAX_INFLIGHT_HANDLERS: usize = INTENT_QUEUE_CAPACITY;
+
 /// Errors that can occur during engine operations.
 ///
 /// These errors represent various failure modes that can occur while
@@ -416,6 +432,12 @@ impl SolverEngine {
 		let transaction_semaphore = Arc::new(Semaphore::new(1)); // Serialize transaction submissions
 		let general_semaphore = Arc::new(Semaphore::new(100)); // Allow concurrent non-tx operations
 
+		// Bounds the number of spawned-but-not-yet-completed handler tasks. Each
+		// `spawn_handler` call acquires a permit before spawning and holds it for
+		// the task's lifetime, so a bounded intake cannot fan out into unlimited
+		// parked semaphore-waiter tasks. See `MAX_INFLIGHT_HANDLERS`.
+		let dispatch_semaphore = Arc::new(Semaphore::new(MAX_INFLIGHT_HANDLERS));
+
 		let rebalance_handle = if let Some(bridge_service) = &self.bridge_service {
 			// Rebalance preflight: cross-check operator-declared route data
 			// against on-chain state before starting the monitor. Catches wrong
@@ -576,12 +598,12 @@ impl SolverEngine {
 			tokio::select! {
 				// Handle discovered intents
 				Some(intent) = intent_rx.recv() => {
-					self.spawn_handler(&general_semaphore, move |engine| async move {
+					self.spawn_handler(&dispatch_semaphore, &general_semaphore, move |engine| async move {
 						if let Err(e) = engine.intent_handler.handle(intent).await {
 							return Err(EngineError::Service(format!("Failed to handle intent: {e}")));
 						}
 						Ok(())
-					});
+					}).await;
 				}
 
 				// Handle events
@@ -589,7 +611,7 @@ impl SolverEngine {
 					match event {
 						SolverEvent::Order(OrderEvent::Preparing { intent, order, params }) => {
 							// Preparing sends a prepare transaction - use transaction semaphore
-							self.spawn_handler(&transaction_semaphore, move |engine| async move {
+							self.spawn_handler(&dispatch_semaphore, &transaction_semaphore, move |engine| async move {
 								let order_id = order.id.clone();
 								if let Err(e) = engine.order_handler.handle_preparation(intent.source, order, params).await {
 									let error_msg = format!("Failed to handle order preparation: {e}");
@@ -603,7 +625,7 @@ impl SolverEngine {
 									return Err(EngineError::Service(error_msg));
 								}
 								Ok(())
-							});
+							}).await;
 						}
 						SolverEvent::Order(OrderEvent::Executing { order, params }) => {
 							tracing::info!(
@@ -612,7 +634,7 @@ impl SolverEngine {
 								"Handling order execution event"
 							);
 							// Executing sends a fill transaction - use transaction semaphore
-							self.spawn_handler(&transaction_semaphore, move |engine| async move {
+							self.spawn_handler(&dispatch_semaphore, &transaction_semaphore, move |engine| async move {
 								let order_id = order.id.clone();
 								if let Err(e) = engine.order_handler.handle_execution(order, params).await {
 									let error_msg = format!("Failed to handle order execution: {e}");
@@ -626,7 +648,7 @@ impl SolverEngine {
 									return Err(EngineError::Service(error_msg));
 								}
 								Ok(())
-							});
+							}).await;
 						}
 
 						SolverEvent::Delivery(DeliveryEvent::TransactionPending { order_id, tx_hash, tx_type, tx_chain_id: _ }) => {
@@ -647,7 +669,7 @@ impl SolverEngine {
 							);
 							// Confirmation handling doesn't directly send transactions - use general semaphore
 							// Note: This may trigger OrderEvent::Executing which will be serialized separately
-							self.spawn_handler(&general_semaphore, move |engine| async move {
+							self.spawn_handler(&dispatch_semaphore, &general_semaphore, move |engine| async move {
 								let order_id_clone = order_id.clone();
 								match engine.transaction_handler.handle_confirmed(order_id, tx_hash, tx_type, receipt).await {
 									Ok(()) => Ok(()),
@@ -671,7 +693,7 @@ impl SolverEngine {
 										Err(EngineError::Service(error_msg))
 									}
 								}
-							});
+							}).await;
 						}
 
 						SolverEvent::Delivery(DeliveryEvent::TransactionFailed { order_id, tx_hash, tx_type, error }) => {
@@ -683,12 +705,12 @@ impl SolverEngine {
 								"Transaction failed"
 							);
 							// Failure handling doesn't send transactions - use general semaphore
-							self.spawn_handler(&general_semaphore, move |engine| async move {
+							self.spawn_handler(&dispatch_semaphore, &general_semaphore, move |engine| async move {
 								if let Err(e) = engine.transaction_handler.handle_failed(order_id, tx_hash, tx_type, error).await {
 									return Err(EngineError::Service(format!("Failed to handle transaction failure: {e}")));
 								}
 								Ok(())
-							});
+							}).await;
 						}
 
 						// Handle PostFillReady - use settlement handler
@@ -698,7 +720,7 @@ impl SolverEngine {
 								order_id = %order_id,
 								"Handling post-fill readiness event"
 							);
-							self.spawn_handler(&transaction_semaphore, move |engine| async move {
+							self.spawn_handler(&dispatch_semaphore, &transaction_semaphore, move |engine| async move {
 								let order_id_clone = order_id.clone();
 								if let Err(e) = engine.settlement_handler.handle_post_fill_ready(order_id).await {
 									return engine.handle_settlement_stage_error(
@@ -709,12 +731,12 @@ impl SolverEngine {
 									).await;
 								}
 								Ok(())
-							});
+							}).await;
 						}
 
 						// Handle PreClaimReady - use settlement handler
 						SolverEvent::Settlement(SettlementEvent::PreClaimReady { order_id }) => {
-							self.spawn_handler(&transaction_semaphore, move |engine| async move {
+							self.spawn_handler(&dispatch_semaphore, &transaction_semaphore, move |engine| async move {
 								let order_id_clone = order_id.clone();
 								if let Err(e) = engine.settlement_handler.handle_pre_claim_ready(order_id).await {
 									return engine.handle_settlement_stage_error(
@@ -725,7 +747,7 @@ impl SolverEngine {
 									).await;
 								}
 								Ok(())
-							});
+							}).await;
 						}
 
 						// Handle StartMonitoring - spawn settlement monitor
@@ -753,7 +775,7 @@ impl SolverEngine {
 								let mut batch = std::mem::take(&mut claim_batch);
 								claim_batch.clear();
 								// Claim sends a transaction - use transaction semaphore
-								self.spawn_handler(&transaction_semaphore, move |engine| async move {
+								self.spawn_handler(&dispatch_semaphore, &transaction_semaphore, move |engine| async move {
 									if let Err(e) = engine.settlement_handler.process_claim_batch(&mut batch).await {
 										return engine.handle_settlement_stage_error(
 											&e.order_id,
@@ -763,7 +785,7 @@ impl SolverEngine {
 										).await;
 									}
 									Ok(())
-								});
+								}).await;
 							}
 						}
 
@@ -947,30 +969,64 @@ impl SolverEngine {
 
 	/// Helper method to spawn handler tasks with semaphore-based concurrency control.
 	///
-	/// This method:
-	/// 1. Clones the engine and spawns the handler in a new task
-	/// 2. Acquires the semaphore permit INSIDE the spawned task, so the caller
-	///    (the `select!` event loop) returns immediately and keeps polling even
-	///    when the permit is contended
-	/// 3. Handles errors by logging them appropriately
+	/// Two semaphores cooperate here, with distinct responsibilities:
 	///
-	/// Acquiring the permit inside the task (rather than inline before
-	/// `tokio::spawn`) preserves the semaphore's serialization purpose — at most
-	/// `permits` handlers run concurrently, which is what serializes nonce
-	/// allocation on the single-permit `transaction_semaphore`. The only thing
-	/// that changes is that ordering among already-spawned waiters becomes
-	/// tokio's fair acquisition queue rather than the event-arrival order; that
-	/// is acceptable because nonce allocation only requires mutual exclusion, not
-	/// a specific order. Crucially, a held permit can no longer park the event
-	/// loop and stall unrelated event processing.
-	fn spawn_handler<F, Fut>(&self, semaphore: &Arc<Semaphore>, handler: F)
-	where
+	/// * `dispatch` (capacity `MAX_INFLIGHT_HANDLERS`) — acquired BEFORE
+	///   `tokio::spawn` and held for the spawned task's whole lifetime. This
+	///   bounds the number of spawned-but-not-yet-completed handler tasks, so a
+	///   bounded intake (the H-09 intent queue / event bus) cannot be drained
+	///   into unlimited parked waiter tasks (unbounded memory growth, M-13
+	///   regression). Sized well above the single transaction permit, so the
+	///   common path finds a permit immediately and this `.await` does not park
+	///   the event loop; the loop only blocks here at TRUE saturation.
+	/// * `semaphore` (the per-event-type `transaction_semaphore` /
+	///   `general_semaphore`) — acquired INSIDE the spawned task, so a merely
+	///   contended transaction permit can no longer park the `select!` event loop
+	///   (the original M-13 fix). This serializes nonce allocation on the
+	///   single-permit `transaction_semaphore` via mutual exclusion; ordering
+	///   among already-spawned waiters becomes tokio's fair acquisition queue
+	///   rather than event-arrival order, which is acceptable because nonce
+	///   allocation only requires mutual exclusion, not a specific order.
+	///
+	/// Net effect: bounded in-flight memory WITHOUT reintroducing the per-event
+	/// stall — backpressure engages only when `MAX_INFLIGHT_HANDLERS` tasks are
+	/// already in flight, not on every contended single transaction permit.
+	/// Handler errors are logged.
+	async fn spawn_handler<F, Fut>(
+		&self,
+		dispatch: &Arc<Semaphore>,
+		semaphore: &Arc<Semaphore>,
+		handler: F,
+	) where
 		F: FnOnce(SolverEngine) -> Fut + Send + 'static,
 		Fut: Future<Output = Result<(), EngineError>> + Send,
 	{
 		let engine = self.clone();
 		let semaphore = semaphore.clone();
+
+		// Acquire the dispatch permit BEFORE spawning. This bounds the number of
+		// spawned-but-not-yet-completed handler tasks to the dispatch capacity
+		// (`MAX_INFLIGHT_HANDLERS`), so a bounded intake cannot be drained into
+		// unlimited parked semaphore-waiter tasks (the H-09 memory-exhaustion
+		// concern). Under normal load a permit is immediately available, so this
+		// `.await` completes synchronously and does NOT park the event loop;
+		// crucially, a merely contended single transaction permit never consumes
+		// a dispatch permit at acquisition time, so it cannot stall dispatch
+		// (preserving the M-13 property). The loop only blocks here at TRUE
+		// saturation — `MAX_INFLIGHT_HANDLERS` tasks already in flight — which is
+		// correct, bounded backpressure rather than the original per-event stall.
+		let dispatch_permit = match dispatch.clone().acquire_owned().await {
+			Ok(permit) => permit,
+			Err(e) => {
+				tracing::error!("Failed to acquire dispatch permit: {}", e);
+				return;
+			},
+		};
+
 		tokio::spawn(async move {
+			// Hold the dispatch permit for the whole task lifetime; it is
+			// released on completion, freeing a slot for the next dispatch.
+			let _dispatch_permit = dispatch_permit;
 			match semaphore.acquire_owned().await {
 				Ok(permit) => {
 					let _permit = permit; // Keep permit alive for duration of task
@@ -1264,11 +1320,14 @@ mod tests {
 		);
 
 		let semaphore = Arc::new(Semaphore::new(1));
+		let dispatch = Arc::new(Semaphore::new(64));
 
 		// Test handler that returns an error - should be logged but not panic
-		engine.spawn_handler(&semaphore, move |_engine| async move {
-			Err(EngineError::Service("Test error".to_string()))
-		});
+		engine
+			.spawn_handler(&dispatch, &semaphore, move |_engine| async move {
+				Err(EngineError::Service("Test error".to_string()))
+			})
+			.await;
 	}
 
 	/// M-13: dispatching a second handler must not block the event loop while a
@@ -1283,6 +1342,10 @@ mod tests {
 
 		// Single-permit semaphore mirrors the transaction_semaphore.
 		let semaphore = Arc::new(Semaphore::new(1));
+		// Ample dispatch capacity so the M-13 dispatch path under test never
+		// parks on dispatch backpressure — we are isolating the transaction
+		// permit contention, not the saturation bound.
+		let dispatch = Arc::new(Semaphore::new(64));
 
 		// Hold the only permit for the duration of the dispatch under test.
 		let held = semaphore.clone().acquire_owned().await.unwrap();
@@ -1290,15 +1353,18 @@ mod tests {
 		// Signals when the spawned handler actually begins executing.
 		let (ran_tx, mut ran_rx) = tokio::sync::oneshot::channel::<()>();
 
-		// Dispatching a handler must return promptly even though no permit is
-		// available — the spawned task waits for the permit, the caller does not.
-		// If permit acquisition happened INLINE (pre-fix), this call would block
-		// the caller until `held` is released, so the timeout below would elapse.
+		// Dispatching a handler must return promptly even though no transaction
+		// permit is available — the spawned task waits for the permit, the caller
+		// does not. If transaction-permit acquisition happened INLINE (pre-fix),
+		// this call would block the caller until `held` is released, so the
+		// timeout below would elapse.
 		tokio::time::timeout(std::time::Duration::from_secs(2), async {
-			engine.spawn_handler(&semaphore, move |_engine| async move {
-				let _ = ran_tx.send(());
-				Ok(())
-			});
+			engine
+				.spawn_handler(&dispatch, &semaphore, move |_engine| async move {
+					let _ = ran_tx.send(());
+					Ok(())
+				})
+				.await;
 		})
 		.await
 		.expect("spawn_handler must dispatch without blocking on a contended permit");
@@ -1320,6 +1386,80 @@ mod tests {
 			.await
 			.expect("handler must run once the permit is released")
 			.expect("handler completion signal");
+	}
+
+	/// M-13 regression: the number of spawned-but-not-yet-completed handler
+	/// tasks must be bounded by the dispatch semaphore capacity, even when a
+	/// held transaction permit keeps every handler parked.
+	///
+	/// Without a bound, a bounded intake (the H-09 intent queue / event bus) can
+	/// be drained into UNLIMITED parked semaphore-waiter tasks → unbounded
+	/// memory growth. With a dispatch permit acquired BEFORE `tokio::spawn`, the
+	/// `(cap + 1)`th dispatch must block until an earlier in-flight task
+	/// completes — so no more than `cap` tasks are ever live at once.
+	#[tokio::test]
+	async fn spawn_handler_bounds_inflight_tasks() {
+		use std::sync::atomic::{AtomicUsize, Ordering};
+
+		let engine = create_test_engine().await;
+
+		// Tiny dispatch capacity so we can saturate it cheaply.
+		const CAP: usize = 2;
+		let dispatch = Arc::new(Semaphore::new(CAP));
+
+		// Single-permit transaction semaphore, held for the whole test so every
+		// spawned handler parks on it and therefore never releases its dispatch
+		// permit. This is the worst case for memory: maximal parked waiters.
+		let tx_semaphore = Arc::new(Semaphore::new(1));
+		let held = tx_semaphore.clone().acquire_owned().await.unwrap();
+
+		// Counts handler tasks that have actually been spawned (dispatched).
+		let dispatched = Arc::new(AtomicUsize::new(0));
+
+		// Drive far more dispatches than the cap from a background task. Each
+		// `spawn_handler` call acquires a dispatch permit before spawning; once
+		// CAP permits are held by parked tasks, further calls must block here.
+		let n = CAP * 8;
+		let driver = {
+			let engine = engine.clone();
+			let dispatch = dispatch.clone();
+			let tx_semaphore = tx_semaphore.clone();
+			let dispatched = dispatched.clone();
+			tokio::spawn(async move {
+				for _ in 0..n {
+					let dispatched = dispatched.clone();
+					engine
+						.spawn_handler(&dispatch, &tx_semaphore, move |_engine| async move {
+							dispatched.fetch_add(1, Ordering::SeqCst);
+							Ok(())
+						})
+						.await;
+				}
+			})
+		};
+
+		// Give the driver ample time to run as far as it can. Pre-fix (no bound)
+		// it dispatches all `n` tasks. Post-fix it stalls after `CAP`.
+		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+		let live = dispatched.load(Ordering::SeqCst);
+		assert!(
+			live <= CAP,
+			"in-flight handler tasks must be bounded by the dispatch capacity: \
+			 expected <= {CAP}, observed {live}",
+		);
+		assert!(
+			!driver.is_finished(),
+			"driver must be blocked on the dispatch semaphore, not have dispatched all {n} tasks",
+		);
+
+		// Releasing the transaction permit lets parked tasks complete, freeing
+		// dispatch permits so the driver can finish all `n` dispatches.
+		drop(held);
+		tokio::time::timeout(std::time::Duration::from_secs(5), driver)
+			.await
+			.expect("driver must finish once parked tasks complete")
+			.expect("driver task must not panic");
 	}
 
 	#[test]
