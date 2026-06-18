@@ -581,8 +581,7 @@ impl SolverEngine {
 							return Err(EngineError::Service(format!("Failed to handle intent: {e}")));
 						}
 						Ok(())
-					})
-					.await;
+					});
 				}
 
 				// Handle events
@@ -604,8 +603,7 @@ impl SolverEngine {
 									return Err(EngineError::Service(error_msg));
 								}
 								Ok(())
-							})
-							.await;
+							});
 						}
 						SolverEvent::Order(OrderEvent::Executing { order, params }) => {
 							tracing::info!(
@@ -628,8 +626,7 @@ impl SolverEngine {
 									return Err(EngineError::Service(error_msg));
 								}
 								Ok(())
-							})
-							.await;
+							});
 						}
 
 						SolverEvent::Delivery(DeliveryEvent::TransactionPending { order_id, tx_hash, tx_type, tx_chain_id: _ }) => {
@@ -674,8 +671,7 @@ impl SolverEngine {
 										Err(EngineError::Service(error_msg))
 									}
 								}
-							})
-							.await;
+							});
 						}
 
 						SolverEvent::Delivery(DeliveryEvent::TransactionFailed { order_id, tx_hash, tx_type, error }) => {
@@ -692,8 +688,7 @@ impl SolverEngine {
 									return Err(EngineError::Service(format!("Failed to handle transaction failure: {e}")));
 								}
 								Ok(())
-							})
-							.await;
+							});
 						}
 
 						// Handle PostFillReady - use settlement handler
@@ -714,8 +709,7 @@ impl SolverEngine {
 									).await;
 								}
 								Ok(())
-							})
-							.await;
+							});
 						}
 
 						// Handle PreClaimReady - use settlement handler
@@ -731,8 +725,7 @@ impl SolverEngine {
 									).await;
 								}
 								Ok(())
-							})
-							.await;
+							});
 						}
 
 						// Handle StartMonitoring - spawn settlement monitor
@@ -770,8 +763,7 @@ impl SolverEngine {
 										).await;
 									}
 									Ok(())
-								})
-								.await;
+								});
 							}
 						}
 
@@ -956,28 +948,41 @@ impl SolverEngine {
 	/// Helper method to spawn handler tasks with semaphore-based concurrency control.
 	///
 	/// This method:
-	/// 1. Acquires a permit from the semaphore to limit concurrent tasks
-	/// 2. Clones the engine and spawns the handler in a new task
+	/// 1. Clones the engine and spawns the handler in a new task
+	/// 2. Acquires the semaphore permit INSIDE the spawned task, so the caller
+	///    (the `select!` event loop) returns immediately and keeps polling even
+	///    when the permit is contended
 	/// 3. Handles errors by logging them appropriately
-	async fn spawn_handler<F, Fut>(&self, semaphore: &Arc<Semaphore>, handler: F)
+	///
+	/// Acquiring the permit inside the task (rather than inline before
+	/// `tokio::spawn`) preserves the semaphore's serialization purpose — at most
+	/// `permits` handlers run concurrently, which is what serializes nonce
+	/// allocation on the single-permit `transaction_semaphore`. The only thing
+	/// that changes is that ordering among already-spawned waiters becomes
+	/// tokio's fair acquisition queue rather than the event-arrival order; that
+	/// is acceptable because nonce allocation only requires mutual exclusion, not
+	/// a specific order. Crucially, a held permit can no longer park the event
+	/// loop and stall unrelated event processing.
+	fn spawn_handler<F, Fut>(&self, semaphore: &Arc<Semaphore>, handler: F)
 	where
 		F: FnOnce(SolverEngine) -> Fut + Send + 'static,
 		Fut: Future<Output = Result<(), EngineError>> + Send,
 	{
 		let engine = self.clone();
-		match semaphore.clone().acquire_owned().await {
-			Ok(permit) => {
-				tokio::spawn(async move {
+		let semaphore = semaphore.clone();
+		tokio::spawn(async move {
+			match semaphore.acquire_owned().await {
+				Ok(permit) => {
 					let _permit = permit; // Keep permit alive for duration of task
 					if let Err(e) = handler(engine).await {
 						tracing::error!("Handler error: {}", e);
 					}
-				});
-			},
-			Err(e) => {
-				tracing::error!("Failed to acquire semaphore permit: {}", e);
-			},
-		}
+				},
+				Err(e) => {
+					tracing::error!("Failed to acquire semaphore permit: {}", e);
+				},
+			}
+		});
 	}
 }
 
@@ -1261,11 +1266,60 @@ mod tests {
 		let semaphore = Arc::new(Semaphore::new(1));
 
 		// Test handler that returns an error - should be logged but not panic
-		engine
-			.spawn_handler(&semaphore, move |_engine| async move {
-				Err(EngineError::Service("Test error".to_string()))
-			})
-			.await;
+		engine.spawn_handler(&semaphore, move |_engine| async move {
+			Err(EngineError::Service("Test error".to_string()))
+		});
+	}
+
+	/// M-13: dispatching a second handler must not block the event loop while a
+	/// contended permit is held. The `transaction_semaphore` is `Semaphore::new(1)`
+	/// to serialize nonce allocation; if the permit is acquired INLINE (before the
+	/// spawn) then a second tx event parks the whole `select!` loop until the
+	/// in-flight handler releases the permit. Permit acquisition must therefore
+	/// happen INSIDE the spawned task, so `spawn_handler` returns immediately.
+	#[tokio::test]
+	async fn spawn_handler_does_not_block_when_permit_contended() {
+		let engine = create_test_engine().await;
+
+		// Single-permit semaphore mirrors the transaction_semaphore.
+		let semaphore = Arc::new(Semaphore::new(1));
+
+		// Hold the only permit for the duration of the dispatch under test.
+		let held = semaphore.clone().acquire_owned().await.unwrap();
+
+		// Signals when the spawned handler actually begins executing.
+		let (ran_tx, mut ran_rx) = tokio::sync::oneshot::channel::<()>();
+
+		// Dispatching a handler must return promptly even though no permit is
+		// available — the spawned task waits for the permit, the caller does not.
+		// If permit acquisition happened INLINE (pre-fix), this call would block
+		// the caller until `held` is released, so the timeout below would elapse.
+		tokio::time::timeout(std::time::Duration::from_secs(2), async {
+			engine.spawn_handler(&semaphore, move |_engine| async move {
+				let _ = ran_tx.send(());
+				Ok(())
+			});
+		})
+		.await
+		.expect("spawn_handler must dispatch without blocking on a contended permit");
+
+		// While the permit is held the spawned handler must NOT have run — it is
+		// parked on the semaphore inside its own task, not in the caller.
+		assert!(
+			matches!(
+				ran_rx.try_recv(),
+				Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+			),
+			"handler must not run while the permit is held",
+		);
+
+		// Releasing the permit lets the queued task acquire it and run, proving
+		// serialization is preserved (mutual exclusion via the semaphore).
+		drop(held);
+		tokio::time::timeout(std::time::Duration::from_secs(2), ran_rx)
+			.await
+			.expect("handler must run once the permit is released")
+			.expect("handler completion signal");
 	}
 
 	#[test]
