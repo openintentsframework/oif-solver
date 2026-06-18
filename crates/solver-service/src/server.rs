@@ -386,6 +386,9 @@ pub async fn start_server(
 				AuthState {
 					jwt_service: jwt.clone(),
 					required_scope: solver_types::AuthScope::AdminRead,
+					// Admin routes re-check the live whitelist on every request so
+					// a removed admin's still-unexpired token is rejected at once.
+					admin_whitelist_config: Some(app_state.config.clone()),
 				},
 				auth_middleware,
 			));
@@ -393,6 +396,7 @@ pub async fn start_server(
 				AuthState {
 					jwt_service: jwt.clone(),
 					required_scope: solver_types::AuthScope::AdminAll,
+					admin_whitelist_config: Some(app_state.config.clone()),
 				},
 				auth_middleware,
 			));
@@ -452,6 +456,8 @@ fn build_public_api_routes(
 				AuthState {
 					jwt_service: jwt.clone(),
 					required_scope: solver_types::AuthScope::CreateQuotes,
+					// Public-client routes carry no admin scope: no whitelist gating.
+					admin_whitelist_config: None,
 				},
 				auth_middleware,
 			));
@@ -475,6 +481,7 @@ fn build_public_api_routes(
 					AuthState {
 						jwt_service: jwt.clone(),
 						required_scope: solver_types::AuthScope::CreateOrders,
+						admin_whitelist_config: None,
 					},
 					auth_middleware,
 				),
@@ -486,6 +493,7 @@ fn build_public_api_routes(
 					AuthState {
 						jwt_service: jwt.clone(),
 						required_scope: solver_types::AuthScope::ReadOrders,
+						admin_whitelist_config: None,
 					},
 					auth_middleware,
 				));
