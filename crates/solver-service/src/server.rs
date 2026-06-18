@@ -591,7 +591,13 @@ async fn handle_auth_refresh(
 	State(state): State<AppState>,
 	Json(payload): Json<crate::apis::auth::RefreshRequest>,
 ) -> impl IntoResponse {
-	crate::apis::auth::refresh_token(State(state.jwt_service), Json(payload)).await
+	let siwe_state = crate::apis::auth::SiweAuthState {
+		jwt_service: state.jwt_service,
+		config: state.config,
+		siwe_nonce_store: state.siwe_nonce_store,
+	};
+
+	crate::apis::auth::refresh_token(State(siwe_state), Json(payload)).await
 }
 
 /// Handles POST /api/v1/auth/siwe/nonce requests.
