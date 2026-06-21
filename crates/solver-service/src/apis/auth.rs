@@ -646,18 +646,22 @@ fn resolve_siwe_scopes(
 	}
 }
 
-/// Returns `true` iff `subject` still resolves to an admin role in the LIVE
-/// admin whitelist.
+/// Returns `true` iff `subject` still resolves to a live admin role whose
+/// current scopes grant `required_scope`.
 ///
 /// This is the same live-config / whitelist source the refresh path consults
 /// (`resolve_siwe_runtime_config` + `SiweRuntimeConfig::role_for`, ultimately
 /// `AdminConfig::normalized_whitelist`). The auth middleware reuses it so an
 /// already-issued admin access token stops working the moment the admin is
-/// removed or admin auth is disabled — instead of remaining valid until the
-/// token's own expiry. A `false` result covers both "no longer whitelisted"
-/// and "admin auth is not configured / disabled" (in which case
+/// removed or demoted below the route's required scope — instead of remaining
+/// valid until the token's own expiry. A `false` result covers both "no longer
+/// whitelisted" and "admin auth is not configured / disabled" (in which case
 /// `resolve_siwe_runtime_config` errors).
-pub async fn is_live_admin_subject(config: &Arc<RwLock<Config>>, subject: &str) -> bool {
+pub async fn is_live_admin_subject_authorized(
+	config: &Arc<RwLock<Config>>,
+	subject: &str,
+	required_scope: &AuthScope,
+) -> bool {
 	let runtime = match resolve_siwe_runtime_config(config).await {
 		Ok(runtime) => runtime,
 		Err(_) => return false,
@@ -666,7 +670,9 @@ pub async fn is_live_admin_subject(config: &Arc<RwLock<Config>>, subject: &str) 
 		Ok(address) => address,
 		Err(_) => return false,
 	};
-	runtime.role_for(&address).is_some()
+	resolve_siwe_scopes(&runtime, &address)
+		.map(|scopes| scopes.iter().any(|scope| scope.grants(required_scope)))
+		.unwrap_or(false)
 }
 
 async fn siwe_dependencies(

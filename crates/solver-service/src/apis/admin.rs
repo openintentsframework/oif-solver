@@ -3412,6 +3412,44 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn test_approve_all_chains_fails_closed_when_no_networks_configured() {
+		// With no configured networks there is no chain-local settler allowlist
+		// against which to authorize an all-chains approval. The request must
+		// fail closed before any allowance query or approve submission.
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: true,
+			recipient_allowlist: vec![],
+		};
+		let state = create_admin_state(None, withdrawals, false).await;
+
+		let contents = ApproveTokensContents {
+			chain_id: 0,
+			token_address: zero_alloy_address(),
+			spender: alloy_address("0x2222222222222222222222222222222222222222"),
+			amount: "1000000".to_string(),
+			nonce: 1,
+			deadline: chrono::Utc::now().timestamp() as u64 + 3600,
+		};
+
+		let verified = VerifiedAdmin {
+			admin: solver_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			contents,
+		};
+
+		let result = handle_approve_tokens(State(state), verified).await;
+		match result {
+			Err(AdminAuthError::NotAuthorized(msg)) => {
+				assert!(
+					msg.contains("settler"),
+					"expected settler message, got {msg}"
+				);
+			},
+			Err(other) => panic!("expected NotAuthorized(settler), got {other:?}"),
+			Ok(_) => panic!("all-chains approval must fail closed with no configured networks"),
+		}
+	}
+
+	#[tokio::test]
 	async fn test_approve_configured_settler_spender_is_allowed() {
 		// The legitimate path: approving a configured settler (here the output
 		// settler) must still succeed and reach the chain.

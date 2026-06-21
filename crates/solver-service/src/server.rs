@@ -319,7 +319,11 @@ pub async fn start_server(
 	};
 
 	// Build the router with /api/v1 base path and public API hardening.
-	let mut api_routes = build_public_api_routes(&api_config, jwt_service.as_ref());
+	let mut api_routes = build_public_api_routes(
+		&api_config,
+		jwt_service.as_ref(),
+		Some(app_state.config.clone()),
+	);
 
 	// Add admin routes if enabled
 	if let Some(admin_state) = admin_state {
@@ -441,6 +445,7 @@ pub async fn start_server(
 fn build_public_api_routes(
 	api_config: &ApiConfig,
 	jwt_service: Option<&Arc<JwtService>>,
+	admin_whitelist_config: Option<Arc<RwLock<Config>>>,
 ) -> Router<AppState> {
 	let mut quote_routes = Router::new().route("/quotes", post(handle_quote));
 	quote_routes = crate::api_hardening::apply_quote_concurrency(quote_routes, api_config);
@@ -456,8 +461,7 @@ fn build_public_api_routes(
 				AuthState {
 					jwt_service: jwt.clone(),
 					required_scope: solver_types::AuthScope::CreateQuotes,
-					// Public-client routes carry no admin scope: no whitelist gating.
-					admin_whitelist_config: None,
+					admin_whitelist_config: admin_whitelist_config.clone(),
 				},
 				auth_middleware,
 			));
@@ -481,7 +485,7 @@ fn build_public_api_routes(
 					AuthState {
 						jwt_service: jwt.clone(),
 						required_scope: solver_types::AuthScope::CreateOrders,
-						admin_whitelist_config: None,
+						admin_whitelist_config: admin_whitelist_config.clone(),
 					},
 					auth_middleware,
 				),
@@ -493,7 +497,7 @@ fn build_public_api_routes(
 					AuthState {
 						jwt_service: jwt.clone(),
 						required_scope: solver_types::AuthScope::ReadOrders,
-						admin_whitelist_config: None,
+						admin_whitelist_config: admin_whitelist_config.clone(),
 					},
 					auth_middleware,
 				));
@@ -1680,7 +1684,12 @@ mod tests {
 
 	async fn test_quote_app(api_config: ApiConfig, jwt_service: Option<Arc<JwtService>>) -> Router {
 		let state = build_test_app_state(None).await;
-		build_public_api_routes(&api_config, jwt_service.as_ref()).with_state(state)
+		build_public_api_routes(
+			&api_config,
+			jwt_service.as_ref(),
+			Some(state.config.clone()),
+		)
+		.with_state(state)
 	}
 
 	async fn build_intake_disabled_test_app_state(discovery_impl: Option<String>) -> AppState {
@@ -2237,6 +2246,75 @@ mod tests {
 			.await
 			.unwrap();
 		assert_eq!(response.status(), StatusCode::FORBIDDEN);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn quotes_route_live_rechecks_admin_all_tokens_when_order_auth_enabled() {
+		use alloy_primitives::Address;
+		use solver_types::{AdminConfig, AdminRole, AdminWhitelistEntry};
+
+		let api_config = ApiConfig {
+			enabled: true,
+			host: "127.0.0.1".to_string(),
+			port: 0,
+			timeout_seconds: 30,
+			max_request_size: 1024 * 1024,
+			implementations: Default::default(),
+			rate_limiting: None,
+			cors: None,
+			auth: Some(test_auth_config()),
+			quote: None,
+		};
+		let jwt = Arc::new(JwtService::new(test_auth_config()).unwrap());
+		let admin_address = Address::from([0x11u8; 20]);
+		let token = jwt
+			.generate_access_token(&admin_address.to_string(), vec![AuthScope::AdminAll])
+			.unwrap();
+
+		let state = build_test_app_state(None).await;
+		{
+			let mut config = state.config.write().await;
+			let api = config.api.get_or_insert_with(|| api_config.clone());
+			api.auth = Some(AuthConfig {
+				admin: Some(AdminConfig {
+					enabled: true,
+					domain: "localhost".to_string(),
+					chain_id: Some(1),
+					nonce_ttl_seconds: 300,
+					whitelist: vec![AdminWhitelistEntry {
+						address: admin_address,
+						role: AdminRole::Admin,
+					}],
+				}),
+				..test_auth_config()
+			});
+		}
+		let app = build_public_api_routes(&api_config, Some(&jwt), Some(state.config.clone()))
+			.with_state(state);
+
+		let response = app
+			.clone()
+			.oneshot(
+				Request::builder()
+					.method("POST")
+					.uri("/quotes")
+					.header("content-type", "application/json")
+					.header("authorization", format!("Bearer {token}"))
+					.body(Body::from("{}"))
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+		assert_ne!(
+			response.status(),
+			StatusCode::UNAUTHORIZED,
+			"still-whitelisted AdminAll token should pass public-route live recheck"
+		);
+		assert_ne!(
+			response.status(),
+			StatusCode::FORBIDDEN,
+			"AdminAll token should still satisfy public CreateQuotes scope"
+		);
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

@@ -25,9 +25,9 @@ pub struct AuthState {
 	/// Required scope for accessing the protected endpoint
 	pub required_scope: AuthScope,
 	/// Live runtime config used to re-validate ADMIN tokens against the current
-	/// admin whitelist on every request. `None` for public-client routes, where
-	/// no whitelist gating applies; `Some` for admin routes so a removed admin's
-	/// still-unexpired access token is rejected immediately rather than at expiry.
+	/// admin whitelist on every request. Public-client routes may omit this only
+	/// for public-client tokens; admin-scoped tokens fail closed when this is
+	/// absent so removed admins cannot reuse `AdminAll` on public scopes.
 	pub admin_whitelist_config: Option<Arc<RwLock<Config>>>,
 }
 
@@ -106,23 +106,36 @@ pub async fn auth_middleware(
 	// For ADMIN-scoped tokens we therefore re-validate the subject against the
 	// live whitelist on every request so revocation takes effect immediately
 	// rather than lingering until the token's own expiry. Public-client tokens
-	// carry no admin scope and skip this (`admin_whitelist_config` is also `None`
-	// on their routes).
+	// carry no admin scope and skip this.
 	let is_admin_scoped = claims
 		.scope
 		.iter()
 		.any(|s| matches!(s, AuthScope::AdminAll | AuthScope::AdminRead));
 	if is_admin_scoped {
-		if let Some(config) = &state.admin_whitelist_config {
-			if !crate::apis::auth::is_live_admin_subject(config, &claims.sub).await {
-				return (
-					StatusCode::UNAUTHORIZED,
-					Json(json!({
-						"error": "Admin token subject is no longer an authorized admin"
-					})),
-				)
-					.into_response();
-			}
+		let Some(config) = &state.admin_whitelist_config else {
+			return (
+				StatusCode::UNAUTHORIZED,
+				Json(json!({
+					"error": "Admin token requires live admin whitelist validation"
+				})),
+			)
+				.into_response();
+		};
+
+		if !crate::apis::auth::is_live_admin_subject_authorized(
+			config,
+			&claims.sub,
+			&state.required_scope,
+		)
+		.await
+		{
+			return (
+				StatusCode::UNAUTHORIZED,
+				Json(json!({
+					"error": "Admin token subject is no longer an authorized admin"
+				})),
+			)
+				.into_response();
 		}
 	}
 
@@ -291,6 +304,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_admin_all_grants_admin_read_route() {
+		use alloy_primitives::Address;
+		use solver_types::{AdminRole, AdminWhitelistEntry};
+
 		let config = AuthConfig {
 			orders_auth_enabled: true,
 			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars"),
@@ -302,11 +318,21 @@ mod tests {
 		};
 
 		let jwt_service = Arc::new(JwtService::new(config).unwrap());
+		let admin_address = Address::from([0x11u8; 20]);
 		let token = jwt_service
-			.generate_access_token("admin", vec![AuthScope::AdminAll])
+			.generate_access_token(&admin_address.to_string(), vec![AuthScope::AdminAll])
 			.unwrap();
 
-		let app = create_test_app_with_scope(jwt_service, AuthScope::AdminRead);
+		let live_config = config_with_admin_whitelist(vec![AdminWhitelistEntry {
+			address: admin_address,
+			role: AdminRole::Admin,
+		}]);
+
+		let app = create_test_app_with_scope_and_config(
+			jwt_service,
+			AuthScope::AdminRead,
+			Some(live_config),
+		);
 		let response = app
 			.oneshot(
 				Request::builder()
@@ -319,6 +345,49 @@ mod tests {
 			.unwrap();
 
 		assert_eq!(response.status(), StatusCode::OK);
+	}
+
+	/// M-25: `AdminAll` grants public-client scopes too. If an admin-scoped token
+	/// reaches a public route where no live admin whitelist config is attached, the
+	/// middleware must fail closed instead of allowing a removed admin through for
+	/// the access-token lifetime.
+	#[tokio::test]
+	async fn test_admin_all_public_route_without_whitelist_config_fails_closed() {
+		use alloy_primitives::Address;
+
+		let config = AuthConfig {
+			orders_auth_enabled: true,
+			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars"),
+			access_token_expiry_hours: 1,
+			refresh_token_expiry_hours: 720,
+			issuer: "test".to_string(),
+			public_register_enabled: false,
+			admin: None,
+		};
+
+		let jwt_service = Arc::new(JwtService::new(config).unwrap());
+		let admin_address = Address::from([0x11u8; 20]);
+		let token = jwt_service
+			.generate_access_token(&admin_address.to_string(), vec![AuthScope::AdminAll])
+			.unwrap();
+
+		let app = create_test_app_with_scope_and_config(jwt_service, AuthScope::CreateQuotes, None);
+		let response = app
+			.oneshot(
+				Request::builder()
+					.uri("/protected")
+					.header("Authorization", format!("Bearer {token}"))
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(
+			response.status(),
+			StatusCode::UNAUTHORIZED,
+			"admin-scoped tokens must not bypass live whitelist rechecks on public routes"
+		);
 	}
 
 	#[tokio::test]
@@ -480,6 +549,55 @@ mod tests {
 			response.status(),
 			StatusCode::UNAUTHORIZED,
 			"a removed admin's still-unexpired access token must be rejected by the middleware"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_demoted_admin_all_access_token_rejected_by_middleware() {
+		use alloy_primitives::Address;
+		use solver_types::{AdminRole, AdminWhitelistEntry};
+
+		let config = AuthConfig {
+			orders_auth_enabled: true,
+			jwt_secret: SecretString::from("test-secret-key-at-least-32-chars"),
+			access_token_expiry_hours: 1,
+			refresh_token_expiry_hours: 720,
+			issuer: "test".to_string(),
+			public_register_enabled: false,
+			admin: None,
+		};
+		let jwt_service = Arc::new(JwtService::new(config).unwrap());
+
+		let admin_address = Address::from([0x11u8; 20]);
+		let token = jwt_service
+			.generate_access_token(&admin_address.to_string(), vec![AuthScope::AdminAll])
+			.unwrap();
+
+		let live_config = config_with_admin_whitelist(vec![AdminWhitelistEntry {
+			address: admin_address,
+			role: AdminRole::ReadOnly,
+		}]);
+
+		let app = create_test_app_with_scope_and_config(
+			jwt_service,
+			AuthScope::AdminAll,
+			Some(live_config),
+		);
+		let response = app
+			.oneshot(
+				Request::builder()
+					.uri("/protected")
+					.header("Authorization", format!("Bearer {token}"))
+					.body(Body::empty())
+					.unwrap(),
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(
+			response.status(),
+			StatusCode::UNAUTHORIZED,
+			"a demoted admin's still-unexpired AdminAll access token must be rejected"
 		);
 	}
 
