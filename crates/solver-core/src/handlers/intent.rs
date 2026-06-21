@@ -420,46 +420,12 @@ impl IntentHandler {
 					priority_fee: None,
 				};
 
-				let simulated_fill_gas = match self
+				let fill_tx = match self
 					.order_service
 					.generate_fill_transaction(&order, &default_params)
 					.await
 				{
-					Ok(fill_tx) => {
-						// Simulate the fill transaction to validate callbacks and get gas estimate
-						match self
-							.cost_profit_service
-							.simulate_callback_and_estimate_gas(&order, &fill_tx, &config)
-							.await
-						{
-							Ok(simulation_result) => {
-								if simulation_result.has_callback {
-									tracing::info!(
-										"✅ Callback simulation passed for order {} - estimated gas: {} units on chain {}",
-										order.id,
-										simulation_result.estimated_gas_units,
-										simulation_result.chain_id
-									);
-								}
-								// Use simulated gas if available, otherwise None (will use config default)
-								if simulation_result.estimated_gas_units > 0 {
-									Some(simulation_result.estimated_gas_units)
-								} else {
-									None
-								}
-							},
-							Err(e) => {
-								tracing::warn!("Order failed callback simulation: {}", e);
-								self.event_bus
-									.publish(SolverEvent::Order(OrderEvent::Skipped {
-										order_id: order.id.clone(),
-										reason: format!("Callback simulation failed: {e}"),
-									}))
-									.ok();
-								return Ok(());
-							},
-						}
-					},
+					Ok(fill_tx) => fill_tx,
 					Err(e) => {
 						// If fill transaction generation fails, skip the order
 						tracing::warn!("Failed to generate fill transaction for simulation: {}", e);
@@ -473,10 +439,49 @@ impl IntentHandler {
 					},
 				};
 
+				// Simulate the fill transaction to validate callbacks and get gas estimate.
+				let simulated_fill_gas = match self
+					.cost_profit_service
+					.simulate_callback_and_estimate_gas(&order, &fill_tx, &config)
+					.await
+				{
+					Ok(simulation_result) => {
+						if simulation_result.has_callback {
+							tracing::info!(
+								"✅ Callback simulation passed for order {} - estimated gas: {} units on chain {}",
+								order.id,
+								simulation_result.estimated_gas_units,
+								simulation_result.chain_id
+							);
+						}
+						// Use simulated gas if available, otherwise None (will use config default).
+						if simulation_result.estimated_gas_units > 0 {
+							Some(simulation_result.estimated_gas_units)
+						} else {
+							None
+						}
+					},
+					Err(e) => {
+						tracing::warn!("Order failed callback simulation: {}", e);
+						self.event_bus
+							.publish(SolverEvent::Order(OrderEvent::Skipped {
+								order_id: order.id.clone(),
+								reason: format!("Callback simulation failed: {e}"),
+							}))
+							.ok();
+						return Ok(());
+					},
+				};
+
 				// Step 2: Calculate cost estimation using simulated gas
 				let cost_estimate = match self
 					.cost_profit_service
-					.estimate_cost_for_order_with_gas(&order, &config, simulated_fill_gas)
+					.estimate_cost_for_order_with_gas(
+						&order,
+						&config,
+						simulated_fill_gas,
+						Some(&fill_tx),
+					)
 					.await
 				{
 					Ok(estimate) => estimate,

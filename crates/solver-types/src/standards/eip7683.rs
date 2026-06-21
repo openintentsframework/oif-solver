@@ -208,6 +208,19 @@ pub const MAX_STANDARD_ORDER_OUTPUTS: usize = 16;
 /// far larger than any real payload needs.
 pub const MAX_CALLBACK_DATA_BYTES: usize = 8192;
 
+/// Maximum byte length accepted for a standard escrow signature payload.
+///
+/// Escrow signatures carry a 1-byte scheme prefix followed by a 65-byte ECDSA
+/// signature.
+pub const MAX_ESCROW_SIGNATURE_BYTES: usize = 66;
+
+/// Maximum byte length accepted for a Compact off-chain order signature payload.
+///
+/// Compact flows carry an ABI-encoded signature payload that may include
+/// allocator data. The 8 KiB cap bounds size-blind origin calldata without
+/// constraining normal compact allocator payloads.
+pub const MAX_ORDER_SIGNATURE_BYTES: usize = 8192;
+
 /// Implementation of OrderParsable for EIP-7683 orders
 #[cfg(feature = "oif-interfaces")]
 impl OrderParsable for Eip7683OrderData {
@@ -1014,9 +1027,12 @@ impl interfaces::StandardOrder {
 						.unwrap_or("0x");
 
 					if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
-						let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
+						let token_bytes = parse_bytes32_from_hex(token_str)
+							.map_err(|e| format!("Invalid token address '{token_str}': {e}"))?;
 						let recipient_bytes =
-							parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
+							parse_bytes32_from_hex(recipient_str).map_err(|e| {
+								format!("Invalid recipient address '{recipient_str}': {e}")
+							})?;
 						let oracle_bytes = parse_bytes32_from_hex(oracle_str)
 							.map_err(|e| format!("Invalid oracle address '{oracle_str}': {e}"))?;
 						let settler_bytes = parse_bytes32_from_hex(settler_str)
@@ -1026,8 +1042,9 @@ impl interfaces::StandardOrder {
 						let callback_bytes = if callback_str == "0x" || callback_str.is_empty() {
 							Vec::new()
 						} else {
-							hex::decode(callback_str.trim_start_matches("0x"))
-								.unwrap_or_else(|_| Vec::new())
+							hex::decode(callback_str.trim_start_matches("0x")).map_err(|e| {
+								format!("Invalid callbackData '{callback_str}': {e}")
+							})?
 						};
 
 						// Parse context from hex
@@ -1035,7 +1052,7 @@ impl interfaces::StandardOrder {
 							Vec::new()
 						} else {
 							hex::decode(context_str.trim_start_matches("0x"))
-								.unwrap_or_else(|_| Vec::new())
+								.map_err(|e| format!("Invalid context '{context_str}': {e}"))?
 						};
 
 						sol_outputs.push(SolMandateOutput {
@@ -1588,6 +1605,111 @@ mod tests {
 		assert_eq!(standard_order.originChainId, U256::from(1u64));
 		assert_eq!(standard_order.outputs.len(), 1);
 		assert_eq!(standard_order.outputs[0].chainId, U256::from(137u64));
+	}
+
+	#[cfg(feature = "oif-interfaces")]
+	#[test]
+	fn test_from_batch_compact_malformed_output_returns_err_not_panic() {
+		use crate::api::{OrderPayload, SignatureType};
+		use crate::OifOrder;
+		use std::convert::TryFrom;
+
+		let make_payload = |output: serde_json::Value| OrderPayload {
+			signature_type: SignatureType::Eip712,
+			domain: serde_json::json!({
+				"name": "The Compact",
+				"version": "1",
+				"chainId": 1,
+				"verifyingContract": "0x6666666666666666666666666666666666666666"
+			}),
+			primary_type: "BatchCompact".to_string(),
+			message: serde_json::json!({
+				"sponsor": "0x1111111111111111111111111111111111111111",
+				"nonce": "1",
+				"expires": "3",
+				"commitments": [
+					{
+						"lockTag": "0x0102030405060708090a0b0c",
+						"token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+						"amount": "1000"
+					}
+				],
+				"mandate": {
+					"fillDeadline": "2",
+					"inputOracle": "0x2222222222222222222222222222222222222222",
+					"outputs": [output]
+				}
+			}),
+			types: None,
+		};
+
+		let missing_token = serde_json::json!({
+			"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
+			"chainId": 137,
+			"amount": "900",
+			"recipient": "0x0000000000000000000000005555555555555555555555555555555555555555",
+			"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
+			"callbackData": "0x",
+			"context": "0x"
+		});
+		let order = OifOrder::OifResourceLockV0 {
+			payload: make_payload(missing_token),
+		};
+		let result = interfaces::StandardOrder::try_from(&order);
+		assert!(
+			result.is_err(),
+			"missing `token` should return Err, not panic"
+		);
+
+		let non_string_recipient = serde_json::json!({
+			"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
+			"chainId": 137,
+			"token": "0x000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+			"amount": "900",
+			"recipient": 12345,
+			"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
+			"callbackData": "0x",
+			"context": "0x"
+		});
+		let order = OifOrder::OifResourceLockV0 {
+			payload: make_payload(non_string_recipient),
+		};
+		let result = interfaces::StandardOrder::try_from(&order);
+		assert!(
+			result.is_err(),
+			"non-string `recipient` should return Err, not panic"
+		);
+
+		let make_valid_output = || {
+			serde_json::json!({
+				"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
+				"chainId": 137,
+				"token": "0x000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+				"amount": "900",
+				"recipient": "0x0000000000000000000000005555555555555555555555555555555555555555",
+				"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
+				"callbackData": "0x",
+				"context": "0x"
+			})
+		};
+
+		for (field, malformed_hex) in [
+			("token", "0x12"),
+			("recipient", "0x12"),
+			("callbackData", "0xzz"),
+			("context", "0xzz"),
+		] {
+			let mut output = make_valid_output();
+			output[field] = serde_json::json!(malformed_hex);
+			let order = OifOrder::OifResourceLockV0 {
+				payload: make_payload(output),
+			};
+			let result = interfaces::StandardOrder::try_from(&order);
+			assert!(
+				result.is_err(),
+				"malformed `{field}` hex should return Err, not be defaulted"
+			);
+		}
 	}
 
 	#[test]

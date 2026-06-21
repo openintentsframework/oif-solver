@@ -16,8 +16,8 @@ use solver_types::{
 			IInputSettlerCompact, IInputSettlerEscrow, IOutputSettlerSimple, SolMandateOutput,
 			SolveParams, StandardOrder,
 		},
-		GasLimitOverrides, LockType, MAX_CALLBACK_DATA_BYTES, MAX_STANDARD_ORDER_INPUTS,
-		MAX_STANDARD_ORDER_OUTPUTS,
+		GasLimitOverrides, LockType, MAX_CALLBACK_DATA_BYTES, MAX_ESCROW_SIGNATURE_BYTES,
+		MAX_ORDER_SIGNATURE_BYTES, MAX_STANDARD_ORDER_INPUTS, MAX_STANDARD_ORDER_OUTPUTS,
 	},
 	utils::conversion::hex_to_alloy_address,
 	Address, ConfigSchema, Eip7683OrderData, ExecutionParams, FillProof, NetworksConfig, Order,
@@ -857,6 +857,20 @@ impl OrderInterface for Eip7683OrderImpl {
 			Some(data) => Eip7683OrderData::try_from(data).unwrap_or_else(|_| canonical.clone()),
 			None => canonical.clone(),
 		};
+		if let Some(signature) = order_data.signature.as_deref() {
+			let hex_payload = signature.strip_prefix("0x").unwrap_or(signature);
+			let byte_len = (hex_payload.len() + 1) / 2;
+			let max_signature_bytes = match lock_type {
+				LockType::ResourceLock => MAX_ORDER_SIGNATURE_BYTES,
+				LockType::Permit2Escrow | LockType::Eip3009Escrow => MAX_ESCROW_SIGNATURE_BYTES,
+			};
+
+			if byte_len > max_signature_bytes {
+				return Err(OrderError::ValidationFailed(format!(
+					"signature payload is too large: {byte_len} bytes exceeds {max_signature_bytes} byte limit"
+				)));
+			}
+		}
 
 		// Canonicalize security-critical fields from the decoded StandardOrder; intent_data only contributes sponsor/signature/settlement_name/lock_type.
 		order_data.input_oracle = canonical.input_oracle;
@@ -2513,5 +2527,98 @@ mod tests {
 			stored.signature.is_some(),
 			"signature from intent_data was not preserved"
 		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_rejects_oversized_signature() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let standard_order = create_valid_standard_order();
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let mut data = create_test_order_data();
+		let oversized_bytes = MAX_ORDER_SIGNATURE_BYTES + 1;
+		data.signature = Some(format!("0x{}", "ab".repeat(oversized_bytes)));
+
+		let intent_data = Some(serde_json::to_value(&data).unwrap());
+		let solver_address = Address(vec![0x99; 20]);
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&intent_data,
+				"permit2_escrow",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await;
+
+		assert!(
+			matches!(result, Err(OrderError::ValidationFailed(ref msg)) if msg.contains("signature")),
+			"oversized signature payload should be rejected: {result:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_rejects_oversized_escrow_signature() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let standard_order = create_valid_standard_order();
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let mut data = create_test_order_data();
+		data.signature = Some(format!("0x{}", "ab".repeat(67)));
+
+		let intent_data = Some(serde_json::to_value(&data).unwrap());
+		let solver_address = Address(vec![0x99; 20]);
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&intent_data,
+				"permit2_escrow",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await;
+
+		assert!(
+			matches!(result, Err(OrderError::ValidationFailed(ref msg)) if msg.contains("signature")),
+			"oversized escrow signature should be rejected: {result:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_accepts_max_escrow_signature() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let standard_order = create_valid_standard_order();
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let mut data = create_test_order_data();
+		data.signature = Some(format!("0x{}", "ab".repeat(MAX_ESCROW_SIGNATURE_BYTES)));
+
+		let intent_data = Some(serde_json::to_value(&data).unwrap());
+		let solver_address = Address(vec![0x99; 20]);
+
+		order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&intent_data,
+				"permit2_escrow",
+				Box::new(mock_order_id_callback),
+				&solver_address,
+				None,
+			)
+			.await
+			.expect("max-size prefixed escrow signature should be accepted");
 	}
 }
