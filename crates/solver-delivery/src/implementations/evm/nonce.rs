@@ -240,6 +240,13 @@ pub fn classify_submission_outcome(message: &str) -> SubmissionOutcome {
 		|| lower.contains("fee cap less than block base fee")
 		|| lower.contains("max fee per gas below block base fee");
 
+	// EIP-1559 tip-above-cap: geth `ErrTipAboveFeeCap` in core/error.go,
+	// "max priority fee per gas higher than max fee per gas". This is a
+	// pre-pool transaction validation (ValidateTransaction / GasFeeCapTooLow
+	// guard), so the tx never entered any mempool — safe to roll back the
+	// nonce. Without this it falls through to `Ambiguous` and leaks the nonce.
+	let tip_above_fee_cap = lower.contains("max priority fee per gas higher than max fee per gas");
+
 	if lower.contains("insufficient funds")
 		|| lower.contains("transaction underpriced")
 		|| lower.contains("intrinsic gas too low")
@@ -248,6 +255,8 @@ pub fn classify_submission_outcome(message: &str) -> SubmissionOutcome {
 		|| fee_cap_below_base_fee
 		// Nonce upper-bound (the lower-bound `nonce too low` was handled above)
 		|| lower.contains("nonce too high")
+		// EIP-1559 priority-fee > fee-cap (geth ErrTipAboveFeeCap)
+		|| tip_above_fee_cap
 		// Signature / sender / chain pre-validation
 		|| lower.contains("invalid sender")
 		|| lower.contains("invalid signature")
@@ -580,6 +589,20 @@ mod tests {
 		);
 		assert_eq!(
 			classify_submission_outcome("max fee per gas below block base fee"),
+			DefinitelyRejected
+		);
+		// EIP-1559 tip-above-cap: geth `ErrTipAboveFeeCap`. Pre-pool validation
+		// rejection — the tx never entered any mempool, so the nonce is safe to
+		// roll back. Must not fall through to `Ambiguous` (would leak the nonce).
+		assert_eq!(
+			classify_submission_outcome("max priority fee per gas higher than max fee per gas"),
+			DefinitelyRejected
+		);
+		assert_eq!(
+			classify_submission_outcome(
+				"err: max priority fee per gas higher than max fee per gas: \
+				 address 0x..., maxPriorityFeePerGas: 2, maxFeePerGas: 1"
+			),
 			DefinitelyRejected
 		);
 	}

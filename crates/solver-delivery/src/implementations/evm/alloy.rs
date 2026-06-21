@@ -48,6 +48,20 @@ const TX_CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Best-effort startup nonce reads must not block solver startup indefinitely
 /// when an RPC endpoint accepts connections but does not respond.
 const INITIAL_NONCE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// TCP connect timeout for the HTTP RPC transport. Caps the time spent waiting
+/// for a connection before an RPC call can fail and be retried/looped.
+const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-request timeout for the HTTP RPC transport. Bounds a single RPC call so
+/// an endpoint that accepts but never answers cannot hang a request forever.
+/// This is the transport-level backstop beneath the per-call `tokio::time::timeout`
+/// in `poll_for_confirmation` (M-12).
+const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Upper bound on any single confirmation probe call. Each `get_receipt` /
+/// `get_block_number` await in `poll_for_confirmation` is wrapped in
+/// `tokio::time::timeout(min(remaining_budget, this), ..)` so the loop always
+/// returns to the deadline check and the confirmation timeout is enforced even
+/// when an RPC call never answers (M-12).
+const RPC_PROBE_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Drift-monitor parameters. The monitor periodically compares local nonce
 /// cache against chain pending. Some lead is normal during in-flight
@@ -637,8 +651,27 @@ impl AlloyDelivery {
 				10,   // cups: compute units per second
 			);
 
-			// Create RPC client with retry capabilities
-			let client = RpcClient::builder().layer(retry_layer).http(url);
+			// Build the underlying reqwest client with explicit connect and
+			// request timeouts so an RPC endpoint that accepts connections but
+			// never answers cannot hang a call indefinitely (M-12). Without
+			// these, `RetryBackoffLayer` retries a hung call but never bounds
+			// each attempt, so `tx_confirmation_timeout_seconds` is unenforceable.
+			let http_client = reqwest::Client::builder()
+				.connect_timeout(RPC_CONNECT_TIMEOUT)
+				.timeout(RPC_REQUEST_TIMEOUT)
+				.build()
+				.map_err(|e| {
+					DeliveryError::Network(format!(
+						"Failed to build HTTP client for network {network_id}: {e}"
+					))
+				})?;
+
+			// Create RPC client with retry capabilities over the timeout-bounded
+			// HTTP transport. `http_with_client` preserves the RetryBackoffLayer
+			// while swapping in our pre-built reqwest client.
+			let client = RpcClient::builder()
+				.layer(retry_layer)
+				.http_with_client(http_client, url);
 
 			// Build the provider WITHOUT a NonceFiller — we own nonce assignment via
 			// `ResettableNonceManager` so we can resync from chain after a
@@ -3252,14 +3285,36 @@ async fn poll_for_confirmation(
 	tracing::debug!(?tx_hash, min_confirmations, "Starting tx confirmation poll");
 
 	loop {
-		if Instant::now() >= deadline {
+		let remaining = deadline.saturating_duration_since(Instant::now());
+		if remaining.is_zero() {
 			tracing::warn!(?tx_hash, "Tx confirmation deadline reached → Indeterminate");
 			return PollOutcome::Indeterminate(format!(
 				"Tx {tx_hash:?} did not reach {min_confirmations} confirmations within timeout"
 			));
 		}
 
-		match probe.get_receipt(tx_hash).await {
+		// Bound each RPC call so a hung endpoint (accepts but never answers)
+		// cannot stall confirmation monitoring past `confirmation_timeout`
+		// (M-12). A per-call timeout is treated as a transient error: we loop
+		// back to the deadline check, which terminalizes the budget when
+		// exhausted. The bound is min(remaining budget, RPC_PROBE_CALL_TIMEOUT)
+		// so we never wait longer than the overall confirmation deadline.
+		let call_budget = remaining.min(RPC_PROBE_CALL_TIMEOUT);
+
+		let receipt_result =
+			match tokio::time::timeout(call_budget, probe.get_receipt(tx_hash)).await {
+				Ok(result) => result,
+				Err(_) => {
+					tracing::warn!(
+						?tx_hash,
+						"get_transaction_receipt timed out; will retry until deadline"
+					);
+					// Skip the sleep — the budget already elapsed; re-check deadline.
+					continue;
+				},
+			};
+
+		match receipt_result {
 			Ok(Some(receipt)) => {
 				if !receipt.status() {
 					tracing::warn!(?tx_hash, "Tx reverted on chain");
@@ -3277,7 +3332,24 @@ async fn poll_for_confirmation(
 						continue;
 					},
 				};
-				match probe.get_block_number().await {
+				// Re-derive the call budget: the receipt fetch above may have
+				// consumed part of the overall deadline (M-12).
+				let block_budget = deadline
+					.saturating_duration_since(Instant::now())
+					.min(RPC_PROBE_CALL_TIMEOUT);
+				let block_result =
+					match tokio::time::timeout(block_budget, probe.get_block_number()).await {
+						Ok(result) => result,
+						Err(_) => {
+							tracing::warn!(
+								?tx_hash,
+								"get_block_number timed out; will retry until deadline"
+							);
+							// Budget elapsed — re-check deadline without sleeping.
+							continue;
+						},
+					};
+				match block_result {
 					Ok(current_block) => {
 						let confirmations = current_block.saturating_sub(receipt_block);
 						if last_logged_confirmations != Some(confirmations) {
@@ -4526,6 +4598,47 @@ mod tests {
 			assert!(
 				matches!(outcome, PollOutcome::Indeterminate(_)),
 				"expected Indeterminate on deadline; got {outcome:?}",
+			);
+		}
+
+		/// Probe whose `get_receipt` never resolves, simulating an RPC endpoint
+		/// that accepts the request but never answers (M-12). With unbounded
+		/// awaits in `poll_for_confirmation`, this hangs forever and the
+		/// confirmation timeout is never enforced.
+		struct HangingProbe;
+
+		#[async_trait]
+		impl ConfirmationProbe for HangingProbe {
+			async fn get_receipt(
+				&self,
+				_tx_hash: B256,
+			) -> Result<Option<AlloyReceipt>, TransportError> {
+				// Never resolves.
+				std::future::pending().await
+			}
+
+			async fn get_block_number(&self) -> Result<u64, TransportError> {
+				std::future::pending().await
+			}
+		}
+
+		#[tokio::test]
+		async fn returns_within_deadline_when_probe_hangs() {
+			// M-12: an RPC call that hangs must not stall confirmation monitoring
+			// past `confirmation_timeout`. Each probe call is bounded so the loop
+			// returns to the deadline check; the overall budget (TIMEOUT_SHORT)
+			// must be enforced. We wrap in a generous outer timeout so a hang
+			// fails the test loudly instead of stalling CI.
+			let probe = HangingProbe;
+			let outcome = tokio::time::timeout(
+				Duration::from_secs(5),
+				poll_for_confirmation(&probe, B256::ZERO, 3, TIMEOUT_SHORT, POLL),
+			)
+			.await
+			.expect("poll_for_confirmation must return within the confirmation deadline");
+			assert!(
+				matches!(outcome, PollOutcome::Indeterminate(_)),
+				"expected Indeterminate when probe hangs past deadline; got {outcome:?}",
 			);
 		}
 
