@@ -254,13 +254,19 @@ pub async fn register_client(
 /// Handles POST /api/v1/auth/refresh requests.
 ///
 /// This endpoint exchanges a valid refresh token for new access and refresh tokens.
+///
+/// For admin-scoped refresh tokens, the embedded scope is NOT trusted: the
+/// subject is re-checked against the LIVE admin whitelist and its scope is
+/// re-derived from the current role. A removed admin is rejected; a demoted
+/// admin receives the reduced scope. Non-admin (client) tokens keep their
+/// embedded scope unchanged.
 pub async fn refresh_token(
-	State(jwt_service): State<Option<Arc<JwtService>>>,
+	State(state): State<SiweAuthState>,
 	Json(request): Json<RefreshRequest>,
 ) -> impl IntoResponse {
 	// Check if JWT service is configured
-	let jwt_service = match jwt_service {
-		Some(service) => service,
+	let jwt_service = match &state.jwt_service {
+		Some(service) => service.clone(),
 		None => {
 			return (
 				StatusCode::SERVICE_UNAVAILABLE,
@@ -271,16 +277,6 @@ pub async fn refresh_token(
 				.into_response();
 		},
 	};
-
-	if !jwt_service.config().orders_auth_enabled {
-		return (
-			StatusCode::SERVICE_UNAVAILABLE,
-			Json(json!({
-				"error": "Public-client JWT authentication is disabled (orders_auth_enabled = false)"
-			})),
-		)
-			.into_response();
-	}
 
 	// Validate refresh token is not empty
 	if request.refresh_token.is_empty() {
@@ -293,12 +289,96 @@ pub async fn refresh_token(
 			.into_response();
 	}
 
-	// Exchange refresh token for new tokens. `refresh_access_token` is the
-	// authoritative refresh-flow gate: it rejects anything that isn't a
-	// refresh-typed JWT, and it hands back the access-token claims it just
-	// constructed so the response can be built without a second decode.
+	// Peek at the refresh token's claims so we can decide whether it is
+	// admin-scoped. `decode_refresh_claims` rejects anything that isn't a
+	// refresh-typed JWT, so it also serves as the type gate.
+	let claims = match jwt_service.decode_refresh_claims(&request.refresh_token) {
+		Ok(claims) => claims,
+		Err(e) => {
+			tracing::warn!("Failed to refresh token: {}", e);
+			return (
+				StatusCode::UNAUTHORIZED,
+				Json(json!({
+					"error": "Invalid or expired refresh token"
+				})),
+			)
+				.into_response();
+		},
+	};
+
+	// Admin-scoped tokens must be re-validated against the LIVE whitelist on
+	// every refresh. Copying the embedded scope would let a removed or demoted
+	// admin self-renew access for the lifetime of the refresh token.
+	let is_admin_scoped = claims
+		.scope
+		.iter()
+		.any(|s| matches!(s, AuthScope::AdminAll | AuthScope::AdminRead));
+
+	// The orders gate is a PUBLIC-CLIENT control. It must run only after we know
+	// the token's scope, and must NOT block admin-scoped (SIWE) tokens: an
+	// admin-only deployment keeps `orders_auth_enabled = false` yet must still let
+	// admins refresh. Admin refresh is instead gated by the live whitelist check
+	// below (admin auth must be configured for `resolve_siwe_runtime_config` to
+	// succeed).
+	if !is_admin_scoped && !jwt_service.config().orders_auth_enabled {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			Json(json!({
+				"error": "Public-client JWT authentication is disabled (orders_auth_enabled = false)"
+			})),
+		)
+			.into_response();
+	}
+
+	let scope_override = if is_admin_scoped {
+		let runtime = match resolve_siwe_runtime_config(&state.config).await {
+			Ok(runtime) => runtime,
+			Err(response) => return response,
+		};
+
+		let address = match parse_eth_address(&claims.sub) {
+			Ok(address) => address,
+			Err(_) => {
+				tracing::warn!(
+					subject = %claims.sub,
+					"Rejected admin token refresh: subject is not a valid address"
+				);
+				return (
+					StatusCode::UNAUTHORIZED,
+					Json(json!({
+						"error": "Admin token subject is not authorized"
+					})),
+				)
+					.into_response();
+			},
+		};
+
+		match resolve_siwe_scopes(&runtime, &address) {
+			Some(scopes) => Some(scopes),
+			None => {
+				tracing::warn!(
+					subject = %claims.sub,
+					"Rejected admin token refresh: subject is no longer an authorized admin"
+				);
+				return (
+					StatusCode::UNAUTHORIZED,
+					Json(json!({
+						"error": "Admin token subject is no longer an authorized admin"
+					})),
+				)
+					.into_response();
+			},
+		}
+	} else {
+		None
+	};
+
+	// Exchange refresh token for new tokens. For admin tokens we pass the
+	// freshly-resolved scope; for client tokens we pass `None` to preserve the
+	// embedded scope. The returned access-token claims are reused for the
+	// response body without a second decode.
 	let (new_access_token, new_refresh_token, access_claims) = match jwt_service
-		.refresh_access_token(&request.refresh_token)
+		.refresh_access_token_with_scopes(&request.refresh_token, scope_override)
 		.await
 	{
 		Ok(tokens) => tokens,
@@ -564,6 +644,35 @@ fn resolve_siwe_scopes(
 		Some(AdminRole::ReadOnly) => Some(vec![AuthScope::AdminRead]),
 		None => None,
 	}
+}
+
+/// Returns `true` iff `subject` still resolves to a live admin role whose
+/// current scopes grant `required_scope`.
+///
+/// This is the same live-config / whitelist source the refresh path consults
+/// (`resolve_siwe_runtime_config` + `SiweRuntimeConfig::role_for`, ultimately
+/// `AdminConfig::normalized_whitelist`). The auth middleware reuses it so an
+/// already-issued admin access token stops working the moment the admin is
+/// removed or demoted below the route's required scope — instead of remaining
+/// valid until the token's own expiry. A `false` result covers both "no longer
+/// whitelisted" and "admin auth is not configured / disabled" (in which case
+/// `resolve_siwe_runtime_config` errors).
+pub async fn is_live_admin_subject_authorized(
+	config: &Arc<RwLock<Config>>,
+	subject: &str,
+	required_scope: &AuthScope,
+) -> bool {
+	let runtime = match resolve_siwe_runtime_config(config).await {
+		Ok(runtime) => runtime,
+		Err(_) => return false,
+	};
+	let address = match parse_eth_address(subject) {
+		Ok(address) => address,
+		Err(_) => return false,
+	};
+	resolve_siwe_scopes(&runtime, &address)
+		.map(|scopes| scopes.iter().any(|scope| scope.grants(required_scope)))
+		.unwrap_or(false)
 }
 
 async fn siwe_dependencies(
@@ -868,6 +977,17 @@ mod tests {
 			config: Arc::new(RwLock::new(config)),
 			siwe_nonce_store,
 		}
+	}
+
+	/// Build a `SiweAuthState` for exercising the `refresh_token` handler.
+	/// `whitelist` is the LIVE admin whitelist the refresh path re-validates
+	/// admin-scoped tokens against; it is irrelevant for non-admin client
+	/// tokens.
+	fn create_refresh_state(
+		jwt_service: Option<Arc<JwtService>>,
+		whitelist: Vec<AdminWhitelistEntry>,
+	) -> SiweAuthState {
+		create_test_siwe_state_with_whitelist(jwt_service, true, whitelist, None)
 	}
 
 	async fn create_signed_siwe_verify_request(
@@ -1241,7 +1361,8 @@ mod tests {
 			refresh_token: refresh_token_str,
 		};
 
-		let response = refresh_token(axum::extract::State(Some(jwt_service)), Json(request)).await;
+		let state = create_refresh_state(Some(jwt_service), vec![]);
+		let response = refresh_token(axum::extract::State(state), Json(request)).await;
 
 		let response_obj = response.into_response();
 		let (parts, body) = response_obj.into_parts();
@@ -1262,7 +1383,8 @@ mod tests {
 			refresh_token: "some-token".to_string(),
 		};
 
-		let response = refresh_token(axum::extract::State(None), Json(request)).await;
+		let state = create_refresh_state(None, vec![]);
+		let response = refresh_token(axum::extract::State(state), Json(request)).await;
 
 		let response_obj = response.into_response();
 		let (parts, body) = response_obj.into_parts();
@@ -1282,7 +1404,8 @@ mod tests {
 			refresh_token: "".to_string(),
 		};
 
-		let response = refresh_token(axum::extract::State(Some(jwt_service)), Json(request)).await;
+		let state = create_refresh_state(Some(jwt_service), vec![]);
+		let response = refresh_token(axum::extract::State(state), Json(request)).await;
 
 		let response_obj = response.into_response();
 		let (parts, body) = response_obj.into_parts();
@@ -1295,11 +1418,19 @@ mod tests {
 	#[tokio::test]
 	async fn test_refresh_token_auth_disabled() {
 		let jwt_service = create_test_jwt_service_with(false, true);
+		// A VALID public-client refresh token: the orders gate now fires after the
+		// token is decoded (so admin tokens can bypass it), so the token must
+		// decode for the gate to be the failure point rather than a decode error.
+		let refresh_token_str = jwt_service
+			.generate_refresh_token("test-client", vec![AuthScope::ReadOrders])
+			.await
+			.unwrap();
 		let request = RefreshRequest {
-			refresh_token: "some-token".to_string(),
+			refresh_token: refresh_token_str,
 		};
 
-		let response = refresh_token(axum::extract::State(Some(jwt_service)), Json(request)).await;
+		let state = create_refresh_state(Some(jwt_service), vec![]);
+		let response = refresh_token(axum::extract::State(state), Json(request)).await;
 
 		let response_obj = response.into_response();
 		let (parts, body) = response_obj.into_parts();
@@ -1318,7 +1449,8 @@ mod tests {
 			refresh_token: "invalid-token".to_string(),
 		};
 
-		let response = refresh_token(axum::extract::State(Some(jwt_service)), Json(request)).await;
+		let state = create_refresh_state(Some(jwt_service), vec![]);
+		let response = refresh_token(axum::extract::State(state), Json(request)).await;
 
 		let response_obj = response.into_response();
 		let (parts, body) = response_obj.into_parts();
@@ -1452,8 +1584,17 @@ mod tests {
 		let original_refresh_token = siwe_tokens.refresh_token.clone();
 		assert_eq!(siwe_tokens.scopes, vec!["admin-all"]);
 
+		// Live whitelist still lists the signer as Admin — the refresh must
+		// succeed and preserve the full admin scope.
+		let refresh_state = create_refresh_state(
+			Some(jwt_service.clone()),
+			vec![AdminWhitelistEntry {
+				address: signer_address,
+				role: AdminRole::Admin,
+			}],
+		);
 		let refresh_response = refresh_token(
-			State(Some(jwt_service.clone())),
+			State(refresh_state),
 			Json(RefreshRequest {
 				refresh_token: original_refresh_token.clone(),
 			}),
@@ -1481,6 +1622,170 @@ mod tests {
 			.validate_token(&refreshed_tokens.refresh_token)
 			.expect_err("rotated refresh token must not validate as access");
 		assert!(matches!(err, AuthError::InvalidAccessToken(_)));
+	}
+
+	/// M-25 (a): An admin-scoped refresh token whose subject has been removed
+	/// from the LIVE admin whitelist must be rejected. Copying the embedded
+	/// scope would let a removed admin self-renew access for the full lifetime
+	/// of the refresh token (up to 30 days).
+	#[tokio::test]
+	async fn test_refresh_removed_admin_is_rejected() {
+		let jwt_service = create_test_jwt_service_with(true, false);
+		let signer = create_test_siwe_signer();
+		let signer_address = signer.address();
+
+		// Admin minted a refresh token while whitelisted.
+		let refresh_token_str = jwt_service
+			.generate_refresh_token(&signer_address.to_string(), vec![AuthScope::AdminAll])
+			.await
+			.unwrap();
+
+		// They have since been removed: the live whitelist no longer lists them.
+		let state = create_refresh_state(Some(jwt_service), vec![]);
+		let response = refresh_token(
+			axum::extract::State(state),
+			Json(RefreshRequest {
+				refresh_token: refresh_token_str,
+			}),
+		)
+		.await;
+
+		let response_obj = response.into_response();
+		let (parts, _body) = response_obj.into_parts();
+		assert_eq!(
+			parts.status,
+			StatusCode::UNAUTHORIZED,
+			"a removed admin must not be able to refresh an admin-scoped token"
+		);
+	}
+
+	/// M-25 (b): A demoted admin's refreshed token must carry the CURRENT
+	/// reduced scope (admin-read), not the elevated scope embedded in the old
+	/// refresh token (admin-all).
+	#[tokio::test]
+	async fn test_refresh_demoted_admin_gets_reduced_scope() {
+		let jwt_service = create_test_jwt_service_with(true, false);
+		let signer = create_test_siwe_signer();
+		let signer_address = signer.address();
+
+		// Admin minted a full-admin refresh token while elevated.
+		let refresh_token_str = jwt_service
+			.generate_refresh_token(&signer_address.to_string(), vec![AuthScope::AdminAll])
+			.await
+			.unwrap();
+
+		// They have since been demoted to read-only in the live whitelist.
+		let state = create_refresh_state(
+			Some(jwt_service.clone()),
+			vec![AdminWhitelistEntry {
+				address: signer_address,
+				role: AdminRole::ReadOnly,
+			}],
+		);
+		let response = refresh_token(
+			axum::extract::State(state),
+			Json(RefreshRequest {
+				refresh_token: refresh_token_str,
+			}),
+		)
+		.await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::OK);
+
+		let json_body = extract_json_from_body(body).await;
+		let refreshed: RegisterResponse = serde_json::from_value(json_body).unwrap();
+		assert_eq!(
+			refreshed.scopes,
+			vec!["admin-read"],
+			"refreshed token must carry the demoted (read-only) scope, not the embedded admin-all"
+		);
+
+		// The encoded access token must also carry only the reduced scope.
+		let access_claims = jwt_service.validate_token(&refreshed.access_token).unwrap();
+		assert_eq!(access_claims.scope, vec![AuthScope::AdminRead]);
+		assert!(!JwtService::check_scope(
+			&access_claims,
+			&AuthScope::AdminAll
+		));
+	}
+
+	/// M-25 (a): An admin-scoped refresh must succeed even when
+	/// `orders_auth_enabled = false`. The orders gate is a public-client control;
+	/// it must not block an admin (SIWE) token from refreshing in an admin-only
+	/// deployment. Pre-fix the gate fired before the token was decoded, returning
+	/// 503 for everyone — including admins.
+	#[tokio::test]
+	async fn test_refresh_admin_succeeds_when_orders_auth_disabled() {
+		// orders_auth_enabled = false (admin-only config), admin auth configured.
+		let jwt_service = create_test_jwt_service_with(false, false);
+		let signer = create_test_siwe_signer();
+		let signer_address = signer.address();
+
+		let refresh_token_str = jwt_service
+			.generate_refresh_token(&signer_address.to_string(), vec![AuthScope::AdminAll])
+			.await
+			.unwrap();
+
+		// The admin is on the LIVE whitelist.
+		let state = create_refresh_state(
+			Some(jwt_service),
+			vec![AdminWhitelistEntry {
+				address: signer_address,
+				role: AdminRole::Admin,
+			}],
+		);
+		let response = refresh_token(
+			axum::extract::State(state),
+			Json(RefreshRequest {
+				refresh_token: refresh_token_str,
+			}),
+		)
+		.await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(
+			parts.status,
+			StatusCode::OK,
+			"admin-scoped refresh must succeed when orders_auth_enabled=false"
+		);
+
+		let json_body = extract_json_from_body(body).await;
+		let refreshed: RegisterResponse = serde_json::from_value(json_body).unwrap();
+		assert_eq!(refreshed.scopes, vec!["admin-all"]);
+	}
+
+	/// M-25 (a): The orders gate must STILL block a public-client refresh when
+	/// `orders_auth_enabled = false`. The gate moved after token decode, but its
+	/// effect for non-admin tokens is unchanged.
+	#[tokio::test]
+	async fn test_refresh_public_client_blocked_when_orders_auth_disabled() {
+		let jwt_service = create_test_jwt_service_with(false, false);
+
+		let refresh_token_str = jwt_service
+			.generate_refresh_token("test-client", vec![AuthScope::ReadOrders])
+			.await
+			.unwrap();
+
+		let state = create_refresh_state(Some(jwt_service), vec![]);
+		let response = refresh_token(
+			axum::extract::State(state),
+			Json(RefreshRequest {
+				refresh_token: refresh_token_str,
+			}),
+		)
+		.await;
+
+		let response_obj = response.into_response();
+		let (parts, body) = response_obj.into_parts();
+		assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
+		let json_body = extract_json_from_body(body).await;
+		assert_eq!(
+			json_body["error"],
+			"Public-client JWT authentication is disabled (orders_auth_enabled = false)"
+		);
 	}
 
 	/// Locks in the API-separation hot-fix on the verify path: SIWE verify must
