@@ -198,6 +198,29 @@ pub const MAX_STANDARD_ORDER_INPUTS: usize = 16;
 /// Maximum number of StandardOrder outputs accepted before any RPC-backed validation.
 pub const MAX_STANDARD_ORDER_OUTPUTS: usize = 16;
 
+/// Maximum byte length of a single output's `callbackData` (`MandateOutput.call`)
+/// accepted before any RPC-backed validation.
+///
+/// 8 KiB comfortably exceeds any legitimate callback payload while bounding the
+/// size-blind open/claim calldata gas charged at quote/order time: static gas units
+/// are estimated independently of `callbackData` length, so an oversized callback would
+/// be underpriced (solver loss). The previous core guard allowed `u16::MAX` (64 KiB),
+/// far larger than any real payload needs.
+pub const MAX_CALLBACK_DATA_BYTES: usize = 8192;
+
+/// Maximum byte length accepted for a standard escrow signature payload.
+///
+/// Escrow signatures carry a 1-byte scheme prefix followed by a 65-byte ECDSA
+/// signature.
+pub const MAX_ESCROW_SIGNATURE_BYTES: usize = 66;
+
+/// Maximum byte length accepted for a Compact off-chain order signature payload.
+///
+/// Compact flows carry an ABI-encoded signature payload that may include
+/// allocator data. The 8 KiB cap bounds size-blind origin calldata without
+/// constraining normal compact allocator payloads.
+pub const MAX_ORDER_SIGNATURE_BYTES: usize = 8192;
+
 /// Implementation of OrderParsable for EIP-7683 orders
 #[cfg(feature = "oif-interfaces")]
 impl OrderParsable for Eip7683OrderData {
@@ -588,13 +611,22 @@ impl interfaces::StandardOrder {
 					.get("amount")
 					.and_then(|a| a.as_str())
 					.unwrap_or("0");
-				let token_str = output_obj.get("token").and_then(|t| t.as_str()).unwrap();
+				let token_str = output_obj
+					.get("token")
+					.and_then(|t| t.as_str())
+					.ok_or("Missing or invalid token in output")?;
 				let recipient_str = output_obj
 					.get("recipient")
 					.and_then(|r| r.as_str())
-					.unwrap();
-				let oracle_str = output_obj.get("oracle").and_then(|o| o.as_str()).unwrap();
-				let settler_str = output_obj.get("settler").and_then(|s| s.as_str()).unwrap();
+					.ok_or("Missing or invalid recipient in output")?;
+				let oracle_str = output_obj
+					.get("oracle")
+					.and_then(|o| o.as_str())
+					.ok_or("Missing or invalid oracle in output")?;
+				let settler_str = output_obj
+					.get("settler")
+					.and_then(|s| s.as_str())
+					.ok_or("Missing or invalid settler in output")?;
 				let callback_str = output_obj
 					.get("callbackData")
 					.and_then(|c| c.as_str())
@@ -605,18 +637,21 @@ impl interfaces::StandardOrder {
 					.unwrap_or("0x");
 
 				if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
-					let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
-					let recipient_bytes =
-						parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
-					let oracle_bytes = parse_bytes32_from_hex(oracle_str).unwrap_or([0u8; 32]);
-					let settler_bytes = parse_bytes32_from_hex(settler_str).unwrap_or([0u8; 32]);
+					let token_bytes = parse_bytes32_from_hex(token_str)
+						.map_err(|e| format!("Invalid token address '{token_str}': {e}"))?;
+					let recipient_bytes = parse_bytes32_from_hex(recipient_str)
+						.map_err(|e| format!("Invalid recipient address '{recipient_str}': {e}"))?;
+					let oracle_bytes = parse_bytes32_from_hex(oracle_str)
+						.map_err(|e| format!("Invalid oracle address '{oracle_str}': {e}"))?;
+					let settler_bytes = parse_bytes32_from_hex(settler_str)
+						.map_err(|e| format!("Invalid settler address '{settler_str}': {e}"))?;
 
 					// Parse callbackData from hex
 					let callback_bytes = if callback_str == "0x" || callback_str.is_empty() {
 						Vec::new()
 					} else {
 						hex::decode(callback_str.trim_start_matches("0x"))
-							.unwrap_or_else(|_| Vec::new())
+							.map_err(|e| format!("Invalid callbackData '{callback_str}': {e}"))?
 					};
 
 					// Parse context from hex
@@ -624,7 +659,7 @@ impl interfaces::StandardOrder {
 						Vec::new()
 					} else {
 						hex::decode(context_str.trim_start_matches("0x"))
-							.unwrap_or_else(|_| Vec::new())
+							.map_err(|e| format!("Invalid context '{context_str}': {e}"))?
 					};
 
 					sol_outputs.push(SolMandateOutput {
@@ -969,13 +1004,22 @@ impl interfaces::StandardOrder {
 						.get("amount")
 						.and_then(|a| a.as_str())
 						.unwrap_or("0");
-					let token_str = output_obj.get("token").and_then(|t| t.as_str()).unwrap();
+					let token_str = output_obj
+						.get("token")
+						.and_then(|t| t.as_str())
+						.ok_or("Missing or invalid token in output")?;
 					let recipient_str = output_obj
 						.get("recipient")
 						.and_then(|r| r.as_str())
-						.unwrap();
-					let oracle_str = output_obj.get("oracle").and_then(|o| o.as_str()).unwrap();
-					let settler_str = output_obj.get("settler").and_then(|s| s.as_str()).unwrap();
+						.ok_or("Missing or invalid recipient in output")?;
+					let oracle_str = output_obj
+						.get("oracle")
+						.and_then(|o| o.as_str())
+						.ok_or("Missing or invalid oracle in output")?;
+					let settler_str = output_obj
+						.get("settler")
+						.and_then(|s| s.as_str())
+						.ok_or("Missing or invalid settler in output")?;
 					let callback_str = output_obj
 						.get("callbackData")
 						.and_then(|c| c.as_str())
@@ -986,9 +1030,12 @@ impl interfaces::StandardOrder {
 						.unwrap_or("0x");
 
 					if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
-						let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
+						let token_bytes = parse_bytes32_from_hex(token_str)
+							.map_err(|e| format!("Invalid token address '{token_str}': {e}"))?;
 						let recipient_bytes =
-							parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
+							parse_bytes32_from_hex(recipient_str).map_err(|e| {
+								format!("Invalid recipient address '{recipient_str}': {e}")
+							})?;
 						let oracle_bytes = parse_bytes32_from_hex(oracle_str)
 							.map_err(|e| format!("Invalid oracle address '{oracle_str}': {e}"))?;
 						let settler_bytes = parse_bytes32_from_hex(settler_str)
@@ -998,8 +1045,9 @@ impl interfaces::StandardOrder {
 						let callback_bytes = if callback_str == "0x" || callback_str.is_empty() {
 							Vec::new()
 						} else {
-							hex::decode(callback_str.trim_start_matches("0x"))
-								.unwrap_or_else(|_| Vec::new())
+							hex::decode(callback_str.trim_start_matches("0x")).map_err(|e| {
+								format!("Invalid callbackData '{callback_str}': {e}")
+							})?
 						};
 
 						// Parse context from hex
@@ -1007,7 +1055,7 @@ impl interfaces::StandardOrder {
 							Vec::new()
 						} else {
 							hex::decode(context_str.trim_start_matches("0x"))
-								.unwrap_or_else(|_| Vec::new())
+								.map_err(|e| format!("Invalid context '{context_str}': {e}"))?
 						};
 
 						sol_outputs.push(SolMandateOutput {
@@ -1303,6 +1351,115 @@ mod tests {
 
 	#[cfg(feature = "oif-interfaces")]
 	#[test]
+	fn test_from_permit2_malformed_output_returns_err_not_panic() {
+		use crate::api::{OrderPayload, SignatureType};
+		use crate::OifOrder;
+		use std::convert::TryFrom;
+
+		// Build a base permit2 payload whose single output is malformed. The
+		// `make_payload` closure lets us swap in a different output object so we can
+		// exercise both the missing-field and wrong-type cases against the unauthenticated
+		// `StandardOrder::try_from` path. A crafted body must yield `Err`, never a panic.
+		let make_payload = |output: serde_json::Value| OrderPayload {
+			signature_type: SignatureType::Eip712,
+			domain: serde_json::json!({
+				"name": "Permit2",
+				"chainId": 1,
+				"verifyingContract": "0x000000000022D473030F116dDEE9F6B43aC78BA3"
+			}),
+			primary_type: "PermitBatchWitnessTransferFrom".to_string(),
+			message: serde_json::json!({
+				"permitted": [
+					{
+						"token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+						"amount": "1000"
+					}
+				],
+				"nonce": "1",
+				"deadline": "2",
+				"witness": {
+					"user": "0x1111111111111111111111111111111111111111",
+					"expires": 3,
+					"inputOracle": "0x2222222222222222222222222222222222222222",
+					"outputs": [output]
+				}
+			}),
+			types: None,
+		};
+
+		// Case 1: `token` field entirely absent.
+		let missing_token = serde_json::json!({
+			"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
+			"chainId": 137,
+			"amount": "900",
+			"recipient": "0x0000000000000000000000005555555555555555555555555555555555555555",
+			"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
+			"callbackData": "0x",
+			"context": "0x"
+		});
+		let order = OifOrder::OifEscrowV0 {
+			payload: make_payload(missing_token),
+		};
+		let result = interfaces::StandardOrder::try_from(&order);
+		assert!(
+			result.is_err(),
+			"missing `token` should return Err, not panic"
+		);
+
+		// Case 2: `recipient` present but not a string.
+		let non_string_recipient = serde_json::json!({
+			"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
+			"chainId": 137,
+			"token": "0x000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+			"amount": "900",
+			"recipient": 12345,
+			"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
+			"callbackData": "0x",
+			"context": "0x"
+		});
+		let order = OifOrder::OifEscrowV0 {
+			payload: make_payload(non_string_recipient),
+		};
+		let result = interfaces::StandardOrder::try_from(&order);
+		assert!(
+			result.is_err(),
+			"non-string `recipient` should return Err, not panic"
+		);
+
+		let make_valid_output = || {
+			serde_json::json!({
+				"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
+				"chainId": 137,
+				"token": "0x000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+				"amount": "900",
+				"recipient": "0x0000000000000000000000005555555555555555555555555555555555555555",
+				"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
+				"callbackData": "0x",
+				"context": "0x"
+			})
+		};
+
+		for (field, malformed_hex) in [
+			("token", "0x12"),
+			("recipient", "0x12"),
+			("callbackData", "0xzz"),
+			("context", "0xzz"),
+		] {
+			let mut output = make_valid_output();
+			output[field] = serde_json::json!(malformed_hex);
+			let order = OifOrder::OifEscrowV0 {
+				payload: make_payload(output),
+			};
+			let result = interfaces::StandardOrder::try_from(&order);
+			assert!(
+				result.is_err(),
+				"malformed `{field}` hex should return Err, not be defaulted"
+			);
+		}
+	}
+
+	#[cfg(feature = "oif-interfaces")]
+	#[test]
 	fn test_from_permit2_prefers_witness_user_over_legacy_message_user() {
 		use crate::api::{OrderPayload, SignatureType};
 		use crate::OifOrder;
@@ -1482,6 +1639,111 @@ mod tests {
 		assert_eq!(standard_order.originChainId, U256::from(1u64));
 		assert_eq!(standard_order.outputs.len(), 1);
 		assert_eq!(standard_order.outputs[0].chainId, U256::from(137u64));
+	}
+
+	#[cfg(feature = "oif-interfaces")]
+	#[test]
+	fn test_from_batch_compact_malformed_output_returns_err_not_panic() {
+		use crate::api::{OrderPayload, SignatureType};
+		use crate::OifOrder;
+		use std::convert::TryFrom;
+
+		let make_payload = |output: serde_json::Value| OrderPayload {
+			signature_type: SignatureType::Eip712,
+			domain: serde_json::json!({
+				"name": "The Compact",
+				"version": "1",
+				"chainId": 1,
+				"verifyingContract": "0x6666666666666666666666666666666666666666"
+			}),
+			primary_type: "BatchCompact".to_string(),
+			message: serde_json::json!({
+				"sponsor": "0x1111111111111111111111111111111111111111",
+				"nonce": "1",
+				"expires": "3",
+				"commitments": [
+					{
+						"lockTag": "0x0102030405060708090a0b0c",
+						"token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+						"amount": "1000"
+					}
+				],
+				"mandate": {
+					"fillDeadline": "2",
+					"inputOracle": "0x2222222222222222222222222222222222222222",
+					"outputs": [output]
+				}
+			}),
+			types: None,
+		};
+
+		let missing_token = serde_json::json!({
+			"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
+			"chainId": 137,
+			"amount": "900",
+			"recipient": "0x0000000000000000000000005555555555555555555555555555555555555555",
+			"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
+			"callbackData": "0x",
+			"context": "0x"
+		});
+		let order = OifOrder::OifResourceLockV0 {
+			payload: make_payload(missing_token),
+		};
+		let result = interfaces::StandardOrder::try_from(&order);
+		assert!(
+			result.is_err(),
+			"missing `token` should return Err, not panic"
+		);
+
+		let non_string_recipient = serde_json::json!({
+			"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
+			"chainId": 137,
+			"token": "0x000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+			"amount": "900",
+			"recipient": 12345,
+			"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
+			"callbackData": "0x",
+			"context": "0x"
+		});
+		let order = OifOrder::OifResourceLockV0 {
+			payload: make_payload(non_string_recipient),
+		};
+		let result = interfaces::StandardOrder::try_from(&order);
+		assert!(
+			result.is_err(),
+			"non-string `recipient` should return Err, not panic"
+		);
+
+		let make_valid_output = || {
+			serde_json::json!({
+				"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
+				"chainId": 137,
+				"token": "0x000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+				"amount": "900",
+				"recipient": "0x0000000000000000000000005555555555555555555555555555555555555555",
+				"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
+				"callbackData": "0x",
+				"context": "0x"
+			})
+		};
+
+		for (field, malformed_hex) in [
+			("token", "0x12"),
+			("recipient", "0x12"),
+			("callbackData", "0xzz"),
+			("context", "0xzz"),
+		] {
+			let mut output = make_valid_output();
+			output[field] = serde_json::json!(malformed_hex);
+			let order = OifOrder::OifResourceLockV0 {
+				payload: make_payload(output),
+			};
+			let result = interfaces::StandardOrder::try_from(&order);
+			assert!(
+				result.is_err(),
+				"malformed `{field}` hex should return Err, not be defaulted"
+			);
+		}
 	}
 
 	#[test]
