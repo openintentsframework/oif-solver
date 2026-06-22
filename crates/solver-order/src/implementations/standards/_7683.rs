@@ -795,6 +795,32 @@ impl OrderInterface for Eip7683OrderImpl {
 			.parse::<LockType>()
 			.map_err(|e| OrderError::ValidationFailed(format!("Invalid lock type: {e}")))?;
 
+		// Try to use existing Eip7683OrderData from intent_data if available,
+		// otherwise create from StandardOrder.
+		use std::convert::TryFrom;
+		let canonical = Eip7683OrderData::from(standard_order.clone());
+		let mut order_data = match intent_data {
+			Some(data) => Eip7683OrderData::try_from(data).unwrap_or_else(|_| canonical.clone()),
+			None => canonical.clone(),
+		};
+		if let Some(signature) = order_data.signature.as_deref() {
+			let hex_payload = signature.strip_prefix("0x").unwrap_or(signature);
+			let signature_bytes = hex::decode(hex_payload).map_err(|e| {
+				OrderError::ValidationFailed(format!("Invalid signature payload: {e}"))
+			})?;
+			let byte_len = signature_bytes.len();
+			let max_signature_bytes = match lock_type {
+				LockType::ResourceLock => MAX_ORDER_SIGNATURE_BYTES,
+				LockType::Permit2Escrow | LockType::Eip3009Escrow => MAX_ESCROW_SIGNATURE_BYTES,
+			};
+
+			if byte_len > max_signature_bytes {
+				return Err(OrderError::ValidationFailed(format!(
+					"signature payload is too large: {byte_len} bytes exceeds {max_signature_bytes} byte limit"
+				)));
+			}
+		}
+
 		// Get settler address and build calldata
 		let settler_address = self
 			.get_settler_address(origin_chain_id, lock_type)
@@ -847,29 +873,6 @@ impl OrderInterface for Eip7683OrderImpl {
 				chain_id: output_chain_id,
 				settler_address: output_network.output_settler_address.clone(),
 			});
-		}
-
-		// Try to use existing Eip7683OrderData from intent_data if available,
-		// otherwise create from StandardOrder
-		use std::convert::TryFrom;
-		let canonical = Eip7683OrderData::from(standard_order.clone());
-		let mut order_data = match intent_data {
-			Some(data) => Eip7683OrderData::try_from(data).unwrap_or_else(|_| canonical.clone()),
-			None => canonical.clone(),
-		};
-		if let Some(signature) = order_data.signature.as_deref() {
-			let hex_payload = signature.strip_prefix("0x").unwrap_or(signature);
-			let byte_len = (hex_payload.len() + 1) / 2;
-			let max_signature_bytes = match lock_type {
-				LockType::ResourceLock => MAX_ORDER_SIGNATURE_BYTES,
-				LockType::Permit2Escrow | LockType::Eip3009Escrow => MAX_ESCROW_SIGNATURE_BYTES,
-			};
-
-			if byte_len > max_signature_bytes {
-				return Err(OrderError::ValidationFailed(format!(
-					"signature payload is too large: {byte_len} bytes exceeds {max_signature_bytes} byte limit"
-				)));
-			}
 		}
 
 		// Canonicalize security-critical fields from the decoded StandardOrder; intent_data only contributes sponsor/signature/settlement_name/lock_type.
@@ -983,6 +986,10 @@ mod tests {
 		Address, ExecutionParams, FillProof, Intent, NetworksConfig, TransactionHash,
 	};
 	use std::collections::HashMap;
+	use std::sync::{
+		atomic::{AtomicBool, Ordering},
+		Arc,
+	};
 
 	fn create_test_networks() -> NetworksConfig {
 		NetworksConfigBuilder::new()
@@ -1939,7 +1946,7 @@ mod tests {
 			.validate_and_create_order(
 				&order_bytes,
 				&intent_data,
-				"permit2_escrow",
+				"resource_lock",
 				Box::new(mock_order_id_callback),
 				&solver_address,
 				None,
@@ -2091,7 +2098,7 @@ mod tests {
 		let mut existing_order_data = Eip7683OrderData::from(standard_order.clone());
 		existing_order_data.sponsor =
 			Some("0x1111111111111111111111111111111111111111".to_string());
-		existing_order_data.signature = Some("0x123456789abcdef".to_string());
+		existing_order_data.signature = Some("0x123456789abcdef0".to_string());
 		let intent_data = Some(serde_json::to_value(&existing_order_data).unwrap());
 
 		let result = order_impl
@@ -2113,7 +2120,7 @@ mod tests {
 			order_data.sponsor,
 			Some("0x1111111111111111111111111111111111111111".to_string())
 		);
-		assert_eq!(order_data.signature, Some("0x123456789abcdef".to_string()));
+		assert_eq!(order_data.signature, Some("0x123456789abcdef0".to_string()));
 	}
 
 	#[tokio::test]
@@ -2559,6 +2566,51 @@ mod tests {
 		assert!(
 			matches!(result, Err(OrderError::ValidationFailed(ref msg)) if msg.contains("signature")),
 			"oversized signature payload should be rejected: {result:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_and_create_order_rejects_invalid_signature_before_order_id_callback() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let standard_order = create_valid_standard_order();
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let mut data = create_test_order_data();
+		data.signature = Some("0xnot-hex".to_string());
+
+		let intent_data = Some(serde_json::to_value(&data).unwrap());
+		let solver_address = Address(vec![0x99; 20]);
+		let callback_called = Arc::new(AtomicBool::new(false));
+		let callback_called_for_closure = Arc::clone(&callback_called);
+		let callback = move |_chain_id: u64, _tx_data: Vec<u8>| {
+			callback_called_for_closure.store(true, Ordering::SeqCst);
+			Box::pin(async move { Ok(vec![0x42u8; 32]) })
+				as std::pin::Pin<
+					Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send>,
+				>
+		};
+
+		let result = order_impl
+			.validate_and_create_order(
+				&order_bytes,
+				&intent_data,
+				"resource_lock",
+				Box::new(callback),
+				&solver_address,
+				None,
+			)
+			.await;
+
+		assert!(
+			matches!(result, Err(OrderError::ValidationFailed(ref msg)) if msg.contains("Invalid signature")),
+			"invalid signature payload should be rejected: {result:?}"
+		);
+		assert!(
+			!callback_called.load(Ordering::SeqCst),
+			"order-id callback should not run for invalid signatures"
 		);
 	}
 

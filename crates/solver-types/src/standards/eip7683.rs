@@ -637,18 +637,21 @@ impl interfaces::StandardOrder {
 					.unwrap_or("0x");
 
 				if let Ok(amount) = U256::from_str_radix(amount_str, 10) {
-					let token_bytes = parse_bytes32_from_hex(token_str).unwrap_or([0u8; 32]);
-					let recipient_bytes =
-						parse_bytes32_from_hex(recipient_str).unwrap_or([0u8; 32]);
-					let oracle_bytes = parse_bytes32_from_hex(oracle_str).unwrap_or([0u8; 32]);
-					let settler_bytes = parse_bytes32_from_hex(settler_str).unwrap_or([0u8; 32]);
+					let token_bytes = parse_bytes32_from_hex(token_str)
+						.map_err(|e| format!("Invalid token address '{token_str}': {e}"))?;
+					let recipient_bytes = parse_bytes32_from_hex(recipient_str)
+						.map_err(|e| format!("Invalid recipient address '{recipient_str}': {e}"))?;
+					let oracle_bytes = parse_bytes32_from_hex(oracle_str)
+						.map_err(|e| format!("Invalid oracle address '{oracle_str}': {e}"))?;
+					let settler_bytes = parse_bytes32_from_hex(settler_str)
+						.map_err(|e| format!("Invalid settler address '{settler_str}': {e}"))?;
 
 					// Parse callbackData from hex
 					let callback_bytes = if callback_str == "0x" || callback_str.is_empty() {
 						Vec::new()
 					} else {
 						hex::decode(callback_str.trim_start_matches("0x"))
-							.unwrap_or_else(|_| Vec::new())
+							.map_err(|e| format!("Invalid callbackData '{callback_str}': {e}"))?
 					};
 
 					// Parse context from hex
@@ -656,7 +659,7 @@ impl interfaces::StandardOrder {
 						Vec::new()
 					} else {
 						hex::decode(context_str.trim_start_matches("0x"))
-							.unwrap_or_else(|_| Vec::new())
+							.map_err(|e| format!("Invalid context '{context_str}': {e}"))?
 					};
 
 					sol_outputs.push(SolMandateOutput {
@@ -1422,6 +1425,37 @@ mod tests {
 			result.is_err(),
 			"non-string `recipient` should return Err, not panic"
 		);
+
+		let make_valid_output = || {
+			serde_json::json!({
+				"settler": "0x0000000000000000000000004444444444444444444444444444444444444444",
+				"chainId": 137,
+				"token": "0x000000000000000000000000a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+				"amount": "900",
+				"recipient": "0x0000000000000000000000005555555555555555555555555555555555555555",
+				"oracle": "0x0000000000000000000000003333333333333333333333333333333333333333",
+				"callbackData": "0x",
+				"context": "0x"
+			})
+		};
+
+		for (field, malformed_hex) in [
+			("token", "0x12"),
+			("recipient", "0x12"),
+			("callbackData", "0xzz"),
+			("context", "0xzz"),
+		] {
+			let mut output = make_valid_output();
+			output[field] = serde_json::json!(malformed_hex);
+			let order = OifOrder::OifEscrowV0 {
+				payload: make_payload(output),
+			};
+			let result = interfaces::StandardOrder::try_from(&order);
+			assert!(
+				result.is_err(),
+				"malformed `{field}` hex should return Err, not be defaulted"
+			);
+		}
 	}
 
 	#[cfg(feature = "oif-interfaces")]

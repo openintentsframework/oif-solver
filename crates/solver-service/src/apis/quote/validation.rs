@@ -101,6 +101,11 @@ impl QuoteValidator {
 			// callbacks, so reject anything over MAX_CALLBACK_DATA_BYTES up front.
 			if let Some(calldata) = &output.calldata {
 				let hex_payload = calldata.strip_prefix("0x").unwrap_or(calldata);
+				if hex_payload.len() % 2 != 0 {
+					return Err(QuoteError::InvalidRequest(
+						"Output callbackData must be valid even-length hex".to_string(),
+					));
+				}
 				let byte_len = hex_payload.len() / 2;
 				if byte_len > MAX_CALLBACK_DATA_BYTES {
 					return Err(QuoteError::InvalidRequest(format!(
@@ -1118,6 +1123,18 @@ mod tests {
 		assert!(
 			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("callbackData")),
 			"Should reject oversized callbackData before RPC work: {result:?}"
+		);
+	}
+
+	#[test]
+	fn test_validate_intent_structure_rejects_odd_length_callback_data() {
+		let mut intent = create_exact_input_request(Some("1000000000000000000"), None);
+		intent.outputs[0].calldata = Some(format!("0x{}f", "ab".repeat(MAX_CALLBACK_DATA_BYTES)));
+
+		let result = QuoteValidator::validate_intent_structure(&intent);
+		assert!(
+			matches!(result, Err(QuoteError::InvalidRequest(ref msg)) if msg.contains("even-length hex")),
+			"Should reject odd-length callbackData before applying size cap: {result:?}"
 		);
 	}
 
