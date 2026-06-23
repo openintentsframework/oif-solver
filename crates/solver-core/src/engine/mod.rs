@@ -14,12 +14,19 @@ pub mod startup_readiness;
 pub mod token_manager;
 
 use self::{
+	context::ContextBuilder,
 	cost_profit::CostProfitService,
 	startup_readiness::{SharedStartupReadiness, StartupReadiness},
 	token_manager::TokenManager,
 };
-use crate::handlers::{IntentHandler, OrderHandler, SettlementHandler, TransactionHandler};
-use crate::recovery::RecoveryService;
+use crate::handlers::{
+	compact_reservation::release_compact_reservations, IntentHandler, OrderHandler,
+	SettlementHandler, TransactionHandler,
+};
+use crate::order_preparation::order_requires_preparation;
+use crate::order_rehydration::intent_from_order;
+use crate::recovery::{ReconcileResult, RecoveryService};
+use crate::state::order::is_terminal_status;
 use crate::state::transaction_attempt::TransactionAttemptStore;
 use crate::state::OrderStateMachine;
 use alloy_primitives::hex;
@@ -32,8 +39,9 @@ use solver_pricing::PricingService;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
 use solver_types::{
-	truncate_id, Address, DeliveryEvent, Intent, Order, OrderEvent, SettlementEvent, SolverEvent,
-	StorageKey, TransactionType,
+	standards::eip7683::Eip7683OrderData, truncate_id, with_0x_prefix, Address, DeliveryEvent,
+	ExecutionDecision, Intent, Order, OrderEvent, SettlementEvent, SolverEvent, StorageKey,
+	TransactionType,
 };
 use std::future::Future;
 use std::sync::Arc;
@@ -59,6 +67,7 @@ const INTENT_QUEUE_CAPACITY: usize = 1024;
 /// merely contended transaction permit never blocks dispatch (preserving the
 /// M-13 property that a held transaction permit cannot stall the event loop).
 const MAX_INFLIGHT_HANDLERS: usize = INTENT_QUEUE_CAPACITY;
+const DEFERRED_RETRY_RECONCILE_UNKNOWN_DELAY: Duration = Duration::from_secs(60);
 
 /// Errors that can occur during engine operations.
 ///
@@ -650,6 +659,9 @@ impl SolverEngine {
 								Ok(())
 							}).await;
 						}
+						SolverEvent::Order(OrderEvent::Deferred { order_id, retry_after }) => {
+							self.spawn_delayed_deferred_retry(&dispatch_semaphore, order_id, retry_after);
+						}
 
 						SolverEvent::Delivery(DeliveryEvent::TransactionPending { order_id, tx_hash, tx_type, tx_chain_id: _ }) => {
 							tracing::info!(
@@ -1040,6 +1052,262 @@ impl SolverEngine {
 			}
 		});
 	}
+
+	fn spawn_delayed_deferred_retry(
+		&self,
+		dispatch: &Arc<Semaphore>,
+		order_id: String,
+		retry_after: Duration,
+	) {
+		let engine = self.clone();
+		let dispatch = dispatch.clone();
+		tokio::spawn(async move {
+			tokio::time::sleep(retry_after).await;
+
+			let dispatch_permit = match dispatch.acquire_owned().await {
+				Ok(permit) => permit,
+				Err(e) => {
+					tracing::error!(
+						"Failed to acquire dispatch permit for deferred retry: {}",
+						e
+					);
+					return;
+				},
+			};
+
+			tokio::spawn(async move {
+				let _dispatch_permit = dispatch_permit;
+				if let Err(e) = engine.retry_deferred_order_once(&order_id).await {
+					tracing::error!(
+						order_id = %order_id,
+						error = %e,
+						"Deferred order retry failed"
+					);
+				}
+			});
+		});
+	}
+
+	async fn retry_deferred_order_once(&self, order_id: &str) -> Result<(), EngineError> {
+		let order: Order = match self
+			.storage
+			.retrieve(StorageKey::Orders.as_str(), order_id)
+			.await
+		{
+			Ok(order) => order,
+			Err(solver_storage::StorageError::NotFound(_)) => {
+				tracing::debug!(
+					order_id = %order_id,
+					"Deferred retry skipped because order is no longer stored"
+				);
+				return Ok(());
+			},
+			Err(e) => {
+				return Err(EngineError::Service(format!(
+					"Failed to retrieve deferred order {order_id}: {e}"
+				)));
+			},
+		};
+
+		if is_terminal_status(&order.status) || order.execution_params.is_some() {
+			return Ok(());
+		}
+		if deferred_order_deadline_elapsed(&order, solver_types::current_timestamp()) {
+			return self
+				.skip_deferred_order(order, "Deferred order reached fill deadline".to_string())
+				.await;
+		}
+
+		let Some(intent) = intent_from_order(&order) else {
+			return self
+				.skip_deferred_order(
+					order,
+					"Deferred order cannot be rehydrated for retry".to_string(),
+				)
+				.await;
+		};
+
+		let attempt_store = Arc::new(TransactionAttemptStore::new(self.storage.clone()));
+		let recovery = RecoveryService::new(
+			self.storage.clone(),
+			self.state_machine.clone(),
+			self.delivery.clone(),
+			self.settlement.clone(),
+			self.event_bus.clone(),
+			attempt_store,
+			Arc::new(self.static_config.networks.clone()),
+		);
+		let (order, result) = match recovery.reconcile_with_blockchain(&order).await {
+			Ok(result) => result,
+			Err(e) => {
+				tracing::warn!(
+					order_id = %order.id,
+					error = %e,
+					"Deferred retry reconciliation failed; scheduling another retry"
+				);
+				return self
+					.republish_deferred_or_skip(order, DEFERRED_RETRY_RECONCILE_UNKNOWN_DELAY)
+					.await;
+			},
+		};
+
+		match result {
+			ReconcileResult::NeedsPrepare | ReconcileResult::NeedsExecution => {},
+			ReconcileResult::Unknown => {
+				return self
+					.republish_deferred_or_skip(order, DEFERRED_RETRY_RECONCILE_UNKNOWN_DELAY)
+					.await;
+			},
+			ReconcileResult::NeedsFill
+			| ReconcileResult::NeedsPostFill
+			| ReconcileResult::NeedsMonitoring
+			| ReconcileResult::NeedsPreClaim { .. }
+			| ReconcileResult::NeedsClaim { .. }
+			| ReconcileResult::Failed(_)
+			| ReconcileResult::Finalized => {
+				recovery.publish_recovery_event(order, result).await;
+				return Ok(());
+			},
+		}
+
+		if deferred_order_deadline_elapsed(&order, solver_types::current_timestamp()) {
+			return self
+				.skip_deferred_order(order, "Deferred order reached fill deadline".to_string())
+				.await;
+		}
+
+		let context = ContextBuilder::new(
+			self.delivery.clone(),
+			self.solver_address.clone(),
+			self.token_manager.clone(),
+			self.dynamic_config.read().await.clone(),
+		)
+		.build_execution_context(&intent)
+		.await
+		.map_err(|e| EngineError::Service(format!("Failed to build execution context: {e}")))?;
+
+		match self.order.should_execute(&order, &context).await {
+			ExecutionDecision::Execute(params) => {
+				let updated_order = self
+					.state_machine
+					.set_execution_params(&order.id, params.clone())
+					.await
+					.map_err(|e| {
+						EngineError::Service(format!(
+							"Failed to persist execution params for deferred order {}: {e}",
+							order.id
+						))
+					})?;
+
+				if order_requires_preparation(&updated_order)
+					&& updated_order.prepare_tx_hash.is_none()
+				{
+					self.event_bus
+						.publish(SolverEvent::Order(OrderEvent::Preparing {
+							intent,
+							order: updated_order,
+							params,
+						}))
+						.ok();
+				} else {
+					self.event_bus
+						.publish(SolverEvent::Order(OrderEvent::Executing {
+							order: updated_order,
+							params,
+						}))
+						.ok();
+				}
+				Ok(())
+			},
+			ExecutionDecision::Defer(retry_after) => {
+				self.republish_deferred_or_skip(order, retry_after).await
+			},
+			ExecutionDecision::Skip(reason) => self.skip_deferred_order(order, reason).await,
+		}
+	}
+
+	async fn republish_deferred_or_skip(
+		&self,
+		order: Order,
+		retry_after: Duration,
+	) -> Result<(), EngineError> {
+		if deferred_retry_would_miss_deadline(
+			&order,
+			retry_after,
+			solver_types::current_timestamp(),
+		) {
+			self.skip_deferred_order(order, "Deferred retry would miss fill deadline".to_string())
+				.await
+		} else {
+			self.event_bus
+				.publish(SolverEvent::Order(OrderEvent::Deferred {
+					order_id: order.id,
+					retry_after,
+				}))
+				.ok();
+			Ok(())
+		}
+	}
+
+	async fn skip_deferred_order(&self, order: Order, reason: String) -> Result<(), EngineError> {
+		self.event_bus
+			.publish(SolverEvent::Order(OrderEvent::Skipped {
+				order_id: order.id.clone(),
+				reason,
+			}))
+			.ok();
+		release_compact_reservations(
+			&self.state_machine.compact_reservations(),
+			&order,
+			"deferred retry skip",
+		)
+		.await;
+		remove_if_present(
+			&self.storage,
+			StorageKey::Orders.as_str(),
+			&order.id,
+			"order",
+		)
+		.await?;
+		let intent_id = with_0x_prefix(&order.id);
+		remove_if_present(
+			&self.storage,
+			StorageKey::Intents.as_str(),
+			&intent_id,
+			"intent",
+		)
+		.await?;
+		Ok(())
+	}
+}
+
+async fn remove_if_present(
+	storage: &StorageService,
+	namespace: &str,
+	id: &str,
+	label: &str,
+) -> Result<(), EngineError> {
+	match storage.remove(namespace, id).await {
+		Ok(()) | Err(solver_storage::StorageError::NotFound(_)) => Ok(()),
+		Err(e) => Err(EngineError::Service(format!(
+			"Failed to remove deferred {label} {id}: {e}"
+		))),
+	}
+}
+
+fn deferred_retry_deadline(order: &Order) -> Option<u64> {
+	let order_data: Eip7683OrderData = serde_json::from_value(order.data.clone()).ok()?;
+	Some(u64::from(order_data.fill_deadline).min(u64::from(order_data.expires)))
+}
+
+fn deferred_order_deadline_elapsed(order: &Order, now: u64) -> bool {
+	deferred_retry_deadline(order).is_some_and(|deadline| now >= deadline)
+}
+
+fn deferred_retry_would_miss_deadline(order: &Order, retry_after: Duration, now: u64) -> bool {
+	deferred_retry_deadline(order).is_some_and(|deadline| {
+		now >= deadline || now.saturating_add(retry_after.as_secs()) >= deadline
+	})
 }
 
 #[cfg(test)]
@@ -1048,13 +1316,21 @@ mod tests {
 	use crate::engine::event_bus::EventBus;
 	use solver_account::AccountService;
 	use solver_config::{Config, ConfigBuilder};
-	use solver_delivery::{DeliveryError, DeliveryService, InsufficientNativeGasInfo};
+	use solver_delivery::{
+		DeliveryError, DeliveryInterface, DeliveryService, InsufficientNativeGasInfo,
+		MockDeliveryInterface,
+	};
 	use solver_discovery::DiscoveryService;
-	use solver_order::OrderService;
+	use solver_order::{MockExecutionStrategy, OrderService};
 	use solver_settlement::SettlementService;
 	use solver_storage::StorageService;
-	use solver_types::utils::tests::builders::OrderBuilder;
-	use solver_types::{Address, OrderStatus, TransactionType};
+	use solver_types::{
+		standards::eip7683::{Eip7683OrderData, LockType},
+		utils::tests::builders::{
+			Eip7683OrderDataBuilder, NetworkConfigBuilder, NetworksConfigBuilder, OrderBuilder,
+		},
+		Address, ExecutionParams, OrderStatus, TransactionType,
+	};
 	use std::sync::Arc;
 	use tokio::sync::Semaphore;
 
@@ -1530,6 +1806,438 @@ mod tests {
 			token_manager,
 			None,
 		)
+	}
+
+	async fn create_test_engine_with_strategy(
+		strategy: Box<dyn solver_order::ExecutionStrategy>,
+	) -> SolverEngine {
+		let (
+			dynamic_config,
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			_order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+		) = create_mock_services().await;
+		let order = Arc::new(OrderService::new(
+			std::collections::HashMap::new(),
+			strategy,
+		));
+
+		SolverEngine::new(
+			dynamic_config,
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+			None,
+		)
+	}
+
+	async fn create_test_engine_with_strategy_delivery_and_config(
+		strategy: Box<dyn solver_order::ExecutionStrategy>,
+		delivery: Arc<DeliveryService>,
+		static_config: Config,
+	) -> SolverEngine {
+		let (
+			_dynamic_config,
+			_config,
+			storage,
+			account,
+			solver_address,
+			_delivery,
+			discovery,
+			_order,
+			settlement,
+			pricing,
+			event_bus,
+			_token_manager,
+		) = create_mock_services().await;
+		let order = Arc::new(OrderService::new(
+			std::collections::HashMap::new(),
+			strategy,
+		));
+		let dynamic_config = Arc::new(RwLock::new(static_config.clone()));
+		let token_manager = Arc::new(TokenManager::new(
+			static_config.networks.clone(),
+			delivery.clone(),
+			account.clone(),
+		));
+
+		SolverEngine::new(
+			dynamic_config,
+			static_config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+			None,
+		)
+	}
+
+	fn config_with_recovery_networks() -> Config {
+		let networks = NetworksConfigBuilder::new()
+			.add_network(1, NetworkConfigBuilder::new().build())
+			.add_network(137, NetworkConfigBuilder::new().build())
+			.build();
+		ConfigBuilder::new().networks(networks).build()
+	}
+
+	fn compact_reservation_for_order(
+		order: &Order,
+	) -> solver_storage::compact_reservations::DepositReservation {
+		let order_data: Eip7683OrderData = serde_json::from_value(order.data.clone()).unwrap();
+		let [token_id, amount] = order_data.inputs[0];
+		solver_storage::compact_reservations::DepositReservation {
+			chain_id: u64::try_from(order_data.origin_chain_id).unwrap(),
+			owner: order_data.user,
+			token_id,
+			amount,
+			available_balance: amount,
+		}
+	}
+
+	fn deferred_order_without_execution_params(
+		lock_type: LockType,
+		seconds_until_deadline: u64,
+	) -> Order {
+		let now = solver_types::current_timestamp();
+		let deadline = now.saturating_add(seconds_until_deadline) as u32;
+		let mut builder = Eip7683OrderDataBuilder::new()
+			.lock_type(lock_type)
+			.raw_order_data("0x1234")
+			.expires(deadline)
+			.fill_deadline(deadline);
+		if matches!(lock_type, LockType::Permit2Escrow | LockType::Eip3009Escrow) {
+			builder = builder
+				.sponsor("0x1111111111111111111111111111111111111111")
+				.signature("0xabcdef");
+		}
+		let order_data = builder.build();
+
+		OrderBuilder::new()
+			.with_id("0x1111111111111111111111111111111111111111111111111111111111111111")
+			.with_status(OrderStatus::Pending)
+			.with_data(serde_json::to_value(order_data).unwrap())
+			.with_execution_params(None)
+			.with_prepare_tx_hash(None)
+			.with_fill_tx_hash(None)
+			.with_post_fill_tx_hash(None)
+			.with_pre_claim_tx_hash(None)
+			.with_claim_tx_hash(None)
+			.build()
+	}
+
+	fn test_execution_params() -> ExecutionParams {
+		ExecutionParams {
+			gas_price: alloy_primitives::U256::from(1_000_000_000u64),
+			priority_fee: Some(alloy_primitives::U256::from(1_000_000u64)),
+		}
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_persists_params_and_publishes_preparing_when_strategy_executes() {
+		let params = test_execution_params();
+		let mut strategy = MockExecutionStrategy::new();
+		let expected_params = params.clone();
+		strategy
+			.expect_should_execute()
+			.times(1)
+			.returning(move |_, _| {
+				let params = expected_params.clone();
+				Box::pin(async move { ExecutionDecision::Execute(params) })
+			});
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let order = deferred_order_without_execution_params(LockType::Permit2Escrow, 600);
+		engine.state_machine.store_order(&order).await.unwrap();
+		let mut receiver = engine.event_bus.subscribe();
+
+		engine.retry_deferred_order_once(&order.id).await.unwrap();
+
+		let stored = engine.state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(
+			stored.execution_params.as_ref().unwrap().gas_price,
+			params.gas_price
+		);
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Preparing {
+				intent,
+				order: event_order,
+				params: event_params,
+			}) => {
+				assert_eq!(intent.id, order.id);
+				assert_eq!(event_order.id, order.id);
+				assert_eq!(event_params.gas_price, params.gas_price);
+			},
+			_ => panic!("Expected Order::Preparing event"),
+		}
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_publishes_executing_for_resource_lock_when_strategy_executes() {
+		let params = test_execution_params();
+		let mut strategy = MockExecutionStrategy::new();
+		let expected_params = params.clone();
+		strategy
+			.expect_should_execute()
+			.times(1)
+			.returning(move |_, _| {
+				let params = expected_params.clone();
+				Box::pin(async move { ExecutionDecision::Execute(params) })
+			});
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let order = deferred_order_without_execution_params(LockType::ResourceLock, 600);
+		engine.state_machine.store_order(&order).await.unwrap();
+		let mut receiver = engine.event_bus.subscribe();
+
+		engine.retry_deferred_order_once(&order.id).await.unwrap();
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Executing {
+				order: event_order,
+				params: event_params,
+			}) => {
+				assert_eq!(event_order.id, order.id);
+				assert_eq!(event_params.gas_price, params.gas_price);
+			},
+			_ => panic!("Expected Order::Executing event"),
+		}
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_republishes_deferred_when_strategy_defers_within_deadline() {
+		let mut strategy = MockExecutionStrategy::new();
+		strategy.expect_should_execute().times(1).returning(|_, _| {
+			Box::pin(async move { ExecutionDecision::Defer(Duration::from_secs(30)) })
+		});
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let order = deferred_order_without_execution_params(LockType::ResourceLock, 600);
+		engine.state_machine.store_order(&order).await.unwrap();
+		let mut receiver = engine.event_bus.subscribe();
+
+		engine.retry_deferred_order_once(&order.id).await.unwrap();
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Deferred {
+				order_id,
+				retry_after,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(retry_after, Duration::from_secs(30));
+			},
+			_ => panic!("Expected Order::Deferred event"),
+		}
+		assert!(engine.state_machine.get_order(&order.id).await.is_ok());
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_republishes_when_reconcile_returns_unknown() {
+		let mut strategy = MockExecutionStrategy::new();
+		strategy.expect_should_execute().times(0);
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_block_number()
+			.with(mockall::predicate::eq(1u64))
+			.times(1)
+			.returning(|_| {
+				Box::pin(async move { Err(DeliveryError::Network("rpc unavailable".to_string())) })
+			});
+		let delivery = Arc::new(DeliveryService::new(
+			std::collections::HashMap::from([(
+				1u64,
+				Arc::new(mock_delivery) as Arc<dyn DeliveryInterface>,
+			)]),
+			1,
+			20,
+			60,
+		));
+		let engine = create_test_engine_with_strategy_delivery_and_config(
+			Box::new(strategy),
+			delivery,
+			config_with_recovery_networks(),
+		)
+		.await;
+		let order = deferred_order_without_execution_params(LockType::ResourceLock, 600);
+		engine.state_machine.store_order(&order).await.unwrap();
+		let mut receiver = engine.event_bus.subscribe();
+
+		engine.retry_deferred_order_once(&order.id).await.unwrap();
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Deferred {
+				order_id,
+				retry_after,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(retry_after, DEFERRED_RETRY_RECONCILE_UNKNOWN_DELAY);
+			},
+			_ => panic!("Expected Order::Deferred event"),
+		}
+		assert!(
+			engine.state_machine.get_order(&order.id).await.is_ok(),
+			"Unknown reconciliation must re-defer, not drop the order"
+		);
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_skips_and_removes_order_and_intent_when_deadline_elapsed() {
+		let mut strategy = MockExecutionStrategy::new();
+		strategy.expect_should_execute().times(0);
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let order = deferred_order_without_execution_params(LockType::ResourceLock, 0);
+		let intent_key = with_0x_prefix(&order.id);
+		engine.state_machine.store_order(&order).await.unwrap();
+		engine
+			.storage
+			.store(
+				StorageKey::Intents.as_str(),
+				&intent_key,
+				&serde_json::json!({"seen": true}),
+				None,
+			)
+			.await
+			.unwrap();
+		let mut receiver = engine.event_bus.subscribe();
+
+		engine.retry_deferred_order_once(&order.id).await.unwrap();
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Skipped { order_id, reason }) => {
+				assert_eq!(order_id, order.id);
+				assert!(reason.contains("deadline"));
+			},
+			_ => panic!("Expected Order::Skipped event"),
+		}
+		assert!(matches!(
+			engine.state_machine.get_order(&order.id).await,
+			Err(crate::state::OrderStateError::Storage(_))
+		));
+		assert!(matches!(
+			engine
+				.storage
+				.retrieve::<serde_json::Value>(StorageKey::Intents.as_str(), &intent_key)
+				.await,
+			Err(solver_storage::StorageError::NotFound(_))
+		));
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_skip_releases_held_compact_reservation() {
+		use solver_storage::compact_reservations::ReservationError;
+
+		let mut strategy = MockExecutionStrategy::new();
+		strategy.expect_should_execute().times(1).returning(|_, _| {
+			Box::pin(async move { ExecutionDecision::Defer(Duration::from_secs(60)) })
+		});
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let order = deferred_order_without_execution_params(LockType::ResourceLock, 30);
+		let deposit = compact_reservation_for_order(&order);
+		let reservations = engine.state_machine.compact_reservations();
+		engine.state_machine.store_order(&order).await.unwrap();
+		reservations
+			.reserve_order(
+				&order.id,
+				solver_types::current_timestamp() + 3600,
+				&[deposit.clone()],
+			)
+			.await
+			.unwrap();
+		let before_skip = reservations
+			.reserve_order(
+				"rl-other-before-skip",
+				solver_types::current_timestamp() + 3600,
+				&[deposit.clone()],
+			)
+			.await
+			.expect_err("held reservation should block a second order before skip");
+		assert!(matches!(
+			before_skip,
+			ReservationError::Oversubscribed { .. }
+		));
+
+		engine.retry_deferred_order_once(&order.id).await.unwrap();
+
+		reservations
+			.reserve_order(
+				"rl-other-after-skip",
+				solver_types::current_timestamp() + 3600,
+				&[deposit],
+			)
+			.await
+			.expect("skip must release the compact reservation for reuse");
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_skips_when_strategy_defer_would_miss_deadline() {
+		let mut strategy = MockExecutionStrategy::new();
+		strategy.expect_should_execute().times(1).returning(|_, _| {
+			Box::pin(async move { ExecutionDecision::Defer(Duration::from_secs(60)) })
+		});
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let order = deferred_order_without_execution_params(LockType::ResourceLock, 30);
+		engine.state_machine.store_order(&order).await.unwrap();
+		let mut receiver = engine.event_bus.subscribe();
+
+		engine.retry_deferred_order_once(&order.id).await.unwrap();
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Skipped { order_id, reason }) => {
+				assert_eq!(order_id, order.id);
+				assert!(reason.contains("deadline"));
+			},
+			_ => panic!("Expected Order::Skipped event"),
+		}
+		assert!(matches!(
+			engine.state_machine.get_order(&order.id).await,
+			Err(crate::state::OrderStateError::Storage(_))
+		));
+	}
+
+	#[tokio::test]
+	async fn spawn_delayed_deferred_retry_does_not_hold_dispatch_permit_while_sleeping() {
+		let mut strategy = MockExecutionStrategy::new();
+		strategy.expect_should_execute().times(0);
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let dispatch = Arc::new(Semaphore::new(1));
+
+		engine.spawn_delayed_deferred_retry(
+			&dispatch,
+			"missing-order".to_string(),
+			Duration::from_secs(60),
+		);
+
+		let permit =
+			tokio::time::timeout(Duration::from_millis(100), dispatch.clone().acquire_owned())
+				.await
+				.expect("dispatch permit must remain available while delayed retry sleeps")
+				.expect("dispatch semaphore open");
+		drop(permit);
 	}
 
 	#[test]

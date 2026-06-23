@@ -9,19 +9,19 @@ mod chain_evidence;
 use crate::bump::lineage::{lineage_components, lineage_tip};
 use crate::engine::event_bus::EventBus;
 use crate::order_preparation::order_requires_preparation;
+use crate::order_rehydration::intent_from_order;
 use crate::state::order::{
 	FAILED_STATUS_KIND_INDEX_VALUE, FINALIZED_STATUS_KIND_INDEX_VALUE, STATUS_KIND_INDEX_FIELD,
 };
 use crate::state::transaction_attempt::TransactionAttemptStore;
 use crate::state::OrderStateMachine;
-use alloy_primitives::hex;
 use solver_delivery::DeliveryService;
 use solver_settlement::{SettlementReadiness, SettlementService};
 use solver_storage::{QueryFilter, StorageService};
 use solver_types::{
-	standards::eip7683::Eip7683OrderData, with_0x_prefix, DeliveryEvent, Intent, IntentMetadata,
-	Order, OrderEvent, OrderStatus, SettlementEvent, SolverEvent, StorageKey, TransactionAttempt,
-	TransactionAttemptStatus, TransactionHash, TransactionReceipt, TransactionType,
+	with_0x_prefix, DeliveryEvent, Intent, Order, OrderEvent, OrderStatus, SettlementEvent,
+	SolverEvent, StorageKey, TransactionAttempt, TransactionAttemptStatus, TransactionHash,
+	TransactionReceipt, TransactionType,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -45,7 +45,7 @@ pub enum RecoveryError {
 /// This enum represents the different states an order can be in after
 /// comparing its stored state with the actual blockchain state during recovery.
 #[derive(Debug)]
-enum ReconcileResult {
+pub(crate) enum ReconcileResult {
 	/// Off-chain escrow order needs origin-chain prepare/openFor before fill.
 	NeedsPrepare,
 	/// Order needs initial execution (no transactions yet)
@@ -1006,7 +1006,7 @@ impl RecoveryService {
 	/// # Returns
 	///
 	/// A `ReconcileResult` indicating what action should be taken next.
-	async fn reconcile_with_blockchain(
+	pub(crate) async fn reconcile_with_blockchain(
 		&self,
 		order: &Order,
 	) -> Result<(Order, ReconcileResult), RecoveryError> {
@@ -1477,32 +1477,6 @@ impl RecoveryService {
 		}
 	}
 
-	fn recovery_intent_for_prepare(order: &Order) -> Option<Intent> {
-		let order_data: Eip7683OrderData = serde_json::from_value(order.data.clone()).ok()?;
-		let raw_order_data = order_data.raw_order_data.as_ref()?;
-		let lock_type = order_data.lock_type?;
-		let order_bytes = alloy_primitives::Bytes::from(
-			hex::decode(solver_types::without_0x_prefix(raw_order_data)).ok()?,
-		);
-
-		// `handle_preparation` consumes only `source`; remaining fields keep the
-		// transient recovery intent complete for event consumers.
-		Some(Intent {
-			id: order.id.clone(),
-			source: "off-chain".to_string(),
-			standard: order.standard.clone(),
-			metadata: IntentMetadata {
-				requires_auction: false,
-				exclusive_until: None,
-				discovered_at: solver_types::current_timestamp(),
-			},
-			data: order.data.clone(),
-			order_bytes,
-			quote_id: order.quote_id.clone(),
-			lock_type: lock_type.to_string(),
-		})
-	}
-
 	/// Publishes appropriate event based on reconciliation result.
 	///
 	/// This method converts the reconciliation result into the appropriate
@@ -1513,19 +1487,25 @@ impl RecoveryService {
 	///
 	/// * `order` - The order being recovered
 	/// * `result` - The result of blockchain reconciliation
-	async fn publish_recovery_event(&self, order: Order, result: ReconcileResult) {
+	pub(crate) async fn publish_recovery_event(&self, order: Order, result: ReconcileResult) {
 		// First ensure the order is in the correct state
 		let order = self.ensure_correct_state(order, &result).await;
 		match result {
 			ReconcileResult::NeedsPrepare => {
 				let Some(params) = order.execution_params.clone() else {
-					tracing::error!(
-						"Order {} missing execution params, cannot resume preparation",
-						order.id
+					tracing::info!(
+						order_id = %order.id,
+						"Order missing execution params during recovery; re-driving deferred strategy"
 					);
+					self.event_bus
+						.publish(SolverEvent::Order(OrderEvent::Deferred {
+							order_id: order.id,
+							retry_after: std::time::Duration::ZERO,
+						}))
+						.ok();
 					return;
 				};
-				let Some(intent) = Self::recovery_intent_for_prepare(&order) else {
+				let Some(intent) = intent_from_order(&order) else {
 					tracing::error!(
 						"Order {} missing recovery intent data, cannot resume preparation",
 						order.id
@@ -1548,7 +1528,16 @@ impl RecoveryService {
 						.publish(SolverEvent::Order(OrderEvent::Executing { order, params }))
 						.ok();
 				} else {
-					tracing::error!("Order {} missing execution params, cannot resume", order.id);
+					tracing::info!(
+						order_id = %order.id,
+						"Order missing execution params during recovery; re-driving deferred strategy"
+					);
+					self.event_bus
+						.publish(SolverEvent::Order(OrderEvent::Deferred {
+							order_id: order.id,
+							retry_after: std::time::Duration::ZERO,
+						}))
+						.ok();
 				}
 			},
 
@@ -3849,6 +3838,50 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn publish_recovery_event_needs_execution_without_params_defers_for_strategy_retry() {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let mut order = create_test_order_with_status(OrderStatus::Created);
+		order.execution_params = None;
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		state_machine.store_order(&order).await.unwrap();
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
+
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+			empty_networks_config(),
+		);
+
+		recovery_service
+			.publish_recovery_event(order.clone(), ReconcileResult::NeedsExecution)
+			.await;
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Deferred {
+				order_id,
+				retry_after,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(retry_after, std::time::Duration::ZERO);
+			},
+			_ => panic!("Expected Order::Deferred event"),
+		}
+	}
+
+	#[tokio::test]
 	async fn publish_recovery_event_needs_prepare_emits_preparing() {
 		let temp_dir = tempfile::tempdir().unwrap();
 		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
@@ -3893,6 +3926,50 @@ mod tests {
 				assert_eq!(params.priority_fee, expected_params.priority_fee);
 			},
 			_ => panic!("Expected Order::Preparing event"),
+		}
+	}
+
+	#[tokio::test]
+	async fn publish_recovery_event_needs_prepare_without_params_defers_for_strategy_retry() {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let mut order = offchain_escrow_order_with_status(OrderStatus::Pending);
+		order.execution_params = None;
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		state_machine.store_order(&order).await.unwrap();
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
+
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+			empty_networks_config(),
+		);
+
+		recovery_service
+			.publish_recovery_event(order.clone(), ReconcileResult::NeedsPrepare)
+			.await;
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Deferred {
+				order_id,
+				retry_after,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(retry_after, std::time::Duration::ZERO);
+			},
+			_ => panic!("Expected Order::Deferred event"),
 		}
 	}
 

@@ -11,6 +11,7 @@ pub mod engine;
 pub mod handlers;
 pub mod monitoring;
 pub(crate) mod order_preparation;
+pub(crate) mod order_rehydration;
 pub mod recovery;
 pub mod state;
 
