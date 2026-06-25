@@ -1902,6 +1902,10 @@ fn build_seed_overrides(
 		let hyperlane = HyperlaneSettlementOverride {
 			mailboxes,
 			igp_addresses,
+			domains: HashMap::from([
+				(origin.chain_id, origin.chain_id as u32),
+				(destination.chain_id, destination.chain_id as u32),
+			]),
 			oracles: OracleOverrides {
 				input: input_oracles,
 				output: output_oracles,
