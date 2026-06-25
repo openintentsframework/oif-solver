@@ -2490,7 +2490,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 			},
 			"hyperlane" => {
 				settlement_priority.push(OperatorSettlementType::Hyperlane);
-				hyperlane = Some(extract_hyperlane_config(&config.settlement, &chain_ids));
+				hyperlane = Some(extract_hyperlane_config(&config.settlement, &chain_ids)?);
 			},
 			"direct" => {
 				settlement_priority.push(OperatorSettlementType::Direct);
@@ -2513,7 +2513,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 			direct = Some(extract_direct_config(&config.settlement, &chain_ids));
 		} else {
 			settlement_priority.push(OperatorSettlementType::Hyperlane);
-			hyperlane = Some(extract_hyperlane_config(&config.settlement, &chain_ids));
+			hyperlane = Some(extract_hyperlane_config(&config.settlement, &chain_ids)?);
 		}
 	}
 
@@ -2870,7 +2870,7 @@ fn json_clone(value: &serde_json::Value) -> serde_json::Value {
 fn extract_hyperlane_config(
 	settlement: &SettlementConfig,
 	chain_ids: &[u64],
-) -> OperatorHyperlaneConfig {
+) -> Result<OperatorHyperlaneConfig, MergeError> {
 	use alloy_primitives::Address;
 
 	let hyperlane_json = settlement.implementations.get("hyperlane");
@@ -2946,12 +2946,27 @@ fn extract_hyperlane_config(
 		.and_then(|v| v.as_object())
 	{
 		for (chain_id_str, domain_val) in json_domains {
-			if let (Ok(chain_id), Some(domain)) = (chain_id_str.parse::<u64>(), domain_val.as_u64())
-			{
-				if domain > 0 && domain <= u32::MAX as u64 {
-					domains.insert(chain_id, domain as u32);
-				}
+			let chain_id = chain_id_str.parse::<u64>().map_err(|e| {
+				MergeError::Validation(format!(
+					"settlement.hyperlane.domains has invalid chain ID '{chain_id_str}': {e}"
+				))
+			})?;
+			let domain = domain_val.as_u64().ok_or_else(|| {
+				MergeError::Validation(format!(
+					"settlement.hyperlane.domains for chain {chain_id} must be an unsigned integer"
+				))
+			})?;
+			if domain == 0 {
+				return Err(MergeError::Validation(format!(
+					"settlement.hyperlane.domains has zero domain for chain {chain_id}"
+				)));
 			}
+			if domain > u32::MAX as u64 {
+				return Err(MergeError::Validation(format!(
+					"settlement.hyperlane.domains domain for chain {chain_id} exceeds u32::MAX"
+				)));
+			}
+			domains.insert(chain_id, domain as u32);
 		}
 	}
 
@@ -3025,7 +3040,7 @@ fn extract_hyperlane_config(
 		}
 	}
 
-	OperatorHyperlaneConfig {
+	Ok(OperatorHyperlaneConfig {
 		default_gas_limit,
 		message_timeout_seconds,
 		finalization_required,
@@ -3038,7 +3053,7 @@ fn extract_hyperlane_config(
 		},
 		routes,
 		intent_min_expiry_seconds,
-	}
+	})
 }
 
 /// Extracts direct settlement config from settlement JSON config.
@@ -6805,6 +6820,97 @@ mod tests {
 		assert!(hyperlane.routes.contains_key(&84532));
 		assert_eq!(hyperlane.domains.get(&11155420), Some(&11155420));
 		assert_eq!(hyperlane.domains.get(&84532), Some(&84532));
+	}
+
+	#[test]
+	fn test_config_to_operator_config_rejects_zero_hyperlane_domain() {
+		let overrides = test_seed_overrides();
+		let mut config = merge_config(overrides, &TESTNET_SEED).unwrap();
+		config
+			.settlement
+			.implementations
+			.get_mut("hyperlane")
+			.unwrap()
+			.get_mut("domains")
+			.unwrap()
+			.as_object_mut()
+			.unwrap()
+			.insert("11155420".to_string(), serde_json::json!(0));
+
+		let err = config_to_operator_config(&config).unwrap_err();
+
+		assert!(
+			matches!(err, MergeError::Validation(msg) if msg.contains("zero domain for chain 11155420"))
+		);
+	}
+
+	#[test]
+	fn test_config_to_operator_config_rejects_oversized_hyperlane_domain() {
+		let overrides = test_seed_overrides();
+		let mut config = merge_config(overrides, &TESTNET_SEED).unwrap();
+		config
+			.settlement
+			.implementations
+			.get_mut("hyperlane")
+			.unwrap()
+			.get_mut("domains")
+			.unwrap()
+			.as_object_mut()
+			.unwrap()
+			.insert(
+				"11155420".to_string(),
+				serde_json::json!(u32::MAX as u64 + 1),
+			);
+
+		let err = config_to_operator_config(&config).unwrap_err();
+
+		assert!(
+			matches!(err, MergeError::Validation(msg) if msg.contains("domain for chain 11155420 exceeds u32::MAX"))
+		);
+	}
+
+	#[test]
+	fn test_config_to_operator_config_rejects_invalid_hyperlane_domain_chain_id() {
+		let overrides = test_seed_overrides();
+		let mut config = merge_config(overrides, &TESTNET_SEED).unwrap();
+		config
+			.settlement
+			.implementations
+			.get_mut("hyperlane")
+			.unwrap()
+			.get_mut("domains")
+			.unwrap()
+			.as_object_mut()
+			.unwrap()
+			.insert("not-a-chain".to_string(), serde_json::json!(10));
+
+		let err = config_to_operator_config(&config).unwrap_err();
+
+		assert!(
+			matches!(err, MergeError::Validation(msg) if msg.contains("invalid chain ID 'not-a-chain'"))
+		);
+	}
+
+	#[test]
+	fn test_config_to_operator_config_rejects_non_integer_hyperlane_domain() {
+		let overrides = test_seed_overrides();
+		let mut config = merge_config(overrides, &TESTNET_SEED).unwrap();
+		config
+			.settlement
+			.implementations
+			.get_mut("hyperlane")
+			.unwrap()
+			.get_mut("domains")
+			.unwrap()
+			.as_object_mut()
+			.unwrap()
+			.insert("11155420".to_string(), serde_json::json!("11155420"));
+
+		let err = config_to_operator_config(&config).unwrap_err();
+
+		assert!(
+			matches!(err, MergeError::Validation(msg) if msg.contains("domains for chain 11155420 must be an unsigned integer"))
+		);
 	}
 
 	// ===== Tests for helper functions =====

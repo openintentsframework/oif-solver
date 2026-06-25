@@ -560,7 +560,7 @@ Settlement implementation is selected from bootstrap config JSON:
 - `broadcaster`
 
 When `settlement.type = "direct"`, `settlement.direct` is required.
-When `settlement.type = "hyperlane"` and you include non-seeded networks, provide `settlement.hyperlane` maps (`mailboxes`, `igp_addresses`, `domains`, `oracles.input`, `oracles.output`) for all configured chains.
+For `settlement.type = "hyperlane"`, any explicit `settlement.hyperlane` override (required for non-seeded networks) must include `mailboxes`, `igp_addresses`, `domains`, `oracles.input`, and `oracles.output` maps for all configured chains. Domain values must be non-zero.
 When `settlement.type = "broadcaster"`, `settlement.broadcaster` is required with `oracles`, `routes`, `broadcaster_addresses`, `receiver_addresses`, and `broadcaster_ids`. Optionally include `pusher_directions` for proactive L1 block hash pushing (required for ETH→ARB, ETH→OP, and ETH→Linea directions). Each pusher direction takes a typed `l2_params` object (`type: "arbitrum"`, `"op_stack"`, `"linea"`, or `"raw"`). See `config/example-broadcaster.json` and `docs/oracles/pusher-setup-guide.md` for details.
 
 See `config/non-seeded-networks-example.json` for a full non-seeded Hyperlane example (both chain IDs are non-seeded).

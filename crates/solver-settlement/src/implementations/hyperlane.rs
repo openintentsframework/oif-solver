@@ -1406,6 +1406,77 @@ mod tests {
 		);
 	}
 
+	#[test]
+	fn hyperlane_domain_table_rejects_non_object() {
+		let err = parse_domain_table(&serde_json::json!([])).unwrap_err();
+		assert!(
+			err.to_string().contains("must be an object"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[test]
+	fn hyperlane_domain_table_rejects_non_integer_domain() {
+		let err = parse_domain_table(&serde_json::json!({ "1": "10" })).unwrap_err();
+		assert!(
+			err.to_string().contains("must be an unsigned integer"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[test]
+	fn hyperlane_domain_table_rejects_oversized_domain() {
+		let err = parse_domain_table(&serde_json::json!({ "1": u32::MAX as u64 + 1 })).unwrap_err();
+		assert!(
+			err.to_string().contains("exceeds u32::MAX"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[test]
+	fn hyperlane_resolved_domains_require_every_network() {
+		let err = HyperlaneSettlement::build_resolved_domains(HashMap::from([(1, 10)]), &[1, 2])
+			.unwrap_err();
+		assert!(
+			err.to_string().contains("not configured for chain 2"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[test]
+	fn hyperlane_resolved_domains_reject_zero_domain() {
+		let err =
+			HyperlaneSettlement::build_resolved_domains(HashMap::from([(1, 0)]), &[1]).unwrap_err();
+		assert!(
+			err.to_string().contains("cannot be zero"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[test]
+	fn hyperlane_create_settlement_requires_domains() {
+		let config = serde_json::json!({
+			"oracles": {
+				"input": {},
+				"output": {}
+			},
+			"routes": {},
+			"mailboxes": {},
+			"igp_addresses": {},
+			"default_gas_limit": 500000
+		});
+
+		let err = match create_settlement(&config, &NetworksConfig::new(), test_storage()) {
+			Ok(_) => panic!("missing domains must fail validation"),
+			Err(err) => err,
+		};
+
+		assert!(
+			err.to_string().contains("Missing required field: domains"),
+			"unexpected error: {err}"
+		);
+	}
+
 	// Shared helpers for OutputFilled emitter-filter tests.
 	fn build_test_order_for_emitter_tests(
 		order_id: [u8; 32],

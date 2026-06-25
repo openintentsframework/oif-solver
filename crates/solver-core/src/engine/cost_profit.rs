@@ -6316,6 +6316,66 @@ mod tests {
 		config
 	}
 
+	#[test]
+	fn hyperlane_domain_for_quote_rejects_missing_domain() {
+		let config = serde_json::json!({
+			"domains": {
+				"137": 137
+			}
+		});
+
+		let err = hyperlane_domain_for_quote(&config, 1).unwrap_err();
+
+		assert!(err
+			.to_string()
+			.contains("Missing Hyperlane domain for chain 1"));
+	}
+
+	#[test]
+	fn hyperlane_domain_for_quote_rejects_non_integer_domain() {
+		let config = serde_json::json!({
+			"domains": {
+				"1": "10"
+			}
+		});
+
+		let err = hyperlane_domain_for_quote(&config, 1).unwrap_err();
+
+		assert!(err
+			.to_string()
+			.contains("Hyperlane domain for chain 1 must be an unsigned integer"));
+	}
+
+	#[test]
+	fn hyperlane_domain_for_quote_rejects_zero_domain() {
+		let config = serde_json::json!({
+			"domains": {
+				"1": 0
+			}
+		});
+
+		let err = hyperlane_domain_for_quote(&config, 1).unwrap_err();
+
+		assert!(err
+			.to_string()
+			.contains("Hyperlane domain for chain 1 must be in 1..=u32::MAX"));
+	}
+
+	#[test]
+	fn hyperlane_domain_for_quote_rejects_oversized_domain() {
+		let config = serde_json::json!({
+			"domains": {
+				"1": u32::MAX as u64 + 1
+			}
+		});
+
+		let err = hyperlane_domain_for_quote(&config, 1).unwrap_err();
+
+		assert!(err
+			.to_string()
+			.contains("Hyperlane domain for chain 1 must be in 1..=u32::MAX"));
+	}
+
 	#[tokio::test]
 	async fn quote_post_fill_submit_uses_hyperlane_domain_not_chain_id() {
 		let service = cost_profit_service_no_delivery_chains();
