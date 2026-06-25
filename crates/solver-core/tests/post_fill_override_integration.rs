@@ -324,6 +324,14 @@ async fn post_fill_estimate_with_overrides_returns_realistic_units() {
 	let origin_chain_id: u64 = require_env("OIF_TEST_ORIGIN_CHAIN_ID")
 		.parse()
 		.expect("OIF_TEST_ORIGIN_CHAIN_ID must be u64");
+	let origin_domain: u32 = std::env::var("OIF_TEST_ORIGIN_DOMAIN")
+		.ok()
+		.map(|value| value.parse().expect("OIF_TEST_ORIGIN_DOMAIN must be u32"))
+		.unwrap_or_else(|| {
+			u32::try_from(origin_chain_id).expect(
+				"OIF_TEST_ORIGIN_CHAIN_ID must fit u32 when OIF_TEST_ORIGIN_DOMAIN is unset",
+			)
+		});
 	let output_settler: Address = require_env("OIF_TEST_OUTPUT_SETTLER")
 		.parse()
 		.expect("OIF_TEST_OUTPUT_SETTLER must be a 0x... address");
@@ -399,7 +407,7 @@ async fn post_fill_estimate_with_overrides_returns_realistic_units() {
 		.erased();
 
 	let quote_call_data = IHyperlaneOracleForQuote::quoteGasPaymentCall {
-		destinationDomain: origin_chain_id as u32,
+		destinationDomain: origin_domain,
 		recipientOracle: recipient_oracle,
 		gasLimit: message_gas_limit,
 		customMetadata: Bytes::new(),
@@ -419,7 +427,7 @@ async fn post_fill_estimate_with_overrides_returns_realistic_units() {
 	let delivery = LiveRpcDelivery::new(&dest_rpc_url, dest_chain_id);
 
 	let submit_call_data = IHyperlaneOracleForQuote::submitCall {
-		destinationDomain: origin_chain_id as u32,
+		destinationDomain: origin_domain,
 		recipientOracle: recipient_oracle,
 		gasLimit: message_gas_limit,
 		customMetadata: Bytes::new(),

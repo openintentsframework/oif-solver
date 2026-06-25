@@ -353,11 +353,41 @@ pub struct HyperlaneSettlement {
 	oracle_config: OracleConfig,
 	mailbox_addresses: HashMap<u64, solver_types::Address>,
 	igp_addresses: HashMap<u64, solver_types::Address>,
+	domains: HashMap<u64, u32>,
 	message_tracker: Arc<MessageTracker>,
 	default_gas_limit: u64,
 }
 
 impl HyperlaneSettlement {
+	fn resolve_domain(&self, chain_id: u64) -> Result<u32, SettlementError> {
+		self.domains.get(&chain_id).copied().ok_or_else(|| {
+			SettlementError::ValidationFailed(format!(
+				"Hyperlane domain not configured for chain {chain_id}"
+			))
+		})
+	}
+
+	fn build_resolved_domains(
+		domains: HashMap<u64, u32>,
+		chain_ids: &[u64],
+	) -> Result<HashMap<u64, u32>, SettlementError> {
+		let mut resolved = HashMap::new();
+		for chain_id in chain_ids {
+			let domain = domains.get(chain_id).copied().ok_or_else(|| {
+				SettlementError::ValidationFailed(format!(
+					"Hyperlane domain not configured for chain {chain_id}"
+				))
+			})?;
+			if domain == 0 {
+				return Err(SettlementError::ValidationFailed(format!(
+					"Hyperlane domain for chain {chain_id} cannot be zero"
+				)));
+			}
+			resolved.insert(*chain_id, domain);
+		}
+		Ok(resolved)
+	}
+
 	/// Validate that the order-bound input oracle is configured for the given
 	/// source chain. Returns the parsed order-bound input oracle on success.
 	fn validate_bound_input_oracle(
@@ -557,6 +587,7 @@ impl HyperlaneSettlement {
 		oracle_config: OracleConfig,
 		mailbox_addresses: HashMap<u64, solver_types::Address>,
 		igp_addresses: HashMap<u64, solver_types::Address>,
+		domains: HashMap<u64, u32>,
 		default_gas_limit: u64,
 		storage: Arc<StorageService>,
 	) -> Result<Self, SettlementError> {
@@ -568,6 +599,7 @@ impl HyperlaneSettlement {
 			.copied()
 			.collect();
 		let providers = create_providers_for_chains(&all_network_ids, networks)?;
+		let domains = Self::build_resolved_domains(domains, &all_network_ids)?;
 
 		// Validate mailbox addresses are configured for all oracle chains
 		for chain_id in &all_network_ids {
@@ -586,6 +618,7 @@ impl HyperlaneSettlement {
 			oracle_config,
 			mailbox_addresses,
 			igp_addresses,
+			domains,
 			message_tracker: Arc::new(message_tracker),
 			default_gas_limit,
 		})
@@ -771,6 +804,37 @@ impl HyperlaneSettlement {
 	}
 }
 
+fn parse_domain_table(table: &serde_json::Value) -> Result<HashMap<u64, u32>, SettlementError> {
+	let table = table.as_object().ok_or_else(|| {
+		SettlementError::ValidationFailed("Hyperlane domains must be an object".to_string())
+	})?;
+	let mut result = HashMap::new();
+
+	for (chain_id_str, domain_value) in table {
+		let chain_id = chain_id_str.parse::<u64>().map_err(|e| {
+			SettlementError::ValidationFailed(format!("Invalid chain ID '{chain_id_str}': {e}"))
+		})?;
+		let domain = domain_value.as_u64().ok_or_else(|| {
+			SettlementError::ValidationFailed(format!(
+				"Hyperlane domain must be an unsigned integer for chain {chain_id}"
+			))
+		})?;
+		if domain == 0 {
+			return Err(SettlementError::ValidationFailed(format!(
+				"Hyperlane domain for chain {chain_id} cannot be zero"
+			)));
+		}
+		if domain > u32::MAX as u64 {
+			return Err(SettlementError::ValidationFailed(format!(
+				"Hyperlane domain for chain {chain_id} exceeds u32::MAX"
+			)));
+		}
+		result.insert(chain_id, domain as u32);
+	}
+
+	Ok(result)
+}
+
 /// Configuration schema for HyperlaneSettlement
 pub struct HyperlaneSettlementSchema;
 
@@ -800,6 +864,7 @@ impl ConfigSchema for HyperlaneSettlementSchema {
 					)),
 				),
 				Field::new("routes", FieldType::Table(Schema::new(vec![], vec![]))),
+				Field::new("domains", FieldType::Table(Schema::new(vec![], vec![]))),
 				Field::new("mailboxes", FieldType::Table(Schema::new(vec![], vec![]))),
 				Field::new(
 					"igp_addresses",
@@ -867,11 +932,12 @@ impl SettlementInterface for HyperlaneSettlement {
 		let payloads = vec![fill_description];
 		let total_payload_size: usize = payloads.iter().map(|p| p.len()).sum();
 		let gas_limit = self.calculate_message_gas_limit(total_payload_size);
+		let origin_domain = self.resolve_domain(params.origin_chain_id)?;
 
 		let fee_wei = self
 			.estimate_gas_payment(
 				params.dest_chain_id,
-				params.origin_chain_id as u32,
+				origin_domain,
 				recipient_oracle,
 				gas_limit,
 				vec![],
@@ -1129,12 +1195,13 @@ impl SettlementInterface for HyperlaneSettlement {
 		// Calculate gas limit based on actual payload size
 		let total_payload_size: usize = payloads.iter().map(|p| p.len()).sum();
 		let gas_limit = self.calculate_message_gas_limit(total_payload_size);
+		let origin_domain = self.resolve_domain(origin_chain)?;
 
 		// Estimate gas payment with correct payloads
 		let gas_payment = self
 			.estimate_gas_payment(
 				dest_chain,
-				origin_chain as u32,
+				origin_domain,
 				recipient_oracle.clone(),
 				gas_limit,
 				vec![], // No custom metadata
@@ -1145,7 +1212,7 @@ impl SettlementInterface for HyperlaneSettlement {
 
 		// Build submit call with correct payloads
 		let call_data = IHyperlaneOracle::submit_0Call {
-			destinationDomain: origin_chain as u32,
+			destinationDomain: origin_domain,
 			recipientOracle: alloy_primitives::Address::from_slice(&recipient_oracle.0),
 			gasLimit: gas_limit,
 			customMetadata: vec![].into(),
@@ -1220,6 +1287,10 @@ pub fn create_settlement(
 			SettlementError::ValidationFailed("Missing IGP addresses".to_string())
 		})?)?;
 
+	let domains = parse_domain_table(config.get("domains").ok_or_else(|| {
+		SettlementError::ValidationFailed("Missing Hyperlane domains".to_string())
+	})?)?;
+
 	let default_gas_limit = config
 		.get("default_gas_limit")
 		.and_then(|v| v.as_i64())
@@ -1233,6 +1304,7 @@ pub fn create_settlement(
 				oracle_config,
 				mailbox_addresses,
 				igp_addresses,
+				domains,
 				default_gas_limit,
 				storage,
 			)
@@ -1281,6 +1353,7 @@ mod tests {
 			oracle_config,
 			mailbox_addresses: HashMap::new(),
 			igp_addresses: HashMap::new(),
+			domains: HashMap::new(),
 			message_tracker: Arc::new(MessageTracker::new(test_storage())),
 			default_gas_limit: 500_000,
 		}
@@ -1289,12 +1362,14 @@ mod tests {
 	fn test_hyperlane_settlement_with_providers(
 		oracle_config: OracleConfig,
 		providers: HashMap<u64, DynProvider>,
+		domains: HashMap<u64, u32>,
 	) -> HyperlaneSettlement {
 		HyperlaneSettlement {
 			providers,
 			oracle_config,
 			mailbox_addresses: HashMap::new(),
 			igp_addresses: HashMap::new(),
+			domains,
 			message_tracker: Arc::new(MessageTracker::new(test_storage())),
 			default_gas_limit: 500_000,
 		}
@@ -1320,6 +1395,15 @@ mod tests {
 			.amount(U256::from(42u64))
 			.recipient([0x22; 32])
 			.build()
+	}
+
+	#[test]
+	fn hyperlane_domain_table_rejects_zero_domain() {
+		let err = parse_domain_table(&serde_json::json!({ "1": 0 })).unwrap_err();
+		assert!(
+			err.to_string().contains("cannot be zero"),
+			"unexpected error: {err}"
+		);
 	}
 
 	// Shared helpers for OutputFilled emitter-filter tests.
@@ -2029,7 +2113,9 @@ mod tests {
 			.await;
 
 		let origin_chain = 1u64;
+		let origin_domain = 10u32;
 		let dest_chain = 2u64;
+		let dest_domain = 20u32;
 		let input_oracle = solver_types::Address(vec![0x33; 20]);
 		let output_oracle = solver_types::Address(vec![0x44; 20]);
 		let provider = ProviderBuilder::new()
@@ -2043,6 +2129,7 @@ mod tests {
 				selection_strategy: OracleSelectionStrategy::First,
 			},
 			HashMap::from([(dest_chain, provider)]),
+			HashMap::from([(origin_chain, origin_domain), (dest_chain, dest_domain)]),
 		);
 		let params = PostFillFeeParams {
 			origin_chain_id: origin_chain,
@@ -2080,7 +2167,7 @@ mod tests {
 		let input_hex = body["params"][0]["input"].as_str().unwrap();
 		let input = hex::decode(input_hex.trim_start_matches("0x")).unwrap();
 		let decoded = IHyperlaneOracle::quoteGasPayment_0Call::abi_decode(&input).unwrap();
-		assert_eq!(decoded.destinationDomain, origin_chain as u32);
+		assert_eq!(decoded.destinationDomain, origin_domain);
 		assert_eq!(
 			decoded.recipientOracle,
 			alloy_primitives::Address::from_slice(&input_oracle.0)
@@ -2129,6 +2216,10 @@ mod tests {
 		let provider = ProviderBuilder::new()
 			.connect_http(server.uri().parse().expect("valid RPC URL"))
 			.erased();
+		let domains = HashMap::from([
+			(origin_chain, origin_chain as u32),
+			(dest_chain, dest_chain as u32),
+		]);
 		let settlement = test_hyperlane_settlement_with_providers(
 			OracleConfig {
 				input_oracles: HashMap::from([(
@@ -2143,6 +2234,7 @@ mod tests {
 				selection_strategy: OracleSelectionStrategy::First,
 			},
 			HashMap::from([(dest_chain, provider)]),
+			domains,
 		);
 
 		assert!(settlement.recover_post_fill_state(&order).await.unwrap());
@@ -2188,6 +2280,10 @@ mod tests {
 		let provider = ProviderBuilder::new()
 			.connect_http(server.uri().parse().expect("valid RPC URL"))
 			.erased();
+		let domains = HashMap::from([
+			(origin_chain, origin_chain as u32),
+			(dest_chain, dest_chain as u32),
+		]);
 		let settlement = test_hyperlane_settlement_with_providers(
 			OracleConfig {
 				input_oracles: HashMap::from([(
@@ -2202,6 +2298,7 @@ mod tests {
 				selection_strategy: OracleSelectionStrategy::First,
 			},
 			HashMap::from([(dest_chain, provider)]),
+			domains,
 		);
 
 		let proof = settlement
@@ -2232,6 +2329,7 @@ mod tests {
 				routes: HashMap::new(),
 				selection_strategy: OracleSelectionStrategy::First,
 			},
+			HashMap::new(),
 			HashMap::new(),
 		);
 		settlement

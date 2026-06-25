@@ -166,13 +166,26 @@ fn validate_seedless_settlement_requirements(
 				for chain_id in chain_ids {
 					if !hyperlane.mailboxes.contains_key(chain_id) {
 						return Err(MergeError::Validation(format!(
-						"seedless mode requires settlement.hyperlane.mailboxes for chain {chain_id}"
-					)));
+							"seedless mode requires settlement.hyperlane.mailboxes for chain {chain_id}"
+						)));
 					}
 					if !hyperlane.igp_addresses.contains_key(chain_id) {
 						return Err(MergeError::Validation(format!(
-						"seedless mode requires settlement.hyperlane.igp_addresses for chain {chain_id}"
-					)));
+							"seedless mode requires settlement.hyperlane.igp_addresses for chain {chain_id}"
+						)));
+					}
+					match hyperlane.domains.get(chain_id) {
+						Some(0) => {
+							return Err(MergeError::Validation(format!(
+									"seedless mode requires non-zero settlement.hyperlane.domains for chain {chain_id}"
+								)))
+						},
+						Some(_) => {},
+						None => {
+							return Err(MergeError::Validation(format!(
+									"seedless mode requires settlement.hyperlane.domains for chain {chain_id}"
+								)))
+						},
 					}
 
 					match hyperlane.oracles.input.get(chain_id) {
@@ -827,6 +840,7 @@ fn build_operator_hyperlane_config_from_seed(
 			.collect();
 		routes.insert(*chain_id, other_chains);
 	}
+	let domains = build_identity_hyperlane_domains(chain_ids, "seed Hyperlane identity domain")?;
 
 	Ok(OperatorHyperlaneConfig {
 		default_gas_limit: seed.defaults.hyperlane_default_gas_limit,
@@ -834,6 +848,7 @@ fn build_operator_hyperlane_config_from_seed(
 		finalization_required: seed.defaults.hyperlane_finalization_required,
 		mailboxes,
 		igp_addresses,
+		domains,
 		oracles: OperatorOracleConfig {
 			input: input_oracles,
 			output: output_oracles,
@@ -870,6 +885,47 @@ fn build_full_mesh_routes(chain_ids: &[u64]) -> HashMap<u64, Vec<u64>> {
 		routes.insert(*chain_id, other_chains);
 	}
 	routes
+}
+
+fn validate_hyperlane_domains(
+	domains: &HashMap<u64, u32>,
+	chain_ids: &[u64],
+	path: &str,
+) -> Result<(), MergeError> {
+	for chain_id in chain_ids {
+		match domains.get(chain_id) {
+			Some(0) => {
+				return Err(MergeError::Validation(format!(
+					"{path} has zero domain for chain {chain_id}"
+				)))
+			},
+			Some(_) => {},
+			None => {
+				return Err(MergeError::Validation(format!(
+					"{path} is missing chain {chain_id}"
+				)))
+			},
+		}
+	}
+	Ok(())
+}
+
+fn build_identity_hyperlane_domains(
+	chain_ids: &[u64],
+	context: &str,
+) -> Result<HashMap<u64, u32>, MergeError> {
+	chain_ids
+		.iter()
+		.map(|chain_id| {
+			u32::try_from(*chain_id)
+				.map(|domain| (*chain_id, domain))
+				.map_err(|_| {
+					MergeError::Validation(format!(
+						"{context} for chain {chain_id} exceeds u32::MAX"
+					))
+				})
+		})
+		.collect()
 }
 
 fn validate_routes(
@@ -981,6 +1037,17 @@ fn build_operator_hyperlane_config_from_override(
 		override_cfg.routes.clone()
 	};
 
+	let domains = if override_cfg.domains.is_empty() {
+		build_identity_hyperlane_domains(chain_ids, "legacy Hyperlane override identity domain")?
+	} else {
+		validate_hyperlane_domains(
+			&override_cfg.domains,
+			chain_ids,
+			"settlement.hyperlane.domains",
+		)?;
+		override_cfg.domains.clone()
+	};
+
 	Ok(OperatorHyperlaneConfig {
 		default_gas_limit: override_cfg
 			.default_gas_limit
@@ -993,6 +1060,7 @@ fn build_operator_hyperlane_config_from_override(
 			.unwrap_or(seed.defaults.hyperlane_finalization_required),
 		mailboxes: override_cfg.mailboxes.clone(),
 		igp_addresses: override_cfg.igp_addresses.clone(),
+		domains,
 		oracles: OperatorOracleConfig {
 			input: override_cfg.oracles.input.clone(),
 			output: override_cfg.oracles.output.clone(),
@@ -1598,7 +1666,7 @@ fn build_settlement_config_from_operator(
 								.to_string(),
 						)
 					})?;
-				let hyperlane_config = build_hyperlane_json_from_operator(hyperlane, chain_ids);
+				let hyperlane_config = build_hyperlane_json_from_operator(hyperlane, chain_ids)?;
 				implementations.insert("hyperlane".to_string(), hyperlane_config);
 			},
 			OperatorSettlementType::Direct => {
@@ -1643,7 +1711,7 @@ fn build_settlement_config_from_operator(
 fn build_hyperlane_json_from_operator(
 	hyperlane: &OperatorHyperlaneConfig,
 	chain_ids: &[u64],
-) -> serde_json::Value {
+) -> Result<serde_json::Value, MergeError> {
 	let mut table = serde_json::Map::new();
 
 	// Basic settings
@@ -1744,7 +1812,30 @@ fn build_hyperlane_json_from_operator(
 		serde_json::Value::Object(igp_addresses),
 	);
 
-	serde_json::Value::Object(table)
+	let resolved_domains = resolve_operator_hyperlane_domains(hyperlane, chain_ids)?;
+	let mut domains = serde_json::Map::new();
+	for (chain_id, domain) in resolved_domains {
+		domains.insert(chain_id.to_string(), int(domain as i64));
+	}
+	table.insert("domains".to_string(), serde_json::Value::Object(domains));
+
+	Ok(serde_json::Value::Object(table))
+}
+
+fn resolve_operator_hyperlane_domains(
+	hyperlane: &OperatorHyperlaneConfig,
+	chain_ids: &[u64],
+) -> Result<HashMap<u64, u32>, MergeError> {
+	if hyperlane.domains.is_empty() {
+		return build_identity_hyperlane_domains(chain_ids, "legacy Hyperlane identity domain");
+	}
+
+	validate_hyperlane_domains(
+		&hyperlane.domains,
+		chain_ids,
+		"settlement.hyperlane.domains",
+	)?;
+	Ok(hyperlane.domains.clone())
 }
 
 /// Builds direct settlement JSON config from OperatorDirectConfig.
@@ -2849,6 +2940,21 @@ fn extract_hyperlane_config(
 		}
 	}
 
+	let mut domains = HashMap::new();
+	if let Some(json_domains) = hyperlane_json
+		.and_then(|h| h.get("domains"))
+		.and_then(|v| v.as_object())
+	{
+		for (chain_id_str, domain_val) in json_domains {
+			if let (Ok(chain_id), Some(domain)) = (chain_id_str.parse::<u64>(), domain_val.as_u64())
+			{
+				if domain > 0 && domain <= u32::MAX as u64 {
+					domains.insert(chain_id, domain as u32);
+				}
+			}
+		}
+	}
+
 	// Extract oracles
 	let mut input_oracles = HashMap::new();
 	let mut output_oracles = HashMap::new();
@@ -2925,6 +3031,7 @@ fn extract_hyperlane_config(
 		finalization_required,
 		mailboxes,
 		igp_addresses,
+		domains,
 		oracles: OperatorOracleConfig {
 			input: input_oracles,
 			output: output_oracles,
@@ -4761,6 +4868,7 @@ mod tests {
 							address!("6000000000000000000000000000000000000006"),
 						),
 					]),
+					domains: HashMap::from([(11155420, 11155420), (non_seed_chain_id, 654321)]),
 					oracles: solver_types::OracleOverrides {
 						input: HashMap::from([
 							(
@@ -4899,6 +5007,7 @@ mod tests {
 							address!("dddddddddddddddddddddddddddddddddddddddd"),
 						),
 					]),
+					domains: HashMap::from([(chain_a, 1001), (chain_b, 1002)]),
 					oracles: solver_types::OracleOverrides {
 						input: HashMap::from([
 							(
@@ -4959,6 +5068,8 @@ mod tests {
 		let hyperlane = op_config.settlement.hyperlane.unwrap();
 		assert_eq!(hyperlane.routes.get(&chain_a), Some(&vec![chain_b]));
 		assert_eq!(hyperlane.routes.get(&chain_b), Some(&vec![chain_a]));
+		assert_eq!(hyperlane.domains.get(&chain_a), Some(&1001));
+		assert_eq!(hyperlane.domains.get(&chain_b), Some(&1002));
 		assert_eq!(
 			op_config.gas.resource_lock.fill,
 			COMMON_DEFAULTS.gas_resource_lock.fill
@@ -5388,6 +5499,7 @@ mod tests {
 							address!("8888888888888888888888888888888888888888"),
 						),
 					]),
+					domains: HashMap::from([(chain_a, chain_a as u32), (chain_b, chain_b as u32)]),
 					oracles: solver_types::OracleOverrides {
 						input: HashMap::from([
 							(
@@ -5564,6 +5676,7 @@ mod tests {
 							address!("8888888888888888888888888888888888888888"),
 						),
 					]),
+					domains: HashMap::from([(chain_a, chain_a as u32), (chain_b, chain_b as u32)]),
 					oracles: solver_types::OracleOverrides {
 						input: HashMap::from([
 							(
@@ -5795,6 +5908,7 @@ mod tests {
 							address!("dddddddddddddddddddddddddddddddddddddddd"),
 						),
 					]),
+					domains: HashMap::from([(chain_a, chain_a as u32), (chain_b, chain_b as u32)]),
 					oracles: solver_types::OracleOverrides {
 						input: HashMap::from([
 							(
@@ -6351,6 +6465,67 @@ mod tests {
 	}
 
 	#[test]
+	fn test_merge_to_operator_config_backfills_legacy_hyperlane_override_domains() {
+		let mut overrides = test_seed_overrides();
+		overrides.settlement = Some(solver_types::SettlementOverride {
+			settlement_type: SettlementTypeOverride::Hyperlane,
+			priority: None,
+			hyperlane: Some(HyperlaneSettlementOverride {
+				mailboxes: HashMap::from([
+					(
+						11155420,
+						address!("3000000000000000000000000000000000000003"),
+					),
+					(84532, address!("4000000000000000000000000000000000000004")),
+				]),
+				igp_addresses: HashMap::from([
+					(
+						11155420,
+						address!("5000000000000000000000000000000000000005"),
+					),
+					(84532, address!("6000000000000000000000000000000000000006")),
+				]),
+				domains: HashMap::new(),
+				oracles: solver_types::OracleOverrides {
+					input: HashMap::from([
+						(
+							11155420,
+							vec![address!("7000000000000000000000000000000000000007")],
+						),
+						(
+							84532,
+							vec![address!("8000000000000000000000000000000000000008")],
+						),
+					]),
+					output: HashMap::from([
+						(
+							11155420,
+							vec![address!("7000000000000000000000000000000000000007")],
+						),
+						(
+							84532,
+							vec![address!("8000000000000000000000000000000000000008")],
+						),
+					]),
+				},
+				routes: HashMap::new(),
+				default_gas_limit: None,
+				message_timeout_seconds: None,
+				finalization_required: None,
+				intent_min_expiry_seconds: None,
+			}),
+			direct: None,
+			broadcaster: None,
+		});
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		let hyperlane = op_config.settlement.hyperlane.as_ref().unwrap();
+
+		assert_eq!(hyperlane.domains.get(&11155420), Some(&11155420));
+		assert_eq!(hyperlane.domains.get(&84532), Some(&84532));
+	}
+
+	#[test]
 	fn test_merge_to_operator_config_gas() {
 		let overrides = test_seed_overrides();
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -6386,6 +6561,29 @@ mod tests {
 	}
 
 	#[test]
+	fn test_build_runtime_config_backfills_legacy_empty_hyperlane_domains() {
+		let overrides = test_seed_overrides();
+		let mut op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		op_config
+			.settlement
+			.hyperlane
+			.as_mut()
+			.unwrap()
+			.domains
+			.clear();
+
+		let config = build_runtime_config(&op_config).unwrap();
+		let hyperlane = config.settlement.implementations.get("hyperlane").unwrap();
+		let domains = hyperlane.get("domains").unwrap().as_object().unwrap();
+
+		assert_eq!(
+			domains.get("11155420").and_then(|v| v.as_u64()),
+			Some(11155420)
+		);
+		assert_eq!(domains.get("84532").and_then(|v| v.as_u64()), Some(84532));
+	}
+
+	#[test]
 	fn test_build_runtime_config_insufficient_networks() {
 		// Create an OperatorConfig with only 1 network (invalid)
 		let mut op_config = OperatorConfig {
@@ -6402,6 +6600,7 @@ mod tests {
 					finalization_required: true,
 					mailboxes: HashMap::new(),
 					igp_addresses: HashMap::new(),
+					domains: HashMap::new(),
 					oracles: OperatorOracleConfig {
 						input: HashMap::new(),
 						output: HashMap::new(),
@@ -6604,6 +6803,8 @@ mod tests {
 		// Check routes exist for both chains
 		assert!(hyperlane.routes.contains_key(&11155420));
 		assert!(hyperlane.routes.contains_key(&84532));
+		assert_eq!(hyperlane.domains.get(&11155420), Some(&11155420));
+		assert_eq!(hyperlane.domains.get(&84532), Some(&84532));
 	}
 
 	// ===== Tests for helper functions =====
@@ -7261,8 +7462,23 @@ mod tests {
 		assert!(hyperlane.mailboxes.contains_key(&84532));
 		assert!(hyperlane.igp_addresses.contains_key(&11155420));
 		assert!(hyperlane.igp_addresses.contains_key(&84532));
+		assert_eq!(hyperlane.domains.get(&11155420), Some(&11155420));
+		assert_eq!(hyperlane.domains.get(&84532), Some(&84532));
 		assert_eq!(hyperlane.routes.get(&11155420), Some(&vec![84532]));
 		assert_eq!(hyperlane.routes.get(&84532), Some(&vec![11155420]));
+	}
+
+	#[test]
+	fn test_validate_hyperlane_domains_rejects_missing_chain() {
+		let err = validate_hyperlane_domains(
+			&HashMap::from([(11155420, 11155420)]),
+			&[11155420, 84532],
+			"domains",
+		)
+		.unwrap_err();
+		assert!(
+			matches!(err, MergeError::Validation(msg) if msg.contains("domains is missing chain 84532"))
+		);
 	}
 
 	#[test]
