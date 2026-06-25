@@ -150,9 +150,7 @@ impl PricingInterface for MockPricing {
 		let eth_amount_str =
 			wei_string_to_eth_string(wei_amount).map_err(PricingError::InvalidData)?;
 
-		let eth_amount_f64 = eth_amount_str
-			.parse::<f64>()
-			.map_err(|e| PricingError::InvalidData(format!("Invalid ETH amount: {e}")))?;
+		let eth_amount_f64 = parse_nonnegative_finite_amount(&eth_amount_str, "ETH amount")?;
 
 		// Convert ETH to target currency
 		let eth_pair = TradingPair::new("ETH", currency);
@@ -395,6 +393,17 @@ mod tests {
 
 		for amount in ["-1", "NaN", "inf"] {
 			let result = pricing.currency_to_wei(amount, "USD").await;
+			assert!(
+				matches!(result, Err(PricingError::InvalidData(_))),
+				"amount {amount} should be rejected"
+			);
+		}
+	}
+
+	#[test]
+	fn test_parse_nonnegative_finite_amount_rejects_invalid_amounts() {
+		for amount in ["-1", "NaN", "inf"] {
+			let result = parse_nonnegative_finite_amount(amount, "ETH amount");
 			assert!(
 				matches!(result, Err(PricingError::InvalidData(_))),
 				"amount {amount} should be rejected"
