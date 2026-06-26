@@ -48,7 +48,15 @@ impl DeliveryInterface for RecordingDelivery {
 			.tracking
 			.attempt_recorder
 			.record_planned_attempt(PlannedAttemptInit {
-				order_id: tracking.tracking.id.clone(),
+				scope: match tracking.tracking.tx_type {
+					TransactionType::Approval
+					| TransactionType::Withdrawal
+					| TransactionType::Bridge
+					| TransactionType::Pusher => {
+						solver_types::TransactionAttemptScope::system(tracking.tracking.id.clone())
+					},
+					_ => solver_types::TransactionAttemptScope::order(tracking.tracking.id.clone()),
+				},
 				signer: Some(self.signer.clone()),
 				tx_type: tracking.tracking.tx_type,
 				tx,
@@ -206,7 +214,7 @@ async fn delivery_service_persists_attempt_ledger_through_tracking() {
 	assert_eq!(attempts.len(), 1);
 
 	let attempt = &attempts[0];
-	assert_eq!(attempt.order_id, "order-delivery-e2e");
+	assert_eq!(attempt.order_id(), Some("order-delivery-e2e"));
 	assert_eq!(attempt.signer, Some(signer));
 	assert_eq!(attempt.tx_type, TransactionType::Fill);
 	assert_eq!(attempt.chain_id, 10);
