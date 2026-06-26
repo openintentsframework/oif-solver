@@ -2807,6 +2807,76 @@ mod tests {
 		assert!(matches!(result, Err(StorageError::Backend(_))));
 	}
 
+	fn redis_url_or_skip() -> Option<String> {
+		match std::env::var("REDIS_URL") {
+			Ok(url) if !url.trim().is_empty() => Some(url),
+			_ => {
+				eprintln!("skipping Redis cleanup test because REDIS_URL is not set");
+				None
+			},
+		}
+	}
+
+	#[tokio::test]
+	async fn cleanup_expired_prunes_stale_order_indexes_when_redis_is_available(
+	) -> Result<(), StorageError> {
+		let Some(redis_url) = redis_url_or_skip() else {
+			return Ok(());
+		};
+		let storage = RedisStorage::new(
+			redis_url,
+			5000,
+			format!("test-{}", uuid::Uuid::new_v4()),
+			TtlConfig::default(),
+			false,
+		)?;
+		let order_key = "orders:stale-order";
+		let indexes = StorageIndexes::new()
+			.with_field("status_kind", serde_json::json!("executing"))
+			.with_field("is_terminal", serde_json::json!(false));
+
+		storage
+			.set_bytes(order_key, b"fresh".to_vec(), Some(indexes), None)
+			.await?;
+		assert_eq!(storage.cleanup_expired().await?, 0);
+
+		let client = storage.get_connection().await?;
+		let mut conn = client.as_ref().clone();
+		assert!(
+			!storage
+				.prune_stale_index_member(&mut conn, "orders", order_key)
+				.await?
+		);
+
+		let active = storage
+			.query(
+				"orders",
+				QueryFilter::Equals("is_terminal".to_string(), serde_json::json!(false)),
+			)
+			.await?;
+		assert_eq!(active, vec![order_key.to_string()]);
+
+		let _: usize = dispatch_redis!(
+			storage,
+			conn,
+			"delete_test_order_data",
+			del(&storage.data_key(order_key))
+		);
+
+		assert_eq!(storage.cleanup_expired().await?, 1);
+		let active = storage
+			.query(
+				"orders",
+				QueryFilter::Equals("is_terminal".to_string(), serde_json::json!(false)),
+			)
+			.await?;
+		assert!(active.is_empty());
+		let all = storage.query("orders", QueryFilter::All).await?;
+		assert!(all.is_empty());
+
+		Ok(())
+	}
+
 	#[tokio::test]
 	#[ignore = "requires local redis-server and redis-cli binaries"]
 	async fn prune_stale_index_member_keeps_recreated_data_indexes() {
