@@ -2831,6 +2831,7 @@ mod tests {
 			false,
 		)?;
 		let order_key = "orders:stale-order";
+		let second_order_key = "orders:second-order";
 		let indexes = StorageIndexes::new()
 			.with_field("status_kind", serde_json::json!("executing"))
 			.with_field("is_terminal", serde_json::json!(false));
@@ -2840,6 +2841,29 @@ mod tests {
 			.await?;
 		assert_eq!(storage.cleanup_expired().await?, 0);
 
+		let active = storage
+			.query(
+				"orders",
+				QueryFilter::Equals("is_terminal".to_string(), serde_json::json!(false)),
+			)
+			.await?;
+		assert_eq!(active, vec![order_key.to_string()]);
+		let executing = storage
+			.query(
+				"orders",
+				QueryFilter::In(
+					"status_kind".to_string(),
+					vec![
+						serde_json::json!("executing"),
+						serde_json::json!("post_filled"),
+					],
+				),
+			)
+			.await?;
+		assert_eq!(executing, vec![order_key.to_string()]);
+		let all = storage.query("orders", QueryFilter::All).await?;
+		assert_eq!(all, vec![order_key.to_string()]);
+
 		let client = storage.get_connection().await?;
 		let mut conn = client.as_ref().clone();
 		assert!(
@@ -2848,13 +2872,19 @@ mod tests {
 				.await?
 		);
 
-		let active = storage
-			.query(
-				"orders",
-				QueryFilter::Equals("is_terminal".to_string(), serde_json::json!(false)),
+		storage
+			.set_bytes(
+				second_order_key,
+				b"terminal".to_vec(),
+				Some(
+					StorageIndexes::new()
+						.with_field("status_kind", serde_json::json!("finalized"))
+						.with_field("is_terminal", serde_json::json!(true))
+						.with_field("chain_id", serde_json::json!(1)),
+				),
+				None,
 			)
 			.await?;
-		assert_eq!(active, vec![order_key.to_string()]);
 
 		let _: usize = dispatch_redis!(
 			storage,
@@ -2862,8 +2892,14 @@ mod tests {
 			"delete_test_order_data",
 			del(&storage.data_key(order_key))
 		);
+		let _: usize = dispatch_redis!(
+			storage,
+			conn,
+			"delete_test_second_order_data",
+			del(&storage.data_key(second_order_key))
+		);
 
-		assert_eq!(storage.cleanup_expired().await?, 1);
+		assert_eq!(storage.cleanup_expired().await?, 2);
 		let active = storage
 			.query(
 				"orders",
@@ -2871,6 +2907,13 @@ mod tests {
 			)
 			.await?;
 		assert!(active.is_empty());
+		let finalized = storage
+			.query(
+				"orders",
+				QueryFilter::Equals("is_terminal".to_string(), serde_json::json!(true)),
+			)
+			.await?;
+		assert!(finalized.is_empty());
 		let all = storage.query("orders", QueryFilter::All).await?;
 		assert!(all.is_empty());
 
