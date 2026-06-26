@@ -213,12 +213,12 @@ impl CoinGeckoPricing {
 			.map_err(|e| PricingError::Network(format!("Failed to create HTTP client: {e}")))?;
 
 		debug!(
-			"CoinGecko pricing initialized - Base URL: {}, Cache: {}s, Rate limit: {}ms, Max rate sleep: {}ms, Request timeout: {}ms",
-			base_url,
-			cache_duration,
+			base_url = %base_url,
+			cache_duration_seconds = cache_duration,
 			rate_limit_delay_ms,
 			max_rate_limit_sleep_ms,
-			request_timeout_ms
+			request_timeout_ms,
+			"CoinGecko pricing initialized"
 		);
 		debug!(
 			"CoinGecko token mappings: {} tokens configured",
@@ -698,10 +698,10 @@ impl ConfigSchema for CoinGeckoConfigSchema {
 
 		// Optional request timeout
 		if let Some(timeout) = config.get("request_timeout_ms") {
-			if timeout.as_u64().is_none() {
+			if timeout.as_u64().is_none_or(|value| value == 0) {
 				return Err(ValidationError::TypeMismatch {
 					field: "request_timeout_ms".to_string(),
-					expected: "non-negative integer".to_string(),
+					expected: "positive integer".to_string(),
 					actual: format!("{timeout:?}"),
 				});
 			}
@@ -1285,6 +1285,16 @@ mod tests {
 				"request_timeout_ms": -1
 			}))
 			.is_err());
+		assert!(schema
+			.validate(&serde_json::json!({
+				"request_timeout_ms": 0
+			}))
+			.is_err());
+		assert!(schema
+			.validate(&serde_json::json!({
+				"request_timeout_ms": 1
+			}))
+			.is_ok());
 	}
 
 	#[test]
