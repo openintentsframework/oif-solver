@@ -148,6 +148,65 @@ async fn cluster_query_with_indexes_round_trip() {
 }
 
 #[tokio::test]
+async fn cluster_cleanup_expired_prunes_stale_order_indexes() {
+	let prefix = unique_prefix("cleanup");
+	let storage = make_storage(&prefix);
+	let order_key = "orders:stale-order";
+	let indexes = StorageIndexes::new()
+		.with_field("status_kind", serde_json::json!("finalized"))
+		.with_field("is_terminal", serde_json::json!(true));
+
+	storage
+		.set_bytes(order_key, b"stale".to_vec(), Some(indexes), None)
+		.await
+		.unwrap();
+
+	let client = redis::cluster::ClusterClient::new(vec![cluster_url()]).unwrap();
+	let mut conn = client.get_async_connection().await.unwrap();
+	let tagged_prefix = format!("{{{prefix}}}");
+	let data_key = format!("{tagged_prefix}:{order_key}");
+	let all_ids_key = format!("{tagged_prefix}:orders:_all");
+	let status_index_key = format!("{tagged_prefix}:orders:_index:status_kind:finalized");
+	let terminal_index_key = format!("{tagged_prefix}:orders:_index:is_terminal:true");
+	let index_meta_key = format!("{tagged_prefix}:{order_key}:_idx_meta");
+
+	let _: usize = redis::cmd("DEL")
+		.arg(&data_key)
+		.query_async(&mut conn)
+		.await
+		.unwrap();
+
+	for set_key in [&all_ids_key, &status_index_key, &terminal_index_key] {
+		let is_member: bool = redis::cmd("SISMEMBER")
+			.arg(set_key)
+			.arg(order_key)
+			.query_async(&mut conn)
+			.await
+			.unwrap();
+		assert!(is_member, "expected stale member in {set_key}");
+	}
+
+	let pruned = storage.cleanup_expired().await.unwrap();
+	assert_eq!(pruned, 1);
+
+	for set_key in [&all_ids_key, &status_index_key, &terminal_index_key] {
+		let is_member: bool = redis::cmd("SISMEMBER")
+			.arg(set_key)
+			.arg(order_key)
+			.query_async(&mut conn)
+			.await
+			.unwrap();
+		assert!(!is_member, "expected stale member pruned from {set_key}");
+	}
+	let meta_exists: bool = redis::cmd("EXISTS")
+		.arg(&index_meta_key)
+		.query_async(&mut conn)
+		.await
+		.unwrap();
+	assert!(!meta_exists, "expected stale index metadata to be removed");
+}
+
+#[tokio::test]
 async fn cluster_set_nx_atomicity() {
 	let storage = make_storage(&unique_prefix("setnx"));
 	let first = storage.set_nx("k", b"v1".to_vec(), None).await.unwrap();

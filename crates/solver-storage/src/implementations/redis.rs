@@ -91,7 +91,7 @@ use redis::aio::ConnectionManager;
 use redis::cluster_async::ClusterConnection;
 use redis::{AsyncCommands, RedisError};
 use solver_types::{ConfigSchema, Field, FieldType, Schema, StorageKey, ValidationError};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::OnceCell;
@@ -144,6 +144,22 @@ const INDEX_SUFFIX: &str = "_index";
 
 /// Suffix for storing index metadata (which indexes reference a key).
 const INDEX_META_SUFFIX: &str = "_idx_meta";
+
+/// Number of set members fetched per SSCAN round during index hygiene.
+const CLEANUP_SCAN_COUNT: usize = 1000;
+
+/// Stable order status index values written by solver-core.
+const ORDER_STATUS_KIND_INDEX_VALUES: &[&str] = &[
+	"created",
+	"pending",
+	"executing",
+	"executed",
+	"post_filled",
+	"pre_claimed",
+	"settled",
+	"finalized",
+	"failed",
+];
 
 /// TTL configuration for different storage keys.
 #[derive(Debug, Clone)]
@@ -380,6 +396,139 @@ impl RedisStorage {
 			)),
 			_ => StorageError::Backend(format!("Redis operation '{context}' failed: {error}")),
 		}
+	}
+
+	fn negative_query_disabled_error() -> StorageError {
+		StorageError::Backend(
+			"Redis negative index queries are disabled; query a positive index instead".to_string(),
+		)
+	}
+
+	async fn sscan_set_batch(
+		&self,
+		conn: &mut RedisConn,
+		set_key: &str,
+		cursor: u64,
+		context: &str,
+	) -> Result<(u64, Vec<String>), StorageError> {
+		let batch: (u64, Vec<String>) = match conn {
+			RedisConn::Standalone(c) => {
+				redis::cmd("SSCAN")
+					.arg(set_key)
+					.arg(cursor)
+					.arg("COUNT")
+					.arg(CLEANUP_SCAN_COUNT)
+					.query_async(c)
+					.await
+			},
+			RedisConn::Cluster(c) => {
+				redis::cmd("SSCAN")
+					.arg(set_key)
+					.arg(cursor)
+					.arg("COUNT")
+					.arg(CLEANUP_SCAN_COUNT)
+					.query_async(c)
+					.await
+			},
+		}
+		.map_err(|e| self.map_redis_error(e, context))?;
+
+		Ok(batch)
+	}
+
+	async fn redis_key_exists(
+		&self,
+		conn: &mut RedisConn,
+		redis_key: &str,
+		context: &str,
+	) -> Result<bool, StorageError> {
+		let exists: bool = match conn {
+			RedisConn::Standalone(c) => redis::cmd("EXISTS").arg(redis_key).query_async(c).await,
+			RedisConn::Cluster(c) => redis::cmd("EXISTS").arg(redis_key).query_async(c).await,
+		}
+		.map_err(|e| self.map_redis_error(e, context))?;
+
+		Ok(exists)
+	}
+
+	fn known_cleanup_index_keys(&self, namespace: &str) -> Vec<String> {
+		if namespace != StorageKey::Orders.as_str() {
+			return Vec::new();
+		}
+
+		let mut keys = Vec::new();
+		for status in ORDER_STATUS_KIND_INDEX_VALUES {
+			keys.push(self.index_key(namespace, "status_kind", &serde_json::json!(*status)));
+		}
+		for is_terminal in [false, true] {
+			keys.push(self.index_key(namespace, "is_terminal", &serde_json::json!(is_terminal)));
+		}
+		keys
+	}
+
+	async fn prune_stale_index_member(
+		&self,
+		conn: &mut RedisConn,
+		namespace: &str,
+		key: &str,
+	) -> Result<bool, StorageError> {
+		let data_key = self.data_key(key);
+		let index_meta_key = self.index_meta_key(key);
+		let all_ids_key = self.all_ids_key(namespace);
+		let known_index_keys = self.known_cleanup_index_keys(namespace);
+		let metadata_index_keys: Vec<String> = match &mut *conn {
+			RedisConn::Standalone(c) => {
+				redis::cmd("SMEMBERS")
+					.arg(&index_meta_key)
+					.query_async(c)
+					.await
+			},
+			RedisConn::Cluster(c) => {
+				redis::cmd("SMEMBERS")
+					.arg(&index_meta_key)
+					.query_async(c)
+					.await
+			},
+		}
+		.map_err(|e| self.map_redis_error(e, "cleanup_expired_get_meta"))?;
+		let script = redis::Script::new(
+			r#"
+            local data_key = KEYS[1]
+            local index_meta_key = KEYS[2]
+            local member = ARGV[1]
+
+            if redis.call('EXISTS', data_key) == 1 then
+                return 0
+            end
+
+            for i = 3, #KEYS do
+                redis.call('SREM', KEYS[i], member)
+            end
+
+            redis.call('DEL', index_meta_key)
+
+            return 1
+            "#,
+		);
+
+		let mut invocation = script.prepare_invoke();
+		invocation
+			.key(&data_key)
+			.key(&index_meta_key)
+			.key(&all_ids_key);
+		for index_key in &known_index_keys {
+			invocation.key(index_key);
+		}
+		for index_key in &metadata_index_keys {
+			invocation.key(index_key);
+		}
+		let pruned: i64 = match conn {
+			RedisConn::Standalone(c) => invocation.arg(key).invoke_async(c).await,
+			RedisConn::Cluster(c) => invocation.arg(key).invoke_async(c).await,
+		}
+		.map_err(|e| self.map_redis_error(e, "cleanup_expired_atomic_prune"))?;
+
+		Ok(pruned == 1)
 	}
 
 	/// Updates indexes when storing data.
@@ -663,6 +812,13 @@ impl StorageInterface for RedisStorage {
 		namespace: &str,
 		filter: QueryFilter,
 	) -> Result<Vec<String>, StorageError> {
+		if matches!(
+			&filter,
+			QueryFilter::NotEquals(_, _) | QueryFilter::NotIn(_, _)
+		) {
+			return Err(Self::negative_query_disabled_error());
+		}
+
 		let client = self.get_connection().await?;
 		let mut conn = client.as_ref().clone();
 
@@ -675,27 +831,6 @@ impl StorageInterface for RedisStorage {
 			QueryFilter::Equals(field, value) => {
 				let index_key = self.index_key(namespace, &field, &value);
 				dispatch_redis!(self, conn, "query_equals", smembers(&index_key))
-			},
-			QueryFilter::NotEquals(field, value) => {
-				// Get all IDs, then filter out those that match the value
-				let all_ids_key = self.all_ids_key(namespace);
-				let index_key = self.index_key(namespace, &field, &value);
-
-				let all_ids: Vec<String> =
-					dispatch_redis!(self, conn, "query_not_equals_all", smembers(&all_ids_key));
-
-				let excluded_ids: Vec<String> = dispatch_redis!(
-					self,
-					conn,
-					"query_not_equals_excluded",
-					smembers(&index_key)
-				);
-
-				let excluded_set: std::collections::HashSet<_> = excluded_ids.into_iter().collect();
-				all_ids
-					.into_iter()
-					.filter(|id| !excluded_set.contains(id))
-					.collect()
 			},
 			QueryFilter::In(field, values) => {
 				// Union of all matching index sets
@@ -710,24 +845,8 @@ impl StorageInterface for RedisStorage {
 
 				result_ids.into_iter().collect()
 			},
-			QueryFilter::NotIn(field, values) => {
-				// Get all IDs, then filter out those in any of the value sets
-				let all_ids_key = self.all_ids_key(namespace);
-				let all_ids: Vec<String> =
-					dispatch_redis!(self, conn, "query_not_in_all", smembers(&all_ids_key));
-
-				let mut excluded_ids = std::collections::HashSet::new();
-				for value in values {
-					let index_key = self.index_key(namespace, &field, &value);
-					let ids: Vec<String> =
-						dispatch_redis!(self, conn, "query_not_in_excluded", smembers(&index_key));
-					excluded_ids.extend(ids);
-				}
-
-				all_ids
-					.into_iter()
-					.filter(|id| !excluded_ids.contains(id))
-					.collect()
+			QueryFilter::NotEquals(_, _) | QueryFilter::NotIn(_, _) => {
+				return Err(Self::negative_query_disabled_error());
 			},
 		};
 
@@ -782,11 +901,53 @@ impl StorageInterface for RedisStorage {
 	}
 
 	async fn cleanup_expired(&self) -> Result<usize, StorageError> {
-		// Redis handles TTL expiration automatically via EXPIRE.
-		// We don't need to do manual cleanup.
-		// However, we might want to clean up stale index entries.
-		debug!("cleanup_expired called - Redis handles TTL automatically");
-		Ok(0)
+		let client = self.get_connection().await?;
+		let mut conn = client.as_ref().clone();
+		let mut pruned_keys = HashSet::new();
+
+		for storage_key in StorageKey::all() {
+			let namespace = storage_key.as_str();
+			let all_ids_key = self.all_ids_key(namespace);
+			let mut candidate_sets = vec![all_ids_key];
+			candidate_sets.extend(self.known_cleanup_index_keys(namespace));
+
+			for candidate_set in candidate_sets {
+				let mut cursor = 0_u64;
+				loop {
+					let (next_cursor, members) = self
+						.sscan_set_batch(&mut conn, &candidate_set, cursor, "cleanup_expired_sscan")
+						.await?;
+
+					for key in members {
+						let data_key = self.data_key(&key);
+						if self
+							.redis_key_exists(&mut conn, &data_key, "cleanup_expired_exists")
+							.await?
+						{
+							continue;
+						}
+
+						if self
+							.prune_stale_index_member(&mut conn, namespace, &key)
+							.await?
+						{
+							pruned_keys.insert(key);
+						}
+					}
+
+					if next_cursor == 0 {
+						break;
+					}
+					cursor = next_cursor;
+				}
+			}
+		}
+
+		debug!(
+			pruned = pruned_keys.len(),
+			"cleanup_expired pruned stale Redis index members"
+		);
+		Ok(pruned_keys.len())
 	}
 
 	async fn set_nx(
@@ -1239,6 +1400,62 @@ mod tests {
 	use super::*;
 	use solver_types::ImplementationRegistry;
 
+	struct RedisServerGuard {
+		child: std::process::Child,
+		_temp_dir: tempfile::TempDir,
+	}
+
+	impl Drop for RedisServerGuard {
+		fn drop(&mut self) {
+			let _ = self.child.kill();
+			let _ = self.child.wait();
+		}
+	}
+
+	fn start_test_redis() -> (RedisServerGuard, String) {
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let port = listener.local_addr().unwrap().port();
+		drop(listener);
+
+		let temp_dir = tempfile::tempdir().unwrap();
+		let child = std::process::Command::new("redis-server")
+			.arg("--port")
+			.arg(port.to_string())
+			.arg("--bind")
+			.arg("127.0.0.1")
+			.arg("--save")
+			.arg("")
+			.arg("--appendonly")
+			.arg("no")
+			.arg("--dir")
+			.arg(temp_dir.path())
+			.stdout(std::process::Stdio::null())
+			.stderr(std::process::Stdio::null())
+			.spawn()
+			.expect("start redis-server");
+		let guard = RedisServerGuard {
+			child,
+			_temp_dir: temp_dir,
+		};
+
+		let url = format!("redis://127.0.0.1:{port}");
+		for _ in 0..50 {
+			if std::process::Command::new("redis-cli")
+				.arg("-p")
+				.arg(port.to_string())
+				.arg("ping")
+				.output()
+				.map(|output| output.status.success())
+				.unwrap_or(false)
+			{
+				return (guard, url);
+			}
+			std::thread::sleep(Duration::from_millis(100));
+		}
+
+		panic!("redis-server did not become ready");
+	}
+
 	// ==================== TtlConfig Tests ====================
 
 	#[test]
@@ -1618,6 +1835,28 @@ mod tests {
 			storage.index_meta_key("orders:123"),
 			"my-prefix:orders:123:_idx_meta"
 		);
+	}
+
+	#[test]
+	fn cleanup_known_order_index_keys_include_status_and_terminal_indexes() {
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"oif-solver".to_string(),
+			ttl_config,
+			false,
+		)
+		.unwrap();
+
+		let keys = storage.known_cleanup_index_keys("orders");
+
+		assert_eq!(keys.len(), ORDER_STATUS_KIND_INDEX_VALUES.len() + 2);
+		assert!(keys.contains(&"oif-solver:orders:_index:status_kind:finalized".to_string()));
+		assert!(keys.contains(&"oif-solver:orders:_index:status_kind:failed".to_string()));
+		assert!(keys.contains(&"oif-solver:orders:_index:is_terminal:false".to_string()));
+		assert!(keys.contains(&"oif-solver:orders:_index:is_terminal:true".to_string()));
+		assert!(storage.known_cleanup_index_keys("quotes").is_empty());
 	}
 
 	// ==================== get_ttl_for_key() Tests ====================
@@ -2447,7 +2686,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_query_not_equals_connection_failure() {
+	async fn redis_negative_filter_not_equals_is_rejected_without_connection() {
 		let config = serde_json::json!({
 			"redis_url": "redis://invalid-host:6379",
 			"connection_timeout_ms": 100,
@@ -2461,8 +2700,15 @@ mod tests {
 			)
 			.await;
 
-		assert!(result.is_err());
-		assert!(matches!(result, Err(StorageError::Backend(_))));
+		match result {
+			Err(StorageError::Backend(message)) => {
+				assert!(
+					message.contains("Redis negative index queries are disabled"),
+					"unexpected error: {message}"
+				);
+			},
+			other => panic!("expected negative query rejection, got {other:?}"),
+		}
 	}
 
 	#[tokio::test]
@@ -2488,7 +2734,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_query_not_in_connection_failure() {
+	async fn redis_negative_filter_not_in_is_rejected_without_connection() {
 		let config = serde_json::json!({
 			"redis_url": "redis://invalid-host:6379",
 			"connection_timeout_ms": 100,
@@ -2505,8 +2751,15 @@ mod tests {
 			)
 			.await;
 
-		assert!(result.is_err());
-		assert!(matches!(result, Err(StorageError::Backend(_))));
+		match result {
+			Err(StorageError::Backend(message)) => {
+				assert!(
+					message.contains("Redis negative index queries are disabled"),
+					"unexpected error: {message}"
+				);
+			},
+			other => panic!("expected negative query rejection, got {other:?}"),
+		}
 	}
 
 	#[tokio::test]
@@ -2541,18 +2794,56 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_cleanup_expired_no_connection_needed() {
+	async fn test_cleanup_expired_requires_connection() {
 		let config = serde_json::json!({
 			"redis_url": "redis://invalid-host:6379",
 			"connection_timeout_ms": 100,
 		});
 
 		let storage = create_storage(&config).unwrap();
-		// cleanup_expired doesn't need a connection for Redis (TTL is automatic)
 		let result = storage.cleanup_expired().await;
 
-		assert!(result.is_ok());
-		assert_eq!(result.unwrap(), 0);
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
+	}
+
+	#[tokio::test]
+	#[ignore = "requires local redis-server and redis-cli binaries"]
+	async fn prune_stale_index_member_keeps_recreated_data_indexes() {
+		let (_redis, redis_url) = start_test_redis();
+		let storage = RedisStorage::new(
+			redis_url,
+			5000,
+			format!("test-{}", uuid::Uuid::new_v4()),
+			TtlConfig::default(),
+			false,
+		)
+		.unwrap();
+		let order_key = "orders:race-order";
+		let indexes = StorageIndexes::new()
+			.with_field("status_kind", serde_json::json!("executing"))
+			.with_field("is_terminal", serde_json::json!(false));
+
+		storage
+			.set_bytes(order_key, b"fresh".to_vec(), Some(indexes), None)
+			.await
+			.unwrap();
+
+		let client = storage.get_connection().await.unwrap();
+		let mut conn = client.as_ref().clone();
+		storage
+			.prune_stale_index_member(&mut conn, "orders", order_key)
+			.await
+			.unwrap();
+
+		let active = storage
+			.query(
+				"orders",
+				QueryFilter::Equals("is_terminal".to_string(), serde_json::json!(false)),
+			)
+			.await
+			.unwrap();
+		assert_eq!(active, vec![order_key.to_string()]);
 	}
 
 	#[tokio::test]

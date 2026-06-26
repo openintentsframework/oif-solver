@@ -9,6 +9,50 @@ The solver uses Redis as the single source of truth for runtime configuration. C
 - **Loaded from Redis** on subsequent startups
 - **Versioned** with optimistic locking for safe updates
 
+## Redis Order Indexing And Cleanup
+
+Recovery and transaction bumping load active orders through the canonical
+`is_terminal=false` order index. They intentionally do not apply a result limit:
+missing an active order would be a correctness failure, so the index itself must
+remain the bounded lookup surface.
+
+The Redis backend rejects `NotEquals` and `NotIn` filters instead of resolving
+them with namespace-wide negative scans. Use positive indexes such as
+`is_terminal=false` for liveness paths and add a dedicated indexed query for new
+production workflows that need Redis-backed filtering.
+
+Redis cleanup runs through the existing solver-engine storage cleanup task using
+`storage.cleanup_interval_seconds`. Cleanup walks known Redis sets with `SSCAN`
+and prunes stale members whose data key no longer exists from:
+
+- `<prefix>:orders:_all`
+- `<prefix>:orders:_index:status_kind:<value>`
+- `<prefix>:orders:_index:is_terminal:<true|false>`
+- `<prefix>:orders:<id>:_idx_meta`
+
+The final prune rechecks data-key absence inside the Redis script that removes
+index memberships. If an order is recreated while cleanup is running, cleanup
+leaves the fresh record's indexes intact.
+
+In Redis cluster mode, the prefix is hash-tagged by the backend, for example
+`{solver-id}:orders:_all`, so cleanup operations route to the expected slot.
+
+Terminal order retention is deliberately separate from blanket data TTL. Avoid
+setting short `ttl_orders` values for normal operation: Redis currently applies
+configured TTLs during index updates, including shared index keys. Active orders
+must not expire before the maximum settlement and recovery window. If terminal
+history needs bounded retention, prefer an index-safe deletion sweeper that only
+deletes records after the operator retention period and then removes their index
+members.
+
+Useful Redis probes:
+
+```bash
+redis-cli SCARD '<prefix>:orders:_all'
+redis-cli SCARD '<prefix>:orders:_index:is_terminal:false'
+redis-cli SCARD '<prefix>:orders:_index:is_terminal:true'
+```
+
 ## Quick Start
 
 ### Prerequisites

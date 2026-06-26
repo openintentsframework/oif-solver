@@ -1093,23 +1093,19 @@ pub enum BumpError {
 }
 
 /// Loads non-terminal order IDs. Mirrors `RecoveryService::load_active_orders`
-/// (which queries the order store by `status_kind` index).
+/// by querying the canonical `is_terminal` index.
 async fn load_active_order_ids(storage: &Arc<StorageService>) -> Result<Vec<String>, BumpError> {
-	use crate::state::order::{
-		FAILED_STATUS_KIND_INDEX_VALUE, FINALIZED_STATUS_KIND_INDEX_VALUE, STATUS_KIND_INDEX_FIELD,
-	};
+	use crate::state::order::IS_TERMINAL_INDEX_FIELD;
 	use solver_storage::QueryFilter;
 	use solver_types::{Order, StorageKey};
-
-	let terminal_status_kinds = vec![
-		serde_json::json!(FINALIZED_STATUS_KIND_INDEX_VALUE),
-		serde_json::json!(FAILED_STATUS_KIND_INDEX_VALUE),
-	];
 
 	let rows = storage
 		.query::<Order>(
 			StorageKey::Orders.as_str(),
-			QueryFilter::NotIn(STATUS_KIND_INDEX_FIELD.to_string(), terminal_status_kinds),
+			QueryFilter::Equals(
+				IS_TERMINAL_INDEX_FIELD.to_string(),
+				serde_json::json!(false),
+			),
 		)
 		.await
 		.map_err(|e| BumpError::Storage(e.to_string()))?;
@@ -1125,6 +1121,7 @@ mod tests {
 		TransactionTrackingWithConfig,
 	};
 	use solver_storage::implementations::file::{FileStorage, TtlConfig};
+	use solver_storage::{MockStorageInterface, QueryFilter};
 	use solver_types::{
 		utils::tests::builders::OrderBuilder, Address, BumpCapField, OrderStatus,
 		TransactionAttempt, TransactionAttemptStatus, TransactionHash, TransactionType,
@@ -1304,6 +1301,49 @@ mod tests {
 			.with_status(OrderStatus::Executing)
 			.build();
 		sm.store_order(&order).await.unwrap();
+	}
+
+	#[tokio::test]
+	async fn load_active_order_ids_queries_is_terminal_index() {
+		use crate::state::order::IS_TERMINAL_INDEX_FIELD;
+
+		let mut mock_storage = MockStorageInterface::new();
+		mock_storage
+			.expect_query()
+			.withf(|namespace, filter| {
+				if namespace != "orders" {
+					return false;
+				}
+
+				matches!(
+					filter,
+					QueryFilter::Equals(field, value)
+						if field == IS_TERMINAL_INDEX_FIELD && value == &serde_json::json!(false)
+				)
+			})
+			.times(1)
+			.returning(|_, _| Box::pin(async move { Ok(Vec::new()) }));
+		mock_storage
+			.expect_get_batch()
+			.times(1)
+			.withf(|keys| keys.is_empty())
+			.returning(|_| Box::pin(async move { Ok(Vec::new()) }));
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let ids = load_active_order_ids(&storage).await.unwrap();
+
+		assert!(ids.is_empty());
+	}
+
+	#[tokio::test]
+	async fn load_active_order_ids_returns_file_backed_non_terminal_orders() {
+		let (_service, _attempt_store, storage, _bus, _tmp) =
+			test_service(default_enabled_config(), MockDeliveryInterface::new());
+		seed_active_order(&storage, "order-1").await;
+
+		let ids = load_active_order_ids(&storage).await.unwrap();
+
+		assert_eq!(ids, vec!["order-1".to_string()]);
 	}
 
 	/// Seed an active order whose data carries a specific `fill_deadline`
