@@ -732,6 +732,17 @@ fn build_operator_settlement_config(
 			},
 		}
 	}
+	if broadcaster.is_none() {
+		if let Some(broadcaster_override) = initializer
+			.settlement
+			.as_ref()
+			.and_then(|s| s.broadcaster.as_ref())
+		{
+			broadcaster = Some(build_operator_broadcaster_finality_config_from_override(
+				broadcaster_override,
+			));
+		}
+	}
 
 	let settlement_type = match primary_settlement {
 		SettlementTypeOverride::Hyperlane => OperatorSettlementType::Hyperlane,
@@ -1108,6 +1119,31 @@ fn build_operator_broadcaster_config_from_override(
 		oracle_selection_strategy: selection_strategy,
 		pusher_directions: override_cfg.pusher_directions.clone(),
 	})
+}
+
+fn build_operator_broadcaster_finality_config_from_override(
+	override_cfg: &BroadcasterSettlementOverride,
+) -> OperatorBroadcasterConfig {
+	OperatorBroadcasterConfig {
+		oracles: OperatorOracleConfig {
+			input: HashMap::new(),
+			output: HashMap::new(),
+		},
+		routes: HashMap::new(),
+		broadcaster_addresses: HashMap::new(),
+		receiver_addresses: HashMap::new(),
+		broadcaster_ids: HashMap::new(),
+		proof_service_url: String::new(),
+		proof_wait_time_seconds: 30,
+		storage_proof_timeout_seconds: 30,
+		default_finality_blocks: override_cfg.default_finality_blocks.unwrap_or(20),
+		finality_blocks: override_cfg.finality_blocks.clone(),
+		chain_block_time_seconds: HashMap::new(),
+		intent_safety_buffer_seconds: None,
+		intent_min_expiry_seconds: None,
+		oracle_selection_strategy: OperatorOracleSelectionStrategy::First,
+		pusher_directions: Vec::new(),
+	}
 }
 
 /// Builds runtime Config from OperatorConfig.
@@ -6862,6 +6898,80 @@ mod tests {
 		assert_eq!(
 			finality_blocks.get("84532").and_then(|v| v.as_i64()),
 			Some(12)
+		);
+	}
+
+	#[test]
+	fn test_merge_retains_broadcaster_finality_outside_settlement_priority() {
+		let mut overrides = test_seed_overrides();
+		let chain_a = 11155420;
+		let chain_b = 84532;
+		let oracle = address!("1111111111111111111111111111111111111111");
+		let routes = HashMap::from([(chain_a, vec![chain_b]), (chain_b, vec![chain_a])]);
+		let oracles = solver_types::seed_overrides::OracleOverrides {
+			input: HashMap::from([(chain_a, vec![oracle]), (chain_b, vec![oracle])]),
+			output: HashMap::from([(chain_a, vec![oracle]), (chain_b, vec![oracle])]),
+		};
+		overrides.settlement = Some(solver_types::seed_overrides::SettlementOverride {
+			settlement_type: solver_types::seed_overrides::SettlementTypeOverride::Direct,
+			priority: Some(vec![
+				solver_types::seed_overrides::SettlementTypeOverride::Direct,
+			]),
+			hyperlane: None,
+			direct: Some(solver_types::seed_overrides::DirectSettlementOverride {
+				oracles: oracles.clone(),
+				routes: routes.clone(),
+				dispute_period_seconds: Some(1),
+				oracle_selection_strategy: None,
+				intent_min_expiry_seconds: None,
+			}),
+			broadcaster: Some(
+				solver_types::seed_overrides::BroadcasterSettlementOverride {
+					default_finality_blocks: Some(0),
+					finality_blocks: HashMap::from([(chain_b, 3)]),
+					..Default::default()
+				},
+			),
+		});
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		assert_eq!(
+			op_config.settlement.priority,
+			Some(vec![OperatorSettlementType::Direct])
+		);
+		assert_eq!(
+			op_config
+				.settlement
+				.broadcaster
+				.as_ref()
+				.map(|config| config.default_finality_blocks),
+			Some(0)
+		);
+		assert_eq!(
+			op_config
+				.settlement
+				.broadcaster
+				.as_ref()
+				.and_then(|config| config.finality_blocks.get(&chain_b).copied()),
+			Some(3)
+		);
+
+		let discovery =
+			build_discovery_config_from_operator(&op_config, &[chain_a, chain_b]).unwrap();
+		let onchain = discovery.implementations.get("onchain_eip7683").unwrap();
+		assert_eq!(
+			onchain
+				.get("default_finality_blocks")
+				.and_then(|v| v.as_i64()),
+			Some(0)
+		);
+		assert_eq!(
+			onchain
+				.get("finality_blocks")
+				.and_then(|v| v.as_object())
+				.and_then(|finality| finality.get(&chain_b.to_string()))
+				.and_then(|v| v.as_i64()),
+			Some(3)
 		);
 	}
 

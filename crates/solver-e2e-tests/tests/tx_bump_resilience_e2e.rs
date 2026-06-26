@@ -44,6 +44,7 @@ fn tx_bump_config() -> OperatorTxBumpConfig {
 fn bump_harness_options() -> HarnessOptions {
 	HarnessOptions {
 		tx_bump: Some(tx_bump_config()),
+		broadcaster_default_finality_blocks: Some(0),
 		..Default::default()
 	}
 }
@@ -691,11 +692,15 @@ async fn many_pending_orders_sweeper_progresses_without_duplicate_offchain_event
 	for index in 0..10 {
 		let (order_id, _order) = open_default_order(&h, &format!("tx-bump-load-{index}")).await?;
 		let order_id_str = order_key(order_id);
+		order_ids.push((order_id, order_id_str));
+	}
+
+	for (_order_id, order_id_str) in &order_ids {
 		wait_for_attempts(
 			&h,
-			&order_id_str,
+			order_id_str,
 			TransactionType::Fill,
-			BUMP_WAIT,
+			LOAD_WAIT,
 			|attempts| {
 				attempts
 					.iter()
@@ -703,7 +708,6 @@ async fn many_pending_orders_sweeper_progresses_without_duplicate_offchain_event
 			},
 		)
 		.await?;
-		order_ids.push((order_id, order_id_str));
 	}
 
 	resume_mining(&h, DEST_CHAIN_ID).await?;

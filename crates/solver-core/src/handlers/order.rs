@@ -54,24 +54,41 @@ fn view_tx(to: &Address, chain_id: u64, data: Vec<u8>) -> Transaction {
 	}
 }
 
-fn broadcaster_finality_blocks_for_config(config: &Config, chain_id: u64) -> u64 {
-	let Some(broadcaster) = config.settlement.implementations.get("broadcaster") else {
-		return DEFAULT_SOURCE_FINALITY_BLOCKS;
-	};
-
-	if let Some(depth) = broadcaster
+fn finality_blocks_from_value(value: &serde_json::Value, chain_id: u64) -> Option<u64> {
+	if let Some(depth) = value
 		.get("finality_blocks")
 		.and_then(|value| value.as_object())
 		.and_then(|object| object.get(&chain_id.to_string()))
 		.and_then(|value| value.as_u64())
 	{
+		return Some(depth);
+	}
+
+	value
+		.get("default_finality_blocks")
+		.and_then(|value| value.as_u64())
+}
+
+fn source_finality_blocks_for_config(config: &Config, chain_id: u64) -> u64 {
+	if let Some(depth) = config
+		.settlement
+		.implementations
+		.get("broadcaster")
+		.and_then(|broadcaster| finality_blocks_from_value(broadcaster, chain_id))
+	{
 		return depth;
 	}
 
-	broadcaster
-		.get("default_finality_blocks")
-		.and_then(|value| value.as_u64())
-		.unwrap_or(DEFAULT_SOURCE_FINALITY_BLOCKS)
+	if let Some(depth) = config
+		.discovery
+		.implementations
+		.get("onchain_eip7683")
+		.and_then(|onchain| finality_blocks_from_value(onchain, chain_id))
+	{
+		return depth;
+	}
+
+	DEFAULT_SOURCE_FINALITY_BLOCKS
 }
 
 /// Errors that can occur during order processing.
@@ -387,7 +404,7 @@ impl OrderHandler {
 						"Escrow fill aborted: input settler not configured for origin chain {origin_chain_id}"
 					))
 				})?;
-			let finality_blocks = broadcaster_finality_blocks_for_config(&config, origin_chain_id);
+			let finality_blocks = source_finality_blocks_for_config(&config, origin_chain_id);
 			(input_settler_address, finality_blocks)
 		};
 
@@ -746,6 +763,31 @@ mod tests {
 		let mut config = create_test_config();
 		config.settlement = settlement;
 		config
+	}
+
+	fn create_test_config_with_discovery_finality(
+		default_finality_blocks: u64,
+		chain_137_finality_blocks: u64,
+	) -> solver_config::Config {
+		let mut config = create_test_config();
+		config.discovery.implementations.insert(
+			"onchain_eip7683".to_string(),
+			serde_json::json!({
+				"default_finality_blocks": default_finality_blocks,
+				"finality_blocks": {
+					"137": chain_137_finality_blocks
+				}
+			}),
+		);
+		config
+	}
+
+	#[test]
+	fn source_finality_falls_back_to_discovery_config_when_broadcaster_settlement_is_absent() {
+		let config = create_test_config_with_discovery_finality(0, 7);
+
+		assert_eq!(source_finality_blocks_for_config(&config, 137), 7);
+		assert_eq!(source_finality_blocks_for_config(&config, 1), 0);
 	}
 
 	fn deposited_status_return() -> alloy_primitives::Bytes {
