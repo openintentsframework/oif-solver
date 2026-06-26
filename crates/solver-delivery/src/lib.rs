@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use solver_types::events::TransactionType;
 use solver_types::{
 	Address, ChainData, ConfigSchema, ImplementationRegistry, Log, LogFilter, NetworksConfig,
-	Transaction, TransactionAttempt, TransactionAttemptStatus, TransactionHash, TransactionReceipt,
+	Transaction, TransactionAttempt, TransactionAttemptScope, TransactionAttemptStatus,
+	TransactionHash, TransactionReceipt,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -56,7 +57,7 @@ mod transaction_attempt_recorder_tests {
 		let recorder = NoopTransactionAttemptRecorder;
 		let attempt = recorder
 			.record_planned_attempt(PlannedAttemptInit {
-				order_id: "order-1".into(),
+				scope: TransactionAttemptScope::order("order-1"),
 				signer: Some(Address(vec![9; 20])),
 				tx_type: TransactionType::Fill,
 				tx: sample_tx(),
@@ -66,7 +67,7 @@ mod transaction_attempt_recorder_tests {
 			.await
 			.unwrap();
 
-		assert_eq!(attempt.order_id, "order-1");
+		assert_eq!(attempt.order_id(), Some("order-1"));
 		assert_eq!(attempt.signer, Some(Address(vec![9; 20])));
 		assert_eq!(attempt.tx_type, TransactionType::Fill);
 		assert_eq!(attempt.status, TransactionAttemptStatus::Planned);
@@ -95,7 +96,7 @@ mod transaction_attempt_recorder_tests {
 
 		let attempt = recorder
 			.record_planned_attempt(PlannedAttemptInit {
-				order_id: "order-1".into(),
+				scope: TransactionAttemptScope::order("order-1"),
 				signer: Some(Address(vec![9; 20])),
 				tx_type: TransactionType::Fill,
 				tx: sample_tx(),
@@ -105,7 +106,7 @@ mod transaction_attempt_recorder_tests {
 			.await
 			.unwrap();
 
-		assert_eq!(attempt.order_id, "order-1");
+		assert_eq!(attempt.order_id(), Some("order-1"));
 	}
 }
 
@@ -176,7 +177,7 @@ pub enum TransactionAttemptRecorderError {
 /// same-nonce lineage tracking).
 #[derive(Debug, Clone)]
 pub struct PlannedAttemptInit {
-	pub order_id: String,
+	pub scope: TransactionAttemptScope,
 	pub signer: Option<Address>,
 	pub tx_type: TransactionType,
 	pub tx: Transaction,
@@ -218,7 +219,7 @@ impl TransactionAttemptRecorder for NoopTransactionAttemptRecorder {
 		let mut attempt = TransactionAttempt::planned(
 			init.attempt_id_override
 				.unwrap_or_else(|| "noop-attempt".to_string()),
-			init.order_id,
+			init.scope,
 			init.signer,
 			init.tx_type,
 			init.tx,
@@ -500,6 +501,161 @@ mod tracking_config_tests {
 	}
 }
 
+#[cfg(test)]
+mod system_delivery_tests {
+	use super::*;
+	use alloy_primitives::{Bytes, U256};
+	use solver_types::validation::ValidationError;
+	use std::sync::{Arc, Mutex};
+
+	struct EmptySchema;
+
+	impl ConfigSchema for EmptySchema {
+		fn validate(&self, _config: &serde_json::Value) -> Result<(), ValidationError> {
+			Ok(())
+		}
+	}
+
+	#[derive(Default)]
+	struct RecordingDelivery {
+		seen_tracking: Mutex<Option<(String, TransactionType, u64, u64, u64)>>,
+	}
+
+	#[async_trait]
+	impl DeliveryInterface for RecordingDelivery {
+		fn config_schema(&self) -> Box<dyn ConfigSchema> {
+			Box::new(EmptySchema)
+		}
+
+		async fn submit(
+			&self,
+			_tx: Transaction,
+			tracking: Option<TransactionTrackingWithConfig>,
+		) -> Result<TransactionHash, DeliveryError> {
+			let tracking = tracking.expect("system delivery must pass tracking");
+			*self.seen_tracking.lock().unwrap() = Some((
+				tracking.tracking.id,
+				tracking.tracking.tx_type,
+				tracking.min_confirmations,
+				tracking.monitoring_timeout_seconds,
+				tracking.tx_confirmation_timeout_seconds,
+			));
+			Ok(TransactionHash(vec![7; 32]))
+		}
+
+		async fn get_receipt(
+			&self,
+			_hash: &TransactionHash,
+			_chain_id: u64,
+		) -> Result<TransactionReceipt, DeliveryError> {
+			unimplemented!()
+		}
+
+		async fn get_fee_params(&self, _chain_id: u64) -> Result<FeeParams, DeliveryError> {
+			unimplemented!()
+		}
+
+		async fn get_balance(
+			&self,
+			_address: &str,
+			_token: Option<&str>,
+			_chain_id: u64,
+		) -> Result<String, DeliveryError> {
+			unimplemented!()
+		}
+
+		async fn get_allowance(
+			&self,
+			_owner: &str,
+			_spender: &str,
+			_token_address: &str,
+			_chain_id: u64,
+		) -> Result<String, DeliveryError> {
+			unimplemented!()
+		}
+
+		async fn get_nonce(&self, _address: &str, _chain_id: u64) -> Result<u64, DeliveryError> {
+			unimplemented!()
+		}
+
+		async fn get_block_number(&self, _chain_id: u64) -> Result<u64, DeliveryError> {
+			unimplemented!()
+		}
+
+		async fn estimate_gas(&self, _tx: Transaction) -> Result<u64, DeliveryError> {
+			unimplemented!()
+		}
+
+		async fn estimate_gas_with_overrides(
+			&self,
+			_tx: Transaction,
+			_state_override: alloy_rpc_types::state::StateOverride,
+		) -> Result<u64, DeliveryError> {
+			unimplemented!()
+		}
+
+		async fn eth_call(&self, _tx: Transaction) -> Result<Bytes, DeliveryError> {
+			unimplemented!()
+		}
+
+		async fn tx_exists(
+			&self,
+			_hash: &TransactionHash,
+			_chain_id: u64,
+		) -> Result<bool, DeliveryError> {
+			unimplemented!()
+		}
+
+		async fn get_logs(
+			&self,
+			_chain_id: u64,
+			_filter: LogFilter,
+		) -> Result<Vec<Log>, DeliveryError> {
+			unimplemented!()
+		}
+	}
+
+	fn system_tx() -> Transaction {
+		Transaction {
+			to: Some(Address(vec![2; 20])),
+			data: vec![1, 2, 3],
+			value: U256::ZERO,
+			chain_id: 8453,
+			nonce: None,
+			gas_limit: Some(100000),
+			gas_price: None,
+			max_fee_per_gas: Some(1000),
+			max_priority_fee_per_gas: Some(10),
+		}
+	}
+
+	#[tokio::test]
+	async fn deliver_system_supplies_attempt_tracking() {
+		let delivery = Arc::new(RecordingDelivery::default());
+		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+		implementations.insert(8453, delivery.clone());
+		let service = DeliveryService::new(implementations, 3, 300, 45)
+			.with_attempt_recorder(Arc::new(NoopTransactionAttemptRecorder));
+
+		let hash = service
+			.deliver_system(system_tx(), "system:bridge:test", TransactionType::Bridge)
+			.await
+			.unwrap();
+
+		assert_eq!(hash, TransactionHash(vec![7; 32]));
+		assert_eq!(
+			delivery.seen_tracking.lock().unwrap().as_ref(),
+			Some(&(
+				"system:bridge:test".to_string(),
+				TransactionType::Bridge,
+				3,
+				300,
+				45
+			))
+		);
+	}
+}
+
 /// Trait defining the interface for transaction delivery implementations.
 ///
 /// This trait must be implemented by any delivery implementation that wants to
@@ -687,6 +843,8 @@ pub fn get_all_implementations() -> Vec<(&'static str, DeliveryFactory)> {
 pub struct DeliveryService {
 	/// Map of chain IDs to their corresponding delivery implementations.
 	implementations: std::collections::HashMap<u64, Arc<dyn DeliveryInterface>>,
+	/// Recorder used by non-order system deliveries.
+	attempt_recorder: Arc<dyn TransactionAttemptRecorder>,
 	/// Default number of confirmations required for transactions.
 	min_confirmations: u64,
 	/// Timeout for settlement-readiness monitoring in seconds (long window).
@@ -708,10 +866,111 @@ impl DeliveryService {
 	) -> Self {
 		Self {
 			implementations,
+			attempt_recorder: Arc::new(NoopTransactionAttemptRecorder),
 			min_confirmations,
 			monitoring_timeout_seconds,
 			tx_confirmation_timeout_seconds,
 		}
+	}
+
+	/// Sets the recorder used by `deliver_system`.
+	pub fn with_attempt_recorder(
+		mut self,
+		attempt_recorder: Arc<dyn TransactionAttemptRecorder>,
+	) -> Self {
+		self.attempt_recorder = attempt_recorder;
+		self
+	}
+
+	/// Delivers a solver-owned non-order transaction with durable attempt tracking.
+	pub async fn deliver_system(
+		&self,
+		tx: Transaction,
+		scope_id: impl Into<String>,
+		tx_type: TransactionType,
+	) -> Result<TransactionHash, DeliveryError> {
+		debug_assert!(matches!(
+			tx_type,
+			TransactionType::Approval
+				| TransactionType::Withdrawal
+				| TransactionType::Bridge
+				| TransactionType::Pusher
+		));
+		let scope_id = scope_id.into();
+		let callback_scope = scope_id.clone();
+		let tracking = TransactionTracking {
+			id: scope_id,
+			tx_type,
+			attempt_recorder: self.attempt_recorder.clone(),
+			callback: Box::new(move |event| match event {
+				TransactionMonitoringEvent::Confirmed {
+					tx_hash,
+					tx_type,
+					receipt,
+					..
+				} => {
+					tracing::info!(
+						scope_id = %callback_scope,
+						?tx_type,
+						?tx_hash,
+						block_number = receipt.block_number,
+						"System transaction confirmed"
+					);
+				},
+				TransactionMonitoringEvent::Failed {
+					tx_hash,
+					tx_type,
+					error,
+					..
+				} => {
+					tracing::warn!(
+						scope_id = %callback_scope,
+						?tx_type,
+						?tx_hash,
+						error = %error,
+						"System transaction failed"
+					);
+				},
+				TransactionMonitoringEvent::Indeterminate {
+					tx_hash,
+					tx_type,
+					reason,
+					..
+				} => {
+					tracing::warn!(
+						scope_id = %callback_scope,
+						?tx_type,
+						?tx_hash,
+						reason = %reason,
+						"System transaction confirmation indeterminate"
+					);
+				},
+				TransactionMonitoringEvent::AttemptLedgerConflict {
+					attempt_id,
+					tx_type,
+					tx_hash,
+					attempted_status,
+					error,
+					context,
+					..
+				} => {
+					tracing::warn!(
+						scope_id = %callback_scope,
+						attempt_id = %attempt_id,
+						?tx_type,
+						?tx_hash,
+						?attempted_status,
+						error = %error,
+						context,
+						"System transaction attempt ledger conflict"
+					);
+				},
+			}),
+			attempt_id: None,
+			replacement_of: None,
+		};
+
+		self.deliver(tx, Some(tracking)).await
 	}
 
 	/// Delivers a transaction to the appropriate blockchain network.

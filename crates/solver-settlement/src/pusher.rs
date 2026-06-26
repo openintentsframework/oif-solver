@@ -19,10 +19,11 @@ use alloy_primitives::U256;
 use alloy_provider::{DynProvider, Provider};
 use alloy_sol_types::{sol, SolCall};
 use solver_delivery::DeliveryService;
-use solver_types::{NetworksConfig, PusherL2Params, Transaction};
+use solver_types::{NetworksConfig, PusherL2Params, Transaction, TransactionType};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 use crate::{utils::create_providers_for_chains, PusherDirection};
 
@@ -53,6 +54,10 @@ sol! {
 			bool isERC20Inbox
 		) external payable;
 	}
+}
+
+fn pusher_system_scope(label: &str, chain_id: u64) -> String {
+	format!("system:pusher:{label}:{chain_id}:{}", Uuid::new_v4())
 }
 
 /// Read the newest block number stored in an L2 buffer contract.
@@ -279,7 +284,14 @@ pub async fn push_if_needed(
 		},
 	};
 
-	match delivery.deliver(tx, None).await {
+	match delivery
+		.deliver_system(
+			tx,
+			pusher_system_scope(&direction.label, direction.l1_chain_id),
+			TransactionType::Pusher,
+		)
+		.await
+	{
 		Ok(hash) => {
 			tracing::info!(label = %direction.label, ?hash, "Push tx submitted");
 		},

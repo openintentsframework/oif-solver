@@ -574,6 +574,7 @@ pub async fn handle_trigger_rebalance(
 		is_composer_flow: is_composer,
 		vault_address: vault_addr,
 		bridge_route: pair.bridge_route.clone(),
+		..Default::default()
 	};
 
 	match bridge_service
