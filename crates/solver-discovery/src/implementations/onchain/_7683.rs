@@ -6,7 +6,7 @@
 use crate::{DiscoveryError, DiscoveryInterface};
 use alloy_primitives::{Address as AlloyAddress, Log as PrimLog, LogData};
 use alloy_provider::{DynProvider, Provider};
-use alloy_rpc_types::{Filter, Log};
+use alloy_rpc_types::{BlockNumberOrTag, Filter, Log};
 use alloy_sol_types::sol;
 use alloy_sol_types::{SolEvent, SolValue};
 use async_trait::async_trait;
@@ -59,6 +59,115 @@ sol! {
 
 const DEFAULT_POLLING_INTERVAL_SECS: u64 = 3;
 const MAX_POLLING_INTERVAL_SECS: u64 = 300;
+const DEFAULT_FINALITY_BLOCKS: u64 = 20;
+const MAX_FINALITY_BLOCKS: u64 = 100_000;
+
+fn numeric_finality_head(current_block: u64, finality_blocks: u64) -> Option<u64> {
+	current_block.checked_sub(finality_blocks)
+}
+
+fn next_poll_range(last_processed: u64, safe_to_block: Option<u64>) -> Option<(u64, u64)> {
+	let safe_to_block = safe_to_block?;
+	if safe_to_block <= last_processed {
+		return None;
+	}
+	Some((last_processed + 1, safe_to_block))
+}
+
+fn finality_blocks_for_config(
+	chain_id: u64,
+	default_finality_blocks: u64,
+	finality_blocks: &HashMap<u64, u64>,
+) -> u64 {
+	finality_blocks
+		.get(&chain_id)
+		.copied()
+		.unwrap_or(default_finality_blocks)
+}
+
+async fn block_number_for_tag(provider: &DynProvider, tag: BlockNumberOrTag) -> Option<u64> {
+	match provider.get_block_by_number(tag).await {
+		Ok(Some(block)) => Some(block.number()),
+		Ok(None) => None,
+		Err(e) => {
+			tracing::debug!(?tag, "RPC finality tag lookup failed; falling back: {}", e);
+			None
+		},
+	}
+}
+
+async fn resolve_finality_head(
+	provider: &DynProvider,
+	finality_blocks: u64,
+) -> Result<Option<u64>, DiscoveryError> {
+	if let Some(block) = block_number_for_tag(provider, BlockNumberOrTag::Finalized).await {
+		return Ok(Some(block));
+	}
+
+	if let Some(block) = block_number_for_tag(provider, BlockNumberOrTag::Safe).await {
+		return Ok(Some(block));
+	}
+
+	let latest = provider
+		.get_block_number()
+		.await
+		.map_err(|e| DiscoveryError::Connection(format!("Failed to get block number: {e}")))?;
+
+	Ok(numeric_finality_head(latest, finality_blocks))
+}
+
+fn validate_finality_blocks_object(
+	value: &serde_json::Value,
+) -> Result<(), solver_types::ValidationError> {
+	let Some(object) = value.as_object() else {
+		return Err(solver_types::ValidationError::TypeMismatch {
+			field: "finality_blocks".to_string(),
+			expected: "object".to_string(),
+			actual: "non-object".to_string(),
+		});
+	};
+
+	for (chain_id, depth) in object {
+		chain_id
+			.parse::<u64>()
+			.map_err(|_| solver_types::ValidationError::InvalidValue {
+				field: "finality_blocks".to_string(),
+				message: format!("chain id key '{chain_id}' is not a u64"),
+			})?;
+
+		let depth = depth
+			.as_i64()
+			.ok_or_else(|| solver_types::ValidationError::TypeMismatch {
+				field: format!("finality_blocks.{chain_id}"),
+				expected: "integer".to_string(),
+				actual: "non-integer".to_string(),
+			})?;
+
+		if !(0..=MAX_FINALITY_BLOCKS as i64).contains(&depth) {
+			return Err(solver_types::ValidationError::InvalidValue {
+				field: format!("finality_blocks.{chain_id}"),
+				message: format!("Value {depth} must be between 0 and {MAX_FINALITY_BLOCKS}"),
+			});
+		}
+	}
+
+	Ok(())
+}
+
+fn parse_finality_blocks_config(config: &serde_json::Value) -> HashMap<u64, u64> {
+	config
+		.get("finality_blocks")
+		.and_then(|v| v.as_object())
+		.map(|object| {
+			object
+				.iter()
+				.filter_map(|(chain_id, depth)| {
+					Some((chain_id.parse::<u64>().ok()?, depth.as_u64()?))
+				})
+				.collect()
+		})
+		.unwrap_or_default()
+}
 
 /// Provider types for different transport modes.
 enum ProviderType {
@@ -68,12 +177,20 @@ enum ProviderType {
 	WebSocket(DynProvider),
 }
 
+struct PollingMonitorContext {
+	networks: NetworksConfig,
+	last_blocks: Arc<Mutex<HashMap<u64, u64>>>,
+	polling_interval_secs: u64,
+	finality_blocks: u64,
+}
+
 /// EIP-7683 on-chain discovery implementation.
 ///
 /// This implementation monitors blockchain events for new EIP-7683 cross-chain
 /// orders and converts them into intents for the solver to process.
 /// Supports monitoring multiple chains concurrently using either HTTP polling
-/// or WebSocket subscriptions (when polling_interval_secs = 0).
+/// WebSocket subscriptions are disabled until removed-log handling is buffered
+/// behind a finality gate.
 pub struct Eip7683Discovery {
 	/// RPC providers for each monitored network.
 	providers: HashMap<u64, ProviderType>,
@@ -91,17 +208,22 @@ pub struct Eip7683Discovery {
 	stop_signal: Arc<Mutex<Option<broadcast::Sender<()>>>>,
 	/// Polling interval for monitoring loop in seconds (0 = WebSocket mode).
 	polling_interval_secs: u64,
+	/// Default source-chain finality depth, in blocks.
+	default_finality_blocks: u64,
+	/// Per-chain source finality depth overrides.
+	finality_blocks: HashMap<u64, u64>,
 }
 
 impl Eip7683Discovery {
 	/// Creates a new EIP-7683 discovery instance.
 	///
 	/// Configures monitoring for the settler contracts on the specified chains.
-	/// When polling_interval_secs = 0, uses WebSocket subscriptions instead of polling.
 	pub async fn new(
 		network_ids: Vec<u64>,
 		networks: NetworksConfig,
 		polling_interval_secs: Option<u64>,
+		default_finality_blocks: u64,
+		finality_blocks: HashMap<u64, u64>,
 	) -> Result<Self, DiscoveryError> {
 		// Validate at least one network
 		if network_ids.is_empty() {
@@ -111,6 +233,12 @@ impl Eip7683Discovery {
 		}
 
 		let interval = polling_interval_secs.unwrap_or(DEFAULT_POLLING_INTERVAL_SECS);
+		if interval == 0 {
+			return Err(DiscoveryError::ValidationError(
+				"polling_interval_secs must be greater than 0; WebSocket on-chain discovery is disabled until removed-log finality buffering is implemented"
+					.to_string(),
+			));
+		}
 		let use_websocket = interval == 0;
 
 		// Create providers and get initial blocks for each network
@@ -143,12 +271,30 @@ impl Eip7683Discovery {
 						ProviderError::InvalidUrl(msg) => DiscoveryError::Connection(msg),
 					})?;
 
-				// Get initial block number
-				let current_block = provider.get_block_number().await.map_err(|e| {
-					DiscoveryError::Connection(format!(
-						"Failed to get block for chain {network_id}: {e}"
-					))
-				})?;
+				let finality_depth = finality_blocks_for_config(
+					*network_id,
+					default_finality_blocks,
+					&finality_blocks,
+				);
+
+				// Initialize the cursor to the current finality head. Logs newer
+				// than this are intentionally left for a later poll once they are
+				// confirmed at the configured depth.
+				let current_block = resolve_finality_head(&provider, finality_depth)
+					.await
+					.map_err(|e| {
+						DiscoveryError::Connection(format!(
+							"Failed to get finality head for chain {network_id}: {e}"
+						))
+					})?
+					.unwrap_or(0);
+
+				tracing::info!(
+					chain = network_id,
+					current_block,
+					finality_depth,
+					"Initialized on-chain discovery cursor at source finality head"
+				);
 
 				providers.insert(*network_id, ProviderType::Http(provider));
 				last_blocks.insert(*network_id, current_block);
@@ -164,7 +310,37 @@ impl Eip7683Discovery {
 			monitoring_handles: Arc::new(Mutex::new(Vec::new())),
 			stop_signal: Arc::new(Mutex::new(None)),
 			polling_interval_secs: interval,
+			default_finality_blocks,
+			finality_blocks,
 		})
+	}
+
+	fn finality_blocks_for_chain(&self, chain_id: u64) -> u64 {
+		finality_blocks_for_config(
+			chain_id,
+			self.default_finality_blocks,
+			&self.finality_blocks,
+		)
+	}
+
+	/// Creates a new EIP-7683 discovery instance with default finality settings.
+	///
+	/// This test helper preserves the historical constructor shape for call sites
+	/// that do not need to override source finality.
+	#[cfg(test)]
+	async fn new_with_default_finality(
+		network_ids: Vec<u64>,
+		networks: NetworksConfig,
+		polling_interval_secs: Option<u64>,
+	) -> Result<Self, DiscoveryError> {
+		Self::new(
+			network_ids,
+			networks,
+			polling_interval_secs,
+			DEFAULT_FINALITY_BLOCKS,
+			HashMap::new(),
+		)
+		.await
 	}
 
 	/// Parses an Open event log into an Intent.
@@ -272,14 +448,13 @@ impl Eip7683Discovery {
 	async fn monitor_chain_polling(
 		provider: DynProvider,
 		chain_id: u64,
-		networks: NetworksConfig,
-		last_blocks: Arc<Mutex<HashMap<u64, u64>>>,
+		context: PollingMonitorContext,
 		sender: mpsc::Sender<Intent>,
 		mut stop_rx: broadcast::Receiver<()>,
-		polling_interval_secs: u64,
 	) {
-		let mut interval =
-			tokio::time::interval(std::time::Duration::from_secs(polling_interval_secs));
+		let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+			context.polling_interval_secs,
+		));
 
 		// Set the interval to skip missed ticks instead of bursting
 		interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -291,28 +466,29 @@ impl Eip7683Discovery {
 				_ = interval.tick() => {
 					// Get last processed block for this chain
 					let last_block_num = {
-						let blocks = last_blocks.lock().await;
+						let blocks = context.last_blocks.lock().await;
 						*blocks.get(&chain_id).unwrap_or(&0)
 					};
 
-					// Get current block
-					let current_block = match provider.get_block_number().await {
+					let safe_to_block = match resolve_finality_head(&provider, context.finality_blocks).await {
 						Ok(block) => block,
 						Err(e) => {
-							tracing::error!(chain = chain_id, "Failed to get block number: {}", e);
+							tracing::error!(chain = chain_id, "Failed to resolve finality head: {}", e);
 							continue;
 						}
 					};
 
-					if current_block <= last_block_num {
-						continue; // No new blocks
-					}
+					let Some((from_block, to_block)) =
+						next_poll_range(last_block_num, safe_to_block)
+					else {
+						continue;
+					};
 
 					// Create filter for Open events
 					let open_sig = Open::SIGNATURE_HASH;
 
 					// Get the input settler address for this chain
-					let settler_address = match networks.get(&chain_id) {
+					let settler_address = match context.networks.get(&chain_id) {
 						Some(network) => {
 							if network.input_settler_address.0.len() != 20 {
 								tracing::error!(chain = chain_id, "Invalid settler address length");
@@ -329,8 +505,8 @@ impl Eip7683Discovery {
 					let filter = Filter::new()
 						.address(vec![settler_address])
 						.event_signature(vec![open_sig])
-						.from_block(last_block_num + 1)
-						.to_block(current_block);
+						.from_block(from_block)
+						.to_block(to_block);
 
 					// Get logs
 					let logs = match provider.get_logs(&filter).await {
@@ -347,7 +523,7 @@ impl Eip7683Discovery {
 					}
 
 					// Update last block for this chain
-					last_blocks.lock().await.insert(chain_id, current_block);
+					context.last_blocks.lock().await.insert(chain_id, to_block);
 				}
 				_ = stop_rx.recv() => {
 					tracing::info!(chain = chain_id, "Stopping monitor");
@@ -461,16 +637,31 @@ impl ConfigSchema for Eip7683DiscoverySchema {
 				}
 			})],
 			// Optional fields
-			vec![Field::new(
-				"polling_interval_secs",
-				FieldType::Integer {
-					min: Some(0),                                // 0 = WebSocket mode
-					max: Some(MAX_POLLING_INTERVAL_SECS as i64), // Maximum 5 minutes
-				},
-			)],
+			vec![
+				Field::new(
+					"polling_interval_secs",
+					FieldType::Integer {
+						min: Some(1),
+						max: Some(MAX_POLLING_INTERVAL_SECS as i64), // Maximum 5 minutes
+					},
+				),
+				Field::new(
+					"default_finality_blocks",
+					FieldType::Integer {
+						min: Some(0),
+						max: Some(MAX_FINALITY_BLOCKS as i64),
+					},
+				),
+			],
 		);
 
-		schema.validate(config)
+		schema.validate(config)?;
+
+		if let Some(value) = config.get("finality_blocks") {
+			validate_finality_blocks_object(value)?;
+		}
+
+		Ok(())
 	}
 }
 
@@ -501,19 +692,15 @@ impl DiscoveryInterface for Eip7683Discovery {
 			let handle = match provider {
 				ProviderType::Http(http_provider) => {
 					let provider = http_provider.clone();
-					let last_blocks = self.last_blocks.clone();
-					let polling_interval_secs = self.polling_interval_secs;
+					let context = PollingMonitorContext {
+						networks,
+						last_blocks: self.last_blocks.clone(),
+						polling_interval_secs: self.polling_interval_secs,
+						finality_blocks: self.finality_blocks_for_chain(chain_id),
+					};
 					tokio::spawn(async move {
-						Self::monitor_chain_polling(
-							provider,
-							chain_id,
-							networks,
-							last_blocks,
-							sender,
-							stop_rx,
-							polling_interval_secs,
-						)
-						.await;
+						Self::monitor_chain_polling(provider, chain_id, context, sender, stop_rx)
+							.await;
 					})
 				},
 				ProviderType::WebSocket(ws_provider) => {
@@ -607,10 +794,23 @@ pub fn create_discovery(
 		.and_then(|v| v.as_i64())
 		.map(|v| v as u64);
 
+	let default_finality_blocks = config
+		.get("default_finality_blocks")
+		.and_then(|v| v.as_u64())
+		.unwrap_or(DEFAULT_FINALITY_BLOCKS);
+	let finality_blocks = parse_finality_blocks_config(config);
+
 	// Create discovery service synchronously
 	let discovery = tokio::task::block_in_place(|| {
 		tokio::runtime::Handle::current().block_on(async {
-			Eip7683Discovery::new(network_ids, networks.clone(), polling_interval_secs).await
+			Eip7683Discovery::new(
+				network_ids,
+				networks.clone(),
+				polling_interval_secs,
+				default_finality_blocks,
+				finality_blocks,
+			)
+			.await
 		})
 	})?;
 
@@ -745,14 +945,67 @@ mod tests {
 	}
 
 	#[test]
-	fn test_config_schema_validation_websocket_mode() {
+	fn test_config_schema_validation_rejects_websocket_mode() {
 		let config = serde_json::json!({
 			"network_ids": [1],
 			"polling_interval_secs": 0
-		}); // WebSocket mode
+		});
+
+		let result = Eip7683DiscoverySchema::validate_config(&config);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_config_schema_validation_accepts_existing_finality_fields() {
+		let config = serde_json::json!({
+			"network_ids": [1],
+			"polling_interval_secs": 5,
+			"default_finality_blocks": 20,
+			"finality_blocks": { "1": 64 }
+		});
 
 		let result = Eip7683DiscoverySchema::validate_config(&config);
 		assert!(result.is_ok());
+	}
+
+	#[test]
+	fn test_config_schema_validation_rejects_negative_default_finality_blocks() {
+		let config = serde_json::json!({
+			"network_ids": [1],
+			"default_finality_blocks": -1
+		});
+
+		let result = Eip7683DiscoverySchema::validate_config(&config);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn test_config_schema_validation_rejects_negative_per_chain_finality_blocks() {
+		let config = serde_json::json!({
+			"network_ids": [1],
+			"finality_blocks": { "1": -1 }
+		});
+
+		let result = Eip7683DiscoverySchema::validate_config(&config);
+		assert!(result.is_err());
+	}
+
+	#[test]
+	fn numeric_finality_head_subtracts_configured_depth() {
+		assert_eq!(numeric_finality_head(100, 20), Some(80));
+		assert_eq!(numeric_finality_head(100, 0), Some(100));
+	}
+
+	#[test]
+	fn numeric_finality_head_returns_none_before_depth_elapses() {
+		assert_eq!(numeric_finality_head(2, 20), None);
+	}
+
+	#[test]
+	fn next_poll_range_only_advances_when_finality_head_advances() {
+		assert_eq!(next_poll_range(80, Some(80)), None);
+		assert_eq!(next_poll_range(80, Some(83)), Some((81, 83)));
+		assert_eq!(next_poll_range(80, None), None);
 	}
 
 	#[test]
@@ -916,7 +1169,8 @@ mod tests {
 		let networks = create_test_networks();
 		let network_ids = vec![];
 
-		let result = Eip7683Discovery::new(network_ids, networks, Some(5)).await;
+		let result =
+			Eip7683Discovery::new_with_default_finality(network_ids, networks, Some(5)).await;
 		assert!(result.is_err());
 
 		if let Err(DiscoveryError::ValidationError(msg)) = result {
@@ -931,7 +1185,8 @@ mod tests {
 		let networks = create_test_networks();
 		let network_ids = vec![999]; // Unknown network
 
-		let result = Eip7683Discovery::new(network_ids, networks, Some(5)).await;
+		let result =
+			Eip7683Discovery::new_with_default_finality(network_ids, networks, Some(5)).await;
 		assert!(result.is_err());
 
 		if let Err(DiscoveryError::ValidationError(msg)) = result {

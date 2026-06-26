@@ -613,6 +613,19 @@ pub trait DeliveryInterface: Send + Sync {
 	/// or simulate transaction execution without submitting to the blockchain.
 	async fn eth_call(&self, tx: Transaction) -> Result<Bytes, DeliveryError>;
 
+	/// Executes a contract call at a specific block number.
+	///
+	/// Backends that cannot pin call state to a historical block fall back to
+	/// their ordinary `eth_call`; callers that require historical precision
+	/// should use an EVM backend that overrides this method.
+	async fn eth_call_at_block(
+		&self,
+		tx: Transaction,
+		_block_number: u64,
+	) -> Result<Bytes, DeliveryError> {
+		self.eth_call(tx).await
+	}
+
 	/// Replays the given transaction via `eth_call` at the specified block and
 	/// returns the revert payload (4-byte selector + ABI-encoded args) if the
 	/// replay reverts. Returns `Ok(None)` if the replay succeeds (unexpected
@@ -955,6 +968,21 @@ impl DeliveryService {
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
 		implementation.eth_call(tx).await
+	}
+
+	/// Executes a contract call at a specific block number.
+	pub async fn contract_call_at_block(
+		&self,
+		chain_id: u64,
+		tx: Transaction,
+		block_number: u64,
+	) -> Result<alloy_primitives::Bytes, DeliveryError> {
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
+
+		implementation.eth_call_at_block(tx, block_number).await
 	}
 
 	/// Checks whether a transaction exists in the mempool or on-chain.

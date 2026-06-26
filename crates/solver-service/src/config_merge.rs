@@ -1147,7 +1147,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 			operator_config.fee_policy.as_ref(),
 		),
 		account: build_account_config_from_operator(operator_config.account.as_ref()),
-		discovery: build_discovery_config_from_operator(&chain_ids)?,
+		discovery: build_discovery_config_from_operator(operator_config, &chain_ids)?,
 		order: build_order_config_from_operator(),
 		settlement: build_settlement_config_from_operator(operator_config, &chain_ids)?,
 		pricing: Some(build_pricing_config_from_operator(&operator_config.pricing)),
@@ -1508,16 +1508,39 @@ fn build_account_config_from_operator(
 }
 
 /// Builds DiscoveryConfig from operator config.
-fn build_discovery_config_from_operator(chain_ids: &[u64]) -> Result<DiscoveryConfig, MergeError> {
+fn build_discovery_config_from_operator(
+	operator_config: &OperatorConfig,
+	chain_ids: &[u64],
+) -> Result<DiscoveryConfig, MergeError> {
 	let mut implementations = HashMap::new();
 
 	let network_ids_array =
 		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect());
+	let broadcaster = operator_config.settlement.broadcaster.as_ref();
+	let default_finality_blocks = broadcaster
+		.map(|config| config.default_finality_blocks)
+		.unwrap_or(20);
+	let finality_blocks = broadcaster
+		.map(|config| {
+			serde_json::Value::Object(
+				config
+					.finality_blocks
+					.iter()
+					.map(|(chain_id, depth)| (chain_id.to_string(), int(*depth as i64)))
+					.collect(),
+			)
+		})
+		.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
 
 	// Onchain discovery - polls chain for new orders
 	let onchain_config = json_object(vec![
 		("network_ids", network_ids_array.clone()),
 		("polling_interval_secs", int(5)),
+		(
+			"default_finality_blocks",
+			int(default_finality_blocks as i64),
+		),
+		("finality_blocks", finality_blocks),
 	]);
 	implementations.insert("onchain_eip7683".to_string(), onchain_config);
 
@@ -6767,13 +6790,24 @@ mod tests {
 	#[test]
 	fn test_build_discovery_config_from_operator() {
 		let chain_ids = vec![1, 10];
-		let discovery = build_discovery_config_from_operator(&chain_ids).unwrap();
+		let op_config = merge_to_operator_config(test_seed_overrides(), &TESTNET_SEED).unwrap();
+		let discovery = build_discovery_config_from_operator(&op_config, &chain_ids).unwrap();
 
 		assert!(discovery.implementations.contains_key("onchain_eip7683"));
 		assert!(discovery.implementations.contains_key("offchain_eip7683"));
 
 		let onchain = discovery.implementations.get("onchain_eip7683").unwrap();
 		assert!(onchain.get("polling_interval_secs").is_some());
+		assert_eq!(
+			onchain
+				.get("default_finality_blocks")
+				.and_then(|v| v.as_i64()),
+			Some(20)
+		);
+		assert!(onchain
+			.get("finality_blocks")
+			.and_then(|v| v.as_object())
+			.is_some());
 
 		// Offchain ingests in-process via /orders; it carries only network_ids
 		// (no api_host/api_port — the HTTP listener was removed in C-04).
@@ -6781,6 +6815,54 @@ mod tests {
 		assert!(offchain.get("network_ids").is_some());
 		assert!(offchain.get("api_host").is_none());
 		assert!(offchain.get("api_port").is_none());
+	}
+
+	#[test]
+	fn test_build_discovery_config_reuses_broadcaster_finality() {
+		let mut op_config = merge_to_operator_config(test_seed_overrides(), &TESTNET_SEED).unwrap();
+		op_config.settlement.broadcaster = Some(OperatorBroadcasterConfig {
+			oracles: OperatorOracleConfig {
+				input: HashMap::new(),
+				output: HashMap::new(),
+			},
+			routes: HashMap::new(),
+			broadcaster_addresses: HashMap::new(),
+			receiver_addresses: HashMap::new(),
+			broadcaster_ids: HashMap::new(),
+			proof_service_url: "http://localhost:8080".to_string(),
+			proof_wait_time_seconds: 30,
+			storage_proof_timeout_seconds: 30,
+			default_finality_blocks: 42,
+			finality_blocks: HashMap::from([(11155420, 64), (84532, 12)]),
+			chain_block_time_seconds: HashMap::new(),
+			intent_safety_buffer_seconds: None,
+			intent_min_expiry_seconds: None,
+			oracle_selection_strategy: OperatorOracleSelectionStrategy::First,
+			pusher_directions: Vec::new(),
+		});
+
+		let discovery =
+			build_discovery_config_from_operator(&op_config, &[11155420, 84532]).unwrap();
+		let onchain = discovery.implementations.get("onchain_eip7683").unwrap();
+
+		assert_eq!(
+			onchain
+				.get("default_finality_blocks")
+				.and_then(|v| v.as_i64()),
+			Some(42)
+		);
+		let finality_blocks = onchain
+			.get("finality_blocks")
+			.and_then(|v| v.as_object())
+			.unwrap();
+		assert_eq!(
+			finality_blocks.get("11155420").and_then(|v| v.as_i64()),
+			Some(64)
+		);
+		assert_eq!(
+			finality_blocks.get("84532").and_then(|v| v.as_i64()),
+			Some(12)
+		);
 	}
 
 	#[test]

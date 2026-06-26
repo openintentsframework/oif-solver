@@ -225,7 +225,8 @@ generate_main_config() {
     local ttl_intents=$(get_config ".storage.file.ttl_intents" "86400")
     local ttl_order_by_tx_hash=$(get_config ".storage.file.ttl_order_by_tx_hash" "86400")
 
-    local onchain_polling=$(get_config ".discovery.onchain.polling_interval_secs" "0")
+    local onchain_polling=$(get_config ".discovery.onchain.polling_interval_secs" "5")
+    local onchain_default_finality_blocks=$(get_config ".discovery.onchain.default_finality_blocks" "20")
 
     local pricing_primary=$(get_config ".pricing.primary" "coingecko")
     local coingecko_cache=$(get_config ".pricing.coingecko.cache_duration_seconds" "60")
@@ -369,7 +370,9 @@ generate_main_config() {
                 implementations: {
                     onchain_eip7683: {
                         network_ids: [$origin_id, $dest_id],
-                        polling_interval_secs: $onchain_polling
+                        polling_interval_secs: $onchain_polling,
+                        default_finality_blocks: $onchain_default_finality_blocks,
+                        finality_blocks: {}
                     },
                     offchain_eip7683: {
                         network_ids: [$origin_id, $dest_id]

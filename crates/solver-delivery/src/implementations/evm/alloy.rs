@@ -3097,6 +3097,25 @@ impl DeliveryInterface for AlloyDelivery {
 		Ok(result)
 	}
 
+	async fn eth_call_at_block(
+		&self,
+		tx: SolverTransaction,
+		block_number: u64,
+	) -> Result<Bytes, DeliveryError> {
+		let chain_id = tx.chain_id;
+		let provider = self.get_provider(chain_id)?;
+		let request: TransactionRequest = tx.into();
+		let block_id = BlockNumberOrTag::Number(block_number).into();
+
+		let result = provider.call(request).block(block_id).await.map_err(|e| {
+			DeliveryError::Network(format!(
+				"Failed to execute eth_call at block {block_number}: {e}"
+			))
+		})?;
+
+		Ok(result)
+	}
+
 	async fn get_revert_data(
 		&self,
 		chain_id: u64,

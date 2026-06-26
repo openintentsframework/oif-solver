@@ -384,6 +384,7 @@ pub mod interfaces {
 			function open(StandardOrder calldata order) external;
 			function openFor(StandardOrder calldata order, address sponsor, bytes calldata signature) external;
 			function orderIdentifier(StandardOrder calldata order) external view returns (bytes32);
+			function orderStatus(bytes32 orderId) external view returns (uint8);
 		}
 
 		/// IInputSettlerCompact interface for Compact-based settlement.
@@ -1248,6 +1249,20 @@ mod tests {
 		assert_eq!(LockType::Permit2Escrow.to_u8(), 1);
 		assert_eq!(LockType::Eip3009Escrow.to_u8(), 2);
 		assert_eq!(LockType::ResourceLock.to_u8(), 3);
+	}
+
+	#[test]
+	fn escrow_order_status_deposited_decodes_to_oif_contract_value() {
+		use alloy_sol_types::{sol_data, SolCall, SolType};
+		use interfaces::IInputSettlerEscrow;
+
+		// openintentsframework/oif-contracts InputSettlerEscrow.OrderStatus:
+		// None = 0, Deposited = 1, Claimed = 2, Refunded = 3.
+		let encoded = sol_data::Uint::<8>::abi_encode(&1u8);
+		let decoded =
+			IInputSettlerEscrow::orderStatusCall::abi_decode_returns_validate(&encoded).unwrap();
+
+		assert_eq!(decoded, 1);
 	}
 
 	#[test]
