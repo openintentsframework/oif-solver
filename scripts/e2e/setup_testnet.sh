@@ -278,6 +278,7 @@ generate_main_config() {
         --arg origin_token_address "$origin_token_address" \
         --arg dest_token_address "$dest_token_address" \
         --argjson onchain_polling "$onchain_polling" \
+        --argjson onchain_default_finality_blocks "$onchain_default_finality_blocks" \
         --argjson max_gas_price_gwei "$max_gas_price_gwei" \
         --arg pricing_primary "$pricing_primary" \
         --argjson coingecko_cache "$coingecko_cache" \

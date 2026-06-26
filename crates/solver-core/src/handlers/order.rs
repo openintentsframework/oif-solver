@@ -415,8 +415,9 @@ impl OrderHandler {
 			})?;
 
 		if status != ESCROW_ORDER_STATUS_DEPOSITED {
+			let expected = ESCROW_ORDER_STATUS_DEPOSITED;
 			return Err(OrderError::Service(format!(
-				"Escrow fill aborted: source orderStatus is {status}, expected Deposited ({ESCROW_ORDER_STATUS_DEPOSITED})"
+				"Escrow fill aborted: source orderStatus is {status}, expected Deposited ({expected})"
 			)));
 		}
 
@@ -624,12 +625,16 @@ mod tests {
 		TransactionHash(vec![0xab; 32])
 	}
 
+	fn test_input_settler_address() -> solver_types::Address {
+		solver_types::Address(vec![0x11u8; 20])
+	}
+
 	fn create_test_config() -> solver_config::Config {
 		let network = NetworkConfig {
 			name: None,
 			network_type: NetworkType::default(),
 			rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
-			input_settler_address: solver_types::Address(vec![0x11u8; 20]),
+			input_settler_address: test_input_settler_address(),
 			output_settler_address: solver_types::Address(vec![0x22u8; 20]),
 			tokens: vec![],
 			input_settler_compact_address: Some(solver_types::Address(vec![0x44u8; 20])),
@@ -642,6 +647,29 @@ mod tests {
 			.build()
 	}
 
+	fn create_test_config_with_broadcaster_finality(
+		default_finality_blocks: u64,
+		chain_137_finality_blocks: u64,
+	) -> solver_config::Config {
+		let settlement = solver_config::SettlementConfig {
+			implementations: HashMap::from([(
+				"broadcaster".to_string(),
+				serde_json::json!({
+					"default_finality_blocks": default_finality_blocks,
+					"finality_blocks": {
+						"137": chain_137_finality_blocks
+					}
+				}),
+			)]),
+			primary: "broadcaster".to_string(),
+			settlement_poll_interval_seconds: 3,
+		};
+
+		let mut config = create_test_config();
+		config.settlement = settlement;
+		config
+	}
+
 	fn deposited_status_return() -> alloy_primitives::Bytes {
 		let mut encoded = vec![0u8; 32];
 		encoded[31] = ESCROW_ORDER_STATUS_DEPOSITED;
@@ -652,6 +680,18 @@ mod tests {
 		let mut encoded = vec![0u8; 32];
 		encoded[31] = status;
 		alloy_primitives::Bytes::from(encoded)
+	}
+
+	fn is_expected_escrow_status_call(tx: &Transaction, order: &Order) -> bool {
+		let Ok(order_data) = serde_json::from_value::<Eip7683OrderData>(order.data.clone()) else {
+			return false;
+		};
+		let expected_call = IInputSettlerEscrow::orderStatusCall {
+			orderId: B256::from(order_data.order_id),
+		}
+		.abi_encode();
+
+		tx.to.as_ref() == Some(&test_input_settler_address()) && tx.data == expected_call
 	}
 
 	fn eip7683_order_with_lock(
@@ -683,6 +723,7 @@ mod tests {
 		let order_clone = order.clone();
 		let fill_tx_clone = fill_tx.clone();
 		let fill_tx_hash_clone = fill_tx_hash.clone();
+		let status_order = order.clone();
 		let needs_escrow_guard = serde_json::from_value::<Eip7683OrderData>(order.data.clone())
 			.ok()
 			.and_then(|data| data.lock_type)
@@ -710,7 +751,10 @@ mod tests {
 					mock_delivery
 						.expect_eth_call_at_block()
 						.times(1)
-						.withf(|tx, block| tx.chain_id == 137 && *block == 80)
+						.withf(move |tx, block| {
+							tx.chain_id == 137
+								&& *block == 80 && is_expected_escrow_status_call(tx, &status_order)
+						})
 						.returning(|_, _| Box::pin(async { Ok(deposited_status_return()) }));
 				}
 				mock_delivery
@@ -1290,6 +1334,7 @@ mod tests {
 	async fn handle_execution_rejects_escrow_when_source_status_not_deposited() {
 		let order = eip7683_order_with_lock(LockType::Permit2Escrow, false, None);
 		let params = create_test_execution_params();
+		let status_order = order.clone();
 
 		let (handler, _event_rx) = create_test_handler_with_config(
 			|mock_order| {
@@ -1304,12 +1349,57 @@ mod tests {
 				mock_delivery
 					.expect_eth_call_at_block()
 					.times(1)
-					.withf(|tx, block| tx.chain_id == 137 && *block == 80)
+					.withf(move |tx, block| {
+						tx.chain_id == 137
+							&& *block == 80 && is_expected_escrow_status_call(tx, &status_order)
+					})
 					.returning(|_, _| Box::pin(async { Ok(escrow_status_return(0)) }));
 				mock_delivery.expect_submit().times(0);
 			},
 			|_mock_storage| {},
 			create_test_config(),
+		)
+		.await;
+
+		let err = handler
+			.handle_execution(order, params)
+			.await
+			.expect_err("source status guard should refuse fill");
+		assert!(
+			err.to_string().contains("expected Deposited"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn handle_execution_uses_configured_broadcaster_finality_for_escrow_status_check() {
+		let order = eip7683_order_with_lock(LockType::Permit2Escrow, false, None);
+		let params = create_test_execution_params();
+		let status_order = order.clone();
+		let config = create_test_config_with_broadcaster_finality(42, 7);
+
+		let (handler, _event_rx) = create_test_handler_with_config(
+			|mock_order| {
+				mock_order.expect_generate_fill_transaction().times(0);
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_block_number()
+					.times(1)
+					.withf(|chain_id| *chain_id == 137)
+					.returning(|_| Box::pin(async { Ok(100) }));
+				mock_delivery
+					.expect_eth_call_at_block()
+					.times(1)
+					.withf(move |tx, block| {
+						tx.chain_id == 137
+							&& *block == 93 && is_expected_escrow_status_call(tx, &status_order)
+					})
+					.returning(|_, _| Box::pin(async { Ok(escrow_status_return(0)) }));
+				mock_delivery.expect_submit().times(0);
+			},
+			|_mock_storage| {},
+			config,
 		)
 		.await;
 

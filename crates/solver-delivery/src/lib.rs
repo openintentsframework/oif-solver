@@ -615,15 +615,18 @@ pub trait DeliveryInterface: Send + Sync {
 
 	/// Executes a contract call at a specific block number.
 	///
-	/// Backends that cannot pin call state to a historical block fall back to
-	/// their ordinary `eth_call`; callers that require historical precision
-	/// should use an EVM backend that overrides this method.
+	/// Backends must override this when they support historical reads. The
+	/// default fails closed so callers do not silently read latest state when
+	/// they asked for a confirmed block.
 	async fn eth_call_at_block(
 		&self,
 		tx: Transaction,
 		_block_number: u64,
 	) -> Result<Bytes, DeliveryError> {
-		self.eth_call(tx).await
+		let _ = tx;
+		Err(DeliveryError::Network(
+			"Historical eth_call is not supported by this delivery backend".to_string(),
+		))
 	}
 
 	/// Replays the given transaction via `eth_call` at the specified block and
