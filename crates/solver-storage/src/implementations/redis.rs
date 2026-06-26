@@ -90,8 +90,11 @@ use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use redis::cluster_async::ClusterConnection;
 use redis::{AsyncCommands, RedisError};
-use solver_types::{ConfigSchema, Field, FieldType, Schema, StorageKey, ValidationError};
-use std::collections::HashMap;
+use solver_types::{
+	ConfigSchema, Field, FieldType, Schema, StorageKey, ValidationError,
+	ORDER_STATUS_KIND_INDEX_VALUES,
+};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::OnceCell;
@@ -144,6 +147,12 @@ const INDEX_SUFFIX: &str = "_index";
 
 /// Suffix for storing index metadata (which indexes reference a key).
 const INDEX_META_SUFFIX: &str = "_idx_meta";
+
+/// Suffix for the set of namespaces that have Redis indexes.
+const NAMESPACE_REGISTRY_SUFFIX: &str = "_namespaces";
+
+/// Number of set members fetched per SSCAN round during index hygiene.
+const CLEANUP_SCAN_COUNT: usize = 1000;
 
 /// TTL configuration for different storage keys.
 #[derive(Debug, Clone)]
@@ -321,6 +330,11 @@ impl RedisStorage {
 		format!("{}:{}:{}", self.tagged_prefix(), namespace, ALL_IDS_SUFFIX)
 	}
 
+	/// Generates the Redis key for the indexed namespace registry.
+	fn namespace_registry_key(&self) -> String {
+		format!("{}:{}", self.tagged_prefix(), NAMESPACE_REGISTRY_SUFFIX)
+	}
+
 	/// Generates the Redis key for a field index.
 	///
 	/// Format: `{prefix}:{namespace}:_index:{field}:{value_hash}`
@@ -382,6 +396,139 @@ impl RedisStorage {
 		}
 	}
 
+	fn negative_query_disabled_error() -> StorageError {
+		StorageError::Backend(
+			"Redis negative index queries are disabled; query a positive index instead".to_string(),
+		)
+	}
+
+	async fn sscan_set_batch(
+		&self,
+		conn: &mut RedisConn,
+		set_key: &str,
+		cursor: u64,
+		context: &str,
+	) -> Result<(u64, Vec<String>), StorageError> {
+		let batch: (u64, Vec<String>) = match conn {
+			RedisConn::Standalone(c) => {
+				redis::cmd("SSCAN")
+					.arg(set_key)
+					.arg(cursor)
+					.arg("COUNT")
+					.arg(CLEANUP_SCAN_COUNT)
+					.query_async(c)
+					.await
+			},
+			RedisConn::Cluster(c) => {
+				redis::cmd("SSCAN")
+					.arg(set_key)
+					.arg(cursor)
+					.arg("COUNT")
+					.arg(CLEANUP_SCAN_COUNT)
+					.query_async(c)
+					.await
+			},
+		}
+		.map_err(|e| self.map_redis_error(e, context))?;
+
+		Ok(batch)
+	}
+
+	async fn redis_key_exists(
+		&self,
+		conn: &mut RedisConn,
+		redis_key: &str,
+		context: &str,
+	) -> Result<bool, StorageError> {
+		let exists: bool = match conn {
+			RedisConn::Standalone(c) => redis::cmd("EXISTS").arg(redis_key).query_async(c).await,
+			RedisConn::Cluster(c) => redis::cmd("EXISTS").arg(redis_key).query_async(c).await,
+		}
+		.map_err(|e| self.map_redis_error(e, context))?;
+
+		Ok(exists)
+	}
+
+	fn known_cleanup_index_keys(&self, namespace: &str) -> Vec<String> {
+		if namespace != StorageKey::Orders.as_str() {
+			return Vec::new();
+		}
+
+		let mut keys = Vec::new();
+		for status in ORDER_STATUS_KIND_INDEX_VALUES {
+			keys.push(self.index_key(namespace, "status_kind", &serde_json::json!(*status)));
+		}
+		for is_terminal in [false, true] {
+			keys.push(self.index_key(namespace, "is_terminal", &serde_json::json!(is_terminal)));
+		}
+		keys
+	}
+
+	async fn prune_stale_index_member(
+		&self,
+		conn: &mut RedisConn,
+		namespace: &str,
+		key: &str,
+	) -> Result<bool, StorageError> {
+		let data_key = self.data_key(key);
+		let index_meta_key = self.index_meta_key(key);
+		let all_ids_key = self.all_ids_key(namespace);
+		let known_index_keys = self.known_cleanup_index_keys(namespace);
+		let metadata_index_keys: Vec<String> = match &mut *conn {
+			RedisConn::Standalone(c) => {
+				redis::cmd("SMEMBERS")
+					.arg(&index_meta_key)
+					.query_async(c)
+					.await
+			},
+			RedisConn::Cluster(c) => {
+				redis::cmd("SMEMBERS")
+					.arg(&index_meta_key)
+					.query_async(c)
+					.await
+			},
+		}
+		.map_err(|e| self.map_redis_error(e, "cleanup_expired_get_meta"))?;
+		let script = redis::Script::new(
+			r#"
+            local data_key = KEYS[1]
+            local index_meta_key = KEYS[2]
+            local member = ARGV[1]
+
+            if redis.call('EXISTS', data_key) == 1 then
+                return 0
+            end
+
+            for i = 3, #KEYS do
+                redis.call('SREM', KEYS[i], member)
+            end
+
+            redis.call('DEL', index_meta_key)
+
+            return 1
+            "#,
+		);
+
+		let mut invocation = script.prepare_invoke();
+		invocation
+			.key(&data_key)
+			.key(&index_meta_key)
+			.key(&all_ids_key);
+		for index_key in &known_index_keys {
+			invocation.key(index_key);
+		}
+		for index_key in &metadata_index_keys {
+			invocation.key(index_key);
+		}
+		let pruned: i64 = match conn {
+			RedisConn::Standalone(c) => invocation.arg(key).invoke_async(c).await,
+			RedisConn::Cluster(c) => invocation.arg(key).invoke_async(c).await,
+		}
+		.map_err(|e| self.map_redis_error(e, "cleanup_expired_atomic_prune"))?;
+
+		Ok(pruned == 1)
+	}
+
 	/// Updates indexes when storing data.
 	///
 	/// This method also stores metadata about which index keys reference this data key,
@@ -391,7 +538,7 @@ impl RedisStorage {
 		key: &str,
 		namespace: &str,
 		indexes: &StorageIndexes,
-		ttl: Option<Duration>,
+		_ttl: Option<Duration>,
 	) -> Result<(), StorageError> {
 		let client = self.get_connection().await?;
 		let mut conn = client.as_ref().clone();
@@ -432,22 +579,17 @@ impl RedisStorage {
 			"update_indexes_add_all",
 			sadd(&all_ids_key, key)
 		);
+		let _: () = dispatch_redis!(
+			self,
+			conn,
+			"update_indexes_register_namespace",
+			sadd(&self.namespace_registry_key(), namespace)
+		);
 
-		// Set TTL on the all-IDs set if configured
-		if let Some(ttl) = ttl {
-			// Get current TTL and only set if not already set or if new TTL is longer
-			let current_ttl: i64 =
-				dispatch_redis!(self, conn, "update_indexes_get_ttl", ttl(&all_ids_key));
-
-			if current_ttl < 0 || (current_ttl as u64) < ttl.as_secs() {
-				let _: () = dispatch_redis!(
-					self,
-					conn,
-					"update_indexes_expire_all",
-					expire(&all_ids_key, ttl.as_secs() as i64)
-				);
-			}
-		}
+		// Shared index sets intentionally do not inherit data-key TTL. If an
+		// index expires while the data key is still live, positive index queries
+		// can silently miss active records. Stale members are pruned by
+		// cleanup_expired after the data key is gone.
 
 		// Track index keys for this data key (for cleanup on delete)
 		let mut index_keys_for_meta: Vec<String> = Vec::new();
@@ -464,21 +606,6 @@ impl RedisStorage {
 
 			// Track this index key for cleanup
 			index_keys_for_meta.push(index_key.clone());
-
-			// Set TTL on index key
-			if let Some(ttl) = ttl {
-				let current_ttl: i64 =
-					dispatch_redis!(self, conn, "update_indexes_get_field_ttl", ttl(&index_key));
-
-				if current_ttl < 0 || (current_ttl as u64) < ttl.as_secs() {
-					let _: () = dispatch_redis!(
-						self,
-						conn,
-						"update_indexes_expire_field",
-						expire(&index_key, ttl.as_secs() as i64)
-					);
-				}
-			}
 		}
 
 		// Store index metadata (which index keys reference this data key)
@@ -492,15 +619,8 @@ impl RedisStorage {
 				);
 			}
 
-			// Set TTL on index metadata key
-			if let Some(ttl) = ttl {
-				let _: () = dispatch_redis!(
-					self,
-					conn,
-					"update_indexes_expire_meta",
-					expire(&index_meta_key, ttl.as_secs() as i64)
-				);
-			}
+			// Metadata must survive data-key expiry so cleanup_expired can prune
+			// dynamic field indexes before deleting this metadata key.
 		}
 
 		debug!(key = %key, namespace = %namespace, index_count = index_keys_for_meta.len(), "updated indexes");
@@ -663,6 +783,13 @@ impl StorageInterface for RedisStorage {
 		namespace: &str,
 		filter: QueryFilter,
 	) -> Result<Vec<String>, StorageError> {
+		if matches!(
+			&filter,
+			QueryFilter::NotEquals(_, _) | QueryFilter::NotIn(_, _)
+		) {
+			return Err(Self::negative_query_disabled_error());
+		}
+
 		let client = self.get_connection().await?;
 		let mut conn = client.as_ref().clone();
 
@@ -675,27 +802,6 @@ impl StorageInterface for RedisStorage {
 			QueryFilter::Equals(field, value) => {
 				let index_key = self.index_key(namespace, &field, &value);
 				dispatch_redis!(self, conn, "query_equals", smembers(&index_key))
-			},
-			QueryFilter::NotEquals(field, value) => {
-				// Get all IDs, then filter out those that match the value
-				let all_ids_key = self.all_ids_key(namespace);
-				let index_key = self.index_key(namespace, &field, &value);
-
-				let all_ids: Vec<String> =
-					dispatch_redis!(self, conn, "query_not_equals_all", smembers(&all_ids_key));
-
-				let excluded_ids: Vec<String> = dispatch_redis!(
-					self,
-					conn,
-					"query_not_equals_excluded",
-					smembers(&index_key)
-				);
-
-				let excluded_set: std::collections::HashSet<_> = excluded_ids.into_iter().collect();
-				all_ids
-					.into_iter()
-					.filter(|id| !excluded_set.contains(id))
-					.collect()
 			},
 			QueryFilter::In(field, values) => {
 				// Union of all matching index sets
@@ -710,24 +816,8 @@ impl StorageInterface for RedisStorage {
 
 				result_ids.into_iter().collect()
 			},
-			QueryFilter::NotIn(field, values) => {
-				// Get all IDs, then filter out those in any of the value sets
-				let all_ids_key = self.all_ids_key(namespace);
-				let all_ids: Vec<String> =
-					dispatch_redis!(self, conn, "query_not_in_all", smembers(&all_ids_key));
-
-				let mut excluded_ids = std::collections::HashSet::new();
-				for value in values {
-					let index_key = self.index_key(namespace, &field, &value);
-					let ids: Vec<String> =
-						dispatch_redis!(self, conn, "query_not_in_excluded", smembers(&index_key));
-					excluded_ids.extend(ids);
-				}
-
-				all_ids
-					.into_iter()
-					.filter(|id| !excluded_ids.contains(id))
-					.collect()
+			QueryFilter::NotEquals(_, _) | QueryFilter::NotIn(_, _) => {
+				return Err(Self::negative_query_disabled_error());
 			},
 		};
 
@@ -782,11 +872,68 @@ impl StorageInterface for RedisStorage {
 	}
 
 	async fn cleanup_expired(&self) -> Result<usize, StorageError> {
-		// Redis handles TTL expiration automatically via EXPIRE.
-		// We don't need to do manual cleanup.
-		// However, we might want to clean up stale index entries.
-		debug!("cleanup_expired called - Redis handles TTL automatically");
-		Ok(0)
+		let client = self.get_connection().await?;
+		let mut conn = client.as_ref().clone();
+		let mut pruned_keys = HashSet::new();
+		let mut checked_keys = HashSet::new();
+		let registry_key = self.namespace_registry_key();
+		let indexed_namespaces: Vec<String> = dispatch_redis!(
+			self,
+			conn,
+			"cleanup_expired_get_namespaces",
+			smembers(&registry_key)
+		);
+		let mut namespaces: HashSet<String> = StorageKey::all()
+			.map(|storage_key| storage_key.as_str().to_string())
+			.collect();
+		namespaces.extend(indexed_namespaces);
+
+		for namespace in namespaces {
+			let all_ids_key = self.all_ids_key(&namespace);
+			let mut candidate_sets = vec![all_ids_key];
+			candidate_sets.extend(self.known_cleanup_index_keys(&namespace));
+
+			for candidate_set in candidate_sets {
+				let mut cursor = 0_u64;
+				loop {
+					let (next_cursor, members) = self
+						.sscan_set_batch(&mut conn, &candidate_set, cursor, "cleanup_expired_sscan")
+						.await?;
+
+					for key in members {
+						if !checked_keys.insert(key.clone()) {
+							continue;
+						}
+
+						let data_key = self.data_key(&key);
+						if self
+							.redis_key_exists(&mut conn, &data_key, "cleanup_expired_exists")
+							.await?
+						{
+							continue;
+						}
+
+						if self
+							.prune_stale_index_member(&mut conn, &namespace, &key)
+							.await?
+						{
+							pruned_keys.insert(key);
+						}
+					}
+
+					if next_cursor == 0 {
+						break;
+					}
+					cursor = next_cursor;
+				}
+			}
+		}
+
+		debug!(
+			pruned = pruned_keys.len(),
+			"cleanup_expired pruned stale Redis index members"
+		);
+		Ok(pruned_keys.len())
 	}
 
 	async fn set_nx(
@@ -1239,6 +1386,62 @@ mod tests {
 	use super::*;
 	use solver_types::ImplementationRegistry;
 
+	struct RedisServerGuard {
+		child: std::process::Child,
+		_temp_dir: tempfile::TempDir,
+	}
+
+	impl Drop for RedisServerGuard {
+		fn drop(&mut self) {
+			let _ = self.child.kill();
+			let _ = self.child.wait();
+		}
+	}
+
+	fn start_test_redis() -> (RedisServerGuard, String) {
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let port = listener.local_addr().unwrap().port();
+		drop(listener);
+
+		let temp_dir = tempfile::tempdir().unwrap();
+		let child = std::process::Command::new("redis-server")
+			.arg("--port")
+			.arg(port.to_string())
+			.arg("--bind")
+			.arg("127.0.0.1")
+			.arg("--save")
+			.arg("")
+			.arg("--appendonly")
+			.arg("no")
+			.arg("--dir")
+			.arg(temp_dir.path())
+			.stdout(std::process::Stdio::null())
+			.stderr(std::process::Stdio::null())
+			.spawn()
+			.expect("start redis-server");
+		let guard = RedisServerGuard {
+			child,
+			_temp_dir: temp_dir,
+		};
+
+		let url = format!("redis://127.0.0.1:{port}");
+		for _ in 0..50 {
+			if std::process::Command::new("redis-cli")
+				.arg("-p")
+				.arg(port.to_string())
+				.arg("ping")
+				.output()
+				.map(|output| output.status.success())
+				.unwrap_or(false)
+			{
+				return (guard, url);
+			}
+			std::thread::sleep(Duration::from_millis(100));
+		}
+
+		panic!("redis-server did not become ready");
+	}
+
 	// ==================== TtlConfig Tests ====================
 
 	#[test]
@@ -1618,6 +1821,28 @@ mod tests {
 			storage.index_meta_key("orders:123"),
 			"my-prefix:orders:123:_idx_meta"
 		);
+	}
+
+	#[test]
+	fn cleanup_known_order_index_keys_include_status_and_terminal_indexes() {
+		let ttl_config = TtlConfig::from_config(&serde_json::Value::Object(serde_json::Map::new()));
+		let storage = RedisStorage::new(
+			"redis://localhost:6379".to_string(),
+			5000,
+			"oif-solver".to_string(),
+			ttl_config,
+			false,
+		)
+		.unwrap();
+
+		let keys = storage.known_cleanup_index_keys("orders");
+
+		assert_eq!(keys.len(), ORDER_STATUS_KIND_INDEX_VALUES.len() + 2);
+		assert!(keys.contains(&"oif-solver:orders:_index:status_kind:finalized".to_string()));
+		assert!(keys.contains(&"oif-solver:orders:_index:status_kind:failed".to_string()));
+		assert!(keys.contains(&"oif-solver:orders:_index:is_terminal:false".to_string()));
+		assert!(keys.contains(&"oif-solver:orders:_index:is_terminal:true".to_string()));
+		assert!(storage.known_cleanup_index_keys("quotes").is_empty());
 	}
 
 	// ==================== get_ttl_for_key() Tests ====================
@@ -2447,7 +2672,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_query_not_equals_connection_failure() {
+	async fn redis_negative_filter_not_equals_is_rejected_without_connection() {
 		let config = serde_json::json!({
 			"redis_url": "redis://invalid-host:6379",
 			"connection_timeout_ms": 100,
@@ -2461,8 +2686,15 @@ mod tests {
 			)
 			.await;
 
-		assert!(result.is_err());
-		assert!(matches!(result, Err(StorageError::Backend(_))));
+		match result {
+			Err(StorageError::Backend(message)) => {
+				assert!(
+					message.contains("Redis negative index queries are disabled"),
+					"unexpected error: {message}"
+				);
+			},
+			other => panic!("expected negative query rejection, got {other:?}"),
+		}
 	}
 
 	#[tokio::test]
@@ -2488,7 +2720,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_query_not_in_connection_failure() {
+	async fn redis_negative_filter_not_in_is_rejected_without_connection() {
 		let config = serde_json::json!({
 			"redis_url": "redis://invalid-host:6379",
 			"connection_timeout_ms": 100,
@@ -2505,8 +2737,15 @@ mod tests {
 			)
 			.await;
 
-		assert!(result.is_err());
-		assert!(matches!(result, Err(StorageError::Backend(_))));
+		match result {
+			Err(StorageError::Backend(message)) => {
+				assert!(
+					message.contains("Redis negative index queries are disabled"),
+					"unexpected error: {message}"
+				);
+			},
+			other => panic!("expected negative query rejection, got {other:?}"),
+		}
 	}
 
 	#[tokio::test]
@@ -2541,18 +2780,337 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_cleanup_expired_no_connection_needed() {
+	async fn test_cleanup_expired_requires_connection() {
 		let config = serde_json::json!({
 			"redis_url": "redis://invalid-host:6379",
 			"connection_timeout_ms": 100,
 		});
 
 		let storage = create_storage(&config).unwrap();
-		// cleanup_expired doesn't need a connection for Redis (TTL is automatic)
 		let result = storage.cleanup_expired().await;
 
-		assert!(result.is_ok());
-		assert_eq!(result.unwrap(), 0);
+		assert!(result.is_err());
+		assert!(matches!(result, Err(StorageError::Backend(_))));
+	}
+
+	fn redis_url_or_skip() -> Option<String> {
+		match std::env::var("REDIS_URL") {
+			Ok(url) if !url.trim().is_empty() => Some(url),
+			_ => {
+				eprintln!("skipping Redis cleanup test because REDIS_URL is not set");
+				None
+			},
+		}
+	}
+
+	#[tokio::test]
+	async fn cleanup_expired_prunes_stale_order_indexes_when_redis_is_available(
+	) -> Result<(), StorageError> {
+		let Some(redis_url) = redis_url_or_skip() else {
+			return Ok(());
+		};
+		let storage = RedisStorage::new(
+			redis_url,
+			5000,
+			format!("test-{}", uuid::Uuid::new_v4()),
+			TtlConfig::default(),
+			false,
+		)?;
+		let order_key = "orders:stale-order";
+		let second_order_key = "orders:second-order";
+		let indexes = StorageIndexes::new()
+			.with_field("status_kind", serde_json::json!("executing"))
+			.with_field("is_terminal", serde_json::json!(false));
+
+		storage
+			.set_bytes(order_key, b"fresh".to_vec(), Some(indexes), None)
+			.await?;
+		assert_eq!(storage.cleanup_expired().await?, 0);
+
+		let active = storage
+			.query(
+				"orders",
+				QueryFilter::Equals("is_terminal".to_string(), serde_json::json!(false)),
+			)
+			.await?;
+		assert_eq!(active, vec![order_key.to_string()]);
+		let executing = storage
+			.query(
+				"orders",
+				QueryFilter::In(
+					"status_kind".to_string(),
+					vec![
+						serde_json::json!("executing"),
+						serde_json::json!("post_filled"),
+					],
+				),
+			)
+			.await?;
+		assert_eq!(executing, vec![order_key.to_string()]);
+		let all = storage.query("orders", QueryFilter::All).await?;
+		assert_eq!(all, vec![order_key.to_string()]);
+
+		let client = storage.get_connection().await?;
+		let mut conn = client.as_ref().clone();
+		assert!(
+			!storage
+				.prune_stale_index_member(&mut conn, "orders", order_key)
+				.await?
+		);
+
+		storage
+			.set_bytes(
+				second_order_key,
+				b"terminal".to_vec(),
+				Some(
+					StorageIndexes::new()
+						.with_field("status_kind", serde_json::json!("finalized"))
+						.with_field("is_terminal", serde_json::json!(true))
+						.with_field("chain_id", serde_json::json!(1)),
+				),
+				None,
+			)
+			.await?;
+
+		let _: usize = dispatch_redis!(
+			storage,
+			conn,
+			"delete_test_order_data",
+			del(&storage.data_key(order_key))
+		);
+		let _: usize = dispatch_redis!(
+			storage,
+			conn,
+			"delete_test_second_order_data",
+			del(&storage.data_key(second_order_key))
+		);
+
+		assert_eq!(storage.cleanup_expired().await?, 2);
+		let active = storage
+			.query(
+				"orders",
+				QueryFilter::Equals("is_terminal".to_string(), serde_json::json!(false)),
+			)
+			.await?;
+		assert!(active.is_empty());
+		let finalized = storage
+			.query(
+				"orders",
+				QueryFilter::Equals("is_terminal".to_string(), serde_json::json!(true)),
+			)
+			.await?;
+		assert!(finalized.is_empty());
+		let all = storage.query("orders", QueryFilter::All).await?;
+		assert!(all.is_empty());
+
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn index_sets_do_not_inherit_data_ttl_when_redis_is_available() -> Result<(), StorageError>
+	{
+		let Some(redis_url) = redis_url_or_skip() else {
+			return Ok(());
+		};
+		let ttl_config = TtlConfig::from_config(&serde_json::json!({
+			"ttl_orders": 1,
+		}));
+		let storage = RedisStorage::new(
+			redis_url,
+			5000,
+			format!("test-{}", uuid::Uuid::new_v4()),
+			ttl_config,
+			false,
+		)?;
+		let order_key = "orders:ttl-order";
+		let indexes = StorageIndexes::new()
+			.with_field("status_kind", serde_json::json!("executing"))
+			.with_field("is_terminal", serde_json::json!(false))
+			.with_field("chain_id", serde_json::json!(1));
+
+		storage
+			.set_bytes(order_key, b"expires".to_vec(), Some(indexes), None)
+			.await?;
+
+		let client = storage.get_connection().await?;
+		let mut conn = client.as_ref().clone();
+		let data_ttl: i64 = dispatch_redis!(
+			storage,
+			conn,
+			"test_data_ttl",
+			ttl(&storage.data_key(order_key))
+		);
+		let all_ttl: i64 = dispatch_redis!(
+			storage,
+			conn,
+			"test_all_index_ttl",
+			ttl(&storage.all_ids_key("orders"))
+		);
+		let terminal_index_key =
+			storage.index_key("orders", "is_terminal", &serde_json::json!(false));
+		let terminal_ttl: i64 = dispatch_redis!(
+			storage,
+			conn,
+			"test_terminal_index_ttl",
+			ttl(&terminal_index_key)
+		);
+		let chain_index_key = storage.index_key("orders", "chain_id", &serde_json::json!(1));
+		let meta_ttl: i64 = dispatch_redis!(
+			storage,
+			conn,
+			"test_meta_index_ttl",
+			ttl(&storage.index_meta_key(order_key))
+		);
+
+		assert!(data_ttl > 0, "data key should inherit ttl_orders");
+		assert_eq!(all_ttl, -1, "shared all-IDs set must not expire");
+		assert_eq!(terminal_ttl, -1, "shared field index must not expire");
+		assert_eq!(meta_ttl, -1, "index metadata must survive until cleanup");
+
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		assert!(!storage.exists(order_key).await?);
+		assert_eq!(storage.cleanup_expired().await?, 1);
+
+		let chain_member: bool = dispatch_redis!(
+			storage,
+			conn,
+			"test_chain_index_member",
+			sismember(&chain_index_key, order_key)
+		);
+		let meta_exists: bool = dispatch_redis!(
+			storage,
+			conn,
+			"test_meta_exists",
+			exists(&storage.index_meta_key(order_key))
+		);
+		assert!(
+			!chain_member,
+			"cleanup should prune metadata-only field indexes"
+		);
+		assert!(
+			!meta_exists,
+			"cleanup should delete index metadata after pruning"
+		);
+
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn cleanup_expired_prunes_dynamic_namespace_indexes_when_redis_is_available(
+	) -> Result<(), StorageError> {
+		let Some(redis_url) = redis_url_or_skip() else {
+			return Ok(());
+		};
+		let storage = RedisStorage::new(
+			redis_url,
+			5000,
+			format!("test-{}", uuid::Uuid::new_v4()),
+			TtlConfig::default(),
+			false,
+		)?;
+		let namespace = "solver-a-bridge-transfer";
+		let transfer_key = format!("{namespace}:transfer-1");
+		let indexes = StorageIndexes::new()
+			.with_field("status", serde_json::json!("completed"))
+			.with_field("pair_id", serde_json::json!("eth-katana"));
+
+		storage
+			.set_bytes(
+				&transfer_key,
+				b"terminal-transfer".to_vec(),
+				Some(indexes),
+				Some(Duration::from_secs(1)),
+			)
+			.await?;
+
+		let client = storage.get_connection().await?;
+		let mut conn = client.as_ref().clone();
+		let registered: bool = dispatch_redis!(
+			storage,
+			conn,
+			"test_dynamic_namespace_registered",
+			sismember(&storage.namespace_registry_key(), namespace)
+		);
+		assert!(registered, "indexed dynamic namespace should be registered");
+
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		assert!(!storage.exists(&transfer_key).await?);
+		assert_eq!(storage.cleanup_expired().await?, 1);
+
+		let status_index_key =
+			storage.index_key(namespace, "status", &serde_json::json!("completed"));
+		let pair_index_key =
+			storage.index_key(namespace, "pair_id", &serde_json::json!("eth-katana"));
+		let status_member: bool = dispatch_redis!(
+			storage,
+			conn,
+			"test_dynamic_status_index_member",
+			sismember(&status_index_key, &transfer_key)
+		);
+		let pair_member: bool = dispatch_redis!(
+			storage,
+			conn,
+			"test_dynamic_pair_index_member",
+			sismember(&pair_index_key, &transfer_key)
+		);
+		let all_member: bool = dispatch_redis!(
+			storage,
+			conn,
+			"test_dynamic_all_index_member",
+			sismember(&storage.all_ids_key(namespace), &transfer_key)
+		);
+		let meta_exists: bool = dispatch_redis!(
+			storage,
+			conn,
+			"test_dynamic_meta_exists",
+			exists(&storage.index_meta_key(&transfer_key))
+		);
+
+		assert!(!status_member, "cleanup should prune dynamic status index");
+		assert!(!pair_member, "cleanup should prune dynamic field index");
+		assert!(!all_member, "cleanup should prune dynamic all-IDs set");
+		assert!(!meta_exists, "cleanup should delete dynamic index metadata");
+
+		Ok(())
+	}
+
+	#[tokio::test]
+	#[ignore = "requires local redis-server and redis-cli binaries"]
+	async fn prune_stale_index_member_keeps_recreated_data_indexes() {
+		let (_redis, redis_url) = start_test_redis();
+		let storage = RedisStorage::new(
+			redis_url,
+			5000,
+			format!("test-{}", uuid::Uuid::new_v4()),
+			TtlConfig::default(),
+			false,
+		)
+		.unwrap();
+		let order_key = "orders:race-order";
+		let indexes = StorageIndexes::new()
+			.with_field("status_kind", serde_json::json!("executing"))
+			.with_field("is_terminal", serde_json::json!(false));
+
+		storage
+			.set_bytes(order_key, b"fresh".to_vec(), Some(indexes), None)
+			.await
+			.unwrap();
+
+		let client = storage.get_connection().await.unwrap();
+		let mut conn = client.as_ref().clone();
+		storage
+			.prune_stale_index_member(&mut conn, "orders", order_key)
+			.await
+			.unwrap();
+
+		let active = storage
+			.query(
+				"orders",
+				QueryFilter::Equals("is_terminal".to_string(), serde_json::json!(false)),
+			)
+			.await
+			.unwrap();
+		assert_eq!(active, vec![order_key.to_string()]);
 	}
 
 	#[tokio::test]
