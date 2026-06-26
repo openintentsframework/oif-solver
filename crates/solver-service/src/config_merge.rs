@@ -732,6 +732,17 @@ fn build_operator_settlement_config(
 			},
 		}
 	}
+	if broadcaster.is_none() {
+		if let Some(broadcaster_override) = initializer
+			.settlement
+			.as_ref()
+			.and_then(|s| s.broadcaster.as_ref())
+		{
+			broadcaster = Some(build_operator_broadcaster_finality_config_from_override(
+				broadcaster_override,
+			));
+		}
+	}
 
 	let settlement_type = match primary_settlement {
 		SettlementTypeOverride::Hyperlane => OperatorSettlementType::Hyperlane,
@@ -1110,6 +1121,31 @@ fn build_operator_broadcaster_config_from_override(
 	})
 }
 
+fn build_operator_broadcaster_finality_config_from_override(
+	override_cfg: &BroadcasterSettlementOverride,
+) -> OperatorBroadcasterConfig {
+	OperatorBroadcasterConfig {
+		oracles: OperatorOracleConfig {
+			input: HashMap::new(),
+			output: HashMap::new(),
+		},
+		routes: HashMap::new(),
+		broadcaster_addresses: HashMap::new(),
+		receiver_addresses: HashMap::new(),
+		broadcaster_ids: HashMap::new(),
+		proof_service_url: String::new(),
+		proof_wait_time_seconds: 30,
+		storage_proof_timeout_seconds: 30,
+		default_finality_blocks: override_cfg.default_finality_blocks.unwrap_or(20),
+		finality_blocks: override_cfg.finality_blocks.clone(),
+		chain_block_time_seconds: HashMap::new(),
+		intent_safety_buffer_seconds: None,
+		intent_min_expiry_seconds: None,
+		oracle_selection_strategy: OperatorOracleSelectionStrategy::First,
+		pusher_directions: Vec::new(),
+	}
+}
+
 /// Builds runtime Config from OperatorConfig.
 ///
 /// Called on every boot (after first boot) and on hot reload.
@@ -1147,7 +1183,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 			operator_config.fee_policy.as_ref(),
 		),
 		account: build_account_config_from_operator(operator_config.account.as_ref()),
-		discovery: build_discovery_config_from_operator(&chain_ids)?,
+		discovery: build_discovery_config_from_operator(operator_config, &chain_ids)?,
 		order: build_order_config_from_operator(),
 		settlement: build_settlement_config_from_operator(operator_config, &chain_ids)?,
 		pricing: Some(build_pricing_config_from_operator(&operator_config.pricing)),
@@ -1508,16 +1544,39 @@ fn build_account_config_from_operator(
 }
 
 /// Builds DiscoveryConfig from operator config.
-fn build_discovery_config_from_operator(chain_ids: &[u64]) -> Result<DiscoveryConfig, MergeError> {
+fn build_discovery_config_from_operator(
+	operator_config: &OperatorConfig,
+	chain_ids: &[u64],
+) -> Result<DiscoveryConfig, MergeError> {
 	let mut implementations = HashMap::new();
 
 	let network_ids_array =
 		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect());
+	let broadcaster = operator_config.settlement.broadcaster.as_ref();
+	let default_finality_blocks = broadcaster
+		.map(|config| config.default_finality_blocks)
+		.unwrap_or(20);
+	let finality_blocks = broadcaster
+		.map(|config| {
+			serde_json::Value::Object(
+				config
+					.finality_blocks
+					.iter()
+					.map(|(chain_id, depth)| (chain_id.to_string(), int(*depth as i64)))
+					.collect(),
+			)
+		})
+		.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
 
 	// Onchain discovery - polls chain for new orders
 	let onchain_config = json_object(vec![
 		("network_ids", network_ids_array.clone()),
 		("polling_interval_secs", int(5)),
+		(
+			"default_finality_blocks",
+			int(default_finality_blocks as i64),
+		),
+		("finality_blocks", finality_blocks),
 	]);
 	implementations.insert("onchain_eip7683".to_string(), onchain_config);
 
@@ -6767,13 +6826,24 @@ mod tests {
 	#[test]
 	fn test_build_discovery_config_from_operator() {
 		let chain_ids = vec![1, 10];
-		let discovery = build_discovery_config_from_operator(&chain_ids).unwrap();
+		let op_config = merge_to_operator_config(test_seed_overrides(), &TESTNET_SEED).unwrap();
+		let discovery = build_discovery_config_from_operator(&op_config, &chain_ids).unwrap();
 
 		assert!(discovery.implementations.contains_key("onchain_eip7683"));
 		assert!(discovery.implementations.contains_key("offchain_eip7683"));
 
 		let onchain = discovery.implementations.get("onchain_eip7683").unwrap();
 		assert!(onchain.get("polling_interval_secs").is_some());
+		assert_eq!(
+			onchain
+				.get("default_finality_blocks")
+				.and_then(|v| v.as_i64()),
+			Some(20)
+		);
+		assert!(onchain
+			.get("finality_blocks")
+			.and_then(|v| v.as_object())
+			.is_some());
 
 		// Offchain ingests in-process via /orders; it carries only network_ids
 		// (no api_host/api_port — the HTTP listener was removed in C-04).
@@ -6781,6 +6851,128 @@ mod tests {
 		assert!(offchain.get("network_ids").is_some());
 		assert!(offchain.get("api_host").is_none());
 		assert!(offchain.get("api_port").is_none());
+	}
+
+	#[test]
+	fn test_build_discovery_config_reuses_broadcaster_finality() {
+		let mut op_config = merge_to_operator_config(test_seed_overrides(), &TESTNET_SEED).unwrap();
+		op_config.settlement.broadcaster = Some(OperatorBroadcasterConfig {
+			oracles: OperatorOracleConfig {
+				input: HashMap::new(),
+				output: HashMap::new(),
+			},
+			routes: HashMap::new(),
+			broadcaster_addresses: HashMap::new(),
+			receiver_addresses: HashMap::new(),
+			broadcaster_ids: HashMap::new(),
+			proof_service_url: "http://localhost:8080".to_string(),
+			proof_wait_time_seconds: 30,
+			storage_proof_timeout_seconds: 30,
+			default_finality_blocks: 42,
+			finality_blocks: HashMap::from([(11155420, 64), (84532, 12)]),
+			chain_block_time_seconds: HashMap::new(),
+			intent_safety_buffer_seconds: None,
+			intent_min_expiry_seconds: None,
+			oracle_selection_strategy: OperatorOracleSelectionStrategy::First,
+			pusher_directions: Vec::new(),
+		});
+
+		let discovery =
+			build_discovery_config_from_operator(&op_config, &[11155420, 84532]).unwrap();
+		let onchain = discovery.implementations.get("onchain_eip7683").unwrap();
+
+		assert_eq!(
+			onchain
+				.get("default_finality_blocks")
+				.and_then(|v| v.as_i64()),
+			Some(42)
+		);
+		let finality_blocks = onchain
+			.get("finality_blocks")
+			.and_then(|v| v.as_object())
+			.unwrap();
+		assert_eq!(
+			finality_blocks.get("11155420").and_then(|v| v.as_i64()),
+			Some(64)
+		);
+		assert_eq!(
+			finality_blocks.get("84532").and_then(|v| v.as_i64()),
+			Some(12)
+		);
+	}
+
+	#[test]
+	fn test_merge_retains_broadcaster_finality_outside_settlement_priority() {
+		let mut overrides = test_seed_overrides();
+		let chain_a = 11155420;
+		let chain_b = 84532;
+		let oracle = address!("1111111111111111111111111111111111111111");
+		let routes = HashMap::from([(chain_a, vec![chain_b]), (chain_b, vec![chain_a])]);
+		let oracles = solver_types::seed_overrides::OracleOverrides {
+			input: HashMap::from([(chain_a, vec![oracle]), (chain_b, vec![oracle])]),
+			output: HashMap::from([(chain_a, vec![oracle]), (chain_b, vec![oracle])]),
+		};
+		overrides.settlement = Some(solver_types::seed_overrides::SettlementOverride {
+			settlement_type: solver_types::seed_overrides::SettlementTypeOverride::Direct,
+			priority: Some(vec![
+				solver_types::seed_overrides::SettlementTypeOverride::Direct,
+			]),
+			hyperlane: None,
+			direct: Some(solver_types::seed_overrides::DirectSettlementOverride {
+				oracles: oracles.clone(),
+				routes: routes.clone(),
+				dispute_period_seconds: Some(1),
+				oracle_selection_strategy: None,
+				intent_min_expiry_seconds: None,
+			}),
+			broadcaster: Some(
+				solver_types::seed_overrides::BroadcasterSettlementOverride {
+					default_finality_blocks: Some(0),
+					finality_blocks: HashMap::from([(chain_b, 3)]),
+					..Default::default()
+				},
+			),
+		});
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		assert_eq!(
+			op_config.settlement.priority,
+			Some(vec![OperatorSettlementType::Direct])
+		);
+		assert_eq!(
+			op_config
+				.settlement
+				.broadcaster
+				.as_ref()
+				.map(|config| config.default_finality_blocks),
+			Some(0)
+		);
+		assert_eq!(
+			op_config
+				.settlement
+				.broadcaster
+				.as_ref()
+				.and_then(|config| config.finality_blocks.get(&chain_b).copied()),
+			Some(3)
+		);
+
+		let discovery =
+			build_discovery_config_from_operator(&op_config, &[chain_a, chain_b]).unwrap();
+		let onchain = discovery.implementations.get("onchain_eip7683").unwrap();
+		assert_eq!(
+			onchain
+				.get("default_finality_blocks")
+				.and_then(|v| v.as_i64()),
+			Some(0)
+		);
+		assert_eq!(
+			onchain
+				.get("finality_blocks")
+				.and_then(|v| v.as_object())
+				.and_then(|finality| finality.get(&chain_b.to_string()))
+				.and_then(|v| v.as_i64()),
+			Some(3)
+		);
 	}
 
 	#[test]

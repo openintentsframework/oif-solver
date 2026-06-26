@@ -1109,7 +1109,7 @@ impl SolverEngine {
 			},
 		};
 
-		if is_terminal_status(&order.status) || order.execution_params.is_some() {
+		if is_terminal_status(&order.status) {
 			return Ok(());
 		}
 		if deferred_order_deadline_elapsed(&order, solver_types::current_timestamp()) {
@@ -1152,7 +1152,13 @@ impl SolverEngine {
 		};
 
 		match result {
-			ReconcileResult::NeedsPrepare | ReconcileResult::NeedsExecution => {},
+			ReconcileResult::NeedsPrepare | ReconcileResult::NeedsExecution => {
+				if order.execution_params.is_some() {
+					return self
+						.publish_recovery_event_or_skip_expired(order, result, &recovery)
+						.await;
+				}
+			},
 			ReconcileResult::Unknown => {
 				return self
 					.republish_deferred_or_skip(order, DEFERRED_RETRY_RECONCILE_UNKNOWN_DELAY)
@@ -1224,6 +1230,22 @@ impl SolverEngine {
 			},
 			ExecutionDecision::Skip(reason) => self.skip_deferred_order(order, reason).await,
 		}
+	}
+
+	async fn publish_recovery_event_or_skip_expired(
+		&self,
+		order: Order,
+		result: ReconcileResult,
+		recovery: &RecoveryService,
+	) -> Result<(), EngineError> {
+		if deferred_order_deadline_elapsed(&order, solver_types::current_timestamp()) {
+			return self
+				.skip_deferred_order(order, "Deferred order reached fill deadline".to_string())
+				.await;
+		}
+
+		recovery.publish_recovery_event(order, result).await;
+		Ok(())
 	}
 
 	async fn republish_deferred_or_skip(
@@ -2022,6 +2044,71 @@ mod tests {
 				assert_eq!(event_params.gas_price, params.gas_price);
 			},
 			_ => panic!("Expected Order::Executing event"),
+		}
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_republishes_execution_when_params_are_already_stored() {
+		let params = test_execution_params();
+		let mut strategy = MockExecutionStrategy::new();
+		strategy.expect_should_execute().times(0);
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let mut order = deferred_order_without_execution_params(LockType::ResourceLock, 600);
+		order.execution_params = Some(params.clone());
+		engine.state_machine.store_order(&order).await.unwrap();
+		let mut receiver = engine.event_bus.subscribe();
+
+		engine.retry_deferred_order_once(&order.id).await.unwrap();
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Executing {
+				order: event_order,
+				params: event_params,
+			}) => {
+				assert_eq!(event_order.id, order.id);
+				assert_eq!(event_params.gas_price, params.gas_price);
+			},
+			_ => panic!("Expected Order::Executing event"),
+		}
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_recovery_publish_skips_when_deadline_elapsed_after_reconcile() {
+		let params = test_execution_params();
+		let mut strategy = MockExecutionStrategy::new();
+		strategy.expect_should_execute().times(0);
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let mut order = deferred_order_without_execution_params(LockType::ResourceLock, 0);
+		order.execution_params = Some(params);
+		engine.state_machine.store_order(&order).await.unwrap();
+		let mut receiver = engine.event_bus.subscribe();
+		let recovery = RecoveryService::new(
+			engine.storage.clone(),
+			engine.state_machine.clone(),
+			engine.delivery.clone(),
+			engine.settlement.clone(),
+			engine.event_bus.clone(),
+			Arc::new(TransactionAttemptStore::new(engine.storage.clone())),
+			Arc::new(engine.static_config.networks.clone()),
+		);
+
+		engine
+			.publish_recovery_event_or_skip_expired(
+				order.clone(),
+				ReconcileResult::NeedsExecution,
+				&recovery,
+			)
+			.await
+			.unwrap();
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Skipped { order_id, reason }) => {
+				assert_eq!(order_id, order.id);
+				assert!(reason.contains("fill deadline"));
+			},
+			_ => panic!("Expected Order::Skipped event"),
 		}
 	}
 

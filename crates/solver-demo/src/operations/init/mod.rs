@@ -713,7 +713,9 @@ fn generate_demo_config(
 			"implementations": {
 				"onchain_eip7683": {
 					"network_ids": chain_ids,
-					"polling_interval_secs": 0
+					"polling_interval_secs": 5,
+					"default_finality_blocks": 20,
+					"finality_blocks": {}
 				},
 				"offchain_eip7683": {
 					"network_ids": [first_chain]
