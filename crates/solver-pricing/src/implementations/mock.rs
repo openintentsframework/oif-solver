@@ -412,6 +412,20 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn test_wei_to_currency_rejects_invalid_amounts() {
+		let config = create_default_config();
+		let pricing = MockPricing::new(&config).unwrap();
+
+		for amount in ["-1", "NaN", "inf"] {
+			let result = pricing.wei_to_currency(amount, "USD").await;
+			assert!(
+				matches!(result, Err(PricingError::InvalidData(_))),
+				"amount {amount} should be rejected"
+			);
+		}
+	}
+
+	#[tokio::test]
 	async fn test_currency_to_wei() {
 		let config = create_default_config();
 		let pricing = MockPricing::new(&config).unwrap();
