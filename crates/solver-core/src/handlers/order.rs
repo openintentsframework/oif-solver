@@ -423,7 +423,7 @@ impl OrderHandler {
 				origin_chain_id,
 				latest_block,
 				finality_blocks,
-				"Escrow fill aborted: origin chain {origin_chain_id} has not reached configured finality depth {finality_blocks}"
+				"Escrow fill deferred: origin chain {origin_chain_id} has not reached configured finality depth {finality_blocks}"
 			);
 			return Ok(EscrowDepositReadiness::Defer(SOURCE_FINALITY_RETRY_AFTER));
 		};
