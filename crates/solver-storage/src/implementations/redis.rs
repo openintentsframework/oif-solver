@@ -540,7 +540,7 @@ impl RedisStorage {
 		key: &str,
 		namespace: &str,
 		indexes: &StorageIndexes,
-		ttl: Option<Duration>,
+		_ttl: Option<Duration>,
 	) -> Result<(), StorageError> {
 		let client = self.get_connection().await?;
 		let mut conn = client.as_ref().clone();
@@ -582,21 +582,10 @@ impl RedisStorage {
 			sadd(&all_ids_key, key)
 		);
 
-		// Set TTL on the all-IDs set if configured
-		if let Some(ttl) = ttl {
-			// Get current TTL and only set if not already set or if new TTL is longer
-			let current_ttl: i64 =
-				dispatch_redis!(self, conn, "update_indexes_get_ttl", ttl(&all_ids_key));
-
-			if current_ttl < 0 || (current_ttl as u64) < ttl.as_secs() {
-				let _: () = dispatch_redis!(
-					self,
-					conn,
-					"update_indexes_expire_all",
-					expire(&all_ids_key, ttl.as_secs() as i64)
-				);
-			}
-		}
+		// Shared index sets intentionally do not inherit data-key TTL. If an
+		// index expires while the data key is still live, positive index queries
+		// can silently miss active records. Stale members are pruned by
+		// cleanup_expired after the data key is gone.
 
 		// Track index keys for this data key (for cleanup on delete)
 		let mut index_keys_for_meta: Vec<String> = Vec::new();
@@ -613,21 +602,6 @@ impl RedisStorage {
 
 			// Track this index key for cleanup
 			index_keys_for_meta.push(index_key.clone());
-
-			// Set TTL on index key
-			if let Some(ttl) = ttl {
-				let current_ttl: i64 =
-					dispatch_redis!(self, conn, "update_indexes_get_field_ttl", ttl(&index_key));
-
-				if current_ttl < 0 || (current_ttl as u64) < ttl.as_secs() {
-					let _: () = dispatch_redis!(
-						self,
-						conn,
-						"update_indexes_expire_field",
-						expire(&index_key, ttl.as_secs() as i64)
-					);
-				}
-			}
 		}
 
 		// Store index metadata (which index keys reference this data key)
@@ -641,15 +615,8 @@ impl RedisStorage {
 				);
 			}
 
-			// Set TTL on index metadata key
-			if let Some(ttl) = ttl {
-				let _: () = dispatch_redis!(
-					self,
-					conn,
-					"update_indexes_expire_meta",
-					expire(&index_meta_key, ttl.as_secs() as i64)
-				);
-			}
+			// Metadata must survive data-key expiry so cleanup_expired can prune
+			// dynamic field indexes before deleting this metadata key.
 		}
 
 		debug!(key = %key, namespace = %namespace, index_count = index_keys_for_meta.len(), "updated indexes");
@@ -904,6 +871,7 @@ impl StorageInterface for RedisStorage {
 		let client = self.get_connection().await?;
 		let mut conn = client.as_ref().clone();
 		let mut pruned_keys = HashSet::new();
+		let mut checked_keys = HashSet::new();
 
 		for storage_key in StorageKey::all() {
 			let namespace = storage_key.as_str();
@@ -919,6 +887,10 @@ impl StorageInterface for RedisStorage {
 						.await?;
 
 					for key in members {
+						if !checked_keys.insert(key.clone()) {
+							continue;
+						}
+
 						let data_key = self.data_key(&key);
 						if self
 							.redis_key_exists(&mut conn, &data_key, "cleanup_expired_exists")
@@ -2916,6 +2888,95 @@ mod tests {
 		assert!(finalized.is_empty());
 		let all = storage.query("orders", QueryFilter::All).await?;
 		assert!(all.is_empty());
+
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn index_sets_do_not_inherit_data_ttl_when_redis_is_available() -> Result<(), StorageError>
+	{
+		let Some(redis_url) = redis_url_or_skip() else {
+			return Ok(());
+		};
+		let ttl_config = TtlConfig::from_config(&serde_json::json!({
+			"ttl_orders": 1,
+		}));
+		let storage = RedisStorage::new(
+			redis_url,
+			5000,
+			format!("test-{}", uuid::Uuid::new_v4()),
+			ttl_config,
+			false,
+		)?;
+		let order_key = "orders:ttl-order";
+		let indexes = StorageIndexes::new()
+			.with_field("status_kind", serde_json::json!("executing"))
+			.with_field("is_terminal", serde_json::json!(false))
+			.with_field("chain_id", serde_json::json!(1));
+
+		storage
+			.set_bytes(order_key, b"expires".to_vec(), Some(indexes), None)
+			.await?;
+
+		let client = storage.get_connection().await?;
+		let mut conn = client.as_ref().clone();
+		let data_ttl: i64 = dispatch_redis!(
+			storage,
+			conn,
+			"test_data_ttl",
+			ttl(&storage.data_key(order_key))
+		);
+		let all_ttl: i64 = dispatch_redis!(
+			storage,
+			conn,
+			"test_all_index_ttl",
+			ttl(&storage.all_ids_key("orders"))
+		);
+		let terminal_index_key =
+			storage.index_key("orders", "is_terminal", &serde_json::json!(false));
+		let terminal_ttl: i64 = dispatch_redis!(
+			storage,
+			conn,
+			"test_terminal_index_ttl",
+			ttl(&terminal_index_key)
+		);
+		let chain_index_key = storage.index_key("orders", "chain_id", &serde_json::json!(1));
+		let meta_ttl: i64 = dispatch_redis!(
+			storage,
+			conn,
+			"test_meta_index_ttl",
+			ttl(&storage.index_meta_key(order_key))
+		);
+
+		assert!(data_ttl > 0, "data key should inherit ttl_orders");
+		assert_eq!(all_ttl, -1, "shared all-IDs set must not expire");
+		assert_eq!(terminal_ttl, -1, "shared field index must not expire");
+		assert_eq!(meta_ttl, -1, "index metadata must survive until cleanup");
+
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		assert!(!storage.exists(order_key).await?);
+		assert_eq!(storage.cleanup_expired().await?, 1);
+
+		let chain_member: bool = dispatch_redis!(
+			storage,
+			conn,
+			"test_chain_index_member",
+			sismember(&chain_index_key, order_key)
+		);
+		let meta_exists: bool = dispatch_redis!(
+			storage,
+			conn,
+			"test_meta_exists",
+			exists(&storage.index_meta_key(order_key))
+		);
+		assert!(
+			!chain_member,
+			"cleanup should prune metadata-only field indexes"
+		);
+		assert!(
+			!meta_exists,
+			"cleanup should delete index metadata after pruning"
+		);
 
 		Ok(())
 	}

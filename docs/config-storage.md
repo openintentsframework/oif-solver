@@ -38,12 +38,17 @@ In Redis cluster mode, the prefix is hash-tagged by the backend, for example
 `{solver-id}:orders:_all`, so cleanup operations route to the expected slot.
 
 Terminal order retention is deliberately separate from blanket data TTL. Avoid
-setting short `ttl_orders` values for normal operation: Redis currently applies
-configured TTLs during index updates, including shared index keys. Active orders
-must not expire before the maximum settlement and recovery window. If terminal
-history needs bounded retention, prefer an index-safe deletion sweeper that only
-deletes records after the operator retention period and then removes their index
-members.
+setting short `ttl_orders` values for normal operation: active order data must
+not expire before the maximum settlement and recovery window. Shared Redis index
+sets and per-key index metadata do not inherit data-key TTL, so positive liveness
+queries keep their index surface while data keys are live and cleanup can prune
+stale memberships after data expiry. If terminal history needs bounded
+retention, prefer an index-safe deletion sweeper that only deletes records after
+the operator retention period and then removes their index members.
+
+When upgrading Redis data written before the `is_terminal` order index existed,
+drain or reindex in-flight orders before relying on `is_terminal=false` liveness
+queries. Orders written or updated by current versions self-index on every store.
 
 Useful Redis probes:
 
