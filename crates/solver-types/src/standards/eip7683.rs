@@ -1252,6 +1252,7 @@ mod tests {
 	}
 
 	#[test]
+	#[cfg(feature = "oif-interfaces")]
 	fn escrow_order_status_deposited_decodes_to_oif_contract_value() {
 		use alloy_sol_types::{sol_data, SolCall, SolType};
 		use interfaces::IInputSettlerEscrow;

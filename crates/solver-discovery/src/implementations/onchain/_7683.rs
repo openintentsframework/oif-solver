@@ -66,6 +66,10 @@ fn numeric_finality_head(current_block: u64, finality_blocks: u64) -> Option<u64
 	current_block.checked_sub(finality_blocks)
 }
 
+fn initial_finality_cursor(finality_head: u64, finality_blocks: u64) -> u64 {
+	finality_head.saturating_sub(finality_blocks)
+}
+
 fn next_poll_range(last_processed: u64, safe_to_block: Option<u64>) -> Option<(u64, u64)> {
 	let safe_to_block = safe_to_block?;
 	if safe_to_block <= last_processed {
@@ -96,16 +100,28 @@ async fn block_number_for_tag(provider: &DynProvider, tag: BlockNumberOrTag) -> 
 	}
 }
 
+fn non_genesis_finality_tag(block: Option<u64>) -> Option<u64> {
+	block.filter(|block| *block > 0)
+}
+
 async fn resolve_finality_head(
 	provider: &DynProvider,
 	finality_blocks: u64,
 ) -> Result<Option<u64>, DiscoveryError> {
-	if let Some(block) = block_number_for_tag(provider, BlockNumberOrTag::Finalized).await {
+	let finalized = block_number_for_tag(provider, BlockNumberOrTag::Finalized).await;
+	if let Some(block) = non_genesis_finality_tag(finalized) {
 		return Ok(Some(block));
+	} else if finalized.is_some() {
+		tracing::debug!(
+			"RPC finalized tag is still at genesis; trying safe/numeric finality fallback"
+		);
 	}
 
-	if let Some(block) = block_number_for_tag(provider, BlockNumberOrTag::Safe).await {
+	let safe = block_number_for_tag(provider, BlockNumberOrTag::Safe).await;
+	if let Some(block) = non_genesis_finality_tag(safe) {
 		return Ok(Some(block));
+	} else if safe.is_some() {
+		tracing::debug!("RPC safe tag is still at genesis; trying numeric finality fallback");
 	}
 
 	let latest = provider
@@ -277,9 +293,9 @@ impl Eip7683Discovery {
 					&finality_blocks,
 				);
 
-				// Initialize the cursor to the current finality head. Logs newer
-				// than this are intentionally left for a later poll once they are
-				// confirmed at the configured depth.
+				// Initialize with a bounded finalized lookback. Logs newer than
+				// the finality head are still left for a later poll, while events
+				// that arrived during solver startup remain discoverable.
 				let current_block = resolve_finality_head(&provider, finality_depth)
 					.await
 					.map_err(|e| {
@@ -288,16 +304,18 @@ impl Eip7683Discovery {
 						))
 					})?
 					.unwrap_or(0);
+				let initial_cursor = initial_finality_cursor(current_block, finality_depth);
 
 				tracing::info!(
 					chain = network_id,
 					current_block,
+					initial_cursor,
 					finality_depth,
-					"Initialized on-chain discovery cursor at source finality head"
+					"Initialized on-chain discovery cursor with source finality lookback"
 				);
 
 				providers.insert(*network_id, ProviderType::Http(provider));
-				last_blocks.insert(*network_id, current_block);
+				last_blocks.insert(*network_id, initial_cursor);
 			}
 		}
 
@@ -999,6 +1017,23 @@ mod tests {
 	#[test]
 	fn numeric_finality_head_returns_none_before_depth_elapses() {
 		assert_eq!(numeric_finality_head(2, 20), None);
+	}
+
+	#[test]
+	fn non_genesis_finality_tag_ignores_stale_genesis_tags() {
+		assert_eq!(non_genesis_finality_tag(Some(0)), None);
+		assert_eq!(non_genesis_finality_tag(Some(42)), Some(42));
+		assert_eq!(non_genesis_finality_tag(None), None);
+	}
+
+	#[test]
+	fn initial_finality_cursor_replays_one_finality_window() {
+		assert_eq!(initial_finality_cursor(100, 20), 80);
+	}
+
+	#[test]
+	fn initial_finality_cursor_saturates_before_chain_is_deep_enough() {
+		assert_eq!(initial_finality_cursor(10, 20), 0);
 	}
 
 	#[test]
