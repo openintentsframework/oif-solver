@@ -3029,6 +3029,21 @@ impl DeliveryInterface for AlloyDelivery {
 			.await
 			.map_err(|e| DeliveryError::Network(format!("Failed to get block number: {e}")))
 	}
+
+	async fn get_finality_tag_block_number(
+		&self,
+		chain_id: u64,
+		tag: BlockNumberOrTag,
+	) -> Result<Option<u64>, DeliveryError> {
+		let provider = self.get_provider(chain_id)?;
+
+		provider
+			.get_block_by_number(tag)
+			.await
+			.map(|block| block.map(|block| block.number()))
+			.map_err(|e| DeliveryError::Network(format!("Failed to get {tag:?} block number: {e}")))
+	}
+
 	async fn estimate_gas(&self, tx: SolverTransaction) -> Result<u64, DeliveryError> {
 		// Get the chain ID from the transaction
 		let chain_id = tx.chain_id;

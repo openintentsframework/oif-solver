@@ -1,0 +1,51 @@
+/// Select the source-chain head that is safe to consume.
+///
+/// The configured numeric depth is always enforced. Finalized/safe tags may
+/// make the result more conservative, but never newer than `latest - depth`.
+pub fn select_finality_head(
+	finalized: Option<u64>,
+	safe: Option<u64>,
+	latest: u64,
+	finality_blocks: u64,
+) -> Option<u64> {
+	let numeric = latest.checked_sub(finality_blocks)?;
+	let mut head = numeric;
+
+	for tagged in [finalized, safe]
+		.into_iter()
+		.flatten()
+		.filter(|block| *block > 0)
+	{
+		head = head.min(tagged);
+	}
+
+	Some(head)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn finality_head_enforces_numeric_depth_when_tags_track_latest() {
+		assert_eq!(
+			select_finality_head(Some(100), Some(100), 100, 20),
+			Some(80)
+		);
+	}
+
+	#[test]
+	fn finality_head_uses_older_finalized_tag_when_more_conservative() {
+		assert_eq!(select_finality_head(Some(70), Some(90), 100, 20), Some(70));
+	}
+
+	#[test]
+	fn finality_head_returns_none_before_numeric_depth_elapses() {
+		assert_eq!(select_finality_head(Some(5), Some(5), 10, 20), None);
+	}
+
+	#[test]
+	fn finality_head_ignores_genesis_tags() {
+		assert_eq!(select_finality_head(Some(0), Some(0), 100, 20), Some(80));
+	}
+}

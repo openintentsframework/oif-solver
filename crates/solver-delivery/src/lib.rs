@@ -5,6 +5,7 @@
 //! blockchain networks, managing transaction signing, submission, and confirmation.
 
 use alloy_primitives::Bytes;
+use alloy_rpc_types::BlockNumberOrTag;
 use async_trait::async_trait;
 use solver_types::events::TransactionType;
 use solver_types::{
@@ -592,6 +593,15 @@ pub trait DeliveryInterface: Send + Sync {
 	/// Returns the latest block number on the network.
 	async fn get_block_number(&self, chain_id: u64) -> Result<u64, DeliveryError>;
 
+	/// Gets a block number by finality tag when the backend supports it.
+	async fn get_finality_tag_block_number(
+		&self,
+		_chain_id: u64,
+		_tag: BlockNumberOrTag,
+	) -> Result<Option<u64>, DeliveryError> {
+		Ok(None)
+	}
+
 	/// Estimates gas units for a transaction without submitting it.
 	/// Implementations should call the chain's estimateGas RPC with the provided transaction.
 	async fn estimate_gas(&self, tx: Transaction) -> Result<u64, DeliveryError>;
@@ -922,6 +932,22 @@ impl DeliveryService {
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
 		implementation.get_block_number(chain_id).await
+	}
+
+	/// Gets a block number by finality tag for a specific chain.
+	pub async fn get_finality_tag_block_number(
+		&self,
+		chain_id: u64,
+		tag: BlockNumberOrTag,
+	) -> Result<Option<u64>, DeliveryError> {
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
+
+		implementation
+			.get_finality_tag_block_number(chain_id, tag)
+			.await
 	}
 
 	/// Estimates gas for a transaction on the specified chain.

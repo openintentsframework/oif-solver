@@ -10,9 +10,8 @@ use alloy_rpc_types::{BlockNumberOrTag, Filter, Log};
 use alloy_sol_types::sol;
 use alloy_sol_types::{SolEvent, SolValue};
 use async_trait::async_trait;
-use futures::StreamExt;
 use solver_types::{
-	create_http_provider, create_ws_provider, current_timestamp,
+	create_http_provider, current_timestamp, select_finality_head,
 	standards::eip7683::{GasLimitOverrides, LockType, MandateOutput},
 	with_0x_prefix, ConfigSchema, Eip7683OrderData, Field, FieldType, Intent, IntentMetadata,
 	NetworksConfig, ProviderError, Schema,
@@ -62,10 +61,6 @@ const MAX_POLLING_INTERVAL_SECS: u64 = 300;
 const DEFAULT_FINALITY_BLOCKS: u64 = 20;
 const MAX_FINALITY_BLOCKS: u64 = 100_000;
 
-fn numeric_finality_head(current_block: u64, finality_blocks: u64) -> Option<u64> {
-	current_block.checked_sub(finality_blocks)
-}
-
 fn initial_finality_cursor(finality_head: u64, finality_blocks: u64) -> u64 {
 	finality_head.saturating_sub(finality_blocks)
 }
@@ -108,19 +103,17 @@ async fn resolve_finality_head(
 	provider: &DynProvider,
 	finality_blocks: u64,
 ) -> Result<Option<u64>, DiscoveryError> {
-	let finalized = block_number_for_tag(provider, BlockNumberOrTag::Finalized).await;
-	if let Some(block) = non_genesis_finality_tag(finalized) {
-		return Ok(Some(block));
-	} else if finalized.is_some() {
+	let finalized_tag = block_number_for_tag(provider, BlockNumberOrTag::Finalized).await;
+	let finalized = non_genesis_finality_tag(finalized_tag);
+	if finalized.is_none() && finalized_tag.is_some() {
 		tracing::debug!(
 			"RPC finalized tag is still at genesis; trying safe/numeric finality fallback"
 		);
 	}
 
-	let safe = block_number_for_tag(provider, BlockNumberOrTag::Safe).await;
-	if let Some(block) = non_genesis_finality_tag(safe) {
-		return Ok(Some(block));
-	} else if safe.is_some() {
+	let safe_tag = block_number_for_tag(provider, BlockNumberOrTag::Safe).await;
+	let safe = non_genesis_finality_tag(safe_tag);
+	if safe.is_none() && safe_tag.is_some() {
 		tracing::debug!("RPC safe tag is still at genesis; trying numeric finality fallback");
 	}
 
@@ -129,7 +122,12 @@ async fn resolve_finality_head(
 		.await
 		.map_err(|e| DiscoveryError::Connection(format!("Failed to get block number: {e}")))?;
 
-	Ok(numeric_finality_head(latest, finality_blocks))
+	Ok(select_finality_head(
+		finalized,
+		safe,
+		latest,
+		finality_blocks,
+	))
 }
 
 fn validate_finality_blocks_object(
@@ -189,8 +187,6 @@ fn parse_finality_blocks_config(config: &serde_json::Value) -> HashMap<u64, u64>
 enum ProviderType {
 	/// HTTP provider for polling mode.
 	Http(DynProvider),
-	/// WebSocket provider for subscription mode.
-	WebSocket(DynProvider),
 }
 
 struct PollingMonitorContext {
@@ -204,7 +200,7 @@ struct PollingMonitorContext {
 ///
 /// This implementation monitors blockchain events for new EIP-7683 cross-chain
 /// orders and converts them into intents for the solver to process.
-/// Supports monitoring multiple chains concurrently using either HTTP polling
+/// Supports monitoring multiple chains concurrently using HTTP polling.
 /// WebSocket subscriptions are disabled until removed-log handling is buffered
 /// behind a finality gate.
 pub struct Eip7683Discovery {
@@ -255,68 +251,44 @@ impl Eip7683Discovery {
 					.to_string(),
 			));
 		}
-		let use_websocket = interval == 0;
 
 		// Create providers and get initial blocks for each network
 		let mut providers = HashMap::new();
 		let mut last_blocks = HashMap::new();
 
 		for network_id in &network_ids {
-			if use_websocket {
-				// WebSocket mode
-				let provider =
-					create_ws_provider(*network_id, &networks)
-						.await
-						.map_err(|e| match e {
-							ProviderError::NetworkConfig(msg) => {
-								DiscoveryError::ValidationError(msg)
-							},
-							ProviderError::Connection(msg) => DiscoveryError::Connection(msg),
-							ProviderError::InvalidUrl(msg) => DiscoveryError::Connection(msg),
-						})?;
+			let provider = create_http_provider(*network_id, &networks).map_err(|e| match e {
+				ProviderError::NetworkConfig(msg) => DiscoveryError::ValidationError(msg),
+				ProviderError::Connection(msg) => DiscoveryError::Connection(msg),
+				ProviderError::InvalidUrl(msg) => DiscoveryError::Connection(msg),
+			})?;
 
-				tracing::info!("Created WebSocket provider for network {}", network_id);
+			let finality_depth =
+				finality_blocks_for_config(*network_id, default_finality_blocks, &finality_blocks);
 
-				providers.insert(*network_id, ProviderType::WebSocket(provider));
-			} else {
-				// HTTP polling mode
-				let provider =
-					create_http_provider(*network_id, &networks).map_err(|e| match e {
-						ProviderError::NetworkConfig(msg) => DiscoveryError::ValidationError(msg),
-						ProviderError::Connection(msg) => DiscoveryError::Connection(msg),
-						ProviderError::InvalidUrl(msg) => DiscoveryError::Connection(msg),
-					})?;
+			// Initialize with a bounded finalized lookback. Logs newer than
+			// the finality head are still left for a later poll, while events
+			// that arrived during solver startup remain discoverable.
+			let current_block = resolve_finality_head(&provider, finality_depth)
+				.await
+				.map_err(|e| {
+					DiscoveryError::Connection(format!(
+						"Failed to get finality head for chain {network_id}: {e}"
+					))
+				})?
+				.unwrap_or(0);
+			let initial_cursor = initial_finality_cursor(current_block, finality_depth);
 
-				let finality_depth = finality_blocks_for_config(
-					*network_id,
-					default_finality_blocks,
-					&finality_blocks,
-				);
+			tracing::info!(
+				chain = network_id,
+				current_block,
+				initial_cursor,
+				finality_depth,
+				"Initialized on-chain discovery cursor with source finality lookback"
+			);
 
-				// Initialize with a bounded finalized lookback. Logs newer than
-				// the finality head are still left for a later poll, while events
-				// that arrived during solver startup remain discoverable.
-				let current_block = resolve_finality_head(&provider, finality_depth)
-					.await
-					.map_err(|e| {
-						DiscoveryError::Connection(format!(
-							"Failed to get finality head for chain {network_id}: {e}"
-						))
-					})?
-					.unwrap_or(0);
-				let initial_cursor = initial_finality_cursor(current_block, finality_depth);
-
-				tracing::info!(
-					chain = network_id,
-					current_block,
-					initial_cursor,
-					finality_depth,
-					"Initialized on-chain discovery cursor with source finality lookback"
-				);
-
-				providers.insert(*network_id, ProviderType::Http(provider));
-				last_blocks.insert(*network_id, initial_cursor);
-			}
+			providers.insert(*network_id, ProviderType::Http(provider));
+			last_blocks.insert(*network_id, initial_cursor);
 		}
 
 		Ok(Self {
@@ -550,70 +522,6 @@ impl Eip7683Discovery {
 			}
 		}
 	}
-
-	/// Subscription-based monitoring for a single chain.
-	///
-	/// Uses WebSocket connection to subscribe to Open events via eth_subscribe
-	/// and processes events as they arrive in real-time.
-	async fn monitor_chain_subscription(
-		provider: DynProvider,
-		chain_id: u64,
-		networks: NetworksConfig,
-		sender: mpsc::Sender<Intent>,
-		mut stop_rx: broadcast::Receiver<()>,
-	) {
-		// Get the input settler address for this chain
-		let settler_address = match networks.get(&chain_id) {
-			Some(network) => {
-				if network.input_settler_address.0.len() != 20 {
-					tracing::error!(chain = chain_id, "Invalid settler address length");
-					return;
-				}
-				AlloyAddress::from_slice(&network.input_settler_address.0)
-			},
-			None => {
-				tracing::error!("Chain ID {} not found in networks config", chain_id);
-				return;
-			},
-		};
-
-		// Create filter for Open events
-		let open_sig = Open::SIGNATURE_HASH;
-		let filter = Filter::new()
-			.address(vec![settler_address])
-			.event_signature(vec![open_sig]);
-
-		// Subscribe to logs
-		let subscription = match provider.subscribe_logs(&filter).await {
-			Ok(sub) => sub,
-			Err(e) => {
-				tracing::error!(chain = chain_id, "Failed to subscribe to logs: {}", e);
-				return;
-			},
-		};
-
-		let mut stream = subscription.into_stream();
-		tracing::info!(
-			chain = chain_id,
-			"WebSocket monitoring started for settler {}",
-			settler_address
-		);
-
-		loop {
-			tokio::select! {
-				Some(log) = stream.next() => {
-					// Process single log as it arrives
-					if !Self::process_discovered_logs(vec![log], &sender, chain_id).await {
-						break;
-					}
-				}
-				_ = stop_rx.recv() => {
-					tracing::info!(chain = chain_id, "Stopping WebSocket monitor");
-					break;
-				}
-			}
-		}
-	}
 }
 
 /// Configuration schema for EIP-7683 on-chain discovery.
@@ -707,30 +615,17 @@ impl DiscoveryInterface for Eip7683Discovery {
 			let stop_rx = stop_tx.subscribe();
 			let chain_id = *network_id;
 
-			let handle = match provider {
-				ProviderType::Http(http_provider) => {
-					let provider = http_provider.clone();
-					let context = PollingMonitorContext {
-						networks,
-						last_blocks: self.last_blocks.clone(),
-						polling_interval_secs: self.polling_interval_secs,
-						finality_blocks: self.finality_blocks_for_chain(chain_id),
-					};
-					tokio::spawn(async move {
-						Self::monitor_chain_polling(provider, chain_id, context, sender, stop_rx)
-							.await;
-					})
-				},
-				ProviderType::WebSocket(ws_provider) => {
-					let provider = ws_provider.clone();
-					tokio::spawn(async move {
-						Self::monitor_chain_subscription(
-							provider, chain_id, networks, sender, stop_rx,
-						)
-						.await;
-					})
-				},
+			let ProviderType::Http(http_provider) = provider;
+			let provider = http_provider.clone();
+			let context = PollingMonitorContext {
+				networks,
+				last_blocks: self.last_blocks.clone(),
+				polling_interval_secs: self.polling_interval_secs,
+				finality_blocks: self.finality_blocks_for_chain(chain_id),
 			};
+			let handle = tokio::spawn(async move {
+				Self::monitor_chain_polling(provider, chain_id, context, sender, stop_rx).await;
+			});
 
 			handles.push(handle);
 		}
@@ -1009,14 +904,14 @@ mod tests {
 	}
 
 	#[test]
-	fn numeric_finality_head_subtracts_configured_depth() {
-		assert_eq!(numeric_finality_head(100, 20), Some(80));
-		assert_eq!(numeric_finality_head(100, 0), Some(100));
+	fn selected_finality_head_subtracts_configured_depth_without_tags() {
+		assert_eq!(select_finality_head(None, None, 100, 20), Some(80));
+		assert_eq!(select_finality_head(None, None, 100, 0), Some(100));
 	}
 
 	#[test]
-	fn numeric_finality_head_returns_none_before_depth_elapses() {
-		assert_eq!(numeric_finality_head(2, 20), None);
+	fn selected_finality_head_returns_none_before_depth_elapses() {
+		assert_eq!(select_finality_head(None, None, 2, 20), None);
 	}
 
 	#[test]
