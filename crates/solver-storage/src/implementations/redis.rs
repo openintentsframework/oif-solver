@@ -90,7 +90,10 @@ use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use redis::cluster_async::ClusterConnection;
 use redis::{AsyncCommands, RedisError};
-use solver_types::{ConfigSchema, Field, FieldType, Schema, StorageKey, ValidationError};
+use solver_types::{
+	ConfigSchema, Field, FieldType, Schema, StorageKey, ValidationError,
+	ORDER_STATUS_KIND_INDEX_VALUES,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -150,19 +153,6 @@ const NAMESPACE_REGISTRY_SUFFIX: &str = "_namespaces";
 
 /// Number of set members fetched per SSCAN round during index hygiene.
 const CLEANUP_SCAN_COUNT: usize = 1000;
-
-/// Stable order status index values written by solver-core.
-const ORDER_STATUS_KIND_INDEX_VALUES: &[&str] = &[
-	"created",
-	"pending",
-	"executing",
-	"executed",
-	"post_filled",
-	"pre_claimed",
-	"settled",
-	"finalized",
-	"failed",
-];
 
 /// TTL configuration for different storage keys.
 #[derive(Debug, Clone)]
