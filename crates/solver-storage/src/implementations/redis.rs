@@ -145,6 +145,9 @@ const INDEX_SUFFIX: &str = "_index";
 /// Suffix for storing index metadata (which indexes reference a key).
 const INDEX_META_SUFFIX: &str = "_idx_meta";
 
+/// Suffix for the set of namespaces that have Redis indexes.
+const NAMESPACE_REGISTRY_SUFFIX: &str = "_namespaces";
+
 /// Number of set members fetched per SSCAN round during index hygiene.
 const CLEANUP_SCAN_COUNT: usize = 1000;
 
@@ -335,6 +338,11 @@ impl RedisStorage {
 	/// Format: `{prefix}:{namespace}:_all`
 	fn all_ids_key(&self, namespace: &str) -> String {
 		format!("{}:{}:{}", self.tagged_prefix(), namespace, ALL_IDS_SUFFIX)
+	}
+
+	/// Generates the Redis key for the indexed namespace registry.
+	fn namespace_registry_key(&self) -> String {
+		format!("{}:{}", self.tagged_prefix(), NAMESPACE_REGISTRY_SUFFIX)
 	}
 
 	/// Generates the Redis key for a field index.
@@ -580,6 +588,12 @@ impl RedisStorage {
 			conn,
 			"update_indexes_add_all",
 			sadd(&all_ids_key, key)
+		);
+		let _: () = dispatch_redis!(
+			self,
+			conn,
+			"update_indexes_register_namespace",
+			sadd(&self.namespace_registry_key(), namespace)
 		);
 
 		// Shared index sets intentionally do not inherit data-key TTL. If an
@@ -872,12 +886,22 @@ impl StorageInterface for RedisStorage {
 		let mut conn = client.as_ref().clone();
 		let mut pruned_keys = HashSet::new();
 		let mut checked_keys = HashSet::new();
+		let registry_key = self.namespace_registry_key();
+		let indexed_namespaces: Vec<String> = dispatch_redis!(
+			self,
+			conn,
+			"cleanup_expired_get_namespaces",
+			smembers(&registry_key)
+		);
+		let mut namespaces: HashSet<String> = StorageKey::all()
+			.map(|storage_key| storage_key.as_str().to_string())
+			.collect();
+		namespaces.extend(indexed_namespaces);
 
-		for storage_key in StorageKey::all() {
-			let namespace = storage_key.as_str();
-			let all_ids_key = self.all_ids_key(namespace);
+		for namespace in namespaces {
+			let all_ids_key = self.all_ids_key(&namespace);
 			let mut candidate_sets = vec![all_ids_key];
-			candidate_sets.extend(self.known_cleanup_index_keys(namespace));
+			candidate_sets.extend(self.known_cleanup_index_keys(&namespace));
 
 			for candidate_set in candidate_sets {
 				let mut cursor = 0_u64;
@@ -900,7 +924,7 @@ impl StorageInterface for RedisStorage {
 						}
 
 						if self
-							.prune_stale_index_member(&mut conn, namespace, &key)
+							.prune_stale_index_member(&mut conn, &namespace, &key)
 							.await?
 						{
 							pruned_keys.insert(key);
@@ -2977,6 +3001,85 @@ mod tests {
 			!meta_exists,
 			"cleanup should delete index metadata after pruning"
 		);
+
+		Ok(())
+	}
+
+	#[tokio::test]
+	async fn cleanup_expired_prunes_dynamic_namespace_indexes_when_redis_is_available(
+	) -> Result<(), StorageError> {
+		let Some(redis_url) = redis_url_or_skip() else {
+			return Ok(());
+		};
+		let storage = RedisStorage::new(
+			redis_url,
+			5000,
+			format!("test-{}", uuid::Uuid::new_v4()),
+			TtlConfig::default(),
+			false,
+		)?;
+		let namespace = "solver-a-bridge-transfer";
+		let transfer_key = format!("{namespace}:transfer-1");
+		let indexes = StorageIndexes::new()
+			.with_field("status", serde_json::json!("completed"))
+			.with_field("pair_id", serde_json::json!("eth-katana"));
+
+		storage
+			.set_bytes(
+				&transfer_key,
+				b"terminal-transfer".to_vec(),
+				Some(indexes),
+				Some(Duration::from_secs(1)),
+			)
+			.await?;
+
+		let client = storage.get_connection().await?;
+		let mut conn = client.as_ref().clone();
+		let registered: bool = dispatch_redis!(
+			storage,
+			conn,
+			"test_dynamic_namespace_registered",
+			sismember(&storage.namespace_registry_key(), namespace)
+		);
+		assert!(registered, "indexed dynamic namespace should be registered");
+
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		assert!(!storage.exists(&transfer_key).await?);
+		assert_eq!(storage.cleanup_expired().await?, 1);
+
+		let status_index_key =
+			storage.index_key(namespace, "status", &serde_json::json!("completed"));
+		let pair_index_key =
+			storage.index_key(namespace, "pair_id", &serde_json::json!("eth-katana"));
+		let status_member: bool = dispatch_redis!(
+			storage,
+			conn,
+			"test_dynamic_status_index_member",
+			sismember(&status_index_key, &transfer_key)
+		);
+		let pair_member: bool = dispatch_redis!(
+			storage,
+			conn,
+			"test_dynamic_pair_index_member",
+			sismember(&pair_index_key, &transfer_key)
+		);
+		let all_member: bool = dispatch_redis!(
+			storage,
+			conn,
+			"test_dynamic_all_index_member",
+			sismember(&storage.all_ids_key(namespace), &transfer_key)
+		);
+		let meta_exists: bool = dispatch_redis!(
+			storage,
+			conn,
+			"test_dynamic_meta_exists",
+			exists(&storage.index_meta_key(&transfer_key))
+		);
+
+		assert!(!status_member, "cleanup should prune dynamic status index");
+		assert!(!pair_member, "cleanup should prune dynamic field index");
+		assert!(!all_member, "cleanup should prune dynamic all-IDs set");
+		assert!(!meta_exists, "cleanup should delete dynamic index metadata");
 
 		Ok(())
 	}

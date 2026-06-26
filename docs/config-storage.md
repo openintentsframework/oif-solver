@@ -23,12 +23,18 @@ production workflows that need Redis-backed filtering.
 
 Redis cleanup runs through the existing solver-engine storage cleanup task using
 `storage.cleanup_interval_seconds`. Cleanup walks known Redis sets with `SSCAN`
-and prunes stale members whose data key no longer exists from:
+and prunes stale members whose data key no longer exists. Statically known order
+sets are scanned directly:
 
 - `<prefix>:orders:_all`
 - `<prefix>:orders:_index:status_kind:<value>`
 - `<prefix>:orders:_index:is_terminal:<true|false>`
 - `<prefix>:orders:<id>:_idx_meta`
+
+The Redis backend also records every namespace that writes indexes in
+`<prefix>:_namespaces`. Cleanup scans each registered namespace's `_all` set, so
+dynamic namespaces such as per-solver bridge transfers keep the same stale-index
+pruning path after TTL-backed data keys expire.
 
 The final prune rechecks data-key absence inside the Redis script that removes
 index memberships. If an order is recreated while cleanup is running, cleanup
