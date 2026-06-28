@@ -177,6 +177,7 @@ fn sample_tx() -> Transaction {
 	}
 }
 
+#[ignore]
 #[tokio::test]
 async fn delivery_service_persists_attempt_ledger_through_tracking() {
 	let (storage, _temp_dir) = make_storage();

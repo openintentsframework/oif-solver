@@ -119,32 +119,76 @@ async fn refresh_transfer_phase_hashes_from_attempts(
 	transfer: &mut crate::types::PendingBridgeTransfer,
 ) -> Result<bool, crate::BridgeError> {
 	let mut changed = false;
-	for (scope_id, hash_slot) in [
-		(
-			transfer.approve_scope_id.clone(),
-			&mut transfer.approve_tx_hash,
-		),
-		(transfer.wrap_scope_id.clone(), &mut transfer.wrap_tx_hash),
-		(transfer.tx_scope_id.clone(), &mut transfer.tx_hash),
-		(
-			transfer.redeem_scope_id.clone(),
-			&mut transfer.redeem_tx_hash,
-		),
-		(
-			transfer.unwrap_scope_id.clone(),
-			&mut transfer.unwrap_tx_hash,
-		),
-	] {
-		if let Some(scope_id) = scope_id {
-			if let Some(latest_hash) = latest_attempt_hash_for_scope(storage, &scope_id).await? {
-				if hash_slot.as_deref() != Some(latest_hash.as_str()) {
-					*hash_slot = Some(latest_hash);
-					changed = true;
-				}
+	if refresh_phase_hash_from_attempt(
+		storage,
+		transfer.approve_scope_id.as_deref(),
+		&mut transfer.approve_tx_hash,
+	)
+	.await?
+	{
+		transfer.approve_missing_checks = 0;
+		transfer.approve_missing_since = None;
+		changed = true;
+	}
+	if refresh_phase_hash_from_attempt(
+		storage,
+		transfer.wrap_scope_id.as_deref(),
+		&mut transfer.wrap_tx_hash,
+	)
+	.await?
+	{
+		transfer.wrap_missing_checks = 0;
+		changed = true;
+	}
+	if refresh_phase_hash_from_attempt(
+		storage,
+		transfer.tx_scope_id.as_deref(),
+		&mut transfer.tx_hash,
+	)
+	.await?
+	{
+		transfer.submitted_missing_checks = 0;
+		transfer.submitted_missing_since = None;
+		changed = true;
+	}
+	if refresh_phase_hash_from_attempt(
+		storage,
+		transfer.redeem_scope_id.as_deref(),
+		&mut transfer.redeem_tx_hash,
+	)
+	.await?
+	{
+		transfer.redeem_missing_checks = 0;
+		transfer.redeem_missing_since = None;
+		changed = true;
+	}
+	if refresh_phase_hash_from_attempt(
+		storage,
+		transfer.unwrap_scope_id.as_deref(),
+		&mut transfer.unwrap_tx_hash,
+	)
+	.await?
+	{
+		transfer.unwrap_missing_checks = 0;
+		changed = true;
+	}
+	Ok(changed)
+}
+
+async fn refresh_phase_hash_from_attempt(
+	storage: &Arc<StorageService>,
+	scope_id: Option<&str>,
+	hash_slot: &mut Option<String>,
+) -> Result<bool, crate::BridgeError> {
+	if let Some(scope_id) = scope_id {
+		if let Some(latest_hash) = latest_attempt_hash_for_scope(storage, scope_id).await? {
+			if hash_slot.as_deref() != Some(latest_hash.as_str()) {
+				*hash_slot = Some(latest_hash);
+				return Ok(true);
 			}
 		}
 	}
-	Ok(changed)
+	Ok(false)
 }
 
 /// Background rebalance monitor.
@@ -4253,6 +4297,77 @@ mod tests {
 			transfer.tx_hash.as_deref(),
 			Some(format!("0x{}", hex::encode(&child_hash.0)).as_str())
 		);
+	}
+
+	#[tokio::test]
+	async fn refresh_resets_missing_counters_for_replaced_phase_hashes() {
+		let storage = make_storage();
+		let tx_scope_id = format!(
+			"system:bridge:deposit:{}:{}",
+			Uuid::new_v4(),
+			Uuid::new_v4()
+		);
+		let redeem_scope_id = format!("system:bridge:redeem:{}:{}", Uuid::new_v4(), Uuid::new_v4());
+		let approve_scope_id = format!(
+			"system:bridge:approve:{}:{}",
+			Uuid::new_v4(),
+			Uuid::new_v4()
+		);
+		let wrap_scope_id = format!("system:bridge:wrap:{}:{}", Uuid::new_v4(), Uuid::new_v4());
+		let unwrap_scope_id = format!("system:bridge:unwrap:{}:{}", Uuid::new_v4(), Uuid::new_v4());
+
+		for (attempt_id, scope_id, hash_byte) in [
+			("deposit-attempt", &tx_scope_id, 0x10),
+			("redeem-attempt", &redeem_scope_id, 0x20),
+			("approve-attempt", &approve_scope_id, 0x30),
+			("wrap-attempt", &wrap_scope_id, 0x40),
+			("unwrap-attempt", &unwrap_scope_id, 0x50),
+		] {
+			let mut attempt = TransactionAttempt::planned(
+				attempt_id.to_string(),
+				TransactionAttemptScope::system(scope_id.clone()),
+				Some(DeliveryAddress(vec![0xaa; 20])),
+				solver_types::TransactionType::Bridge,
+				sample_tx(10),
+			);
+			attempt.status = TransactionAttemptStatus::Broadcast;
+			attempt.tx_hash = Some(TransactionHash(vec![hash_byte; 32]));
+			store_attempt_for_scope(&storage, &attempt).await;
+		}
+
+		let mut transfer = pending_transfer(BridgeTransferStatus::Submitted);
+		transfer.tx_scope_id = Some(tx_scope_id);
+		transfer.redeem_scope_id = Some(redeem_scope_id);
+		transfer.approve_scope_id = Some(approve_scope_id);
+		transfer.wrap_scope_id = Some(wrap_scope_id);
+		transfer.unwrap_scope_id = Some(unwrap_scope_id);
+		transfer.tx_hash = Some(format!("0x{}", hex::encode(vec![0x01; 32])));
+		transfer.redeem_tx_hash = Some(format!("0x{}", hex::encode(vec![0x02; 32])));
+		transfer.approve_tx_hash = Some(format!("0x{}", hex::encode(vec![0x03; 32])));
+		transfer.wrap_tx_hash = Some(format!("0x{}", hex::encode(vec![0x04; 32])));
+		transfer.unwrap_tx_hash = Some(format!("0x{}", hex::encode(vec![0x05; 32])));
+		transfer.submitted_missing_checks = 2;
+		transfer.submitted_missing_since = Some(1_700_000_000);
+		transfer.redeem_missing_checks = 2;
+		transfer.redeem_missing_since = Some(1_700_000_001);
+		transfer.approve_missing_checks = 2;
+		transfer.approve_missing_since = Some(1_700_000_002);
+		transfer.wrap_missing_checks = 2;
+		transfer.unwrap_missing_checks = 2;
+
+		let changed = refresh_transfer_phase_hashes_from_attempts(&storage, &mut transfer)
+			.await
+			.unwrap();
+
+		assert!(changed);
+		assert_eq!(transfer.submitted_missing_checks, 0);
+		assert!(transfer.submitted_missing_since.is_none());
+		assert_eq!(transfer.redeem_missing_checks, 0);
+		assert!(transfer.redeem_missing_since.is_none());
+		assert_eq!(transfer.approve_missing_checks, 0);
+		assert!(transfer.approve_missing_since.is_none());
+		assert_eq!(transfer.wrap_missing_checks, 0);
+		assert_eq!(transfer.unwrap_missing_checks, 0);
 	}
 
 	#[tokio::test]
