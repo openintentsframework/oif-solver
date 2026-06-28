@@ -87,8 +87,8 @@ pub use registry::ImplementationRegistry;
 pub use secret_string::SecretString;
 pub use seed_overrides::{AccountOverride, NetworkOverride, SeedOverrides, Token};
 pub use seed_overrides::{
-	BroadcasterSettlementOverride, DirectSettlementOverride, FeePolicyChainOverride,
-	FeePolicyOverride, HyperlaneSettlementOverride, OracleOverrides,
+	BroadcasterSettlementOverride, DirectSettlementOverride, ExtraNativeFeeOverride,
+	FeePolicyChainOverride, FeePolicyOverride, HyperlaneSettlementOverride, OracleOverrides,
 	OracleSelectionStrategyOverride, RoutingDefaults, SettlementOverride, SettlementTypeOverride,
 };
 pub use standards::{

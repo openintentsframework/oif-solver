@@ -21,6 +21,7 @@ pub mod implementations {
 		pub mod alloy;
 		pub mod fees;
 		pub mod nonce;
+		pub mod op_stack;
 	}
 }
 
@@ -159,7 +160,26 @@ pub struct InsufficientNativeGasInfo {
 	pub gas_limit: Option<u64>,
 	pub max_fee_per_gas: Option<u128>,
 	pub gas_price: Option<u128>,
+	pub extra_native_fee_wei: String,
 	pub value_wei: String,
+}
+
+/// Estimated native fee charged outside execution gas, such as OP Stack L1 data fee.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtraNativeFeeEstimate {
+	pub raw_fee_wei: String,
+	pub buffer_wei: String,
+	pub total_fee_wei: String,
+}
+
+impl Default for ExtraNativeFeeEstimate {
+	fn default() -> Self {
+		Self {
+			raw_fee_wei: "0".to_string(),
+			buffer_wei: "0".to_string(),
+			total_fee_wei: "0".to_string(),
+		}
+	}
 }
 
 /// Errors that can occur while recording transaction attempt ledger rows.
@@ -544,6 +564,17 @@ pub trait DeliveryInterface: Send + Sync {
 	/// will use when filling missing fee fields before signing a transaction.
 	async fn get_fee_params(&self, chain_id: u64) -> Result<FeeParams, DeliveryError>;
 
+	/// Estimates native fees that are charged outside execution gas for this transaction.
+	///
+	/// Backends without an extra native fee model return zero by default.
+	async fn estimate_extra_native_fee(
+		&self,
+		_chain_id: u64,
+		_tx: &Transaction,
+	) -> Result<ExtraNativeFeeEstimate, DeliveryError> {
+		Ok(ExtraNativeFeeEstimate::default())
+	}
+
 	/// Returns the address this backend would use to sign a transaction
 	/// submitted on `chain_id` right now. `None` when the backend has
 	/// no configured signer for this chain. Synchronous; no RPC.
@@ -894,6 +925,20 @@ impl DeliveryService {
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
 		implementation.get_fee_params(chain_id).await
+	}
+
+	/// Estimates native fees that are charged outside execution gas for a transaction.
+	pub async fn estimate_extra_native_fee(
+		&self,
+		chain_id: u64,
+		tx: &Transaction,
+	) -> Result<ExtraNativeFeeEstimate, DeliveryError> {
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
+
+		implementation.estimate_extra_native_fee(chain_id, tx).await
 	}
 
 	/// Gets the current block number for a specific chain.

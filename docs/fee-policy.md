@@ -59,6 +59,28 @@ All wei values are decimal strings to avoid JSON's 53-bit float precision pit.
 - **`priority_fee_fallback`** *(default `"10000000"` = 0.01 gwei)* — kicks in when `eth_feeHistory` returns all-zero rewards. Without this, priority would be 0 and your transaction could sit forever.
 - **`quote_cost_strategy`** *(default `"buffered_effective_125"`)* — how the user is charged for gas. See strategy table below.
 - **`gas_price_cap`** *(default: no ceiling)* — hard ceiling on `max_fee_per_gas`. Use as a panic stop against extreme spikes.
+- **`extra_native_fee`** *(default: known OP Stack chains only)* — extra native fee model for chains whose total transaction fee is not fully represented by execution gas. See OP Stack section below.
+
+### OP Stack L1 data fee
+
+OP Stack chains charge an L1 data fee in addition to execution gas. The solver models this through:
+
+```json
+{
+  "extra_native_fee": {
+    "type": "op_stack_l1_data",
+    "oracle_address": "0x420000000000000000000000000000000000000F",
+    "buffer_bps": 1000
+  }
+}
+```
+
+Known OP Stack chains default to this policy automatically when present in `network_ids`: Optimism (`10`), Base (`8453`), Optimism Sepolia (`11155420`), Base Sepolia (`84532`), and Katana (`747474`). Other OP Stack-style chains must opt in explicitly with `extra_native_fee`.
+
+- `oracle_address` is optional and defaults to the OP Stack Gas Price Oracle predeploy.
+- `buffer_bps` is optional, defaults to `1000` (10%), and must be at most `10000`.
+- Quote-time estimates call the chain oracle with conservative synthetic signed transaction bytes.
+- Submit-time native gas preflight calls the oracle with the exact signed transaction bytes before raw broadcast.
 
 ### Speed → percentile mapping
 

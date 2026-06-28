@@ -84,6 +84,22 @@ fn quote_hyperlane_message_gas_limit(payload_size: usize) -> U256 {
 	U256::from(base_gas + (payload_size * gas_per_byte) + buffer)
 }
 
+fn extra_native_fee_configured(config: &Config, chain_id: u64) -> bool {
+	let chain_key = chain_id.to_string();
+	config
+		.delivery
+		.implementations
+		.values()
+		.any(|implementation| {
+			implementation
+				.get("fee_policy")
+				.and_then(|fee_policy| fee_policy.get("chains"))
+				.and_then(|chains| chains.get(&chain_key))
+				.and_then(|chain| chain.get("extra_native_fee"))
+				.is_some()
+		})
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_quote_hyperlane_fill_description(
 	solver_identifier: [u8; 32],
@@ -888,6 +904,65 @@ impl CostProfitService {
 			gas_units.post_fill_units = live_units;
 		}
 
+		let mut l1_data_fee_wei = U256::ZERO;
+		let mut l1_data_fee_buffer_wei = U256::ZERO;
+
+		match self
+			.build_fill_tx_for_quote(
+				request,
+				context,
+				&swap_amounts_with_info,
+				config,
+				solver_address,
+			)
+			.await
+		{
+			Ok(mut fill_tx) => {
+				fill_tx.gas_limit = Some(gas_units.fill_units);
+				let (raw, buffer) = self
+					.estimate_extra_native_fee_wei(config, dest_chain_id, &fill_tx)
+					.await?;
+				l1_data_fee_wei = l1_data_fee_wei.saturating_add(raw);
+				l1_data_fee_buffer_wei = l1_data_fee_buffer_wei.saturating_add(buffer);
+			},
+			Err(e) => {
+				tracing::warn!(
+					chain_id = dest_chain_id,
+					error = %e,
+					"Skipping fill extra native fee estimate: failed to build synthetic fill tx"
+				);
+			},
+		}
+
+		match self
+			.build_post_fill_tx_for_quote(
+				request,
+				context,
+				&swap_amounts_with_info,
+				config,
+				solver_address,
+				settlement_fee_wei,
+			)
+			.await
+		{
+			Ok(Some(mut post_fill)) => {
+				post_fill.tx.gas_limit = Some(gas_units.post_fill_units);
+				let (raw, buffer) = self
+					.estimate_extra_native_fee_wei(config, dest_chain_id, &post_fill.tx)
+					.await?;
+				l1_data_fee_wei = l1_data_fee_wei.saturating_add(raw);
+				l1_data_fee_buffer_wei = l1_data_fee_buffer_wei.saturating_add(buffer);
+			},
+			Ok(None) => {},
+			Err(e) => {
+				tracing::warn!(
+					chain_id = dest_chain_id,
+					error = %e,
+					"Skipping post-fill extra native fee estimate: failed to build synthetic post-fill tx"
+				);
+			},
+		}
+
 		// Parse inputs/outputs to proper types for cost calculation
 		let mut parsed_inputs = Vec::new();
 		for input in inputs {
@@ -925,6 +1000,8 @@ impl CostProfitService {
 				dest_chain_id,
 				&gas_units,
 				settlement_fee_wei,
+				l1_data_fee_wei,
+				l1_data_fee_buffer_wei,
 			)
 			.await?;
 
@@ -988,7 +1065,9 @@ impl CostProfitService {
 			cost_breakdown.gas_fill
 				+ cost_breakdown.gas_post_fill
 				+ cost_breakdown.settlement_fee
-				+ cost_breakdown.settlement_fee_buffer,
+				+ cost_breakdown.settlement_fee_buffer
+				+ cost_breakdown.l1_data_fee
+				+ cost_breakdown.l1_data_fee_buffer,
 		);
 
 		// Calculate adjusted amounts (swap amounts +/- costs based on swap type)
@@ -1050,6 +1129,8 @@ impl CostProfitService {
 		dest_chain_id: u64,
 		gas_units: &GasUnits,
 		settlement_fee_wei: U256,
+		l1_data_fee_wei: U256,
+		l1_data_fee_buffer_wei: U256,
 	) -> Result<CostBreakdown, CostProfitError> {
 		// Read gas_buffer_bps from solver config (hot-reloadable)
 		let gas_buffer_bps_value = config.solver.gas_buffer_bps;
@@ -1118,6 +1199,10 @@ impl CostProfitService {
 			Decimal::new(config.solver.settlement_fee_buffer_bps as i64, 0);
 		let settlement_fee_buffer =
 			(settlement_fee * settlement_fee_buffer_bps) / Decimal::from(10000);
+		let (l1_data_fee, l1_data_fee_buffer) = tokio::try_join!(
+			self.wei_to_usd(&l1_data_fee_wei),
+			self.wei_to_usd(&l1_data_fee_buffer_wei),
+		)?;
 
 		// Input and output valuations do not depend on each other.
 		let (total_input_value_usd, total_output_value_usd) = tokio::try_join!(
@@ -1149,6 +1234,8 @@ impl CostProfitService {
 				+ gas_claim + gas_buffer
 				+ settlement_fee
 				+ settlement_fee_buffer
+				+ l1_data_fee
+				+ l1_data_fee_buffer
 				+ rate_buffer;
 
 		// Calculate subtotal (actual costs only, excluding profit)
@@ -1166,6 +1253,8 @@ impl CostProfitService {
 			gas_buffer,
 			settlement_fee,
 			settlement_fee_buffer,
+			l1_data_fee,
+			l1_data_fee_buffer,
 			rate_buffer,
 			base_price,
 			min_profit,
@@ -1405,6 +1494,15 @@ impl CostProfitService {
 			None => U256::ZERO,
 		};
 
+		let (l1_data_fee_wei, l1_data_fee_buffer_wei) = if let Some(fill_tx) = fill_tx {
+			let mut fill_tx = fill_tx.clone();
+			fill_tx.gas_limit = Some(gas_units.fill_units);
+			self.estimate_extra_native_fee_wei(config, dest_chain_id, &fill_tx)
+				.await?
+		} else {
+			(U256::ZERO, U256::ZERO)
+		};
+
 		// Use the unified cost calculation method
 		let cost_breakdown = self
 			.calculate_total_cost(
@@ -1415,6 +1513,8 @@ impl CostProfitService {
 				dest_chain_id,
 				&gas_units,
 				settlement_fee_wei,
+				l1_data_fee_wei,
+				l1_data_fee_buffer_wei,
 			)
 			.await?;
 
@@ -2537,6 +2637,35 @@ impl CostProfitService {
 			})
 	}
 
+	async fn estimate_extra_native_fee_wei(
+		&self,
+		config: &Config,
+		chain_id: u64,
+		tx: &Transaction,
+	) -> Result<(U256, U256), CostProfitError> {
+		if !extra_native_fee_configured(config, chain_id) {
+			return Ok((U256::ZERO, U256::ZERO));
+		}
+
+		let estimate = self
+			.delivery_service
+			.estimate_extra_native_fee(chain_id, tx)
+			.await
+			.map_err(|e| APIError::InternalServerError {
+				error_type: ApiErrorType::ServiceError,
+				message: format!("Failed to estimate extra native fee: {e}"),
+			})?;
+		let raw = U256::from_str(&estimate.raw_fee_wei).map_err(|e| {
+			CostProfitError::Calculation(format!("Failed to parse extra native raw fee wei: {e}"))
+		})?;
+		let buffer = U256::from_str(&estimate.buffer_wei).map_err(|e| {
+			CostProfitError::Calculation(format!(
+				"Failed to parse extra native fee buffer wei: {e}"
+			))
+		})?;
+		Ok((raw, buffer))
+	}
+
 	async fn wei_to_usd(&self, value_wei: &U256) -> Result<Decimal, CostProfitError> {
 		let usd_value = self
 			.pricing_service
@@ -3287,6 +3416,8 @@ mod tests {
 			gas_buffer: Decimal::from_str("0.004").unwrap(),
 			settlement_fee: Decimal::ZERO,
 			settlement_fee_buffer: Decimal::ZERO,
+			l1_data_fee: Decimal::ZERO,
+			l1_data_fee_buffer: Decimal::ZERO,
 			rate_buffer: Decimal::ZERO,
 			base_price: Decimal::ZERO,
 			min_profit: Decimal::from_str("5.00").unwrap(),
@@ -4133,11 +4264,11 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_calculate_total_cost_includes_optional_settlement_gas() {
+	async fn test_calculate_total_cost_includes_optional_settlement_and_l1_data_fees() {
 		let mut mock_pricing = MockPricingInterface::new();
 		mock_pricing
 			.expect_wei_to_currency()
-			.times(6)
+			.times(8)
 			.returning(|wei, _| {
 				let wei = wei.to_string();
 				Box::pin(async move { Ok(wei) })
@@ -4205,6 +4336,8 @@ mod tests {
 					claim_units: 5,
 				},
 				U256::from(10u64),
+				U256::from(7u64),
+				U256::from(8u64),
 			)
 			.await
 			.unwrap();
@@ -4217,7 +4350,9 @@ mod tests {
 		assert_eq!(breakdown.gas_buffer, Decimal::from(60));
 		assert_eq!(breakdown.settlement_fee, Decimal::from(10));
 		assert_eq!(breakdown.settlement_fee_buffer, Decimal::from(1));
-		assert_eq!(breakdown.operational_cost, Decimal::from(671));
+		assert_eq!(breakdown.l1_data_fee, Decimal::from(7));
+		assert_eq!(breakdown.l1_data_fee_buffer, Decimal::from(8));
+		assert_eq!(breakdown.operational_cost, Decimal::from(686));
 	}
 
 	// ============================================================================
@@ -4318,6 +4453,8 @@ mod tests {
 			gas_buffer: Decimal::from_str("0.004").unwrap(),
 			settlement_fee: Decimal::ZERO,
 			settlement_fee_buffer: Decimal::ZERO,
+			l1_data_fee: Decimal::ZERO,
+			l1_data_fee_buffer: Decimal::ZERO,
 			rate_buffer: Decimal::ZERO,
 			base_price: Decimal::ZERO,
 			min_profit,

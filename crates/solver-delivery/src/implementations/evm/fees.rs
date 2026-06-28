@@ -7,12 +7,17 @@
 //! projection, and optional cap application all live here. Fee-history
 //! retrieval and base-fee parsing are handled by alloy itself.
 
+use alloy_primitives::{address, Address};
 use alloy_provider::utils::{Eip1559Estimation, Eip1559EstimatorFn};
 use std::collections::HashMap;
 
 use crate::{FeeCostStrategy, FeeSpeed};
 
 const BASE_PRIORITY_FEE_FALLBACK_WEI: u128 = 10_000_000; // 0.01 gwei
+pub const DEFAULT_OP_STACK_GAS_PRICE_ORACLE: Address =
+	address!("420000000000000000000000000000000000000F");
+const DEFAULT_EXTRA_NATIVE_FEE_BUFFER_BPS: u32 = 1000;
+const MAX_EXTRA_NATIVE_FEE_BUFFER_BPS: u32 = 10_000;
 
 /// Per-chain fee-policy knobs that sit on top of alloy's EIP-1559 pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +27,7 @@ pub struct ChainFeePolicy {
 	pub priority_fee_fallback: u128,
 	pub quote_cost_strategy: FeeCostStrategy,
 	pub gas_price_cap: Option<u128>,
+	pub extra_native_fee: ExtraNativeFeePolicy,
 }
 
 impl ChainFeePolicy {
@@ -32,8 +38,29 @@ impl ChainFeePolicy {
 			priority_fee_fallback: BASE_PRIORITY_FEE_FALLBACK_WEI,
 			quote_cost_strategy: FeeCostStrategy::BufferedEffective125,
 			gas_price_cap: None,
+			extra_native_fee: ExtraNativeFeePolicy::None,
 		}
 	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExtraNativeFeeConfig {
+	OpStackL1Data {
+		#[serde(default)]
+		oracle_address: Option<String>,
+		#[serde(default)]
+		buffer_bps: Option<u32>,
+	},
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtraNativeFeePolicy {
+	None,
+	OpStackL1Data {
+		oracle_address: Address,
+		buffer_bps: u32,
+	},
 }
 
 // Note: we deliberately do NOT carry an `average_block_time_ms` here.
@@ -76,6 +103,24 @@ pub enum FeePolicyError {
 		 (every configured network must declare a fee policy)"
 	)]
 	MissingChainPolicy { chain_id: u64 },
+	/// The configured oracle address could not be parsed as an EVM address.
+	#[error("Invalid address for fee_policy.chains.{chain_id}.{field}: {value:?} ({reason})")]
+	InvalidAddress {
+		chain_id: String,
+		field: &'static str,
+		value: String,
+		reason: String,
+	},
+	/// Extra native fee buffer is capped at 100%.
+	#[error(
+		"Invalid fee_policy.chains.{chain_id}.extra_native_fee.buffer_bps: {value} \
+		 (must be <= {max})"
+	)]
+	InvalidBufferBps {
+		chain_id: String,
+		value: u32,
+		max: u32,
+	},
 }
 
 /// Top-level fee-policy block consumed by the Alloy delivery config.
@@ -101,6 +146,8 @@ pub struct ChainFeePolicyConfig {
 	pub priority_fee_fallback: String,
 	pub quote_cost_strategy: FeeCostStrategy,
 	pub gas_price_cap: Option<String>,
+	#[serde(default)]
+	pub extra_native_fee: Option<ExtraNativeFeeConfig>,
 }
 
 /// Parse a decimal wei string into u128, mapping failure into a
@@ -118,6 +165,52 @@ fn parse_wei_field(
 			value: value.to_string(),
 			source,
 		})
+}
+
+fn parse_address_field(
+	chain_id: &str,
+	field: &'static str,
+	value: &str,
+) -> Result<Address, FeePolicyError> {
+	value
+		.parse::<Address>()
+		.map_err(|err| FeePolicyError::InvalidAddress {
+			chain_id: chain_id.to_string(),
+			field,
+			value: value.to_string(),
+			reason: err.to_string(),
+		})
+}
+
+fn parse_extra_native_fee_policy(
+	chain_id: &str,
+	cfg: Option<&ExtraNativeFeeConfig>,
+) -> Result<ExtraNativeFeePolicy, FeePolicyError> {
+	match cfg {
+		None => Ok(ExtraNativeFeePolicy::None),
+		Some(ExtraNativeFeeConfig::OpStackL1Data {
+			oracle_address,
+			buffer_bps,
+		}) => {
+			let oracle_address = oracle_address
+				.as_deref()
+				.map(|raw| parse_address_field(chain_id, "extra_native_fee.oracle_address", raw))
+				.transpose()?
+				.unwrap_or(DEFAULT_OP_STACK_GAS_PRICE_ORACLE);
+			let buffer_bps = buffer_bps.unwrap_or(DEFAULT_EXTRA_NATIVE_FEE_BUFFER_BPS);
+			if buffer_bps > MAX_EXTRA_NATIVE_FEE_BUFFER_BPS {
+				return Err(FeePolicyError::InvalidBufferBps {
+					chain_id: chain_id.to_string(),
+					value: buffer_bps,
+					max: MAX_EXTRA_NATIVE_FEE_BUFFER_BPS,
+				});
+			}
+			Ok(ExtraNativeFeePolicy::OpStackL1Data {
+				oracle_address,
+				buffer_bps,
+			})
+		},
+	}
 }
 
 impl ChainFeePolicy {
@@ -146,12 +239,15 @@ impl ChainFeePolicy {
 			.as_deref()
 			.map(|raw| parse_wei_field(chain_id, "gas_price_cap", raw))
 			.transpose()?;
+		let extra_native_fee =
+			parse_extra_native_fee_policy(chain_id, cfg.extra_native_fee.as_ref())?;
 		Ok(Self {
 			speed: default_speed,
 			min_priority_fee_per_gas,
 			priority_fee_fallback,
 			quote_cost_strategy: cfg.quote_cost_strategy,
 			gas_price_cap,
+			extra_native_fee,
 		})
 	}
 }
@@ -422,6 +518,60 @@ mod tests {
 	}
 
 	#[test]
+	fn fee_policy_config_deserializes_extra_native_fee() {
+		let cfg = parse_fee_policy(serde_json::json!({
+			"default_speed": "fast",
+			"chains": {
+				"8453": {
+					"priority_fee_fallback": "100000000",
+					"quote_cost_strategy": "buffered_effective_125",
+					"extra_native_fee": {
+						"type": "op_stack_l1_data",
+						"oracle_address": "0x420000000000000000000000000000000000000F",
+						"buffer_bps": 1500
+					}
+				}
+			}
+		}));
+		let registry = FeePolicyRegistry::from_config(&cfg, &[8453]).expect("valid registry");
+		let policy = registry.policy_for_chain(8453);
+
+		assert_eq!(
+			policy.extra_native_fee,
+			ExtraNativeFeePolicy::OpStackL1Data {
+				oracle_address: "0x420000000000000000000000000000000000000F"
+					.parse()
+					.unwrap(),
+				buffer_bps: 1500,
+			}
+		);
+	}
+
+	#[test]
+	fn fee_policy_config_rejects_extra_native_fee_buffer_above_100_percent() {
+		let cfg = parse_fee_policy(serde_json::json!({
+			"default_speed": "fast",
+			"chains": {
+				"8453": {
+					"priority_fee_fallback": "100000000",
+					"quote_cost_strategy": "buffered_effective_125",
+					"extra_native_fee": {
+						"type": "op_stack_l1_data",
+						"buffer_bps": 10001
+					}
+				}
+			}
+		}));
+
+		let err =
+			FeePolicyRegistry::from_config(&cfg, &[8453]).expect_err("buffer above 100% must fail");
+		assert!(
+			err.to_string().contains("buffer_bps"),
+			"error should mention buffer_bps: {err}"
+		);
+	}
+
+	#[test]
 	fn fee_policy_registry_round_trips_mainnet_floor_and_cap() {
 		let cfg = parse_fee_policy(serde_json::json!({
 			"default_speed": "fast",
@@ -587,6 +737,7 @@ mod tests {
 			priority_fee_fallback: 100_000_000,
 			quote_cost_strategy: FeeCostStrategy::BufferedEffective125,
 			gas_price_cap: Some(2_500_000_000),
+			extra_native_fee: ExtraNativeFeePolicy::None,
 		};
 
 		assert_eq!(
@@ -603,6 +754,7 @@ mod tests {
 			priority_fee_fallback: 100_000_000,
 			quote_cost_strategy: FeeCostStrategy::BufferedEffective125,
 			gas_price_cap: Some(2_500_000_000),
+			extra_native_fee: ExtraNativeFeePolicy::None,
 		};
 
 		assert_eq!(
@@ -619,6 +771,7 @@ mod tests {
 			priority_fee_fallback: 100_000_000,
 			quote_cost_strategy: FeeCostStrategy::BufferedEffective125,
 			gas_price_cap: None,
+			extra_native_fee: ExtraNativeFeePolicy::None,
 		};
 
 		assert_eq!(
@@ -682,6 +835,7 @@ mod proptests {
 				priority_fee_fallback: fallback,
 				quote_cost_strategy: FeeCostStrategy::BufferedEffective125,
 				gas_price_cap: cap,
+				extra_native_fee: ExtraNativeFeePolicy::None,
 			};
 			let estimator = SolverEip1559Estimator { policy: policy.clone() };
 			let rewards = vec![vec![observed_priority]];

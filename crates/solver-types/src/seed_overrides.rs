@@ -207,6 +207,23 @@ pub struct FeePolicyChainOverride {
 	/// Hard ceiling on `max_fee_per_gas`, decimal wei. Absent = no ceiling.
 	#[serde(default)]
 	pub gas_price_cap: Option<String>,
+
+	/// Optional extra native transaction fee model, such as OP Stack L1 data fee.
+	#[serde(default)]
+	pub extra_native_fee: Option<ExtraNativeFeeOverride>,
+}
+
+/// Extra native fee override for chains whose transaction fee is not fully
+/// represented by execution gas price times gas units.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExtraNativeFeeOverride {
+	OpStackL1Data {
+		#[serde(default)]
+		oracle_address: Option<String>,
+		#[serde(default)]
+		buffer_bps: Option<u32>,
+	},
 }
 
 /// Supported settlement type overrides.
@@ -1085,6 +1102,39 @@ mod tests {
 
 		let config: SeedOverrides = serde_json::from_str(json).unwrap();
 		assert!(config.account.is_none());
+	}
+
+	#[test]
+	fn test_parse_extra_native_fee_override() {
+		let json = r#"{
+            "networks": [],
+            "fee_policy": {
+                "chains": {
+                    "8453": {
+                        "extra_native_fee": {
+                            "type": "op_stack_l1_data",
+                            "oracle_address": "0x420000000000000000000000000000000000000F",
+                            "buffer_bps": 1500
+                        }
+                    }
+                }
+            }
+        }"#;
+
+		let config: SeedOverrides = serde_json::from_str(json).unwrap();
+		let chain = config
+			.fee_policy
+			.as_ref()
+			.and_then(|policy| policy.chains.get("8453"))
+			.expect("chain override");
+
+		assert_eq!(
+			chain.extra_native_fee,
+			Some(ExtraNativeFeeOverride::OpStackL1Data {
+				oracle_address: Some("0x420000000000000000000000000000000000000F".to_string()),
+				buffer_bps: Some(1500),
+			})
+		);
 	}
 
 	#[test]

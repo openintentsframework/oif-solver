@@ -1434,6 +1434,17 @@ fn build_delivery_config_from_operator(
 			entry.insert("gas_price_cap".to_string(), serde_json::Value::String(cap));
 		}
 
+		if let Some(extra_native_fee) = override_entry.and_then(|e| e.extra_native_fee.as_ref()) {
+			entry.insert(
+				"extra_native_fee".to_string(),
+				serde_json::to_value(extra_native_fee)
+					.expect("ExtraNativeFeeOverride serializes to JSON"),
+			);
+		} else if let Some(default_extra_native_fee) = default_extra_native_fee_for_chain(*chain_id)
+		{
+			entry.insert("extra_native_fee".to_string(), default_extra_native_fee);
+		}
+
 		fee_policy_chains.insert(key, serde_json::Value::Object(entry));
 	}
 
@@ -1456,6 +1467,16 @@ fn build_delivery_config_from_operator(
 		implementations,
 		min_confirmations: 3,
 		tx_confirmation_timeout_seconds: 600,
+	}
+}
+
+fn default_extra_native_fee_for_chain(chain_id: u64) -> Option<serde_json::Value> {
+	match chain_id {
+		10 | 8453 | 11155420 | 84532 | 747474 => Some(json_object(vec![(
+			"type",
+			serde_json::Value::String("op_stack_l1_data".to_string()),
+		)])),
+		_ => None,
 	}
 }
 
@@ -6671,13 +6692,70 @@ mod tests {
 			// gas_price_cap is omitted by default (no ceiling).
 			assert!(entry.get("gas_price_cap").is_none());
 		}
+		assert!(
+			chains
+				.get("1")
+				.and_then(|entry| entry.get("extra_native_fee"))
+				.is_none(),
+			"Ethereum should not default to an OP Stack extra fee",
+		);
+		assert_eq!(
+			chains
+				.get("10")
+				.and_then(|entry| entry.get("extra_native_fee"))
+				.and_then(|extra| extra.get("type"))
+				.and_then(|v| v.as_str()),
+			Some("op_stack_l1_data"),
+			"Optimism should default to OP Stack L1 data fee",
+		);
+		assert!(
+			chains
+				.get("137")
+				.and_then(|entry| entry.get("extra_native_fee"))
+				.is_none(),
+			"Polygon should not default to an OP Stack extra fee",
+		);
+	}
+
+	#[test]
+	fn test_build_delivery_config_defaults_extra_native_fee_for_known_op_stack_chains() {
+		let chain_ids = vec![10, 8453, 11155420, 84532, 747474, 1, 137, 42161];
+		let delivery = build_delivery_config_from_operator(&chain_ids, None);
+		let evm = delivery.implementations.get("evm_alloy").unwrap();
+		let chains = evm
+			.get("fee_policy")
+			.and_then(|policy| policy.get("chains"))
+			.and_then(|v| v.as_object())
+			.unwrap();
+
+		for chain_id in [10_u64, 8453, 11155420, 84532, 747474] {
+			assert_eq!(
+				chains
+					.get(&chain_id.to_string())
+					.and_then(|entry| entry.get("extra_native_fee"))
+					.and_then(|extra| extra.get("type"))
+					.and_then(|v| v.as_str()),
+				Some("op_stack_l1_data"),
+				"chain {chain_id} should default to OP Stack L1 data fee",
+			);
+		}
+
+		for chain_id in [1_u64, 137, 42161] {
+			assert!(
+				chains
+					.get(&chain_id.to_string())
+					.and_then(|entry| entry.get("extra_native_fee"))
+					.is_none(),
+				"chain {chain_id} should not default to an OP Stack extra fee",
+			);
+		}
 	}
 
 	#[test]
 	fn test_build_delivery_config_applies_per_chain_override() {
 		// Bootstrap config can override defaults per-chain. Whatever the
 		// operator specifies replaces; whatever they omit keeps the default.
-		use solver_types::{FeePolicyChainOverride, FeePolicyOverride};
+		use solver_types::{ExtraNativeFeeOverride, FeePolicyChainOverride, FeePolicyOverride};
 		use std::collections::HashMap as StdHashMap;
 
 		let mut chains = StdHashMap::new();
@@ -6688,6 +6766,7 @@ mod tests {
 				priority_fee_fallback: None, // keep default
 				quote_cost_strategy: None,
 				gas_price_cap: Some("300000000000".to_string()),
+				extra_native_fee: None,
 			},
 		);
 		chains.insert(
@@ -6697,6 +6776,10 @@ mod tests {
 				priority_fee_fallback: Some("100000000".to_string()),
 				quote_cost_strategy: None,
 				gas_price_cap: None,
+				extra_native_fee: Some(ExtraNativeFeeOverride::OpStackL1Data {
+					oracle_address: None,
+					buffer_bps: Some(1500),
+				}),
 			},
 		);
 		let override_ = FeePolicyOverride {
@@ -6761,6 +6844,21 @@ mod tests {
 		assert_eq!(
 			katana.get("priority_fee_fallback").and_then(|v| v.as_str()),
 			Some("100000000")
+		);
+		assert_eq!(
+			katana
+				.get("extra_native_fee")
+				.and_then(|extra| extra.get("type"))
+				.and_then(|v| v.as_str()),
+			Some("op_stack_l1_data")
+		);
+		assert_eq!(
+			katana
+				.get("extra_native_fee")
+				.and_then(|extra| extra.get("buffer_bps"))
+				.and_then(|v| v.as_u64()),
+			Some(1500),
+			"operator-supplied extra native fee override should win",
 		);
 	}
 

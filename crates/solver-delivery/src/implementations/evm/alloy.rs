@@ -4,8 +4,10 @@
 //! supporting blockchain transaction submission and monitoring using the Alloy library.
 
 use crate::implementations::evm::fees::{
-	clamp_legacy_gas_price_to_cap, FeePolicyConfig, FeePolicyRegistry, SolverEip1559Estimator,
+	clamp_legacy_gas_price_to_cap, ExtraNativeFeePolicy, FeePolicyConfig, FeePolicyRegistry,
+	SolverEip1559Estimator,
 };
+use crate::implementations::evm::op_stack;
 // Re-import directly because the schema validator below builds a transient
 // `FeePolicyRegistry` purely to surface field-level wei-parse errors. Going
 // through `from_config` keeps validation and runtime conversion behind a
@@ -15,9 +17,9 @@ use crate::implementations::evm::nonce::{
 	classify_submission_outcome, ResettableNonceManager, SubmissionOutcome,
 };
 use crate::{
-	DeliveryError, DeliveryInterface, FeeParams, InsufficientNativeGasInfo, PlannedAttemptInit,
-	TransactionAttemptRecorder, TransactionCallback, TransactionMonitoringEvent,
-	TransactionTrackingWithConfig,
+	DeliveryError, DeliveryInterface, ExtraNativeFeeEstimate, FeeParams, InsufficientNativeGasInfo,
+	PlannedAttemptInit, TransactionAttemptRecorder, TransactionCallback,
+	TransactionMonitoringEvent, TransactionTrackingWithConfig,
 };
 use alloy_consensus::{BlockHeader, SignableTransaction, TxEnvelope};
 use alloy_network::{eip2718::Encodable2718, BlockResponse, EthereumWallet, TxSigner};
@@ -112,17 +114,24 @@ enum PollOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NativeGasBudget {
 	gas_budget_wei: U256,
+	extra_native_fee_wei: U256,
 	required_wei: U256,
 }
 
-fn native_gas_budget_wei(tx: &SolverTransaction) -> Option<NativeGasBudget> {
+fn native_gas_budget_wei(
+	tx: &SolverTransaction,
+	extra_native_fee_wei: U256,
+) -> Option<NativeGasBudget> {
 	let gas_limit = tx.gas_limit?;
 	let fee_per_gas = tx.max_fee_per_gas.or(tx.gas_price)?;
 	let gas_budget_wei = U256::from(gas_limit).saturating_mul(U256::from(fee_per_gas));
-	let required_wei = gas_budget_wei.saturating_add(tx.value);
+	let required_wei = gas_budget_wei
+		.saturating_add(tx.value)
+		.saturating_add(extra_native_fee_wei);
 
 	Some(NativeGasBudget {
 		gas_budget_wei,
+		extra_native_fee_wei,
 		required_wei,
 	})
 }
@@ -760,6 +769,242 @@ impl AlloyDelivery {
 		})
 	}
 
+	async fn estimate_op_stack_l1_data_fee_from_bytes(
+		&self,
+		chain_id: u64,
+		oracle_address: Address,
+		buffer_bps: u32,
+		tx_bytes: Bytes,
+	) -> Result<ExtraNativeFeeEstimate, DeliveryError> {
+		let provider = self.get_provider(chain_id)?;
+		let call_data = op_stack::encode_get_l1_fee_call(tx_bytes);
+		let request = TransactionRequest::default()
+			.to(oracle_address)
+			.input(call_data.into());
+
+		let mut last_error = None;
+		for _ in 0..2 {
+			match provider.call(request.clone()).await {
+				Ok(output) => {
+					let raw_fee = op_stack::decode_get_l1_fee_return(&output).map_err(|err| {
+						DeliveryError::Network(format!(
+							"Failed to decode OP Stack L1 data fee on chain {chain_id}: {err}"
+						))
+					})?;
+					let buffer =
+						raw_fee.saturating_mul(U256::from(buffer_bps)) / U256::from(10_000_u64);
+					let total = raw_fee.saturating_add(buffer);
+					return Ok(ExtraNativeFeeEstimate {
+						raw_fee_wei: raw_fee.to_string(),
+						buffer_wei: buffer.to_string(),
+						total_fee_wei: total.to_string(),
+					});
+				},
+				Err(err) => {
+					last_error = Some(err.to_string());
+				},
+			}
+		}
+
+		Err(DeliveryError::Network(format!(
+			"Failed to estimate OP Stack L1 data fee on chain {chain_id}: {}",
+			last_error.unwrap_or_else(|| "unknown oracle error".to_string())
+		)))
+	}
+
+	async fn estimate_extra_native_fee_for_tx(
+		&self,
+		chain_id: u64,
+		tx: &SolverTransaction,
+	) -> Result<ExtraNativeFeeEstimate, DeliveryError> {
+		let policy = self.fee_policy.policy_for_chain(chain_id);
+		match &policy.extra_native_fee {
+			ExtraNativeFeePolicy::None => Ok(ExtraNativeFeeEstimate::default()),
+			ExtraNativeFeePolicy::OpStackL1Data {
+				oracle_address,
+				buffer_bps,
+			} => {
+				let mut tx_for_estimate = tx.clone();
+				let fee_params = self.get_fee_params(chain_id).await?;
+				fee_params.apply_if_missing(&mut tx_for_estimate);
+				let tx_bytes = op_stack::synthetic_signed_transaction_bytes(&tx_for_estimate)
+					.map_err(|err| {
+						DeliveryError::Network(format!(
+								"Failed to build OP Stack L1 data fee estimate for chain {chain_id}: {err}"
+							))
+					})?;
+				self.estimate_op_stack_l1_data_fee_from_bytes(
+					chain_id,
+					*oracle_address,
+					*buffer_bps,
+					tx_bytes,
+				)
+				.await
+			},
+		}
+	}
+
+	async fn estimate_extra_native_fee_for_signed_bytes(
+		&self,
+		chain_id: u64,
+		tx_bytes: Bytes,
+	) -> Result<ExtraNativeFeeEstimate, DeliveryError> {
+		let policy = self.fee_policy.policy_for_chain(chain_id);
+		match &policy.extra_native_fee {
+			ExtraNativeFeePolicy::None => Ok(ExtraNativeFeeEstimate::default()),
+			ExtraNativeFeePolicy::OpStackL1Data {
+				oracle_address,
+				buffer_bps,
+			} => {
+				self.estimate_op_stack_l1_data_fee_from_bytes(
+					chain_id,
+					*oracle_address,
+					*buffer_bps,
+					tx_bytes,
+				)
+				.await
+			},
+		}
+	}
+
+	fn chain_requires_extra_native_fee_preflight(&self, chain_id: u64) -> bool {
+		matches!(
+			self.fee_policy.policy_for_chain(chain_id).extra_native_fee,
+			ExtraNativeFeePolicy::OpStackL1Data { .. }
+		)
+	}
+
+	async fn rollback_nonce_after_pre_broadcast_rejection(
+		&self,
+		chain_id: u64,
+		provider: &DynProvider,
+		from: Address,
+		rejected_nonce: Option<u64>,
+		reason: &str,
+	) -> Result<(), DeliveryError> {
+		let mgr = self.get_nonce_manager(chain_id)?;
+		let cache_before = mgr.peek(from);
+		let pending_result = provider.get_transaction_count(from).pending().await;
+		let (pending_opt, fetch_err): (Option<u64>, Option<String>) = match pending_result {
+			Ok(p) => (Some(p), None),
+			Err(e) => (None, Some(e.to_string())),
+		};
+		let cache_after = apply_nonce_cache_action(
+			mgr,
+			from,
+			NonceCacheAction::AttemptRollback { rejected_nonce },
+			pending_opt,
+		);
+		tracing::warn!(
+			chain_id,
+			signer = %from,
+			rejected_nonce = ?rejected_nonce,
+			cache_before = ?cache_before,
+			cache_after = ?cache_after,
+			chain_pending = ?pending_opt,
+			pending_fetch_error = ?fetch_err,
+			reason,
+			"transaction rejected before broadcast; nonce cache reconciled"
+		);
+		Ok(())
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	async fn ensure_signed_transaction_affordable(
+		&self,
+		chain_id: u64,
+		provider: &DynProvider,
+		from: Address,
+		tx: &SolverTransaction,
+		encoded: &[u8],
+		tracking: Option<&TransactionTrackingWithConfig>,
+		planned_attempt: Option<&TransactionAttempt>,
+		context: &'static str,
+	) -> Result<(), DeliveryError> {
+		if !self.chain_requires_extra_native_fee_preflight(chain_id) {
+			return Ok(());
+		}
+
+		let estimate = self
+			.estimate_extra_native_fee_for_signed_bytes(chain_id, Bytes::copy_from_slice(encoded))
+			.await?;
+		let extra_native_fee_wei = estimate.total_fee_wei.parse::<U256>().map_err(|err| {
+			DeliveryError::Network(format!(
+				"Invalid extra native fee estimate on chain {chain_id}: {err}"
+			))
+		})?;
+		let budget = native_gas_budget_wei(tx, extra_native_fee_wei).ok_or_else(|| {
+			DeliveryError::Network(format!(
+				"Cannot calculate signed native gas budget on chain {chain_id}"
+			))
+		})?;
+		let balance = provider.get_balance(from).await.map_err(|err| {
+			DeliveryError::Network(format!(
+				"Failed to read signer balance for OP Stack fee preflight on chain {chain_id}: {err}"
+			))
+		})?;
+
+		if let Some(shortfall) = native_gas_shortfall(balance, budget.required_wei) {
+			let err_msg = format!(
+				"insufficient native gas for OP Stack signed transaction preflight: \
+				 balance {balance} wei, required {} wei, shortfall {shortfall} wei",
+				budget.required_wei
+			);
+			if let (Some(tracking_ref), Some(planned)) = (tracking, planned_attempt) {
+				record_attempt_update_best_effort(
+					tracking_ref.tracking.attempt_recorder.clone(),
+					Some(&tracking_ref.tracking.callback),
+					&tracking_ref.tracking.id,
+					planned.id.clone(),
+					tracking_ref.tracking.tx_type,
+					TransactionAttemptStatus::SubmitRejected,
+					None,
+					None,
+					Some(err_msg.clone()),
+					context,
+				)
+				.await;
+			}
+
+			self.rollback_nonce_after_pre_broadcast_rejection(
+				chain_id, provider, from, tx.nonce, context,
+			)
+			.await?;
+
+			tracing::error!(
+				chain_id,
+				signer = %from,
+				balance_wei = %balance,
+				required_wei = %budget.required_wei,
+				shortfall_wei = %shortfall,
+				gas_budget_wei = %budget.gas_budget_wei,
+				extra_native_fee_wei = %budget.extra_native_fee_wei,
+				value_wei = %tx.value,
+				gas_limit = ?tx.gas_limit,
+				gas_price = ?tx.gas_price,
+				max_fee_per_gas = ?tx.max_fee_per_gas,
+				context,
+				"Insufficient native gas for signed OP Stack transaction"
+			);
+			return Err(DeliveryError::InsufficientNativeGas(Box::new(
+				InsufficientNativeGasInfo {
+					chain_id,
+					signer: from.to_string(),
+					balance_wei: balance.to_string(),
+					required_wei: budget.required_wei.to_string(),
+					shortfall_wei: shortfall.to_string(),
+					gas_limit: tx.gas_limit,
+					max_fee_per_gas: tx.max_fee_per_gas,
+					gas_price: tx.gas_price,
+					extra_native_fee_wei: budget.extra_native_fee_wei.to_string(),
+					value_wei: tx.value.to_string(),
+				},
+			)));
+		}
+
+		Ok(())
+	}
+
 	/// Gets the nonce manager for a specific chain ID.
 	fn get_nonce_manager(&self, chain_id: u64) -> Result<&ResettableNonceManager, DeliveryError> {
 		self.nonce_managers.get(&chain_id).ok_or_else(|| {
@@ -986,7 +1231,7 @@ impl DeliveryInterface for AlloyDelivery {
 		// that the RPC will require. If the balance read succeeds and the
 		// signer cannot cover `gas_limit × fee_per_gas + value`, return before
 		// consuming a nonce from the local cache.
-		let native_gas_budget = native_gas_budget_wei(&tx_attempt);
+		let native_gas_budget = native_gas_budget_wei(&tx_attempt, U256::ZERO);
 		let pre_submit_balance = match provider.get_balance(from).await {
 			Ok(balance) => Some(balance),
 			Err(e) => {
@@ -1033,6 +1278,7 @@ impl DeliveryInterface for AlloyDelivery {
 					gas_limit: tx_attempt.gas_limit,
 					max_fee_per_gas: tx_attempt.max_fee_per_gas,
 					gas_price: tx_attempt.gas_price,
+					extra_native_fee_wei: "0".to_string(),
 					value_wei: tx_attempt.value.to_string(),
 				},
 			)));
@@ -1115,7 +1361,7 @@ impl DeliveryInterface for AlloyDelivery {
 		// unmineable hash, and fail only at send_raw_transaction. Fail-open
 		// on balance-read failure (matches the earlier preflight): if
 		// pre_submit_balance is None, log and proceed without re-fetching.
-		let post_estimate_gas_budget = native_gas_budget_wei(&tx_attempt);
+		let post_estimate_gas_budget = native_gas_budget_wei(&tx_attempt, U256::ZERO);
 		let post_estimate_shortfall = match (pre_submit_balance, post_estimate_gas_budget.as_ref())
 		{
 			(Some(balance), Some(budget)) => native_gas_shortfall(balance, budget.required_wei),
@@ -1150,6 +1396,7 @@ impl DeliveryInterface for AlloyDelivery {
 					gas_limit: tx_attempt.gas_limit,
 					max_fee_per_gas: tx_attempt.max_fee_per_gas,
 					gas_price: tx_attempt.gas_price,
+					extra_native_fee_wei: "0".to_string(),
 					value_wei: tx_attempt.value.to_string(),
 				},
 			)));
@@ -1298,6 +1545,18 @@ impl DeliveryInterface for AlloyDelivery {
 				return Err(sign_err);
 			},
 		};
+
+		self.ensure_signed_transaction_affordable(
+			chain_id,
+			provider,
+			from,
+			&tx_attempt,
+			&encoded,
+			tracking.as_ref(),
+			first_attempt.as_ref(),
+			"signed OP Stack fee preflight failed before first broadcast",
+		)
+		.await?;
 
 		// Hash persist must succeed before broadcast — broadcasting an
 		// unpersisted hash would lose the recovery anchor. The best-effort
@@ -2123,6 +2382,18 @@ impl DeliveryInterface for AlloyDelivery {
 					},
 				};
 
+				self.ensure_signed_transaction_affordable(
+					chain_id,
+					provider,
+					from,
+					&tx_attempt,
+					&new_encoded,
+					tracking.as_ref(),
+					retry_planned_attempt.as_ref(),
+					"signed OP Stack fee preflight failed before nonce-too-low retry broadcast",
+				)
+				.await?;
+
 				// Persist the new hash on the RETRY planned attempt row
 				// before broadcast — failure aborts the broadcast (same
 				// invariant as the primary submit path). The retry row was
@@ -2897,6 +3168,14 @@ impl DeliveryInterface for AlloyDelivery {
 			.insert(chain_id, params.clone(), now)
 			.await;
 		Ok(params)
+	}
+
+	async fn estimate_extra_native_fee(
+		&self,
+		chain_id: u64,
+		tx: &SolverTransaction,
+	) -> Result<ExtraNativeFeeEstimate, DeliveryError> {
+		self.estimate_extra_native_fee_for_tx(chain_id, tx).await
 	}
 
 	async fn get_balance(
@@ -4994,7 +5273,8 @@ mod tests {
 				nonce: None,
 			};
 
-			let budget = native_gas_budget_wei(&tx).expect("budget should be calculable");
+			let budget =
+				native_gas_budget_wei(&tx, U256::ZERO).expect("budget should be calculable");
 
 			assert_eq!(budget.gas_budget_wei.to_string(), "5716680576344997");
 			assert_eq!(budget.required_wei.to_string(), "5727564958858220");
@@ -5014,7 +5294,8 @@ mod tests {
 				nonce: None,
 			};
 
-			let budget = native_gas_budget_wei(&tx).expect("budget should be calculable");
+			let budget =
+				native_gas_budget_wei(&tx, U256::ZERO).expect("budget should be calculable");
 
 			assert_eq!(budget.required_wei.to_string(), "42000000001000");
 		}
@@ -5033,9 +5314,31 @@ mod tests {
 				nonce: None,
 			};
 
-			let budget = native_gas_budget_wei(&tx).expect("budget should be calculable");
+			let budget =
+				native_gas_budget_wei(&tx, U256::ZERO).expect("budget should be calculable");
 
 			assert_eq!(budget.required_wei.to_string(), "42000000000000");
+		}
+
+		#[test]
+		fn native_gas_budget_includes_extra_native_fee() {
+			let tx = SolverTransaction {
+				chain_id: 10,
+				to: None,
+				data: vec![],
+				value: U256::from(1_000u64),
+				gas_limit: Some(21_000),
+				gas_price: Some(2_000_000_000),
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+				nonce: None,
+			};
+
+			let budget = native_gas_budget_wei(&tx, U256::from(123_u64))
+				.expect("budget should be calculable");
+
+			assert_eq!(budget.extra_native_fee_wei, U256::from(123_u64));
+			assert_eq!(budget.required_wei.to_string(), "42000000001123");
 		}
 
 		#[test]
@@ -5052,7 +5355,7 @@ mod tests {
 				nonce: None,
 			};
 
-			assert!(native_gas_budget_wei(&tx).is_none());
+			assert!(native_gas_budget_wei(&tx, U256::ZERO).is_none());
 		}
 
 		#[test]

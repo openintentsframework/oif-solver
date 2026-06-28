@@ -121,6 +121,27 @@ Bootstrap config specifies which networks your solver will support. Networks can
 | `settlement.direct` | Conditional | Required when `settlement.type = "direct"` |
 | `settlement.broadcaster` | Conditional | Required when `settlement.type = "broadcaster"` |
 
+### OP Stack Extra Native Fee Override
+
+Known OP Stack chains are configured with `op_stack_l1_data` automatically. For a non-seeded OP Stack-style chain, add an explicit fee-policy override:
+
+```json
+{
+  "fee_policy": {
+    "chains": {
+      "747474": {
+        "extra_native_fee": {
+          "type": "op_stack_l1_data",
+          "buffer_bps": 1500
+        }
+      }
+    }
+  }
+}
+```
+
+`oracle_address` may also be supplied when the chain does not use the default OP Stack Gas Price Oracle predeploy.
+
 ### Required Fields For Non-Seeded Networks
 
 For each non-seeded network, provide:

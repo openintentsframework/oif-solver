@@ -953,6 +953,7 @@ mod tests {
 				gas_limit: None,
 				max_fee_per_gas: None,
 				gas_price: None,
+				extra_native_fee_wei: "0".to_string(),
 				value_wei: "0".to_string(),
 			},
 		)));
@@ -985,6 +986,7 @@ mod tests {
 				gas_limit: None,
 				max_fee_per_gas: None,
 				gas_price: None,
+				extra_native_fee_wei: "0".to_string(),
 				value_wei: "0".to_string(),
 			},
 		)));

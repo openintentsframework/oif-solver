@@ -1719,6 +1719,8 @@ mod tests {
 				gas_buffer: Decimal::ZERO,
 				settlement_fee: Decimal::ZERO,
 				settlement_fee_buffer: Decimal::ZERO,
+				l1_data_fee: Decimal::ZERO,
+				l1_data_fee_buffer: Decimal::ZERO,
 				rate_buffer: Decimal::ZERO,
 				base_price: Decimal::ZERO,
 				min_profit: Decimal::ZERO,
