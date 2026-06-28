@@ -5,6 +5,7 @@
 //! blockchain networks, managing transaction signing, submission, and confirmation.
 
 use alloy_primitives::Bytes;
+use alloy_rpc_types::BlockNumberOrTag;
 use async_trait::async_trait;
 use solver_types::events::TransactionType;
 use solver_types::{
@@ -748,6 +749,15 @@ pub trait DeliveryInterface: Send + Sync {
 	/// Returns the latest block number on the network.
 	async fn get_block_number(&self, chain_id: u64) -> Result<u64, DeliveryError>;
 
+	/// Gets a block number by finality tag when the backend supports it.
+	async fn get_finality_tag_block_number(
+		&self,
+		_chain_id: u64,
+		_tag: BlockNumberOrTag,
+	) -> Result<Option<u64>, DeliveryError> {
+		Ok(None)
+	}
+
 	/// Estimates gas units for a transaction without submitting it.
 	/// Implementations should call the chain's estimateGas RPC with the provided transaction.
 	async fn estimate_gas(&self, tx: Transaction) -> Result<u64, DeliveryError>;
@@ -768,6 +778,22 @@ pub trait DeliveryInterface: Send + Sync {
 	/// This performs an eth_call RPC to read data from smart contracts
 	/// or simulate transaction execution without submitting to the blockchain.
 	async fn eth_call(&self, tx: Transaction) -> Result<Bytes, DeliveryError>;
+
+	/// Executes a contract call at a specific block number.
+	///
+	/// Backends must override this when they support historical reads. The
+	/// default fails closed so callers do not silently read latest state when
+	/// they asked for a confirmed block.
+	async fn eth_call_at_block(
+		&self,
+		tx: Transaction,
+		_block_number: u64,
+	) -> Result<Bytes, DeliveryError> {
+		let _ = tx;
+		Err(DeliveryError::Network(
+			"Historical eth_call is not supported by this delivery backend".to_string(),
+		))
+	}
 
 	/// Replays the given transaction via `eth_call` at the specified block and
 	/// returns the revert payload (4-byte selector + ABI-encoded args) if the
@@ -1167,6 +1193,22 @@ impl DeliveryService {
 		implementation.get_block_number(chain_id).await
 	}
 
+	/// Gets a block number by finality tag for a specific chain.
+	pub async fn get_finality_tag_block_number(
+		&self,
+		chain_id: u64,
+		tag: BlockNumberOrTag,
+	) -> Result<Option<u64>, DeliveryError> {
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
+
+		implementation
+			.get_finality_tag_block_number(chain_id, tag)
+			.await
+	}
+
 	/// Estimates gas for a transaction on the specified chain.
 	pub async fn estimate_gas(&self, chain_id: u64, tx: Transaction) -> Result<u64, DeliveryError> {
 		let implementation = self
@@ -1214,6 +1256,21 @@ impl DeliveryService {
 			.ok_or(DeliveryError::NoImplementationAvailable)?;
 
 		implementation.eth_call(tx).await
+	}
+
+	/// Executes a contract call at a specific block number.
+	pub async fn contract_call_at_block(
+		&self,
+		chain_id: u64,
+		tx: Transaction,
+		block_number: u64,
+	) -> Result<alloy_primitives::Bytes, DeliveryError> {
+		let implementation = self
+			.implementations
+			.get(&chain_id)
+			.ok_or(DeliveryError::NoImplementationAvailable)?;
+
+		implementation.eth_call_at_block(tx, block_number).await
 	}
 
 	/// Checks whether a transaction exists in the mempool or on-chain.

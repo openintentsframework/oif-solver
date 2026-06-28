@@ -8,8 +8,10 @@ use crate::handlers::forced_withdrawal::ensure_resource_locks_claimable;
 use crate::order_preparation::order_requires_preparation;
 use crate::state::transaction_attempt::TransactionAttemptStore;
 use crate::state::OrderStateMachine;
-use alloy_primitives::hex;
-use solver_config::Config;
+use alloy_primitives::{hex, B256, U256};
+use alloy_rpc_types::BlockNumberOrTag;
+use alloy_sol_types::SolCall;
+use solver_config::{source_finality_blocks_for_config, Config};
 use solver_delivery::{
 	DeliveryService, RevertClassification, TransactionAttemptRecorder, TransactionMonitoringEvent,
 	TransactionTracking,
@@ -17,14 +19,41 @@ use solver_delivery::{
 use solver_order::OrderService;
 use solver_storage::StorageService;
 use solver_types::{
-	standards::eip7683::LockType, truncate_id, utils::conversion::hex_to_alloy_address,
-	DeliveryEvent, Eip7683OrderData, ExecutionParams, Order, OrderEvent, OrderStatus, SolverEvent,
-	StorageKey, TransactionType,
+	select_finality_head,
+	standards::eip7683::{interfaces::IInputSettlerEscrow, LockType},
+	truncate_id,
+	utils::conversion::hex_to_alloy_address,
+	Address, DeliveryEvent, Eip7683OrderData, ExecutionParams, Order, OrderEvent, OrderStatus,
+	SolverEvent, StorageKey, Transaction, TransactionType,
 };
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::instrument;
+
+const ESCROW_ORDER_STATUS_DEPOSITED: u8 = 1;
+const ESCROW_ORDER_STATUS_NONE: u8 = 0;
+const SOURCE_FINALITY_RETRY_AFTER: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscrowDepositReadiness {
+	Ready,
+	Defer(Duration),
+}
+
+fn view_tx(to: &Address, chain_id: u64, data: Vec<u8>) -> Transaction {
+	Transaction {
+		to: Some(to.clone()),
+		data,
+		value: U256::ZERO,
+		chain_id,
+		nonce: None,
+		gas_limit: None,
+		gas_price: None,
+		max_fee_per_gas: None,
+		max_priority_fee_per_gas: None,
+	}
+}
 
 /// Errors that can occur during order processing.
 ///
@@ -302,6 +331,206 @@ impl OrderHandler {
 		.map_err(|e| OrderError::Service(e.to_string()))
 	}
 
+	/// (M-01) For escrow-origin orders, confirm the source-chain deposit still
+	/// exists at the configured finality depth immediately before releasing the
+	/// destination fill.
+	async fn check_escrow_deposit_before_fill(
+		&self,
+		order: &Order,
+	) -> Result<EscrowDepositReadiness, OrderError> {
+		let order_data: Eip7683OrderData = match serde_json::from_value(order.data.clone()) {
+			Ok(data) => data,
+			Err(e) if order.standard == "eip7683" => {
+				return Err(OrderError::Service(format!(
+					"Failed to parse EIP-7683 order data before source deposit guard: {e}"
+				)));
+			},
+			Err(_) => return Ok(EscrowDepositReadiness::Ready),
+		};
+
+		let Some(lock_type) = order_data.lock_type else {
+			return Ok(EscrowDepositReadiness::Ready);
+		};
+		if !lock_type.is_escrow() {
+			return Ok(EscrowDepositReadiness::Ready);
+		}
+
+		let origin_chain_id = u64::try_from(order_data.origin_chain_id)
+			.map_err(|_| OrderError::Service("Invalid origin chain ID".to_string()))?;
+		let (input_settler_address, finality_blocks) = {
+			let config = self.dynamic_config.read().await;
+			let input_settler_address = config
+				.networks
+				.get(&origin_chain_id)
+				.map(|network| network.input_settler_address.clone())
+				.ok_or_else(|| {
+					OrderError::Service(format!(
+						"Escrow fill aborted: input settler not configured for origin chain {origin_chain_id}"
+					))
+				})?;
+			let finality_blocks = source_finality_blocks_for_config(&config, origin_chain_id);
+			(input_settler_address, finality_blocks)
+		};
+
+		let finalized = self
+			.delivery
+			.get_finality_tag_block_number(origin_chain_id, BlockNumberOrTag::Finalized)
+			.await
+			.map_err(|e| {
+				tracing::debug!(
+					order_id = %order.id,
+					origin_chain_id,
+					error = %e,
+					"RPC finalized tag lookup failed; falling back"
+				);
+				e
+			})
+			.ok()
+			.flatten();
+		let safe = self
+			.delivery
+			.get_finality_tag_block_number(origin_chain_id, BlockNumberOrTag::Safe)
+			.await
+			.map_err(|e| {
+				tracing::debug!(
+					order_id = %order.id,
+					origin_chain_id,
+					error = %e,
+					"RPC safe tag lookup failed; falling back"
+				);
+				e
+			})
+			.ok()
+			.flatten();
+
+		let latest_block = self
+			.delivery
+			.get_block_number(origin_chain_id)
+			.await
+			.map_err(|e| {
+				tracing::warn!(
+					order_id = %order.id,
+					origin_chain_id,
+					error = %e,
+					"Escrow fill deferred: failed to get origin chain head"
+				);
+				e
+			});
+		let latest_block = match latest_block {
+			Ok(block) => block,
+			Err(_) => return Ok(EscrowDepositReadiness::Defer(SOURCE_FINALITY_RETRY_AFTER)),
+		};
+		let Some(confirmed_block) =
+			select_finality_head(finalized, safe, latest_block, finality_blocks)
+		else {
+			tracing::info!(
+				order_id = %order.id,
+				origin_chain_id,
+				latest_block,
+				finality_blocks,
+				"Escrow fill deferred: origin chain {origin_chain_id} has not reached configured finality depth {finality_blocks}"
+			);
+			return Ok(EscrowDepositReadiness::Defer(SOURCE_FINALITY_RETRY_AFTER));
+		};
+
+		let order_id = B256::from(order_data.order_id);
+		let call = IInputSettlerEscrow::orderStatusCall { orderId: order_id };
+		let tx = view_tx(&input_settler_address, origin_chain_id, call.abi_encode());
+		let result = self
+			.delivery
+			.contract_call_at_block(origin_chain_id, tx.clone(), confirmed_block)
+			.await
+			.map_err(|e| {
+				tracing::warn!(
+					order_id = %order.id,
+					origin_chain_id,
+					confirmed_block,
+					error = %e,
+					"Escrow fill deferred: failed to query source orderStatus"
+				);
+				e
+			});
+		let result = match result {
+			Ok(result) => result,
+			Err(_) => return Ok(EscrowDepositReadiness::Defer(SOURCE_FINALITY_RETRY_AFTER)),
+		};
+		if result.is_empty() {
+			let latest_result = self
+				.delivery
+				.contract_call(origin_chain_id, tx)
+				.await
+				.map_err(|e| {
+					tracing::warn!(
+						order_id = %order.id,
+						origin_chain_id,
+						confirmed_block,
+						error = %e,
+						"Escrow fill deferred: failed to query latest source orderStatus after empty confirmed read"
+					);
+					e
+				});
+			let latest_result = match latest_result {
+				Ok(result) => result,
+				Err(_) => return Ok(EscrowDepositReadiness::Defer(SOURCE_FINALITY_RETRY_AFTER)),
+			};
+			if latest_result.is_empty() {
+				return Err(OrderError::Service(format!(
+					"Escrow fill aborted: source orderStatus returned empty data at latest; check input settler address and orderStatus ABI for origin chain {origin_chain_id}"
+				)));
+			}
+			let latest_status = IInputSettlerEscrow::orderStatusCall::abi_decode_returns_validate(
+				&latest_result,
+			)
+			.map_err(|e| {
+				OrderError::Service(format!(
+					"Escrow fill aborted: failed to decode latest source orderStatus after empty confirmed read at block {confirmed_block}: {e}"
+				))
+			})?;
+			if latest_status != ESCROW_ORDER_STATUS_DEPOSITED
+				&& latest_status != ESCROW_ORDER_STATUS_NONE
+			{
+				let expected = ESCROW_ORDER_STATUS_DEPOSITED;
+				return Err(OrderError::Service(format!(
+					"Escrow fill aborted: latest source orderStatus is {latest_status}, expected Deposited ({expected})"
+				)));
+			}
+
+			tracing::info!(
+				order_id = %order.id,
+				origin_chain_id,
+				confirmed_block,
+				"Escrow fill deferred: source orderStatus read returned empty data"
+			);
+			return Ok(EscrowDepositReadiness::Defer(SOURCE_FINALITY_RETRY_AFTER));
+		}
+
+		let status = IInputSettlerEscrow::orderStatusCall::abi_decode_returns_validate(&result)
+			.map_err(|e| {
+				OrderError::Service(format!(
+					"Escrow fill aborted: failed to decode source orderStatus: {e}"
+				))
+			})?;
+
+		if status != ESCROW_ORDER_STATUS_DEPOSITED {
+			if status == ESCROW_ORDER_STATUS_NONE {
+				tracing::info!(
+					order_id = %order.id,
+					origin_chain_id,
+					confirmed_block,
+					"Escrow fill deferred: source order deposit is not final yet"
+				);
+				return Ok(EscrowDepositReadiness::Defer(SOURCE_FINALITY_RETRY_AFTER));
+			}
+
+			let expected = ESCROW_ORDER_STATUS_DEPOSITED;
+			return Err(OrderError::Service(format!(
+				"Escrow fill aborted: source orderStatus is {status}, expected Deposited ({expected})"
+			)));
+		}
+
+		Ok(EscrowDepositReadiness::Ready)
+	}
+
 	/// Handles order execution by generating and submitting a fill transaction.
 	#[instrument(skip_all, fields(order_id = %truncate_id(&order.id)))]
 	pub async fn handle_execution(
@@ -321,6 +550,19 @@ impl OrderHandler {
 		// it catches a sponsor who enabled (or began) a forced withdrawal before the
 		// order was submitted — a case the intake-time reset-period floor cannot see.
 		self.check_forced_withdrawal_before_fill(&order).await?;
+
+		match self.check_escrow_deposit_before_fill(&order).await? {
+			EscrowDepositReadiness::Ready => {},
+			EscrowDepositReadiness::Defer(retry_after) => {
+				self.event_bus
+					.publish(SolverEvent::Order(OrderEvent::Deferred {
+						order_id: order.id,
+						retry_after,
+					}))
+					.ok();
+				return Ok(());
+			},
+		}
 
 		// Generate fill transaction
 		let tx = self
@@ -467,6 +709,7 @@ mod tests {
 	use solver_delivery::{DeliveryService, MockDeliveryInterface};
 	use solver_order::{MockOrderInterface, OrderService};
 	use solver_storage::{MockStorageInterface, StorageService};
+	use solver_types::networks::{NetworkConfig, NetworkType, RpcEndpoint};
 	use solver_types::utils::tests::builders::{
 		Eip7683OrderDataBuilder, OrderBuilder, TransactionBuilder,
 	};
@@ -500,12 +743,107 @@ mod tests {
 		TransactionHash(vec![0xab; 32])
 	}
 
+	fn test_input_settler_address() -> solver_types::Address {
+		solver_types::Address(vec![0x11u8; 20])
+	}
+
+	fn create_test_config() -> solver_config::Config {
+		let network = NetworkConfig {
+			name: None,
+			network_type: NetworkType::default(),
+			rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
+			input_settler_address: test_input_settler_address(),
+			output_settler_address: solver_types::Address(vec![0x22u8; 20]),
+			tokens: vec![],
+			input_settler_compact_address: Some(solver_types::Address(vec![0x44u8; 20])),
+			the_compact_address: Some(solver_types::Address(vec![0x88u8; 20])),
+			allocator_address: Some(solver_types::Address(vec![0xA1u8; 20])),
+		};
+
+		solver_config::ConfigBuilder::new()
+			.networks(HashMap::from([(137, network)]))
+			.build()
+	}
+
+	fn create_test_config_with_broadcaster_finality(
+		default_finality_blocks: u64,
+		chain_137_finality_blocks: u64,
+	) -> solver_config::Config {
+		let settlement = solver_config::SettlementConfig {
+			implementations: HashMap::from([(
+				"broadcaster".to_string(),
+				serde_json::json!({
+					"default_finality_blocks": default_finality_blocks,
+					"finality_blocks": {
+						"137": chain_137_finality_blocks
+					}
+				}),
+			)]),
+			primary: "broadcaster".to_string(),
+			settlement_poll_interval_seconds: 3,
+		};
+
+		let mut config = create_test_config();
+		config.settlement = settlement;
+		config
+	}
+
+	fn create_test_config_with_discovery_finality(
+		default_finality_blocks: u64,
+		chain_137_finality_blocks: u64,
+	) -> solver_config::Config {
+		let mut config = create_test_config();
+		config.discovery.implementations.insert(
+			"onchain_eip7683".to_string(),
+			serde_json::json!({
+				"default_finality_blocks": default_finality_blocks,
+				"finality_blocks": {
+					"137": chain_137_finality_blocks
+				}
+			}),
+		);
+		config
+	}
+
+	#[test]
+	fn source_finality_falls_back_to_discovery_config_when_broadcaster_settlement_is_absent() {
+		let config = create_test_config_with_discovery_finality(0, 7);
+
+		assert_eq!(source_finality_blocks_for_config(&config, 137), 7);
+		assert_eq!(source_finality_blocks_for_config(&config, 1), 0);
+	}
+
+	fn deposited_status_return() -> alloy_primitives::Bytes {
+		let mut encoded = vec![0u8; 32];
+		encoded[31] = ESCROW_ORDER_STATUS_DEPOSITED;
+		alloy_primitives::Bytes::from(encoded)
+	}
+
+	fn escrow_status_return(status: u8) -> alloy_primitives::Bytes {
+		let mut encoded = vec![0u8; 32];
+		encoded[31] = status;
+		alloy_primitives::Bytes::from(encoded)
+	}
+
+	fn is_expected_escrow_status_call(tx: &Transaction, order: &Order) -> bool {
+		let Ok(order_data) = serde_json::from_value::<Eip7683OrderData>(order.data.clone()) else {
+			return false;
+		};
+		let expected_call = IInputSettlerEscrow::orderStatusCall {
+			orderId: B256::from(order_data.order_id),
+		}
+		.abi_encode();
+
+		tx.to.as_ref() == Some(&test_input_settler_address()) && tx.data == expected_call
+	}
+
 	fn eip7683_order_with_lock(
 		lock_type: LockType,
 		offchain_fields: bool,
 		prepare_tx_hash: Option<TransactionHash>,
 	) -> Order {
 		let mut order_data = Eip7683OrderDataBuilder::new()
+			.origin_chain_id(U256::from(137))
 			.lock_type(lock_type)
 			.raw_order_data("0x1234");
 
@@ -528,8 +866,13 @@ mod tests {
 		let order_clone = order.clone();
 		let fill_tx_clone = fill_tx.clone();
 		let fill_tx_hash_clone = fill_tx_hash.clone();
+		let status_order = order.clone();
+		let needs_escrow_guard = serde_json::from_value::<Eip7683OrderData>(order.data.clone())
+			.ok()
+			.and_then(|data| data.lock_type)
+			.is_some_and(|lock_type| lock_type.is_escrow());
 
-		let (handler, mut event_rx) = create_test_handler_with_mocks(
+		let (handler, mut event_rx) = create_test_handler_with_config(
 			|mock_order| {
 				let fill_tx_clone = fill_tx_clone.clone();
 				mock_order
@@ -542,6 +885,21 @@ mod tests {
 			},
 			|mock_delivery| {
 				let fill_tx_hash_clone = fill_tx_hash_clone.clone();
+				if needs_escrow_guard {
+					mock_delivery
+						.expect_get_block_number()
+						.times(1)
+						.withf(|chain_id| *chain_id == 137)
+						.returning(|_| Box::pin(async { Ok(100) }));
+					mock_delivery
+						.expect_eth_call_at_block()
+						.times(1)
+						.withf(move |tx, block| {
+							tx.chain_id == 137
+								&& *block == 80 && is_expected_escrow_status_call(tx, &status_order)
+						})
+						.returning(|_, _| Box::pin(async { Ok(deposited_status_return()) }));
+				}
 				mock_delivery
 					.expect_submit()
 					.times(1)
@@ -571,6 +929,7 @@ mod tests {
 					.times(1)
 					.returning(|_, _, _, _, _| Box::pin(async { Ok(true) }));
 			},
+			create_test_config(),
 		)
 		.await;
 
@@ -612,7 +971,7 @@ mod tests {
 			setup_order,
 			setup_delivery,
 			setup_storage,
-			solver_config::ConfigBuilder::new().build(),
+			create_test_config(),
 		)
 		.await
 	}
@@ -635,6 +994,9 @@ mod tests {
 		// Set up expectations using the provided closures
 		setup_order(&mut mock_order);
 		setup_delivery(&mut mock_delivery);
+		mock_delivery
+			.expect_get_finality_tag_block_number()
+			.returning(|_, _| Box::pin(async { Ok(None) }));
 		setup_storage(&mut mock_storage);
 		mock_storage
 			.expect_compare_and_swap_with_indexes()
@@ -1112,6 +1474,523 @@ mod tests {
 		let order = eip7683_order_with_lock(LockType::Permit2Escrow, false, None);
 
 		assert_handle_execution_succeeds(order).await;
+	}
+
+	#[tokio::test]
+	async fn handle_execution_rejects_escrow_when_source_status_not_deposited() {
+		let order = eip7683_order_with_lock(LockType::Permit2Escrow, false, None);
+		let params = create_test_execution_params();
+		let status_order = order.clone();
+
+		let (handler, _event_rx) = create_test_handler_with_config(
+			|mock_order| {
+				mock_order.expect_generate_fill_transaction().times(0);
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_block_number()
+					.times(1)
+					.withf(|chain_id| *chain_id == 137)
+					.returning(|_| Box::pin(async { Ok(100) }));
+				mock_delivery
+					.expect_eth_call_at_block()
+					.times(1)
+					.withf(move |tx, block| {
+						tx.chain_id == 137
+							&& *block == 80 && is_expected_escrow_status_call(tx, &status_order)
+					})
+					.returning(|_, _| Box::pin(async { Ok(escrow_status_return(2)) }));
+				mock_delivery.expect_submit().times(0);
+			},
+			|_mock_storage| {},
+			create_test_config(),
+		)
+		.await;
+
+		let err = handler
+			.handle_execution(order, params)
+			.await
+			.expect_err("source status guard should refuse fill");
+		assert!(
+			err.to_string().contains("expected Deposited"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn handle_execution_defers_escrow_when_source_finality_depth_not_reached() {
+		let order = eip7683_order_with_lock(LockType::Permit2Escrow, false, None);
+		let params = create_test_execution_params();
+
+		let (handler, mut event_rx) = create_test_handler_with_config(
+			|mock_order| {
+				mock_order.expect_generate_fill_transaction().times(0);
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_block_number()
+					.times(1)
+					.withf(|chain_id| *chain_id == 137)
+					.returning(|_| Box::pin(async { Ok(10) }));
+				mock_delivery.expect_eth_call_at_block().times(0);
+				mock_delivery.expect_submit().times(0);
+			},
+			|_mock_storage| {},
+			create_test_config(),
+		)
+		.await;
+
+		let result = handler.handle_execution(order.clone(), params).await;
+		assert!(result.is_ok(), "finality wait should defer, got {result:?}");
+
+		let event = tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv())
+			.await
+			.expect("Should receive deferred event")
+			.expect("Event should be valid");
+		match event {
+			SolverEvent::Order(OrderEvent::Deferred {
+				order_id,
+				retry_after,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(retry_after, std::time::Duration::from_secs(5));
+			},
+			other => panic!("Expected deferred event, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn handle_execution_defers_escrow_when_source_head_read_fails() {
+		let order = eip7683_order_with_lock(LockType::Permit2Escrow, false, None);
+		let params = create_test_execution_params();
+
+		let (handler, mut event_rx) = create_test_handler_with_config(
+			|mock_order| {
+				mock_order.expect_generate_fill_transaction().times(0);
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_block_number()
+					.times(1)
+					.withf(|chain_id| *chain_id == 137)
+					.returning(|_| {
+						Box::pin(async {
+							Err(solver_delivery::DeliveryError::Network(
+								"origin rpc unavailable".to_string(),
+							))
+						})
+					});
+				mock_delivery.expect_eth_call_at_block().times(0);
+				mock_delivery.expect_submit().times(0);
+			},
+			|_mock_storage| {},
+			create_test_config(),
+		)
+		.await;
+
+		let result = handler.handle_execution(order.clone(), params).await;
+		assert!(
+			result.is_ok(),
+			"transient source head read should defer, got {result:?}"
+		);
+
+		let event = tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv())
+			.await
+			.expect("Should receive deferred event")
+			.expect("Event should be valid");
+		match event {
+			SolverEvent::Order(OrderEvent::Deferred {
+				order_id,
+				retry_after,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(retry_after, std::time::Duration::from_secs(5));
+			},
+			other => panic!("Expected deferred event, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn handle_execution_defers_escrow_when_confirmed_status_read_fails() {
+		let order = eip7683_order_with_lock(LockType::Permit2Escrow, false, None);
+		let params = create_test_execution_params();
+		let status_order = order.clone();
+
+		let (handler, mut event_rx) = create_test_handler_with_config(
+			|mock_order| {
+				mock_order.expect_generate_fill_transaction().times(0);
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_block_number()
+					.times(1)
+					.withf(|chain_id| *chain_id == 137)
+					.returning(|_| Box::pin(async { Ok(100) }));
+				mock_delivery
+					.expect_eth_call_at_block()
+					.times(1)
+					.withf(move |tx, block| {
+						tx.chain_id == 137
+							&& *block == 80 && is_expected_escrow_status_call(tx, &status_order)
+					})
+					.returning(|_, _| {
+						Box::pin(async {
+							Err(solver_delivery::DeliveryError::Network(
+								"origin rpc timeout".to_string(),
+							))
+						})
+					});
+				mock_delivery.expect_submit().times(0);
+			},
+			|_mock_storage| {},
+			create_test_config(),
+		)
+		.await;
+
+		let result = handler.handle_execution(order.clone(), params).await;
+		assert!(
+			result.is_ok(),
+			"transient source status read should defer, got {result:?}"
+		);
+
+		let event = tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv())
+			.await
+			.expect("Should receive deferred event")
+			.expect("Event should be valid");
+		match event {
+			SolverEvent::Order(OrderEvent::Deferred {
+				order_id,
+				retry_after,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(retry_after, std::time::Duration::from_secs(5));
+			},
+			other => panic!("Expected deferred event, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn handle_execution_defers_offchain_escrow_when_source_status_not_final_yet() {
+		let order = eip7683_order_with_lock(
+			LockType::Permit2Escrow,
+			true,
+			Some(TransactionHash(vec![0xcd; 32])),
+		);
+		let params = create_test_execution_params();
+		let status_order = order.clone();
+
+		let (handler, mut event_rx) = create_test_handler_with_config(
+			|mock_order| {
+				mock_order.expect_generate_fill_transaction().times(0);
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_block_number()
+					.times(1)
+					.withf(|chain_id| *chain_id == 137)
+					.returning(|_| Box::pin(async { Ok(100) }));
+				mock_delivery
+					.expect_eth_call_at_block()
+					.times(1)
+					.withf(move |tx, block| {
+						tx.chain_id == 137
+							&& *block == 80 && is_expected_escrow_status_call(tx, &status_order)
+					})
+					.returning(|_, _| Box::pin(async { Ok(escrow_status_return(0)) }));
+				mock_delivery.expect_submit().times(0);
+			},
+			|_mock_storage| {},
+			create_test_config(),
+		)
+		.await;
+
+		let result = handler.handle_execution(order.clone(), params).await;
+		assert!(
+			result.is_ok(),
+			"unfinalized deposit should defer, got {result:?}"
+		);
+
+		let event = tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv())
+			.await
+			.expect("Should receive deferred event")
+			.expect("Event should be valid");
+		match event {
+			SolverEvent::Order(OrderEvent::Deferred {
+				order_id,
+				retry_after,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(retry_after, std::time::Duration::from_secs(5));
+			},
+			other => panic!("Expected deferred event, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn handle_execution_defers_onchain_escrow_when_source_status_not_final_yet() {
+		let order = eip7683_order_with_lock(LockType::Permit2Escrow, false, None);
+		let params = create_test_execution_params();
+		let status_order = order.clone();
+
+		let (handler, mut event_rx) = create_test_handler_with_config(
+			|mock_order| {
+				mock_order.expect_generate_fill_transaction().times(0);
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_block_number()
+					.times(1)
+					.withf(|chain_id| *chain_id == 137)
+					.returning(|_| Box::pin(async { Ok(100) }));
+				mock_delivery
+					.expect_eth_call_at_block()
+					.times(1)
+					.withf(move |tx, block| {
+						tx.chain_id == 137
+							&& *block == 80 && is_expected_escrow_status_call(tx, &status_order)
+					})
+					.returning(|_, _| Box::pin(async { Ok(escrow_status_return(0)) }));
+				mock_delivery.expect_submit().times(0);
+			},
+			|_mock_storage| {},
+			create_test_config(),
+		)
+		.await;
+
+		let result = handler.handle_execution(order.clone(), params).await;
+		assert!(
+			result.is_ok(),
+			"unfinalized on-chain deposit should defer, got {result:?}"
+		);
+
+		let event = tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv())
+			.await
+			.expect("Should receive deferred event")
+			.expect("Event should be valid");
+		match event {
+			SolverEvent::Order(OrderEvent::Deferred {
+				order_id,
+				retry_after,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(retry_after, std::time::Duration::from_secs(5));
+			},
+			other => panic!("Expected deferred event, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn handle_execution_defers_escrow_when_source_status_read_is_empty() {
+		let order = eip7683_order_with_lock(
+			LockType::Permit2Escrow,
+			true,
+			Some(TransactionHash(vec![0xcd; 32])),
+		);
+		let params = create_test_execution_params();
+		let status_order = order.clone();
+		let latest_order = order.clone();
+
+		let (handler, mut event_rx) = create_test_handler_with_config(
+			|mock_order| {
+				mock_order.expect_generate_fill_transaction().times(0);
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_block_number()
+					.times(1)
+					.withf(|chain_id| *chain_id == 137)
+					.returning(|_| Box::pin(async { Ok(100) }));
+				mock_delivery
+					.expect_eth_call_at_block()
+					.times(1)
+					.withf(move |tx, block| {
+						tx.chain_id == 137
+							&& *block == 80 && is_expected_escrow_status_call(tx, &status_order)
+					})
+					.returning(|_, _| Box::pin(async { Ok(alloy_primitives::Bytes::new()) }));
+				mock_delivery
+					.expect_eth_call()
+					.times(1)
+					.withf(move |tx| {
+						tx.chain_id == 137 && is_expected_escrow_status_call(tx, &latest_order)
+					})
+					.returning(|_| Box::pin(async { Ok(deposited_status_return()) }));
+				mock_delivery.expect_submit().times(0);
+			},
+			|_mock_storage| {},
+			create_test_config(),
+		)
+		.await;
+
+		let result = handler.handle_execution(order.clone(), params).await;
+		assert!(
+			result.is_ok(),
+			"empty status read should defer, got {result:?}"
+		);
+
+		let event = tokio::time::timeout(std::time::Duration::from_millis(100), event_rx.recv())
+			.await
+			.expect("Should receive deferred event")
+			.expect("Event should be valid");
+		match event {
+			SolverEvent::Order(OrderEvent::Deferred {
+				order_id,
+				retry_after,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(retry_after, std::time::Duration::from_secs(5));
+			},
+			other => panic!("Expected deferred event, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn handle_execution_rejects_escrow_when_status_read_is_empty_at_latest() {
+		let order = eip7683_order_with_lock(
+			LockType::Permit2Escrow,
+			true,
+			Some(TransactionHash(vec![0xcd; 32])),
+		);
+		let params = create_test_execution_params();
+		let status_order = order.clone();
+		let latest_order = order.clone();
+
+		let (handler, _event_rx) = create_test_handler_with_config(
+			|mock_order| {
+				mock_order.expect_generate_fill_transaction().times(0);
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_block_number()
+					.times(1)
+					.withf(|chain_id| *chain_id == 137)
+					.returning(|_| Box::pin(async { Ok(100) }));
+				mock_delivery
+					.expect_eth_call_at_block()
+					.times(1)
+					.withf(move |tx, block| {
+						tx.chain_id == 137
+							&& *block == 80 && is_expected_escrow_status_call(tx, &status_order)
+					})
+					.returning(|_, _| Box::pin(async { Ok(alloy_primitives::Bytes::new()) }));
+				mock_delivery
+					.expect_eth_call()
+					.times(1)
+					.withf(move |tx| {
+						tx.chain_id == 137 && is_expected_escrow_status_call(tx, &latest_order)
+					})
+					.returning(|_| Box::pin(async { Ok(alloy_primitives::Bytes::new()) }));
+				mock_delivery.expect_submit().times(0);
+			},
+			|_mock_storage| {},
+			create_test_config(),
+		)
+		.await;
+
+		let err = handler
+			.handle_execution(order, params)
+			.await
+			.expect_err("empty latest status read should fail closed");
+		assert!(
+			err.to_string().contains("returned empty data at latest"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn handle_execution_uses_configured_broadcaster_finality_for_escrow_status_check() {
+		let order = eip7683_order_with_lock(LockType::Permit2Escrow, false, None);
+		let params = create_test_execution_params();
+		let status_order = order.clone();
+		let config = create_test_config_with_broadcaster_finality(42, 7);
+
+		let (handler, _event_rx) = create_test_handler_with_config(
+			|mock_order| {
+				mock_order.expect_generate_fill_transaction().times(0);
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_block_number()
+					.times(1)
+					.withf(|chain_id| *chain_id == 137)
+					.returning(|_| Box::pin(async { Ok(100) }));
+				mock_delivery
+					.expect_eth_call_at_block()
+					.times(1)
+					.withf(move |tx, block| {
+						tx.chain_id == 137
+							&& *block == 93 && is_expected_escrow_status_call(tx, &status_order)
+					})
+					.returning(|_, _| Box::pin(async { Ok(escrow_status_return(2)) }));
+				mock_delivery.expect_submit().times(0);
+			},
+			|_mock_storage| {},
+			config,
+		)
+		.await;
+
+		let err = handler
+			.handle_execution(order, params)
+			.await
+			.expect_err("source status guard should refuse fill");
+		assert!(
+			err.to_string().contains("expected Deposited"),
+			"unexpected error: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn handle_execution_uses_finalized_tag_when_it_is_more_conservative() {
+		let order = eip7683_order_with_lock(LockType::Permit2Escrow, false, None);
+		let params = create_test_execution_params();
+		let status_order = order.clone();
+		let config = create_test_config_with_broadcaster_finality(42, 7);
+
+		let (handler, _event_rx) = create_test_handler_with_config(
+			|mock_order| {
+				mock_order.expect_generate_fill_transaction().times(0);
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_finality_tag_block_number()
+					.times(2)
+					.returning(|_, tag| {
+						Box::pin(async move {
+							Ok(match tag {
+								alloy_rpc_types::BlockNumberOrTag::Finalized => Some(80),
+								alloy_rpc_types::BlockNumberOrTag::Safe => Some(90),
+								_ => None,
+							})
+						})
+					});
+				mock_delivery
+					.expect_get_block_number()
+					.times(1)
+					.withf(|chain_id| *chain_id == 137)
+					.returning(|_| Box::pin(async { Ok(100) }));
+				mock_delivery
+					.expect_eth_call_at_block()
+					.times(1)
+					.withf(move |tx, block| {
+						tx.chain_id == 137
+							&& *block == 80 && is_expected_escrow_status_call(tx, &status_order)
+					})
+					.returning(|_, _| Box::pin(async { Ok(escrow_status_return(2)) }));
+				mock_delivery.expect_submit().times(0);
+			},
+			|_mock_storage| {},
+			config,
+		)
+		.await;
+
+		let err = handler
+			.handle_execution(order, params)
+			.await
+			.expect_err("source status guard should refuse fill");
+		assert!(
+			err.to_string().contains("expected Deposited"),
+			"unexpected error: {err}"
+		);
 	}
 
 	#[tokio::test]

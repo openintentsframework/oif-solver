@@ -254,6 +254,10 @@ pub struct OperatorHyperlaneConfig {
 	/// IGP (Interchain Gas Paymaster) address per chain.
 	pub igp_addresses: HashMap<u64, Address>,
 
+	/// Hyperlane domain per canonical chain ID.
+	#[serde(default)]
+	pub domains: HashMap<u64, u32>,
+
 	/// Oracle addresses for input and output verification.
 	pub oracles: OperatorOracleConfig,
 
@@ -1142,6 +1146,7 @@ mod tests {
 					finalization_required: true,
 					mailboxes: HashMap::new(),
 					igp_addresses: HashMap::new(),
+					domains: HashMap::new(),
 					oracles: OperatorOracleConfig {
 						input: HashMap::new(),
 						output: HashMap::new(),

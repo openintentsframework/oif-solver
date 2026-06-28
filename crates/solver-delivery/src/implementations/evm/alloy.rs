@@ -3039,6 +3039,21 @@ impl DeliveryInterface for AlloyDelivery {
 			.await
 			.map_err(|e| DeliveryError::Network(format!("Failed to get block number: {e}")))
 	}
+
+	async fn get_finality_tag_block_number(
+		&self,
+		chain_id: u64,
+		tag: BlockNumberOrTag,
+	) -> Result<Option<u64>, DeliveryError> {
+		let provider = self.get_provider(chain_id)?;
+
+		provider
+			.get_block_by_number(tag)
+			.await
+			.map(|block| block.map(|block| block.number()))
+			.map_err(|e| DeliveryError::Network(format!("Failed to get {tag:?} block number: {e}")))
+	}
+
 	async fn estimate_gas(&self, tx: SolverTransaction) -> Result<u64, DeliveryError> {
 		// Get the chain ID from the transaction
 		let chain_id = tx.chain_id;
@@ -3103,6 +3118,25 @@ impl DeliveryInterface for AlloyDelivery {
 			.call(request)
 			.await
 			.map_err(|e| DeliveryError::Network(format!("Failed to execute eth_call: {e}")))?;
+
+		Ok(result)
+	}
+
+	async fn eth_call_at_block(
+		&self,
+		tx: SolverTransaction,
+		block_number: u64,
+	) -> Result<Bytes, DeliveryError> {
+		let chain_id = tx.chain_id;
+		let provider = self.get_provider(chain_id)?;
+		let request: TransactionRequest = tx.into();
+		let block_id = BlockNumberOrTag::Number(block_number).into();
+
+		let result = provider.call(request).block(block_id).await.map_err(|e| {
+			DeliveryError::Network(format!(
+				"Failed to execute eth_call at block {block_number}: {e}"
+			))
+		})?;
 
 		Ok(result)
 	}

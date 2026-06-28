@@ -1032,6 +1032,7 @@ mod tests {
 					finalization_required: false,
 					mailboxes: HashMap::new(),
 					igp_addresses: HashMap::new(),
+					domains: HashMap::new(),
 					oracles: OperatorOracleConfig {
 						input: HashMap::new(),
 						output: HashMap::new(),
