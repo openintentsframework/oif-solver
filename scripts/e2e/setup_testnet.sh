@@ -643,6 +643,8 @@ append_hyperlane_settlement() {
     dest_mailbox=$(jq -r --arg dest_chain "$DEST_CHAIN" ".settlement.implementations[$impl_index].chains[\$dest_chain].mailbox // \"0x0000000000000000000000000000000000000000\"" "$CONFIG_FILE")
     origin_igp=$(jq -r --arg origin_chain "$ORIGIN_CHAIN" ".settlement.implementations[$impl_index].chains[\$origin_chain].igp // \"0x0000000000000000000000000000000000000000\"" "$CONFIG_FILE")
     dest_igp=$(jq -r --arg dest_chain "$DEST_CHAIN" ".settlement.implementations[$impl_index].chains[\$dest_chain].igp // \"0x0000000000000000000000000000000000000000\"" "$CONFIG_FILE")
+    origin_domain=$(jq -r --arg origin_chain "$ORIGIN_CHAIN" ".settlement.implementations[$impl_index].chains[\$origin_chain].domain // .settlement.implementations[$impl_index].chains[\$origin_chain].chain_id" "$CONFIG_FILE")
+    dest_domain=$(jq -r --arg dest_chain "$DEST_CHAIN" ".settlement.implementations[$impl_index].chains[\$dest_chain].domain // .settlement.implementations[$impl_index].chains[\$dest_chain].chain_id" "$CONFIG_FILE")
 
     local temp_file
     temp_file=$(mktemp)
@@ -650,6 +652,8 @@ append_hyperlane_settlement() {
         --arg order_type "$order_type" \
         --argjson origin_id "$origin_id" \
         --argjson dest_id "$dest_id" \
+        --argjson origin_domain "$origin_domain" \
+        --argjson dest_domain "$dest_domain" \
         --arg origin_oracle "$origin_oracle" \
         --arg dest_oracle "$dest_oracle" \
         --arg origin_mailbox "$origin_mailbox" \
@@ -687,6 +691,10 @@ append_hyperlane_settlement() {
             igp_addresses: {
                 ($origin_id | tostring): $origin_igp,
                 ($dest_id | tostring): $dest_igp
+            },
+            domains: {
+                ($origin_id | tostring): $origin_domain,
+                ($dest_id | tostring): $dest_domain
             }
         }
         ' "$PROJECT_ROOT/config/testnet.json" > "$temp_file"
