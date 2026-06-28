@@ -140,6 +140,45 @@ fn native_gas_shortfall(balance: U256, required: U256) -> Option<U256> {
 	(balance < required).then(|| required.saturating_sub(balance))
 }
 
+fn buffered_extra_native_fee_estimate(raw_fee: U256, buffer_bps: u32) -> ExtraNativeFeeEstimate {
+	let buffer = raw_fee.saturating_mul(U256::from(buffer_bps)) / U256::from(10_000_u64);
+	let total = raw_fee.saturating_add(buffer);
+	ExtraNativeFeeEstimate {
+		raw_fee_wei: raw_fee.to_string(),
+		buffer_wei: buffer.to_string(),
+		total_fee_wei: total.to_string(),
+	}
+}
+
+fn signed_preflight_shortfall_message(balance: U256, required: U256, shortfall: U256) -> String {
+	format!(
+		"insufficient native gas for OP Stack signed transaction preflight: \
+		 balance {balance} wei, required {required} wei, shortfall {shortfall} wei"
+	)
+}
+
+fn signed_preflight_insufficient_native_gas_info(
+	chain_id: u64,
+	from: Address,
+	tx: &SolverTransaction,
+	budget: &NativeGasBudget,
+	balance: U256,
+	shortfall: U256,
+) -> InsufficientNativeGasInfo {
+	InsufficientNativeGasInfo {
+		chain_id,
+		signer: from.to_string(),
+		balance_wei: balance.to_string(),
+		required_wei: budget.required_wei.to_string(),
+		shortfall_wei: shortfall.to_string(),
+		gas_limit: tx.gas_limit,
+		max_fee_per_gas: tx.max_fee_per_gas,
+		gas_price: tx.gas_price,
+		extra_native_fee_wei: budget.extra_native_fee_wei.to_string(),
+		value_wei: tx.value.to_string(),
+	}
+}
+
 /// One cached fee-params entry. `inserted_at` is captured at insertion time and
 /// compared against TTL on read; we use `std::time::Instant` so tests can pass an
 /// explicit `now` to exercise expiry without sleeping.
@@ -791,14 +830,7 @@ impl AlloyDelivery {
 							"Failed to decode OP Stack L1 data fee on chain {chain_id}: {err}"
 						))
 					})?;
-					let buffer =
-						raw_fee.saturating_mul(U256::from(buffer_bps)) / U256::from(10_000_u64);
-					let total = raw_fee.saturating_add(buffer);
-					return Ok(ExtraNativeFeeEstimate {
-						raw_fee_wei: raw_fee.to_string(),
-						buffer_wei: buffer.to_string(),
-						total_fee_wei: total.to_string(),
-					});
+					return Ok(buffered_extra_native_fee_estimate(raw_fee, buffer_bps));
 				},
 				Err(err) => {
 					last_error = Some(err.to_string());
@@ -945,11 +977,8 @@ impl AlloyDelivery {
 		})?;
 
 		if let Some(shortfall) = native_gas_shortfall(balance, budget.required_wei) {
-			let err_msg = format!(
-				"insufficient native gas for OP Stack signed transaction preflight: \
-				 balance {balance} wei, required {} wei, shortfall {shortfall} wei",
-				budget.required_wei
-			);
+			let err_msg =
+				signed_preflight_shortfall_message(balance, budget.required_wei, shortfall);
 			if let (Some(tracking_ref), Some(planned)) = (tracking, planned_attempt) {
 				record_attempt_update_best_effort(
 					tracking_ref.tracking.attempt_recorder.clone(),
@@ -987,18 +1016,9 @@ impl AlloyDelivery {
 				"Insufficient native gas for signed OP Stack transaction"
 			);
 			return Err(DeliveryError::InsufficientNativeGas(Box::new(
-				InsufficientNativeGasInfo {
-					chain_id,
-					signer: from.to_string(),
-					balance_wei: balance.to_string(),
-					required_wei: budget.required_wei.to_string(),
-					shortfall_wei: shortfall.to_string(),
-					gas_limit: tx.gas_limit,
-					max_fee_per_gas: tx.max_fee_per_gas,
-					gas_price: tx.gas_price,
-					extra_native_fee_wei: budget.extra_native_fee_wei.to_string(),
-					value_wei: tx.value.to_string(),
-				},
+				signed_preflight_insufficient_native_gas_info(
+					chain_id, from, tx, &budget, balance, shortfall,
+				),
 			)));
 		}
 
@@ -3935,6 +3955,7 @@ mod tests {
 		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder},
 	};
 	use std::collections::HashMap;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
 	use tokio::net::TcpListener;
 
 	mod revert_data_extractor_tests {
@@ -4018,6 +4039,43 @@ mod tests {
 				});
 			}
 		});
+		format!("http://{address}")
+	}
+
+	async fn start_json_rpc_with_responses(responses: Vec<serde_json::Value>) -> String {
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let address = listener.local_addr().unwrap();
+		let responses = Arc::new(tokio::sync::Mutex::new(std::collections::VecDeque::from(
+			responses,
+		)));
+
+		tokio::spawn(async move {
+			while let Ok((mut socket, _)) = listener.accept().await {
+				let responses = Arc::clone(&responses);
+				tokio::spawn(async move {
+					let mut buffer = vec![0_u8; 8192];
+					let _ = socket.read(&mut buffer).await;
+					let body = responses.lock().await.pop_front().unwrap_or_else(|| {
+						serde_json::json!({
+							"jsonrpc": "2.0",
+							"id": 1,
+							"error": {
+								"code": -32000,
+								"message": "no mocked response available"
+							}
+						})
+					});
+					let body = body.to_string();
+					let response = format!(
+						"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+						body.len(),
+						body
+					);
+					let _ = socket.write_all(response.as_bytes()).await;
+				});
+			}
+		});
+
 		format!("http://{address}")
 	}
 
@@ -5339,6 +5397,320 @@ mod tests {
 
 			assert_eq!(budget.extra_native_fee_wei, U256::from(123_u64));
 			assert_eq!(budget.required_wei.to_string(), "42000000001123");
+		}
+
+		#[test]
+		fn buffered_extra_native_fee_estimate_applies_basis_point_buffer() {
+			let estimate = buffered_extra_native_fee_estimate(U256::from(1_000u64), 1_250);
+
+			assert_eq!(estimate.raw_fee_wei, "1000");
+			assert_eq!(estimate.buffer_wei, "125");
+			assert_eq!(estimate.total_fee_wei, "1125");
+		}
+
+		#[test]
+		fn signed_preflight_insufficient_native_gas_info_preserves_extra_fee() {
+			let tx = SolverTransaction {
+				chain_id: 10,
+				to: None,
+				data: vec![],
+				value: U256::from(7u64),
+				gas_limit: Some(21_000),
+				gas_price: None,
+				max_fee_per_gas: Some(3),
+				max_priority_fee_per_gas: Some(1),
+				nonce: Some(42),
+			};
+			let budget = NativeGasBudget {
+				gas_budget_wei: U256::from(63_000u64),
+				extra_native_fee_wei: U256::from(9_001u64),
+				required_wei: U256::from(72_008u64),
+			};
+			let signer: Address = "0x00000000000000000000000000000000000000aa"
+				.parse()
+				.expect("valid address");
+
+			let info = signed_preflight_insufficient_native_gas_info(
+				10,
+				signer,
+				&tx,
+				&budget,
+				U256::from(10u64),
+				U256::from(71_998u64),
+			);
+
+			assert_eq!(info.chain_id, 10);
+			assert_eq!(info.signer, signer.to_string());
+			assert_eq!(info.balance_wei, "10");
+			assert_eq!(info.required_wei, "72008");
+			assert_eq!(info.shortfall_wei, "71998");
+			assert_eq!(info.extra_native_fee_wei, "9001");
+			assert_eq!(info.value_wei, "7");
+			assert_eq!(info.gas_limit, Some(21_000));
+			assert_eq!(info.max_fee_per_gas, Some(3));
+			assert_eq!(info.gas_price, None);
+		}
+
+		#[test]
+		fn signed_preflight_shortfall_message_includes_required_amounts() {
+			let msg = signed_preflight_shortfall_message(
+				U256::from(10u64),
+				U256::from(72_008u64),
+				U256::from(71_998u64),
+			);
+
+			assert!(msg.contains("balance 10 wei"));
+			assert!(msg.contains("required 72008 wei"));
+			assert!(msg.contains("shortfall 71998 wei"));
+		}
+
+		fn extra_native_fee_test_policy() -> FeePolicyConfig {
+			serde_json::from_value(serde_json::json!({
+				"default_speed": "fast",
+				"chains": {
+					"1": {
+						"priority_fee_fallback": "100000000",
+						"quote_cost_strategy": "buffered_effective_125"
+					},
+					"10": {
+						"priority_fee_fallback": "100000000",
+						"quote_cost_strategy": "buffered_effective_125",
+						"extra_native_fee": {
+							"type": "op_stack_l1_data",
+							"buffer_bps": 1250
+						}
+					}
+				}
+			}))
+			.expect("valid fee policy")
+		}
+
+		fn delivery_with_extra_native_fee_policy() -> AlloyDelivery {
+			AlloyDelivery {
+				providers: HashMap::new(),
+				nonce_managers: HashMap::new(),
+				signer_addresses: HashMap::new(),
+				signers: HashMap::new(),
+				fee_params_cache: Arc::new(FeeParamsCache::default()),
+				fee_policy: FeePolicyRegistry::from_config(
+					&extra_native_fee_test_policy(),
+					&[1, 10],
+				)
+				.expect("valid fee policy registry"),
+			}
+		}
+
+		fn rpc_success_uint256(value: u64) -> serde_json::Value {
+			serde_json::json!({
+				"jsonrpc": "2.0",
+				"id": 1,
+				"result": format!("0x{value:064x}")
+			})
+		}
+
+		fn rpc_error(message: &str) -> serde_json::Value {
+			serde_json::json!({
+				"jsonrpc": "2.0",
+				"id": 1,
+				"error": {
+					"code": -32000,
+					"message": message
+				}
+			})
+		}
+
+		fn delivery_with_op_stack_provider(rpc_url: String) -> AlloyDelivery {
+			let url = rpc_url.parse().expect("valid rpc url");
+			let provider = ProviderBuilder::new().connect_http(url).erased();
+			let mut providers = HashMap::new();
+			providers.insert(10, provider);
+
+			AlloyDelivery {
+				providers,
+				nonce_managers: HashMap::new(),
+				signer_addresses: HashMap::new(),
+				signers: HashMap::new(),
+				fee_params_cache: Arc::new(FeeParamsCache::default()),
+				fee_policy: FeePolicyRegistry::from_config(
+					&extra_native_fee_test_policy(),
+					&[1, 10],
+				)
+				.expect("valid fee policy registry"),
+			}
+		}
+
+		#[tokio::test]
+		async fn op_stack_l1_data_fee_estimate_decodes_oracle_response_and_applies_buffer() {
+			let rpc_url = start_json_rpc_with_responses(vec![rpc_success_uint256(500)]).await;
+			let delivery = delivery_with_op_stack_provider(rpc_url);
+
+			let estimate = delivery
+				.estimate_op_stack_l1_data_fee_from_bytes(
+					10,
+					crate::implementations::evm::fees::DEFAULT_OP_STACK_GAS_PRICE_ORACLE,
+					1_000,
+					Bytes::from(vec![0x01, 0x02, 0x03]),
+				)
+				.await
+				.expect("oracle response should decode");
+
+			assert_eq!(estimate.raw_fee_wei, "500");
+			assert_eq!(estimate.buffer_wei, "50");
+			assert_eq!(estimate.total_fee_wei, "550");
+		}
+
+		#[tokio::test]
+		async fn op_stack_l1_data_fee_estimate_retries_once_after_oracle_error() {
+			let rpc_url = start_json_rpc_with_responses(vec![
+				rpc_error("temporary oracle error"),
+				rpc_success_uint256(400),
+			])
+			.await;
+			let delivery = delivery_with_op_stack_provider(rpc_url);
+
+			let estimate = delivery
+				.estimate_op_stack_l1_data_fee_from_bytes(
+					10,
+					crate::implementations::evm::fees::DEFAULT_OP_STACK_GAS_PRICE_ORACLE,
+					2_500,
+					Bytes::from(vec![0x04]),
+				)
+				.await
+				.expect("second oracle response should decode");
+
+			assert_eq!(estimate.raw_fee_wei, "400");
+			assert_eq!(estimate.buffer_wei, "100");
+			assert_eq!(estimate.total_fee_wei, "500");
+		}
+
+		#[tokio::test]
+		async fn op_stack_l1_data_fee_estimate_reports_decode_errors() {
+			let rpc_url = start_json_rpc_with_responses(vec![serde_json::json!({
+				"jsonrpc": "2.0",
+				"id": 1,
+				"result": "0x1234"
+			})])
+			.await;
+			let delivery = delivery_with_op_stack_provider(rpc_url);
+
+			let err = delivery
+				.estimate_op_stack_l1_data_fee_from_bytes(
+					10,
+					crate::implementations::evm::fees::DEFAULT_OP_STACK_GAS_PRICE_ORACLE,
+					1_000,
+					Bytes::from(vec![0x01]),
+				)
+				.await
+				.expect_err("short ABI response should fail");
+
+			assert!(err
+				.to_string()
+				.contains("Failed to decode OP Stack L1 data fee on chain 10"));
+		}
+
+		#[tokio::test]
+		async fn op_stack_l1_data_fee_estimate_reports_last_oracle_error_after_retry() {
+			let rpc_url = start_json_rpc_with_responses(vec![
+				rpc_error("first oracle error"),
+				rpc_error("second oracle error"),
+			])
+			.await;
+			let delivery = delivery_with_op_stack_provider(rpc_url);
+
+			let err = delivery
+				.estimate_op_stack_l1_data_fee_from_bytes(
+					10,
+					crate::implementations::evm::fees::DEFAULT_OP_STACK_GAS_PRICE_ORACLE,
+					1_000,
+					Bytes::from(vec![0x01]),
+				)
+				.await
+				.expect_err("two oracle errors should fail");
+
+			assert!(err
+				.to_string()
+				.contains("Failed to estimate OP Stack L1 data fee on chain 10"));
+			assert!(err.to_string().contains("second oracle error"));
+		}
+
+		#[tokio::test]
+		async fn quote_time_op_stack_extra_native_fee_uses_cached_fee_params_and_oracle() {
+			let rpc_url = start_json_rpc_with_responses(vec![rpc_success_uint256(900)]).await;
+			let delivery = delivery_with_op_stack_provider(rpc_url);
+			delivery
+				.fee_params_cache
+				.insert(10, FeeParams::legacy(10, 1_000_000_000), Instant::now())
+				.await;
+			let tx = SolverTransaction {
+				chain_id: 10,
+				to: Some(solver_types::Address(vec![0x22; 20])),
+				data: vec![0xab, 0xcd],
+				value: U256::ZERO,
+				gas_limit: Some(120_000),
+				gas_price: None,
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+				nonce: Some(7),
+			};
+
+			let estimate = DeliveryInterface::estimate_extra_native_fee(&delivery, 10, &tx)
+				.await
+				.expect("cached fee params and oracle response should estimate");
+
+			assert_eq!(estimate.raw_fee_wei, "900");
+			assert_eq!(estimate.buffer_wei, "112");
+			assert_eq!(estimate.total_fee_wei, "1012");
+		}
+
+		#[tokio::test]
+		async fn signed_bytes_extra_native_fee_returns_zero_for_unconfigured_chain() {
+			let delivery = delivery_with_extra_native_fee_policy();
+
+			let estimate = delivery
+				.estimate_extra_native_fee_for_signed_bytes(1, Bytes::from(vec![0x01]))
+				.await
+				.expect("unconfigured chain should not require oracle RPC");
+
+			assert_eq!(estimate, ExtraNativeFeeEstimate::default());
+		}
+
+		#[tokio::test]
+		async fn estimate_extra_native_fee_returns_zero_for_unconfigured_chain_without_provider() {
+			let delivery = delivery_with_extra_native_fee_policy();
+			let tx = SolverTransaction {
+				chain_id: 1,
+				to: None,
+				data: vec![],
+				value: U256::ZERO,
+				gas_limit: Some(21_000),
+				gas_price: Some(1),
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+				nonce: None,
+			};
+
+			let estimate = DeliveryInterface::estimate_extra_native_fee(&delivery, 1, &tx)
+				.await
+				.expect("chain without extra native fee should not require provider RPC");
+
+			assert_eq!(estimate, ExtraNativeFeeEstimate::default());
+			assert!(!delivery.chain_requires_extra_native_fee_preflight(1));
+		}
+
+		#[tokio::test]
+		async fn op_stack_extra_native_fee_requires_configured_provider() {
+			let delivery = delivery_with_extra_native_fee_policy();
+
+			let err = delivery
+				.estimate_extra_native_fee_for_signed_bytes(10, Bytes::from(vec![0x01]))
+				.await
+				.expect_err("configured OP Stack chain requires a provider");
+
+			assert!(delivery.chain_requires_extra_native_fee_preflight(10));
+			assert!(matches!(err, DeliveryError::Network(_)));
+			assert!(err
+				.to_string()
+				.contains("No provider configured for chain ID 10"));
 		}
 
 		#[test]

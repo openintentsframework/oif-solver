@@ -103,6 +103,29 @@ mod tests {
 	}
 
 	#[test]
+	fn synthetic_signed_transaction_bytes_marks_legacy_transactions() {
+		let mut tx = tx_with_data(vec![0xab]);
+		tx.max_fee_per_gas = None;
+		tx.max_priority_fee_per_gas = None;
+		tx.gas_price = Some(1_000_000_000);
+
+		let encoded = synthetic_signed_transaction_bytes(&tx).expect("synthetic bytes");
+
+		assert_eq!(encoded[0], 0x01);
+	}
+
+	#[test]
+	fn synthetic_signed_transaction_bytes_uses_zero_to_for_contract_creation() {
+		let mut tx = tx_with_data(vec![0xab]);
+		tx.to = None;
+
+		let encoded = synthetic_signed_transaction_bytes(&tx).expect("synthetic bytes");
+		let to_offset = 1 + 8 + 8 + 16 + 8;
+
+		assert_eq!(&encoded[to_offset..to_offset + 20], &[0_u8; 20]);
+	}
+
+	#[test]
 	fn get_l1_fee_call_data_is_non_empty() {
 		let call = encode_get_l1_fee_call(Bytes::from(vec![0x02, 0xff]));
 

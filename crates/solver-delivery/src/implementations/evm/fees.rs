@@ -572,6 +572,30 @@ mod tests {
 	}
 
 	#[test]
+	fn fee_policy_config_rejects_invalid_extra_native_fee_oracle_address() {
+		let cfg = parse_fee_policy(serde_json::json!({
+			"default_speed": "fast",
+			"chains": {
+				"8453": {
+					"priority_fee_fallback": "100000000",
+					"quote_cost_strategy": "buffered_effective_125",
+					"extra_native_fee": {
+						"type": "op_stack_l1_data",
+						"oracle_address": "not-an-address"
+					}
+				}
+			}
+		}));
+
+		let err = FeePolicyRegistry::from_config(&cfg, &[8453])
+			.expect_err("invalid oracle address must fail");
+		assert!(
+			err.to_string().contains("extra_native_fee.oracle_address"),
+			"error should mention oracle address: {err}"
+		);
+	}
+
+	#[test]
 	fn fee_policy_registry_round_trips_mainnet_floor_and_cap() {
 		let cfg = parse_fee_policy(serde_json::json!({
 			"default_speed": "fast",
