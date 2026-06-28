@@ -18,6 +18,8 @@ pub mod delivery;
 pub mod discovery;
 /// Event types for inter-service communication.
 pub mod events;
+/// Source-chain finality selection helpers.
+pub mod finality;
 /// Network and token configuration types.
 pub mod networks;
 /// Operator configuration types for runtime storage in Redis.
@@ -66,6 +68,7 @@ pub use costs::{CostBreakdown, CostContext};
 pub use delivery::*;
 pub use discovery::*;
 pub use events::*;
+pub use finality::select_finality_head;
 pub use networks::{NetworkConfig, NetworkType, NetworksConfig, TokenConfig};
 pub use operator_config::{
 	OperatorAccountConfig, OperatorAdminConfig, OperatorBroadcasterConfig, OperatorConfig,

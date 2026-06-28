@@ -314,6 +314,10 @@ pub struct HarnessOptions {
 	/// Optional transaction bumping configuration for tests that need the
 	/// sweeper enabled. Passed through to `SeedOverrides` unchanged.
 	pub tx_bump: Option<solver_types::OperatorTxBumpConfig>,
+	/// Optional existing broadcaster default finality depth to carry into
+	/// discovery config even when the active settlement priority is direct or
+	/// Hyperlane.
+	pub broadcaster_default_finality_blocks: Option<u64>,
 }
 
 async fn read_order_from_storage_root(
@@ -418,6 +422,7 @@ impl Default for HarnessOptions {
 			deny_list_addresses: None,
 			run_solver: true,
 			tx_bump: None,
+			broadcaster_default_finality_blocks: None,
 		}
 	}
 }
@@ -1835,8 +1840,9 @@ fn build_seed_overrides(
 ) -> Result<solver_types::SeedOverrides> {
 	use solver_types::networks::NetworkType;
 	use solver_types::seed_overrides::{
-		AdminOverride, DirectSettlementOverride, HyperlaneSettlementOverride, NetworkOverride,
-		OracleOverrides, SettlementOverride, SettlementTypeOverride, Token,
+		AdminOverride, BroadcasterSettlementOverride, DirectSettlementOverride,
+		HyperlaneSettlementOverride, NetworkOverride, OracleOverrides, SettlementOverride,
+		SettlementTypeOverride, Token,
 	};
 
 	fn token(symbol: &str, address: Address) -> Token {
@@ -1877,7 +1883,7 @@ fn build_seed_overrides(
 	routes.insert(origin.chain_id, vec![destination.chain_id]);
 	routes.insert(destination.chain_id, vec![origin.chain_id]);
 
-	let settlement = if options.use_hyperlane_settlement {
+	let mut settlement = if options.use_hyperlane_settlement {
 		// Hyperlane settlement requires per-chain mailbox + IGP entries
 		// (`validate_seedless_settlement_requirements` enforces presence,
 		// not connectivity). Origin's mailbox is unexercised since our flow
@@ -1907,10 +1913,10 @@ fn build_seed_overrides(
 				(destination.chain_id, destination.chain_id as u32),
 			]),
 			oracles: OracleOverrides {
-				input: input_oracles,
-				output: output_oracles,
+				input: input_oracles.clone(),
+				output: output_oracles.clone(),
 			},
-			routes,
+			routes: routes.clone(),
 			default_gas_limit: None,
 			message_timeout_seconds: None,
 			finalization_required: None,
@@ -1926,10 +1932,10 @@ fn build_seed_overrides(
 	} else {
 		let direct = DirectSettlementOverride {
 			oracles: OracleOverrides {
-				input: input_oracles,
-				output: output_oracles,
+				input: input_oracles.clone(),
+				output: output_oracles.clone(),
 			},
-			routes,
+			routes: routes.clone(),
 			// AlwaysYesOracle short-circuits dispute logic; 1s keeps the test fast.
 			dispute_period_seconds: Some(1),
 			oracle_selection_strategy: None,
@@ -1943,6 +1949,30 @@ fn build_seed_overrides(
 			broadcaster: None,
 		}
 	};
+	if let Some(broadcaster_default_finality_blocks) = options.broadcaster_default_finality_blocks {
+		settlement.broadcaster = Some(BroadcasterSettlementOverride {
+			oracles: OracleOverrides {
+				input: input_oracles.clone(),
+				output: output_oracles.clone(),
+			},
+			routes: routes.clone(),
+			broadcaster_addresses: HashMap::from([
+				(origin.chain_id, origin.output_settler),
+				(destination.chain_id, destination.output_settler),
+			]),
+			receiver_addresses: HashMap::from([
+				(origin.chain_id, origin.input_settler),
+				(destination.chain_id, destination.input_settler),
+			]),
+			broadcaster_ids: HashMap::from([
+				(origin.chain_id, B256::ZERO),
+				(destination.chain_id, B256::ZERO),
+			]),
+			proof_service_url: Some("http://127.0.0.1:9".to_string()),
+			default_finality_blocks: Some(broadcaster_default_finality_blocks),
+			..Default::default()
+		});
+	}
 
 	let admin = if options.enable_admin_api {
 		Some(AdminOverride {
