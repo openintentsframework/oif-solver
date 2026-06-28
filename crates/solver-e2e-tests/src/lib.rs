@@ -377,7 +377,13 @@ async fn scan_attempt_files(
 
 	Ok(attempts
 		.into_iter()
-		.filter(|attempt| attempt.order_id == order_id || attempt.order_id == alternate_order_id)
+		.filter(|attempt| {
+			matches!(
+				attempt.order_id(),
+				Some(attempt_order_id)
+					if attempt_order_id == order_id || attempt_order_id == alternate_order_id
+			)
+		})
 		.collect())
 }
 

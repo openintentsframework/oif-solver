@@ -99,7 +99,9 @@ pub use standards::{
 	eip7930::{InteropAddress, InteropAddressError},
 };
 pub use storage::*;
-pub use transaction_attempt::{TransactionAttempt, TransactionAttemptStatus};
+pub use transaction_attempt::{
+	TransactionAttempt, TransactionAttemptScope, TransactionAttemptStatus,
+};
 pub use utils::{
 	bytes32_to_address, current_timestamp, format_token_amount, normalize_bytes32_address,
 	order_id_to_bytes32, parse_address, truncate_id, wei_string_to_eth_string, with_0x_prefix,

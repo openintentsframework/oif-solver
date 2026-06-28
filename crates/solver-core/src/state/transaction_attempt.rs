@@ -12,14 +12,19 @@ use solver_delivery::{
 use solver_storage::{QueryFilter, StorageError, StorageIndexes, StorageService};
 use solver_types::{
 	current_timestamp, Address, StorageKey, Transaction, TransactionAttempt,
-	TransactionAttemptStatus, TransactionHash, TransactionReceipt, TransactionType,
+	TransactionAttemptScope, TransactionAttemptStatus, TransactionHash, TransactionReceipt,
+	TransactionType,
 };
 use thiserror::Error;
 use uuid::Uuid;
 
 const ORDER_ID_INDEX_FIELD: &str = "order_id";
+const SCOPE_KIND_INDEX_FIELD: &str = "scope_kind";
+const SCOPE_ID_INDEX_FIELD: &str = "scope_id";
 const TX_HASH_INDEX_FIELD: &str = "tx_hash";
 const IS_TERMINAL_INDEX_FIELD: &str = "is_terminal";
+const SCOPE_KIND_ORDER: &str = "order";
+const SCOPE_KIND_SYSTEM: &str = "system";
 
 #[derive(Debug, Error)]
 pub enum TransactionAttemptStoreError {
@@ -51,9 +56,19 @@ fn tx_hash_index_value(tx_hash: &TransactionHash) -> String {
 }
 
 fn transaction_attempt_indexes(attempt: &TransactionAttempt) -> StorageIndexes {
+	let scope_kind = if attempt.scope.is_system() {
+		SCOPE_KIND_SYSTEM
+	} else {
+		SCOPE_KIND_ORDER
+	};
 	let mut indexes = StorageIndexes::new()
-		.with_field(ORDER_ID_INDEX_FIELD, &attempt.order_id)
+		.with_field(SCOPE_KIND_INDEX_FIELD, scope_kind)
+		.with_field(SCOPE_ID_INDEX_FIELD, attempt.scope_id())
 		.with_field(IS_TERMINAL_INDEX_FIELD, attempt.is_terminal());
+
+	if let Some(order_id) = attempt.order_id() {
+		indexes = indexes.with_field(ORDER_ID_INDEX_FIELD, order_id);
+	}
 
 	if let Some(tx_hash) = &attempt.tx_hash {
 		indexes = indexes.with_field(TX_HASH_INDEX_FIELD, tx_hash_index_value(tx_hash));
@@ -83,7 +98,7 @@ impl TransactionAttemptStore {
 	) -> Result<TransactionAttempt, TransactionAttemptStoreError> {
 		let attempt = TransactionAttempt::planned(
 			Uuid::new_v4().hyphenated().to_string(),
-			order_id.to_string(),
+			TransactionAttemptScope::order(order_id),
 			signer,
 			tx_type,
 			tx,
@@ -123,7 +138,7 @@ impl TransactionAttemptStore {
 	) -> Result<Vec<TransactionAttempt>, TransactionAttemptStoreError> {
 		let rows = self
 			.storage
-			.query(
+			.query::<TransactionAttempt>(
 				StorageKey::TransactionAttempts.as_str(),
 				QueryFilter::Equals(
 					ORDER_ID_INDEX_FIELD.to_string(),
@@ -132,6 +147,52 @@ impl TransactionAttemptStore {
 			)
 			.await?;
 		Ok(rows.into_iter().map(|(_, attempt)| attempt).collect())
+	}
+
+	pub async fn non_terminal_system_attempts(
+		&self,
+	) -> Result<Vec<TransactionAttempt>, TransactionAttemptStoreError> {
+		let rows = self
+			.storage
+			.query::<TransactionAttempt>(
+				StorageKey::TransactionAttempts.as_str(),
+				QueryFilter::Equals(
+					SCOPE_KIND_INDEX_FIELD.to_string(),
+					serde_json::json!(SCOPE_KIND_SYSTEM),
+				),
+			)
+			.await?;
+		Ok(rows
+			.into_iter()
+			.map(|(_, attempt)| attempt)
+			.filter(|attempt| !attempt.is_terminal())
+			.collect())
+	}
+
+	pub async fn attempts_for_system_scope(
+		&self,
+		scope_id: &str,
+	) -> Result<Vec<TransactionAttempt>, TransactionAttemptStoreError> {
+		let rows = self
+			.storage
+			.query::<TransactionAttempt>(
+				StorageKey::TransactionAttempts.as_str(),
+				QueryFilter::Equals(
+					SCOPE_ID_INDEX_FIELD.to_string(),
+					serde_json::json!(scope_id),
+				),
+			)
+			.await?;
+		Ok(rows
+			.into_iter()
+			.map(|(_, attempt)| attempt)
+			.filter(|attempt| {
+				matches!(
+					&attempt.scope,
+					TransactionAttemptScope::System { scope_id: stored } if stored == scope_id
+				)
+			})
+			.collect())
 	}
 
 	pub async fn attempt_by_hash(
@@ -283,7 +344,7 @@ impl TransactionAttemptRecorder for TransactionAttemptStore {
 			.attempt_id_override
 			.unwrap_or_else(|| Uuid::new_v4().hyphenated().to_string());
 		let mut attempt =
-			TransactionAttempt::planned(id, init.order_id, init.signer, init.tx_type, init.tx);
+			TransactionAttempt::planned(id, init.scope, init.signer, init.tx_type, init.tx);
 		attempt.replacement_of = init.replacement_of;
 		self.save_attempt(&attempt)
 			.await
@@ -347,7 +408,7 @@ mod tests {
 		let (storage, _tmp) = test_storage();
 		let store = TransactionAttemptStore::new(storage);
 		let init = PlannedAttemptInit {
-			order_id: "order-1".into(),
+			scope: TransactionAttemptScope::order("order-1"),
 			signer: Some(Address(vec![9; 20])),
 			tx_type: TransactionType::Fill,
 			tx: sample_tx(),
@@ -365,7 +426,7 @@ mod tests {
 		let (storage, _tmp) = test_storage();
 		let store = TransactionAttemptStore::new(storage);
 		let init = PlannedAttemptInit {
-			order_id: "order-1".into(),
+			scope: TransactionAttemptScope::order("order-1"),
 			signer: None,
 			tx_type: TransactionType::Fill,
 			tx: sample_tx(),
@@ -385,7 +446,7 @@ mod tests {
 
 		let parent = store
 			.record_planned_attempt(solver_delivery::PlannedAttemptInit {
-				order_id: "o".into(),
+				scope: TransactionAttemptScope::order("o"),
 				signer: None,
 				tx_type: TransactionType::Fill,
 				tx: sample_tx(),
@@ -415,7 +476,7 @@ mod tests {
 
 		let parent = store
 			.record_planned_attempt(solver_delivery::PlannedAttemptInit {
-				order_id: "o".into(),
+				scope: TransactionAttemptScope::order("o"),
 				signer: None,
 				tx_type: TransactionType::Fill,
 				tx: sample_tx(),
@@ -451,7 +512,7 @@ mod tests {
 
 		let a = store
 			.record_planned_attempt(solver_delivery::PlannedAttemptInit {
-				order_id: "o".into(),
+				scope: TransactionAttemptScope::order("o"),
 				signer: None,
 				tx_type: TransactionType::Fill,
 				tx: sample_tx(),
@@ -493,7 +554,7 @@ mod tests {
 
 		let a = store
 			.record_planned_attempt(solver_delivery::PlannedAttemptInit {
-				order_id: "o".into(),
+				scope: TransactionAttemptScope::order("o"),
 				signer: None,
 				tx_type: TransactionType::Fill,
 				tx: sample_tx(),

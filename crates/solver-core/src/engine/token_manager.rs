@@ -21,9 +21,12 @@
 
 use alloy_primitives::{hex, U256};
 use solver_account::AccountService;
-use solver_delivery::DeliveryService;
+use solver_delivery::{
+	DeliveryService, TransactionAttemptRecorder, TransactionMonitoringEvent, TransactionTracking,
+};
 use solver_types::{
 	with_0x_prefix, Address, NetworksConfig, TokenConfig, Transaction, TransactionHash,
+	TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -74,6 +77,8 @@ pub struct TokenManager {
 	delivery: Arc<DeliveryService>,
 	/// Service for managing the solver's account and signatures.
 	account: Arc<AccountService>,
+	/// Durable attempt recorder for token-management/admin transactions.
+	attempt_recorder: Option<Arc<dyn TransactionAttemptRecorder>>,
 }
 
 impl TokenManager {
@@ -93,7 +98,94 @@ impl TokenManager {
 			networks: Arc::new(RwLock::new(networks)),
 			delivery,
 			account,
+			attempt_recorder: None,
 		}
+	}
+
+	pub fn with_attempt_recorder(
+		mut self,
+		attempt_recorder: Arc<dyn TransactionAttemptRecorder>,
+	) -> Self {
+		self.attempt_recorder = Some(attempt_recorder);
+		self
+	}
+
+	fn tracking_for_system_tx(
+		&self,
+		scope_id: String,
+		tx_type: TransactionType,
+	) -> Option<TransactionTracking> {
+		let attempt_recorder = self.attempt_recorder.clone()?;
+		Some(TransactionTracking {
+			id: scope_id,
+			tx_type,
+			attempt_recorder,
+			callback: Box::new(|event| match event {
+				TransactionMonitoringEvent::Confirmed {
+					id,
+					tx_hash,
+					tx_type,
+					..
+				} => {
+					tracing::info!(
+						scope_id = %id,
+						?tx_hash,
+						?tx_type,
+						"system transaction confirmed"
+					);
+				},
+				TransactionMonitoringEvent::Failed {
+					id,
+					tx_hash,
+					tx_type,
+					error,
+					..
+				} => {
+					tracing::warn!(
+						scope_id = %id,
+						?tx_hash,
+						?tx_type,
+						error = %error,
+						"system transaction failed"
+					);
+				},
+				TransactionMonitoringEvent::Indeterminate {
+					id,
+					tx_hash,
+					tx_type,
+					reason,
+				} => {
+					tracing::warn!(
+						scope_id = %id,
+						?tx_hash,
+						?tx_type,
+						reason = %reason,
+						"system transaction confirmation indeterminate"
+					);
+				},
+				TransactionMonitoringEvent::AttemptLedgerConflict {
+					id,
+					attempt_id,
+					tx_type,
+					attempted_status,
+					error,
+					context,
+					..
+				} => {
+					tracing::warn!(
+						scope_id = %id,
+						attempt_id = %attempt_id,
+						?tx_type,
+						?attempted_status,
+						error = %error,
+						context,
+						"system transaction attempt ledger conflict"
+					);
+				},
+			}),
+			attempt_id: None,
+			replacement_of: None,
+		})
 	}
 
 	/// Updates the networks configuration for hot-reload support.
@@ -352,7 +444,14 @@ impl TokenManager {
 			nonce: None,
 		};
 
-		let tx_hash = self.delivery.deliver(tx, None).await?;
+		let scope_id = format!(
+			"system:approval:{chain_id}:{}:{}:{}",
+			hex::encode(&token_address.0),
+			hex::encode(&spender.0),
+			uuid::Uuid::new_v4()
+		);
+		let tracking = self.tracking_for_system_tx(scope_id, TransactionType::Approval);
+		let tx_hash = self.delivery.deliver(tx, tracking).await?;
 
 		Ok(tx_hash)
 	}
@@ -505,7 +604,14 @@ impl TokenManager {
 			}
 		};
 
-		let tx_hash = self.delivery.deliver(tx, None).await?;
+		let scope_id = format!(
+			"system:withdrawal:{chain_id}:{}:{}:{}",
+			hex::encode(&token_address.0),
+			hex::encode(&recipient.0),
+			uuid::Uuid::new_v4()
+		);
+		let tracking = self.tracking_for_system_tx(scope_id, TransactionType::Withdrawal);
+		let tx_hash = self.delivery.deliver(tx, tracking).await?;
 		Ok(tx_hash)
 	}
 
@@ -593,7 +699,7 @@ mod tests {
 	use super::*;
 	use mockall::predicate::*;
 	use solver_account::{AccountService, MockAccountInterface};
-	use solver_delivery::{DeliveryService, MockDeliveryInterface};
+	use solver_delivery::{DeliveryService, MockDeliveryInterface, NoopTransactionAttemptRecorder};
 	use solver_types::{
 		parse_address,
 		utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder, TokenConfigBuilder},
@@ -1009,6 +1115,89 @@ mod tests {
 
 		assert!(result.is_ok());
 		assert_eq!(result.unwrap().0, vec![0xaa; 32]);
+	}
+
+	#[tokio::test]
+	async fn approval_submission_is_tracked_as_system_attempt() {
+		let networks = create_test_networks_config();
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_allowance()
+			.returning(|_, _, _, _| Box::pin(async { Ok("0".to_string()) }));
+		mock_delivery
+			.expect_submit()
+			.withf(|_, tracking| {
+				tracking
+					.as_ref()
+					.is_some_and(|tracking| tracking.tracking.tx_type == TransactionType::Approval)
+			})
+			.returning(|_, _| {
+				Box::pin(async { Ok(solver_types::TransactionHash(vec![0xcc; 32])) })
+			});
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations = HashMap::new();
+		implementations.insert(
+			1,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 20, 60));
+
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account)
+			.with_attempt_recorder(Arc::new(NoopTransactionAttemptRecorder));
+
+		let token_address = parse_address("a0b86991c6218b36c1d19d4a2e9eb0cee3606eb48").unwrap();
+		let spender = parse_address("2222222222222222222222222222222222222222").unwrap();
+
+		let result = token_manager
+			.ensure_token_approval(1, &token_address, &spender, U256::MAX)
+			.await;
+
+		assert!(result.unwrap());
+	}
+
+	#[tokio::test]
+	async fn withdrawal_submission_is_tracked_as_system_attempt() {
+		let networks = create_test_networks_config();
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_submit()
+			.withf(|_, tracking| {
+				tracking.as_ref().is_some_and(|tracking| {
+					tracking.tracking.tx_type == TransactionType::Withdrawal
+				})
+			})
+			.returning(|_, _| {
+				Box::pin(async { Ok(solver_types::TransactionHash(vec![0xdd; 32])) })
+			});
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations = HashMap::new();
+		implementations.insert(
+			1,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 20, 60));
+
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account)
+			.with_attempt_recorder(Arc::new(NoopTransactionAttemptRecorder));
+
+		let zero_address = Address(vec![0u8; 20]);
+		let recipient = parse_address("1111111111111111111111111111111111111111").unwrap();
+
+		let result = token_manager
+			.withdraw_token(1, &zero_address, &recipient, U256::from(1u64))
+			.await;
+
+		assert!(result.is_ok());
 	}
 
 	#[tokio::test]

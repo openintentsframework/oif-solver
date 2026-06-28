@@ -34,8 +34,8 @@ use async_trait::async_trait;
 use solver_account::AccountSigner;
 use solver_types::{
 	Address as SolverAddress, ConfigSchema, Field, FieldType, NetworksConfig, Schema,
-	Transaction as SolverTransaction, TransactionAttempt, TransactionAttemptStatus,
-	TransactionHash, TransactionReceipt, TransactionType,
+	Transaction as SolverTransaction, TransactionAttempt, TransactionAttemptScope,
+	TransactionAttemptStatus, TransactionHash, TransactionReceipt, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -350,6 +350,16 @@ fn solver_address_from_alloy(address: Address) -> SolverAddress {
 	SolverAddress(address.as_slice().to_vec())
 }
 
+fn tracking_scope(id: &str, tx_type: TransactionType) -> TransactionAttemptScope {
+	match tx_type {
+		TransactionType::Approval
+		| TransactionType::Withdrawal
+		| TransactionType::Bridge
+		| TransactionType::Pusher => TransactionAttemptScope::system(id.to_string()),
+		_ => TransactionAttemptScope::order(id.to_string()),
+	}
+}
+
 async fn record_planned_attempt(
 	tracking: &TransactionTrackingWithConfig,
 	signer: SolverAddress,
@@ -361,7 +371,7 @@ async fn record_planned_attempt(
 		.tracking
 		.attempt_recorder
 		.record_planned_attempt(PlannedAttemptInit {
-			order_id: tracking.tracking.id.clone(),
+			scope: tracking_scope(&tracking.tracking.id, tracking.tracking.tx_type),
 			signer: Some(signer),
 			tx_type: tracking.tracking.tx_type,
 			tx,
@@ -4857,6 +4867,10 @@ mod tests {
 				TransactionType::PostFill,
 				TransactionType::PreClaim,
 				TransactionType::Claim,
+				TransactionType::Approval,
+				TransactionType::Withdrawal,
+				TransactionType::Bridge,
+				TransactionType::Pusher,
 			];
 
 			for tx_type in types {
@@ -4882,6 +4896,10 @@ mod tests {
 							| TransactionType::PostFill
 							| TransactionType::PreClaim
 							| TransactionType::Claim
+							| TransactionType::Approval
+							| TransactionType::Withdrawal
+							| TransactionType::Bridge
+							| TransactionType::Pusher
 					));
 				}
 			}
@@ -5249,6 +5267,10 @@ mod tests {
 				TransactionType::PostFill,
 				TransactionType::PreClaim,
 				TransactionType::Claim,
+				TransactionType::Approval,
+				TransactionType::Withdrawal,
+				TransactionType::Bridge,
+				TransactionType::Pusher,
 			];
 
 			for tx_type in tx_types {
