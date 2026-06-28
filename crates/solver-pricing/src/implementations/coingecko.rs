@@ -19,14 +19,25 @@ use solver_types::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OnceCell, RwLock};
 use tracing::debug;
+
+const NEGATIVE_CACHE_DURATION_SECONDS: u64 = 5;
+
+type SharedPriceResult = Result<String, Arc<PricingError>>;
+type InFlightPriceFetch = Arc<OnceCell<SharedPriceResult>>;
 
 /// Cache entry for price data
 #[derive(Debug, Clone)]
-struct PriceCacheEntry {
-	price: String,
-	timestamp: u64,
+enum PriceCacheEntry {
+	Success {
+		price: String,
+		timestamp: u64,
+	},
+	Failure {
+		error: Arc<PricingError>,
+		timestamp: u64,
+	},
 }
 
 /// CoinGecko pricing implementation with caching and rate limiting.
@@ -42,14 +53,18 @@ pub struct CoinGeckoPricing {
 	price_cache: Arc<RwLock<HashMap<String, PriceCacheEntry>>>,
 	/// Cache duration in seconds
 	cache_duration: u64,
-	/// Per-key mutexes to collapse concurrent cache misses for the same asset pair.
-	price_fetch_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+	/// Shared in-flight requests to collapse concurrent cache misses for the same asset pair.
+	in_flight_price_fetches: Arc<Mutex<HashMap<String, InFlightPriceFetch>>>,
 	/// Map of token symbols to CoinGecko IDs
 	token_id_map: HashMap<String, String>,
 	/// Custom fixed prices for tokens (useful for testing/demo)
 	custom_prices: HashMap<String, String>,
 	/// Rate limit delay in milliseconds
 	rate_limit_delay_ms: u64,
+	/// Maximum allowed rate-limit sleep before returning an error.
+	max_rate_limit_sleep_ms: u64,
+	/// Timeout for the complete uncached CoinGecko fetch path.
+	request_timeout_ms: u64,
 	/// Reserved timestamp for the next outbound CoinGecko API call.
 	next_api_call_at_ms: Arc<Mutex<u64>>,
 }
@@ -59,6 +74,37 @@ pub struct CoinGeckoPricing {
 struct SimplePriceResponse {
 	#[serde(flatten)]
 	prices: HashMap<String, HashMap<String, Decimal>>,
+}
+
+fn current_time_ms() -> u64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap()
+		.as_millis() as u64
+}
+
+fn current_time_secs() -> u64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap()
+		.as_secs()
+}
+
+fn request_timeout_duration(request_timeout_ms: u64) -> Duration {
+	Duration::from_millis(request_timeout_ms)
+}
+
+fn clone_pricing_error(error: &PricingError) -> PricingError {
+	match error {
+		PricingError::PriceNotAvailable(message) => {
+			PricingError::PriceNotAvailable(message.clone())
+		},
+		PricingError::Network(message) => PricingError::Network(message.clone()),
+		PricingError::InvalidData(message) => PricingError::InvalidData(message.clone()),
+		PricingError::InvalidPairFormat(message) => {
+			PricingError::InvalidPairFormat(message.clone())
+		},
+	}
 }
 
 impl CoinGeckoPricing {
@@ -95,6 +141,14 @@ impl CoinGeckoPricing {
 			.get("rate_limit_delay_ms")
 			.and_then(|v| v.as_i64())
 			.unwrap_or(if api_key.is_some() { 100 } else { 1200 }) as u64; // Pro: 100ms, Free: 1.2s
+		let max_rate_limit_sleep_ms = config
+			.get("max_rate_limit_sleep_ms")
+			.and_then(|v| v.as_u64())
+			.unwrap_or(30_000);
+		let request_timeout_ms = config
+			.get("request_timeout_ms")
+			.and_then(|v| v.as_u64())
+			.unwrap_or(30_000);
 
 		// Build token ID map from shared defaults
 		let mut token_id_map: HashMap<String, String> = crate::DEFAULT_TOKEN_MAPPINGS
@@ -155,13 +209,16 @@ impl CoinGeckoPricing {
 		let client = Client::builder()
 			.default_headers(headers)
 			.user_agent("oif-solver/0.1.0 (https://github.com/openintentsframework/oif-solver)")
-			.timeout(Duration::from_secs(30))
 			.build()
 			.map_err(|e| PricingError::Network(format!("Failed to create HTTP client: {e}")))?;
 
 		debug!(
-			"CoinGecko pricing initialized - Base URL: {}, Cache: {}s, Rate limit: {}ms",
-			base_url, cache_duration, rate_limit_delay_ms
+			base_url = %base_url,
+			cache_duration_seconds = cache_duration,
+			rate_limit_delay_ms,
+			max_rate_limit_sleep_ms,
+			request_timeout_ms,
+			"CoinGecko pricing initialized"
 		);
 		debug!(
 			"CoinGecko token mappings: {} tokens configured",
@@ -174,67 +231,106 @@ impl CoinGeckoPricing {
 			base_url,
 			price_cache: Arc::new(RwLock::new(HashMap::new())),
 			cache_duration,
-			price_fetch_locks: Arc::new(Mutex::new(HashMap::new())),
+			in_flight_price_fetches: Arc::new(Mutex::new(HashMap::new())),
 			token_id_map,
 			custom_prices,
 			rate_limit_delay_ms,
+			max_rate_limit_sleep_ms,
+			request_timeout_ms,
 			next_api_call_at_ms: Arc::new(Mutex::new(0)),
 		})
 	}
 
 	/// Apply rate limiting
-	async fn apply_rate_limit(&self) {
-		let delay_ms = {
-			let mut next_api_call_at_ms = self.next_api_call_at_ms.lock().await;
-			let now = SystemTime::now()
-				.duration_since(UNIX_EPOCH)
-				.unwrap()
-				.as_millis() as u64;
-			let scheduled_at = (*next_api_call_at_ms).max(now);
-			*next_api_call_at_ms = scheduled_at.saturating_add(self.rate_limit_delay_ms);
-			scheduled_at.saturating_sub(now)
-		};
+	async fn apply_rate_limit(&self) -> Result<(), PricingError> {
+		let mut next_api_call_at_ms = self.next_api_call_at_ms.lock().await;
+		let now = current_time_ms();
+		let scheduled_at = (*next_api_call_at_ms).max(now);
+		let delay_ms = scheduled_at.saturating_sub(now);
+
+		if delay_ms > self.max_rate_limit_sleep_ms {
+			return Err(PricingError::Network(format!(
+				"CoinGecko rate limit delay {delay_ms}ms exceeds configured maximum {}ms",
+				self.max_rate_limit_sleep_ms
+			)));
+		}
 
 		if delay_ms > 0 {
 			tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 		}
+
+		let issued_at = current_time_ms().max(scheduled_at);
+		*next_api_call_at_ms = issued_at.saturating_add(self.rate_limit_delay_ms);
+		Ok(())
 	}
 
-	async fn get_cached_price_if_fresh(&self, cache_key: &str) -> Option<String> {
+	async fn get_cached_price_if_fresh(
+		&self,
+		cache_key: &str,
+	) -> Result<Option<String>, PricingError> {
 		let cache = self.price_cache.read().await;
-		let entry = cache.get(cache_key)?;
-		let now = SystemTime::now()
-			.duration_since(UNIX_EPOCH)
-			.unwrap()
-			.as_secs();
-		if now.saturating_sub(entry.timestamp) < self.cache_duration {
-			debug!("Using cached price for {}: ${}", cache_key, entry.price);
-			return Some(entry.price.clone());
+		let Some(entry) = cache.get(cache_key) else {
+			return Ok(None);
+		};
+		let now = current_time_secs();
+		match entry {
+			PriceCacheEntry::Success { price, timestamp }
+				if now.saturating_sub(*timestamp) < self.cache_duration =>
+			{
+				debug!("Using cached price for {}: ${}", cache_key, price);
+				Ok(Some(price.clone()))
+			},
+			PriceCacheEntry::Failure { error, timestamp }
+				if now.saturating_sub(*timestamp) < NEGATIVE_CACHE_DURATION_SECONDS =>
+			{
+				Err(clone_pricing_error(error.as_ref()))
+			},
+			_ => Ok(None),
 		}
-
-		None
 	}
 
 	async fn cache_price(&self, cache_key: &str, price: String) {
 		let mut cache = self.price_cache.write().await;
 		cache.insert(
 			cache_key.to_string(),
-			PriceCacheEntry {
+			PriceCacheEntry::Success {
 				price,
-				timestamp: SystemTime::now()
-					.duration_since(UNIX_EPOCH)
-					.unwrap()
-					.as_secs(),
+				timestamp: current_time_secs(),
 			},
 		);
 	}
 
-	async fn get_price_fetch_lock(&self, cache_key: &str) -> Arc<Mutex<()>> {
-		let mut locks = self.price_fetch_locks.lock().await;
-		locks
-			.entry(cache_key.to_string())
-			.or_insert_with(|| Arc::new(Mutex::new(())))
-			.clone()
+	async fn cache_failure(&self, cache_key: &str, error: Arc<PricingError>) {
+		let mut cache = self.price_cache.write().await;
+		cache.insert(
+			cache_key.to_string(),
+			PriceCacheEntry::Failure {
+				error,
+				timestamp: current_time_secs(),
+			},
+		);
+	}
+
+	async fn get_in_flight_price_fetch(&self, cache_key: &str) -> InFlightPriceFetch {
+		let mut in_flight = self.in_flight_price_fetches.lock().await;
+		match in_flight.get(cache_key) {
+			Some(fetch) if fetch.get().is_none() => fetch.clone(),
+			_ => {
+				let fetch = Arc::new(OnceCell::new());
+				in_flight.insert(cache_key.to_string(), fetch.clone());
+				fetch
+			},
+		}
+	}
+
+	async fn remove_in_flight_price_fetch(&self, cache_key: &str, fetch: &InFlightPriceFetch) {
+		let mut in_flight = self.in_flight_price_fetches.lock().await;
+		if in_flight
+			.get(cache_key)
+			.is_some_and(|existing| Arc::ptr_eq(existing, fetch))
+		{
+			in_flight.remove(cache_key);
+		}
 	}
 
 	/// Get CoinGecko ID for a token symbol
@@ -253,7 +349,25 @@ impl CoinGeckoPricing {
 		ids: Vec<String>,
 		vs_currencies: Vec<String>,
 	) -> Result<SimplePriceResponse, PricingError> {
-		self.apply_rate_limit().await;
+		tokio::time::timeout(
+			request_timeout_duration(self.request_timeout_ms),
+			self.fetch_prices_inner(ids, vs_currencies),
+		)
+		.await
+		.map_err(|_| {
+			PricingError::Network(format!(
+				"CoinGecko request timed out after {}ms",
+				self.request_timeout_ms
+			))
+		})?
+	}
+
+	async fn fetch_prices_inner(
+		&self,
+		ids: Vec<String>,
+		vs_currencies: Vec<String>,
+	) -> Result<SimplePriceResponse, PricingError> {
+		self.apply_rate_limit().await?;
 
 		let ids_param = ids.join(",");
 		let vs_currencies_param = vs_currencies.join(",");
@@ -291,7 +405,7 @@ impl CoinGeckoPricing {
 		let cache_key = format!("{}/{}", token.to_uppercase(), vs_currency.to_uppercase());
 
 		// Check cache first
-		if let Some(price) = self.get_cached_price_if_fresh(&cache_key).await {
+		if let Some(price) = self.get_cached_price_if_fresh(&cache_key).await? {
 			return Ok(price);
 		}
 
@@ -313,35 +427,58 @@ impl CoinGeckoPricing {
 			return Ok(custom_price.clone());
 		}
 
-		let fetch_lock = self.get_price_fetch_lock(&cache_key).await;
-		let _fetch_guard = fetch_lock.lock().await;
-
-		// Another task may have fetched this price while we waited for the
-		// per-key lock, so check the cache again before going to CoinGecko.
-		if let Some(price) = self.get_cached_price_if_fresh(&cache_key).await {
+		// Another task may have fetched this price while we validated the token,
+		// so check the cache again before joining or creating an upstream request.
+		if let Some(price) = self.get_cached_price_if_fresh(&cache_key).await? {
 			return Ok(price);
 		}
 
-		// Fetch from API
 		let coingecko_id = self
 			.get_coingecko_id(token)
 			.ok_or_else(|| PricingError::PriceNotAvailable(format!("Unknown token: {token}")))?;
 
-		let response = self
-			.fetch_prices(vec![coingecko_id.clone()], vec!["usd".to_string()])
-			.await?;
+		let in_flight_fetch = self.get_in_flight_price_fetch(&cache_key).await;
+		let shared_result = in_flight_fetch
+			.get_or_init(|| async {
+				let response = match self
+					.fetch_prices(vec![coingecko_id.clone()], vec!["usd".to_string()])
+					.await
+				{
+					Ok(response) => response,
+					Err(error) => {
+						let error = Arc::new(error);
+						self.cache_failure(&cache_key, error.clone()).await;
+						return Err(error);
+					},
+				};
 
-		let price = response
-			.prices
-			.get(&coingecko_id)
-			.and_then(|prices| prices.get("usd"))
-			.ok_or_else(|| PricingError::PriceNotAvailable(format!("{token}/USD")))?;
+				let price = match response
+					.prices
+					.get(&coingecko_id)
+					.and_then(|prices| prices.get("usd"))
+				{
+					Some(price) => price,
+					None => {
+						let error =
+							Arc::new(PricingError::PriceNotAvailable(format!("{token}/USD")));
+						self.cache_failure(&cache_key, error.clone()).await;
+						return Err(error);
+					},
+				};
 
-		let price_str = price.to_string();
-		self.cache_price(&cache_key, price_str.clone()).await;
+				let price_str = price.to_string();
+				self.cache_price(&cache_key, price_str.clone()).await;
 
-		debug!("Fetched and cached price for {}: ${}", cache_key, price_str);
-		Ok(price_str)
+				debug!("Fetched and cached price for {}: ${}", cache_key, price_str);
+				Ok(price_str)
+			})
+			.await
+			.clone();
+
+		self.remove_in_flight_price_fetch(&cache_key, &in_flight_fetch)
+			.await;
+
+		shared_result.map_err(|error| clone_pricing_error(error.as_ref()))
 	}
 
 	/// Get price for a trading pair
@@ -548,6 +685,28 @@ impl ConfigSchema for CoinGeckoConfigSchema {
 			}
 		}
 
+		// Optional maximum rate-limit sleep
+		if let Some(delay) = config.get("max_rate_limit_sleep_ms") {
+			if delay.as_u64().is_none() {
+				return Err(ValidationError::TypeMismatch {
+					field: "max_rate_limit_sleep_ms".to_string(),
+					expected: "non-negative integer".to_string(),
+					actual: format!("{delay:?}"),
+				});
+			}
+		}
+
+		// Optional request timeout
+		if let Some(timeout) = config.get("request_timeout_ms") {
+			if timeout.as_u64().is_none_or(|value| value == 0) {
+				return Err(ValidationError::TypeMismatch {
+					field: "request_timeout_ms".to_string(),
+					expected: "positive integer".to_string(),
+					actual: format!("{timeout:?}"),
+				});
+			}
+		}
+
 		// Optional token_id_map
 		if let Some(token_map) = config.get("token_id_map") {
 			if let Some(table) = token_map.as_object() {
@@ -652,6 +811,13 @@ mod tests {
 		assert_eq!(pricing.base_url, "https://api.coingecko.com/api/v3");
 		assert_eq!(pricing.cache_duration, 60);
 		assert_eq!(pricing.rate_limit_delay_ms, 1200);
+		assert_eq!(pricing.max_rate_limit_sleep_ms, 30_000);
+		assert_eq!(pricing.request_timeout_ms, 30_000);
+	}
+
+	#[test]
+	fn test_request_timeout_duration_honors_extended_timeout() {
+		assert_eq!(request_timeout_duration(45_000), Duration::from_secs(45));
 	}
 
 	#[test]
@@ -758,6 +924,276 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn test_concurrent_failed_cold_misses_share_single_fetch_and_failure_cache() {
+		let server = MockServer::start().await;
+		Mock::given(method("GET"))
+			.and(path("/simple/price"))
+			.and(query_param("ids", "ethereum"))
+			.and(query_param("vs_currencies", "usd"))
+			.respond_with(
+				ResponseTemplate::new(500)
+					.set_delay(Duration::from_millis(50))
+					.set_body_string("upstream unavailable"),
+			)
+			.mount(&server)
+			.await;
+
+		let pricing = Arc::new(
+			CoinGeckoPricing::new(&serde_json::json!({
+				"base_url": server.uri(),
+				"cache_duration_seconds": 60,
+				"rate_limit_delay_ms": 0
+			}))
+			.unwrap(),
+		);
+
+		let mut handles = Vec::new();
+		for _ in 0..3 {
+			let pricing = pricing.clone();
+			handles.push(tokio::spawn(async move {
+				pricing.get_price("ETH", "USD").await
+			}));
+		}
+
+		for handle in handles {
+			assert!(matches!(
+				handle.await.unwrap(),
+				Err(PricingError::Network(_))
+			));
+		}
+
+		assert!(matches!(
+			pricing.get_price("ETH", "USD").await,
+			Err(PricingError::Network(_))
+		));
+
+		let requests = server.received_requests().await.unwrap();
+		assert_eq!(
+			requests.len(),
+			1,
+			"failed same-pair burst should share one upstream request and cache the failure briefly"
+		);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn test_cancelled_rate_limit_sleep_does_not_reserve_future_slot() {
+		let pricing = Arc::new(
+			CoinGeckoPricing::new(&serde_json::json!({
+				"cache_duration_seconds": 60,
+				"rate_limit_delay_ms": 150
+			}))
+			.unwrap(),
+		);
+
+		pricing.apply_rate_limit().await.unwrap();
+
+		let cancellable_pricing = pricing.clone();
+		let cancellable = tokio::spawn(async move {
+			cancellable_pricing.apply_rate_limit().await.unwrap();
+		});
+
+		tokio::time::sleep(Duration::from_millis(20)).await;
+		cancellable.abort();
+		let _ = cancellable.await;
+
+		tokio::time::sleep(Duration::from_millis(170)).await;
+
+		let result =
+			tokio::time::timeout(Duration::from_millis(60), pricing.apply_rate_limit()).await;
+		assert!(
+			matches!(result, Ok(Ok(()))),
+			"cancelling a sleeping limiter task must not push the global schedule forward"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_rate_limit_sleep_cap_returns_error_without_sleeping() {
+		let server = MockServer::start().await;
+		Mock::given(method("GET"))
+			.and(path("/simple/price"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+				"ethereum": {
+					"usd": 2120.06
+				},
+				"bitcoin": {
+					"usd": 65000
+				}
+			})))
+			.mount(&server)
+			.await;
+
+		let pricing = CoinGeckoPricing::new(&serde_json::json!({
+			"base_url": server.uri(),
+			"rate_limit_delay_ms": 200,
+			"max_rate_limit_sleep_ms": 50
+		}))
+		.unwrap();
+
+		pricing
+			.fetch_prices(vec!["ethereum".to_string()], vec!["usd".to_string()])
+			.await
+			.unwrap();
+
+		let result = tokio::time::timeout(
+			Duration::from_millis(80),
+			pricing.fetch_prices(vec!["bitcoin".to_string()], vec!["usd".to_string()]),
+		)
+		.await;
+
+		assert!(matches!(
+			result,
+			Ok(Err(PricingError::Network(message))) if message.contains("rate limit")
+		));
+	}
+
+	#[tokio::test]
+	async fn test_fetch_timeout_bounds_http_stalls() {
+		let server = MockServer::start().await;
+		Mock::given(method("GET"))
+			.and(path("/simple/price"))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_delay(Duration::from_millis(200))
+					.set_body_json(serde_json::json!({
+						"ethereum": {
+							"usd": 2120.06
+						}
+					})),
+			)
+			.mount(&server)
+			.await;
+
+		let pricing = CoinGeckoPricing::new(&serde_json::json!({
+			"base_url": server.uri(),
+			"rate_limit_delay_ms": 0,
+			"request_timeout_ms": 50
+		}))
+		.unwrap();
+
+		let result = tokio::time::timeout(
+			Duration::from_millis(100),
+			pricing.fetch_prices(vec!["ethereum".to_string()], vec!["usd".to_string()]),
+		)
+		.await;
+
+		assert!(matches!(
+			result,
+			Ok(Err(PricingError::Network(message))) if message.contains("timed out")
+		));
+	}
+
+	#[tokio::test]
+	async fn test_pricing_service_fallback_engages_after_coingecko_timeout_for_same_pair_waiters() {
+		let server = MockServer::start().await;
+		Mock::given(method("GET"))
+			.and(path("/simple/price"))
+			.and(query_param("ids", "ethereum"))
+			.and(query_param("vs_currencies", "usd"))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_delay(Duration::from_millis(200))
+					.set_body_json(serde_json::json!({
+						"ethereum": {
+							"usd": 2120.06
+						}
+					})),
+			)
+			.mount(&server)
+			.await;
+
+		let primary = Box::new(
+			CoinGeckoPricing::new(&serde_json::json!({
+				"base_url": server.uri(),
+				"rate_limit_delay_ms": 0,
+				"request_timeout_ms": 50
+			}))
+			.unwrap(),
+		);
+		let fallback = crate::implementations::mock::create_mock_pricing(&serde_json::json!({
+			"pair_prices": {
+				"ETH/USD": "3000"
+			}
+		}))
+		.unwrap();
+		let service = Arc::new(crate::PricingService::new(primary, vec![fallback]));
+
+		let first = {
+			let service = service.clone();
+			tokio::spawn(async move { service.convert_asset("ETH", "USD", "1").await })
+		};
+		let second = {
+			let service = service.clone();
+			tokio::spawn(async move { service.convert_asset("ETH", "USD", "1").await })
+		};
+
+		let results = tokio::time::timeout(Duration::from_millis(300), async {
+			(first.await.unwrap(), second.await.unwrap())
+		})
+		.await
+		.unwrap();
+
+		assert_eq!(results.0.unwrap(), "3000");
+		assert_eq!(results.1.unwrap(), "3000");
+
+		let requests = server.received_requests().await.unwrap();
+		assert_eq!(
+			requests.len(),
+			1,
+			"same-pair timeout waiters should share one CoinGecko attempt before fallback"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_stale_completed_in_flight_entry_does_not_bypass_cache_ttl() {
+		let server = MockServer::start().await;
+		Mock::given(method("GET"))
+			.and(path("/simple/price"))
+			.and(query_param("ids", "ethereum"))
+			.and(query_param("vs_currencies", "usd"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+				"ethereum": {
+					"usd": 2222
+				}
+			})))
+			.mount(&server)
+			.await;
+
+		let pricing = CoinGeckoPricing::new(&serde_json::json!({
+			"base_url": server.uri(),
+			"cache_duration_seconds": 1,
+			"rate_limit_delay_ms": 0
+		}))
+		.unwrap();
+		let cache_key = "ETH/USD";
+
+		pricing.price_cache.write().await.insert(
+			cache_key.to_string(),
+			PriceCacheEntry::Success {
+				price: "1111".to_string(),
+				timestamp: 0,
+			},
+		);
+
+		let completed_fetch = Arc::new(OnceCell::new());
+		completed_fetch.set(Ok("1111".to_string())).unwrap();
+		pricing
+			.in_flight_price_fetches
+			.lock()
+			.await
+			.insert(cache_key.to_string(), completed_fetch);
+
+		let price = pricing.get_price("ETH", "USD").await.unwrap();
+
+		assert_eq!(price, "2222");
+		let requests = server.received_requests().await.unwrap();
+		assert_eq!(
+			requests.len(),
+			1,
+			"completed in-flight entries left by cancellation must not outlive cache TTL"
+		);
+	}
+
+	#[tokio::test]
 	async fn test_get_price_non_usd_fails() {
 		let pricing = CoinGeckoPricing::new(&minimal_config()).unwrap();
 		let result = pricing.get_price("ETH", "EUR").await;
@@ -836,13 +1272,42 @@ mod tests {
 	}
 
 	#[test]
+	fn test_config_schema_rejects_negative_timeout_controls() {
+		let schema = CoinGeckoConfigSchema;
+
+		assert!(schema
+			.validate(&serde_json::json!({
+				"max_rate_limit_sleep_ms": -1
+			}))
+			.is_err());
+		assert!(schema
+			.validate(&serde_json::json!({
+				"request_timeout_ms": -1
+			}))
+			.is_err());
+		assert!(schema
+			.validate(&serde_json::json!({
+				"request_timeout_ms": 0
+			}))
+			.is_err());
+		assert!(schema
+			.validate(&serde_json::json!({
+				"request_timeout_ms": 1
+			}))
+			.is_ok());
+	}
+
+	#[test]
 	fn test_price_cache_entry() {
-		let entry = PriceCacheEntry {
+		let entry = PriceCacheEntry::Success {
 			price: "2500.0".to_string(),
 			timestamp: 1234567890,
 		};
 		let cloned = entry.clone();
-		assert_eq!(entry.price, cloned.price);
-		assert_eq!(entry.timestamp, cloned.timestamp);
+		assert!(matches!(
+			cloned,
+			PriceCacheEntry::Success { price, timestamp }
+				if price == "2500.0" && timestamp == 1234567890
+		));
 	}
 }
