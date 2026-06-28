@@ -172,7 +172,7 @@ Bootstrap config specifies which networks your solver will support. Networks can
 | `admin.withdrawals.enabled` | No | Enables `POST /api/v1/admin/withdrawals`. Defaults to `false`. |
 | `admin.withdrawals.recipient_allowlist` | No | Pre-approved admin withdrawal recipients. Empty or omitted preserves previous behavior and permits any recipient; non-empty requires each withdrawal recipient to match one listed address exactly. |
 | `settlement.type` | No | `"hyperlane"` (default), `"direct"`, or `"broadcaster"` |
-| `settlement.hyperlane` | Conditional | Required for non-seeded chains when `settlement.type = "hyperlane"` |
+| `settlement.hyperlane` | Conditional | Required for non-seeded chains when `settlement.type = "hyperlane"`; include `mailboxes`, `igp_addresses`, `domains`, and oracle maps for every configured chain |
 | `settlement.direct` | Conditional | Required when `settlement.type = "direct"` |
 | `settlement.broadcaster` | Conditional | Required when `settlement.type = "broadcaster"` |
 

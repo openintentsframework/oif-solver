@@ -1,7 +1,7 @@
 use crate::{
 	current_timestamp, Address, Transaction, TransactionHash, TransactionReceipt, TransactionType,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -24,10 +24,49 @@ impl TransactionAttemptStatus {
 	}
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum TransactionAttemptScope {
+	Order { order_id: String },
+	System { scope_id: String },
+}
+
+impl TransactionAttemptScope {
+	pub fn order(order_id: impl Into<String>) -> Self {
+		Self::Order {
+			order_id: order_id.into(),
+		}
+	}
+
+	pub fn system(scope_id: impl Into<String>) -> Self {
+		Self::System {
+			scope_id: scope_id.into(),
+		}
+	}
+
+	pub fn scope_id(&self) -> &str {
+		match self {
+			Self::Order { order_id } => order_id,
+			Self::System { scope_id } => scope_id,
+		}
+	}
+
+	pub fn order_id(&self) -> Option<&str> {
+		match self {
+			Self::Order { order_id } => Some(order_id),
+			Self::System { .. } => None,
+		}
+	}
+
+	pub fn is_system(&self) -> bool {
+		matches!(self, Self::System { .. })
+	}
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TransactionAttempt {
 	pub id: String,
-	pub order_id: String,
+	pub scope: TransactionAttemptScope,
 	pub signer: Option<Address>,
 	pub tx_type: TransactionType,
 	pub chain_id: u64,
@@ -49,10 +88,66 @@ pub struct TransactionAttempt {
 	pub replaced_by: Option<String>,
 }
 
+impl<'de> Deserialize<'de> for TransactionAttempt {
+	fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+	where
+		D: Deserializer<'de>,
+	{
+		#[derive(Deserialize)]
+		struct TransactionAttemptWire {
+			id: String,
+			scope: Option<TransactionAttemptScope>,
+			order_id: Option<String>,
+			signer: Option<Address>,
+			tx_type: TransactionType,
+			chain_id: u64,
+			nonce: Option<u64>,
+			tx_hash: Option<TransactionHash>,
+			receipt: Option<TransactionReceipt>,
+			tx: Transaction,
+			status: TransactionAttemptStatus,
+			error: Option<String>,
+			created_at: u64,
+			updated_at: u64,
+			#[serde(default)]
+			replacement_of: Option<String>,
+			#[serde(default)]
+			replaced_by: Option<String>,
+		}
+
+		let wire = TransactionAttemptWire::deserialize(deserializer)?;
+		let scope = match (wire.scope, wire.order_id) {
+			(Some(scope), _) => scope,
+			(None, Some(order_id)) => TransactionAttemptScope::order(order_id),
+			(None, None) => {
+				return Err(serde::de::Error::missing_field("scope"));
+			},
+		};
+
+		Ok(Self {
+			id: wire.id,
+			scope,
+			signer: wire.signer,
+			tx_type: wire.tx_type,
+			chain_id: wire.chain_id,
+			nonce: wire.nonce,
+			tx_hash: wire.tx_hash,
+			receipt: wire.receipt,
+			tx: wire.tx,
+			status: wire.status,
+			error: wire.error,
+			created_at: wire.created_at,
+			updated_at: wire.updated_at,
+			replacement_of: wire.replacement_of,
+			replaced_by: wire.replaced_by,
+		})
+	}
+}
+
 impl TransactionAttempt {
 	pub fn planned(
 		id: String,
-		order_id: String,
+		scope: TransactionAttemptScope,
 		signer: Option<Address>,
 		tx_type: TransactionType,
 		tx: Transaction,
@@ -60,7 +155,7 @@ impl TransactionAttempt {
 		let now = current_timestamp();
 		Self {
 			id,
-			order_id,
+			scope,
 			signer,
 			tx_type,
 			chain_id: tx.chain_id,
@@ -79,6 +174,14 @@ impl TransactionAttempt {
 
 	pub fn is_terminal(&self) -> bool {
 		self.status.is_terminal()
+	}
+
+	pub fn order_id(&self) -> Option<&str> {
+		self.scope.order_id()
+	}
+
+	pub fn scope_id(&self) -> &str {
+		self.scope.scope_id()
 	}
 }
 
@@ -106,14 +209,14 @@ mod tests {
 	fn planned_attempt_copies_tx_metadata() {
 		let attempt = TransactionAttempt::planned(
 			"attempt-1".to_string(),
-			"order-1".to_string(),
+			TransactionAttemptScope::order("order-1"),
 			Some(Address(vec![9; 20])),
 			TransactionType::Fill,
 			sample_tx(),
 		);
 
 		assert_eq!(attempt.id, "attempt-1");
-		assert_eq!(attempt.order_id, "order-1");
+		assert_eq!(attempt.order_id(), Some("order-1"));
 		assert_eq!(attempt.signer, Some(Address(vec![9; 20])));
 		assert_eq!(attempt.tx_type, TransactionType::Fill);
 		assert_eq!(attempt.chain_id, 10);
@@ -148,7 +251,7 @@ mod tests {
 	fn attempt_round_trips_through_json() {
 		let mut attempt = TransactionAttempt::planned(
 			"attempt-1".to_string(),
-			"order-1".to_string(),
+			TransactionAttemptScope::order("order-1"),
 			Some(Address(vec![9; 20])),
 			TransactionType::Fill,
 			sample_tx(),
@@ -173,7 +276,7 @@ mod tests {
 		let decoded: TransactionAttempt = serde_json::from_str(&json).unwrap();
 
 		assert_eq!(decoded.id, attempt.id);
-		assert_eq!(decoded.order_id, attempt.order_id);
+		assert_eq!(decoded.scope, attempt.scope);
 		assert_eq!(decoded.signer, attempt.signer);
 		assert_eq!(decoded.tx_type, attempt.tx_type);
 		assert_eq!(decoded.chain_id, attempt.chain_id);
@@ -196,7 +299,7 @@ mod tests {
 	fn replaced_attempt_is_terminal() {
 		let mut a = TransactionAttempt::planned(
 			"x".into(),
-			"order-1".into(),
+			TransactionAttemptScope::order("order-1"),
 			Some(Address(vec![9; 20])),
 			TransactionType::Fill,
 			sample_tx(),
@@ -209,7 +312,7 @@ mod tests {
 	fn lineage_fields_default_to_none_on_planned() {
 		let a = TransactionAttempt::planned(
 			"x".into(),
-			"order-1".into(),
+			TransactionAttemptScope::order("order-1"),
 			Some(Address(vec![9; 20])),
 			TransactionType::Fill,
 			sample_tx(),
@@ -244,6 +347,8 @@ mod tests {
 			"updated_at": 0
 		}"#;
 		let a: TransactionAttempt = serde_json::from_str(json).unwrap();
+		assert_eq!(a.scope, TransactionAttemptScope::order("o"));
+		assert_eq!(a.order_id(), Some("o"));
 		assert!(a.replacement_of.is_none());
 		assert!(a.replaced_by.is_none());
 	}

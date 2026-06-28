@@ -271,6 +271,10 @@ pub struct HyperlaneSettlementOverride {
 	#[serde(default)]
 	pub igp_addresses: HashMap<u64, Address>,
 
+	/// Hyperlane domains by canonical chain ID.
+	#[serde(default)]
+	pub domains: HashMap<u64, u32>,
+
 	/// Oracle maps.
 	#[serde(default)]
 	pub oracles: OracleOverrides,

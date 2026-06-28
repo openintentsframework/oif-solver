@@ -44,6 +44,10 @@ fn stage_hash(order: &Order, tx_type: TransactionType) -> Option<&TransactionHas
 		TransactionType::PostFill => order.post_fill_tx_hash.as_ref(),
 		TransactionType::PreClaim => order.pre_claim_tx_hash.as_ref(),
 		TransactionType::Claim => order.claim_tx_hash.as_ref(),
+		TransactionType::Approval
+		| TransactionType::Withdrawal
+		| TransactionType::Bridge
+		| TransactionType::Pusher => None,
 	}
 }
 
@@ -54,6 +58,10 @@ fn set_stage_hash(order: &mut Order, tx_type: TransactionType, tx_hash: Transact
 		TransactionType::PostFill => order.post_fill_tx_hash = Some(tx_hash),
 		TransactionType::PreClaim => order.pre_claim_tx_hash = Some(tx_hash),
 		TransactionType::Claim => order.claim_tx_hash = Some(tx_hash),
+		TransactionType::Approval
+		| TransactionType::Withdrawal
+		| TransactionType::Bridge
+		| TransactionType::Pusher => {},
 	}
 }
 
@@ -201,6 +209,16 @@ impl TransactionHandler {
 			return Ok(());
 		}
 
+		if matches!(
+			tx_type,
+			TransactionType::Approval
+				| TransactionType::Withdrawal
+				| TransactionType::Bridge
+				| TransactionType::Pusher
+		) {
+			return Ok(());
+		}
+
 		// Retrieve the order for confirmation handling.
 		let order: Order = self
 			.storage
@@ -230,6 +248,10 @@ impl TransactionHandler {
 			TransactionType::Claim => {
 				self.handle_claim_confirmed(tx_hash, order).await?;
 			},
+			TransactionType::Approval
+			| TransactionType::Withdrawal
+			| TransactionType::Bridge
+			| TransactionType::Pusher => {},
 		}
 
 		// For PostFill and PreClaim, run settlement-specific receipt post-processing
@@ -688,6 +710,24 @@ mod tests {
 			},
 			_ => panic!("Expected TransactionFailed event"),
 		}
+	}
+
+	#[tokio::test]
+	async fn system_confirmation_returns_before_order_lookup() {
+		let (handler, _receiver) = create_test_handler_with_mocks(|_storage| {
+			// No expectations needed for system-scoped confirmations.
+		})
+		.await;
+
+		handler
+			.handle_confirmed(
+				"system:approval:1:token:spender".to_string(),
+				create_test_tx_hash(),
+				TransactionType::Approval,
+				create_test_receipt(true),
+			)
+			.await
+			.unwrap();
 	}
 
 	#[tokio::test]

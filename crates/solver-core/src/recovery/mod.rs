@@ -151,6 +151,10 @@ fn order_stage_hash(order: &Order, tx_type: TransactionType) -> Option<Transacti
 		TransactionType::PostFill => order.post_fill_tx_hash.clone(),
 		TransactionType::PreClaim => order.pre_claim_tx_hash.clone(),
 		TransactionType::Claim => order.claim_tx_hash.clone(),
+		TransactionType::Approval
+		| TransactionType::Withdrawal
+		| TransactionType::Bridge
+		| TransactionType::Pusher => None,
 	}
 }
 
@@ -173,6 +177,10 @@ fn set_order_stage_hash(order: &mut Order, tx_type: TransactionType, tx_hash: Tr
 		TransactionType::PostFill => order.post_fill_tx_hash = Some(tx_hash),
 		TransactionType::PreClaim => order.pre_claim_tx_hash = Some(tx_hash),
 		TransactionType::Claim => order.claim_tx_hash = Some(tx_hash),
+		TransactionType::Approval
+		| TransactionType::Withdrawal
+		| TransactionType::Bridge
+		| TransactionType::Pusher => {},
 	}
 }
 
@@ -408,7 +416,9 @@ impl RecoveryService {
 		receipt: &TransactionReceipt,
 	) {
 		match self.attempt_store.attempt_by_hash(tx_hash).await {
-			Ok(Some(attempt)) if attempt.order_id == order_id && attempt.tx_type == tx_type => {
+			Ok(Some(attempt))
+				if attempt.order_id() == Some(order_id) && attempt.tx_type == tx_type =>
+			{
 				if let Err(error) = self
 					.attempt_store
 					.mark_attempt_confirmed_from_receipt(
@@ -445,7 +455,7 @@ impl RecoveryService {
 				tracing::debug!(
 					%order_id,
 					attempt_id = %attempt.id,
-					attempt_order_id = %attempt.order_id,
+					attempt_scope_id = %attempt.scope_id(),
 					attempt_tx_type = ?attempt.tx_type,
 					expected_tx_type = ?tx_type,
 					?tx_hash,
@@ -845,6 +855,18 @@ impl RecoveryService {
 					"StageComplete classification on stage with no chain-probe support; treating as Failed"
 				);
 				ReconcileResult::Failed(tx_type)
+			},
+			TransactionType::Approval
+			| TransactionType::Withdrawal
+			| TransactionType::Bridge
+			| TransactionType::Pusher => {
+				tracing::warn!(
+					order_id = %order.id,
+					?tx_type,
+					?reason,
+					"StageComplete classification on system transaction type in order recovery; returning Unknown"
+				);
+				ReconcileResult::Unknown
 			},
 		}
 	}
@@ -2022,7 +2044,7 @@ mod tests {
 	) -> TransactionAttempt {
 		let mut attempt = TransactionAttempt::planned(
 			id.to_string(),
-			"test_order_123".to_string(),
+			solver_types::TransactionAttemptScope::order("test_order_123"),
 			Some(Address(vec![9; 20])),
 			tx_type,
 			Transaction {

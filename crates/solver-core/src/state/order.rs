@@ -392,6 +392,10 @@ impl OrderStateMachine {
 			TransactionType::PostFill => order.post_fill_tx_hash = Some(tx_hash.clone()),
 			TransactionType::PreClaim => order.pre_claim_tx_hash = Some(tx_hash.clone()),
 			TransactionType::Claim => order.claim_tx_hash = Some(tx_hash.clone()),
+			TransactionType::Approval
+			| TransactionType::Withdrawal
+			| TransactionType::Bridge
+			| TransactionType::Pusher => {},
 		})
 		.await
 	}

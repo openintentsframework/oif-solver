@@ -96,6 +96,82 @@ impl TransactionBumpService {
 		Ok(())
 	}
 
+	fn bucket_by_tx_type(
+		attempts: Vec<TransactionAttempt>,
+	) -> Vec<(TransactionType, Vec<TransactionAttempt>)> {
+		let mut buckets: Vec<(TransactionType, Vec<TransactionAttempt>)> = Vec::new();
+		for attempt in attempts {
+			if let Some(bucket) = buckets.iter_mut().find(|(t, _)| *t == attempt.tx_type) {
+				bucket.1.push(attempt);
+			} else {
+				buckets.push((attempt.tx_type, vec![attempt]));
+			}
+		}
+		buckets
+	}
+
+	fn bucket_by_chain_and_type(
+		attempts: Vec<TransactionAttempt>,
+	) -> Vec<((u64, TransactionType), Vec<TransactionAttempt>)> {
+		let mut by_chain_and_type: Vec<((u64, TransactionType), Vec<TransactionAttempt>)> =
+			Vec::new();
+		for attempt in attempts {
+			if let Some(slot) = by_chain_and_type
+				.iter_mut()
+				.find(|((cid, t), _)| *cid == attempt.chain_id && *t == attempt.tx_type)
+			{
+				slot.1.push(attempt);
+			} else {
+				by_chain_and_type.push(((attempt.chain_id, attempt.tx_type), vec![attempt]));
+			}
+		}
+		by_chain_and_type
+	}
+
+	fn active_system_scope_ids(attempts: Vec<TransactionAttempt>) -> Vec<String> {
+		let mut scope_ids = Vec::new();
+		for attempt in attempts {
+			let solver_types::TransactionAttemptScope::System { scope_id } = attempt.scope else {
+				continue;
+			};
+			if !scope_ids.iter().any(|seen| seen == &scope_id) {
+				scope_ids.push(scope_id);
+			}
+		}
+		scope_ids
+	}
+
+	async fn reconcile_attempts(&self, attempts: Vec<TransactionAttempt>) {
+		for (_tx_type, group) in Self::bucket_by_tx_type(attempts) {
+			for component in lineage_components(&group) {
+				if !has_confirmed_member(&component) {
+					continue;
+				}
+				let winner_id = component
+					.iter()
+					.find(|a| a.status == TransactionAttemptStatus::Confirmed)
+					.map(|a| a.id.clone())
+					.unwrap();
+				for member in component {
+					if member.is_terminal() {
+						continue;
+					}
+					let _ = self
+						.attempt_store
+						.update_attempt_status(
+							&member.id,
+							TransactionAttemptStatus::Replaced,
+							Some(format!("superseded by {winner_id}")),
+							|_| {},
+						)
+						.await;
+					// CAS conflict (member transitioned mid-call) is
+					// a no-op — next tick re-evaluates.
+				}
+			}
+		}
+	}
+
 	async fn phase_1_reconcile(&self) -> Result<(), BumpError> {
 		let active_orders = load_active_order_ids(&self.storage).await?;
 		for order_id in active_orders {
@@ -105,46 +181,20 @@ impl TransactionBumpService {
 				.await
 				.map_err(|e| BumpError::Storage(e.to_string()))?;
 
-			// Bucket by tx_type. `TransactionType` is `Copy + PartialEq` but
-			// not `Hash + Eq`, so we use a `Vec` of buckets instead of a
-			// `HashMap` keyed by `TransactionType`.
-			let mut buckets: Vec<(TransactionType, Vec<TransactionAttempt>)> = Vec::new();
-			for a in attempts {
-				if let Some(bucket) = buckets.iter_mut().find(|(t, _)| *t == a.tx_type) {
-					bucket.1.push(a);
-				} else {
-					buckets.push((a.tx_type, vec![a]));
-				}
-			}
-
-			for (_tx_type, group) in buckets {
-				for component in lineage_components(&group) {
-					if !has_confirmed_member(&component) {
-						continue;
-					}
-					let winner_id = component
-						.iter()
-						.find(|a| a.status == TransactionAttemptStatus::Confirmed)
-						.map(|a| a.id.clone())
-						.unwrap();
-					for member in component {
-						if member.is_terminal() {
-							continue;
-						}
-						let _ = self
-							.attempt_store
-							.update_attempt_status(
-								&member.id,
-								TransactionAttemptStatus::Replaced,
-								Some(format!("superseded by {winner_id}")),
-								|_| {},
-							)
-							.await;
-						// CAS conflict (member transitioned mid-call) is
-						// a no-op — next tick re-evaluates.
-					}
-				}
-			}
+			self.reconcile_attempts(attempts).await;
+		}
+		let active_system_attempts = self
+			.attempt_store
+			.non_terminal_system_attempts()
+			.await
+			.map_err(|e| BumpError::Storage(e.to_string()))?;
+		for scope_id in Self::active_system_scope_ids(active_system_attempts) {
+			let attempts = self
+				.attempt_store
+				.attempts_for_system_scope(&scope_id)
+				.await
+				.map_err(|e| BumpError::Storage(e.to_string()))?;
+			self.reconcile_attempts(attempts).await;
 		}
 		Ok(())
 	}
@@ -158,30 +208,40 @@ impl TransactionBumpService {
 				.await
 				.map_err(|e| BumpError::Storage(e.to_string()))?;
 
-			// Bucket by (chain_id, tx_type) so multi-chain orders apply the
-			// correct per-chain policy. Vec-pair pattern because neither
-			// TransactionType nor the tuple implements Hash.
-			let mut by_chain_and_type: Vec<((u64, TransactionType), Vec<TransactionAttempt>)> =
-				Vec::new();
-			for a in attempts {
-				if let Some(slot) = by_chain_and_type
-					.iter_mut()
-					.find(|((cid, t), _)| *cid == a.chain_id && *t == a.tx_type)
-				{
-					slot.1.push(a);
-				} else {
-					by_chain_and_type.push(((a.chain_id, a.tx_type), vec![a]));
-				}
-			}
-
-			for ((chain_id, tx_type), group) in by_chain_and_type {
+			for ((chain_id, tx_type), group) in Self::bucket_by_chain_and_type(attempts) {
 				let policy = match self.config.for_chain(chain_id) {
 					Some(p) => p,
 					None => continue,
 				};
 				for component in lineage_components(&group) {
-					self.maybe_bump_component(&component, &policy, chain_id, &order_id, tx_type)
-						.await;
+					self.maybe_bump_component(
+						&component, &policy, chain_id, &order_id, tx_type, true,
+					)
+					.await;
+				}
+			}
+		}
+		let active_system_attempts = self
+			.attempt_store
+			.non_terminal_system_attempts()
+			.await
+			.map_err(|e| BumpError::Storage(e.to_string()))?;
+		for scope_id in Self::active_system_scope_ids(active_system_attempts) {
+			let attempts = self
+				.attempt_store
+				.attempts_for_system_scope(&scope_id)
+				.await
+				.map_err(|e| BumpError::Storage(e.to_string()))?;
+			for ((chain_id, tx_type), group) in Self::bucket_by_chain_and_type(attempts) {
+				let policy = match self.config.for_chain(chain_id) {
+					Some(p) => p,
+					None => continue,
+				};
+				for component in lineage_components(&group) {
+					self.maybe_bump_component(
+						&component, &policy, chain_id, &scope_id, tx_type, false,
+					)
+					.await;
 				}
 			}
 		}
@@ -196,6 +256,7 @@ impl TransactionBumpService {
 		chain_id: u64,
 		order_id: &str,
 		tx_type: TransactionType,
+		order_scoped: bool,
 	) {
 		// 2. Lineage tip
 		let tip = match lineage_tip(component) {
@@ -227,7 +288,7 @@ impl TransactionBumpService {
 		//        input-settler state moved on.
 		//      Fail-open if the order can't be retrieved or the standard
 		//      doesn't expose a deadline accessor (returns None).
-		if matches!(tx_type, TransactionType::Fill | TransactionType::Claim) {
+		if order_scoped && matches!(tx_type, TransactionType::Fill | TransactionType::Claim) {
 			if let Some(deadline) = self.deadline_for_stage(order_id, tx_type).await {
 				if now >= deadline {
 					self.event_bus
@@ -360,38 +421,44 @@ impl TransactionBumpService {
 			return;
 		}
 
-		// Per-order profitability gate.
-		let order_opt: Option<solver_types::Order> = match self
-			.storage
-			.retrieve::<solver_types::Order>(solver_types::StorageKey::Orders.as_str(), order_id)
-			.await
-		{
-			Ok(o) => Some(o),
-			Err(e) => {
-				tracing::warn!(
-					%order_id,
-					error = %e,
-					"tx_bump: order retrieve failed; proceeding with bump (fail-open)"
-				);
-				self.emit_profitability_check_skipped(
+		// Per-order profitability gate. System attempts have no order economics;
+		// they remain bounded by fee caps and max replacement count.
+		if order_scoped {
+			let order_opt: Option<solver_types::Order> = match self
+				.storage
+				.retrieve::<solver_types::Order>(
+					solver_types::StorageKey::Orders.as_str(),
 					order_id,
-					&tip.id,
-					chain_id,
-					tx_type,
-					"order not found",
-				);
-				if policy.profitability_gate_fail_closed {
-					return;
-				}
-				None
-			},
-		};
-		if let Some(order) = order_opt.as_ref() {
-			if self
-				.should_skip_for_profitability(order, &bumped, tip, chain_id, tx_type, policy)
+				)
 				.await
 			{
-				return;
+				Ok(o) => Some(o),
+				Err(e) => {
+					tracing::warn!(
+						%order_id,
+						error = %e,
+						"tx_bump: order retrieve failed; proceeding with bump (fail-open)"
+					);
+					self.emit_profitability_check_skipped(
+						order_id,
+						&tip.id,
+						chain_id,
+						tx_type,
+						"order not found",
+					);
+					if policy.profitability_gate_fail_closed {
+						return;
+					}
+					None
+				},
+			};
+			if let Some(order) = order_opt.as_ref() {
+				if self
+					.should_skip_for_profitability(order, &bumped, tip, chain_id, tx_type, policy)
+					.await
+				{
+					return;
+				}
 			}
 		}
 
@@ -528,14 +595,25 @@ impl TransactionBumpService {
 								))
 								.ok();
 						}
-						self.event_bus
-							.publish(SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
-								order_id: order_id.to_string(),
-								tx_hash: tip_hash,
-								tx_type,
-								receipt: receipt_for_event,
-							}))
-							.ok();
+						if order_scoped {
+							self.event_bus
+								.publish(SolverEvent::Delivery(
+									DeliveryEvent::TransactionConfirmed {
+										order_id: order_id.to_string(),
+										tx_hash: tip_hash,
+										tx_type,
+										receipt: receipt_for_event,
+									},
+								))
+								.ok();
+						} else {
+							tracing::info!(
+								scope_id = %order_id,
+								?tip_hash,
+								?tx_type,
+								"system receipt preflight found confirmed lineage tip"
+							);
+						}
 						return;
 					},
 					Ok(receipt) => {
@@ -645,6 +723,7 @@ impl TransactionBumpService {
 		// 15. Build TransactionTracking with a callback that fans monitor
 		//     events out to the event bus as DeliveryEvent::Transaction*.
 		let event_bus = self.event_bus.clone();
+		let publish_order_events = order_scoped;
 		let callback = Box::new(move |event: TransactionMonitoringEvent| match event {
 			TransactionMonitoringEvent::Confirmed {
 				id,
@@ -652,6 +731,10 @@ impl TransactionBumpService {
 				tx_type,
 				receipt,
 			} => {
+				if !publish_order_events {
+					tracing::info!(scope_id = %id, ?tx_hash, ?tx_type, "system replacement confirmed");
+					return;
+				}
 				event_bus
 					.publish(SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed {
 						order_id: id,
@@ -667,29 +750,41 @@ impl TransactionBumpService {
 				tx_type,
 				error,
 				classification,
-			} => match classification {
-				RevertClassification::StageComplete { .. } => {
-					event_bus
-						.publish(SolverEvent::Delivery(
-							DeliveryEvent::TransactionIndeterminate {
+			} => {
+				if !publish_order_events {
+					tracing::warn!(
+						scope_id = %id,
+						?tx_hash,
+						?tx_type,
+						error = %error,
+						"system replacement failed"
+					);
+					return;
+				}
+				match classification {
+					RevertClassification::StageComplete { .. } => {
+						event_bus
+							.publish(SolverEvent::Delivery(
+								DeliveryEvent::TransactionIndeterminate {
+									order_id: id,
+									tx_hash,
+									tx_type,
+									reason: format!("stage-complete revert: {error}"),
+								},
+							))
+							.ok();
+					},
+					RevertClassification::Terminal { .. } | RevertClassification::Unknown => {
+						event_bus
+							.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
 								order_id: id,
 								tx_hash,
 								tx_type,
-								reason: format!("stage-complete revert: {error}"),
-							},
-						))
-						.ok();
-				},
-				RevertClassification::Terminal { .. } | RevertClassification::Unknown => {
-					event_bus
-						.publish(SolverEvent::Delivery(DeliveryEvent::TransactionFailed {
-							order_id: id,
-							tx_hash,
-							tx_type,
-							error,
-						}))
-						.ok();
-				},
+								error,
+							}))
+							.ok();
+					},
+				}
 			},
 			TransactionMonitoringEvent::Indeterminate {
 				id,
@@ -697,6 +792,16 @@ impl TransactionBumpService {
 				tx_type,
 				reason,
 			} => {
+				if !publish_order_events {
+					tracing::warn!(
+						scope_id = %id,
+						?tx_hash,
+						?tx_type,
+						reason = %reason,
+						"system replacement confirmation indeterminate"
+					);
+					return;
+				}
 				event_bus
 					.publish(SolverEvent::Delivery(
 						DeliveryEvent::TransactionIndeterminate {
@@ -717,6 +822,18 @@ impl TransactionBumpService {
 				error,
 				context,
 			} => {
+				if !publish_order_events {
+					tracing::warn!(
+						scope_id = %id,
+						attempt_id = %attempt_id,
+						?tx_type,
+						?attempted_status,
+						error = %error,
+						context,
+						"system replacement attempt ledger conflict"
+					);
+					return;
+				}
 				event_bus
 					.publish(SolverEvent::Delivery(
 						DeliveryEvent::TransactionAttemptLedgerConflict {
@@ -1042,6 +1159,10 @@ impl TransactionBumpService {
 			solver_types::TransactionType::PostFill => cb.gas_post_fill,
 			solver_types::TransactionType::PreClaim => cb.gas_pre_claim,
 			solver_types::TransactionType::Claim => cb.gas_claim,
+			solver_types::TransactionType::Approval
+			| solver_types::TransactionType::Withdrawal
+			| solver_types::TransactionType::Bridge
+			| solver_types::TransactionType::Pusher => rust_decimal::Decimal::ZERO,
 		};
 
 		let headroom = cb.gas_buffer + cb.min_profit;
@@ -1124,7 +1245,8 @@ mod tests {
 	use solver_storage::{MockStorageInterface, QueryFilter};
 	use solver_types::{
 		utils::tests::builders::OrderBuilder, Address, BumpCapField, OrderStatus,
-		TransactionAttempt, TransactionAttemptStatus, TransactionHash, TransactionType,
+		TransactionAttempt, TransactionAttemptScope, TransactionAttemptStatus, TransactionHash,
+		TransactionType,
 	};
 	use std::collections::HashMap;
 	use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1157,8 +1279,15 @@ mod tests {
 		outcome: &Result<TransactionHash, DeliveryError>,
 		signer: Option<Address>,
 	) {
+		let scope = match tracking.tracking.tx_type {
+			TransactionType::Approval
+			| TransactionType::Withdrawal
+			| TransactionType::Bridge
+			| TransactionType::Pusher => TransactionAttemptScope::system(tracking.tracking.id.clone()),
+			_ => TransactionAttemptScope::order(tracking.tracking.id.clone()),
+		};
 		let init = solver_delivery::PlannedAttemptInit {
-			order_id: tracking.tracking.id.clone(),
+			scope,
 			signer,
 			tx_type: tracking.tracking.tx_type,
 			tx: tx.clone(),
@@ -1274,7 +1403,7 @@ mod tests {
 		max_fee: u128,
 	) -> TransactionAttempt {
 		let init = solver_delivery::PlannedAttemptInit {
-			order_id: "order-1".into(),
+			scope: TransactionAttemptScope::order("order-1"),
 			signer,
 			tx_type: TransactionType::Fill,
 			tx: tx_with_fees(max_fee),
@@ -1554,6 +1683,91 @@ mod tests {
 		let child = all.iter().find(|a| a.id != "parent-1").unwrap();
 		assert_eq!(child.replacement_of.as_deref(), Some("parent-1"));
 		// 15% bump default: 10 gwei -> 11.5 gwei
+		assert_eq!(child.tx.max_fee_per_gas, Some(11_500_000_000));
+	}
+
+	#[tokio::test]
+	async fn system_scoped_attempt_dispatches_replacement_without_active_order() {
+		let cfg = default_enabled_config();
+		let signer = Address(vec![9; 20]);
+		let scope_id = "system:approval:1:token:spender:nonce";
+
+		let (service, attempt_store, storage, _bus, _tmp) =
+			test_service(cfg, MockDeliveryInterface::new());
+		let parent = attempt_store
+			.record_planned_attempt(solver_delivery::PlannedAttemptInit {
+				scope: TransactionAttemptScope::system(scope_id),
+				signer: Some(signer.clone()),
+				tx_type: TransactionType::Approval,
+				tx: tx_with_fees(10_000_000_000),
+				attempt_id_override: Some("system-parent-1".into()),
+				replacement_of: None,
+			})
+			.await
+			.unwrap();
+		attempt_store
+			.update_attempt_status(&parent.id, TransactionAttemptStatus::Broadcast, None, |a| {
+				a.tx_hash = Some(TransactionHash(vec![0x11; 32]));
+			})
+			.await
+			.unwrap();
+
+		let mut mock = MockDeliveryInterface::new();
+		let signer_clone = signer.clone();
+		mock.expect_submission_signer()
+			.returning(move |_| Some(signer_clone.clone()));
+		mock_large_balance(&mut mock);
+		let recorder: Arc<dyn TransactionAttemptRecorder> = attempt_store.clone();
+		let recorder_for_mock = recorder.clone();
+		mock.expect_submit()
+			.times(1)
+			.returning(move |tx, tracking| {
+				let recorder = recorder_for_mock.clone();
+				Box::pin(async move {
+					let tracking = tracking.expect("sweeper must supply tracking");
+					assert_eq!(tracking.tracking.id, scope_id);
+					assert_eq!(tracking.tracking.tx_type, TransactionType::Approval);
+					let outcome: Result<TransactionHash, DeliveryError> =
+						Ok(TransactionHash(vec![0xcd; 32]));
+					simulate_submit_recording(
+						&recorder,
+						&tracking,
+						&tx,
+						&outcome,
+						Some(Address(vec![9; 20])),
+					)
+					.await;
+					outcome
+				})
+			});
+
+		let delivery_impls: HashMap<u64, Arc<dyn DeliveryInterface>> =
+			HashMap::from([(1u64, Arc::new(mock) as Arc<dyn DeliveryInterface>)]);
+		let delivery_svc = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
+		let service = TransactionBumpService::new(
+			service.config.clone(),
+			storage,
+			attempt_store.clone(),
+			delivery_svc,
+			service.event_bus.clone(),
+			recorder.clone(),
+			test_pricing(),
+		);
+
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		service.tick().await.unwrap();
+
+		let attempts = attempt_store
+			.attempts_for_system_scope(scope_id)
+			.await
+			.unwrap();
+		assert_eq!(attempts.len(), 2, "should now have parent + child");
+		let child = attempts
+			.iter()
+			.find(|attempt| attempt.id != "system-parent-1")
+			.unwrap();
+		assert_eq!(child.replacement_of.as_deref(), Some("system-parent-1"));
+		assert_eq!(child.scope.scope_id(), scope_id);
 		assert_eq!(child.tx.max_fee_per_gas, Some(11_500_000_000));
 	}
 
@@ -2687,7 +2901,7 @@ mod tests {
 		tx.nonce = None;
 		let attempt = store
 			.record_planned_attempt(solver_delivery::PlannedAttemptInit {
-				order_id: "order-1".into(),
+				scope: TransactionAttemptScope::order("order-1"),
 				signer: Some(signer),
 				tx_type: TransactionType::Fill,
 				tx,
@@ -2861,6 +3075,77 @@ mod tests {
 				}) if order_id == "order-1" && receipt.success
 			)),
 			"expected TransactionConfirmed so the engine can advance the order, got: {events:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn system_receipt_preflight_marks_tip_confirmed_without_order_event() {
+		let cfg = default_enabled_config();
+		let signer = Address(vec![9; 20]);
+		let scope_id = "system:approval:1:token:spender:preflight";
+		let tip_hash = TransactionHash(vec![0x45; 32]);
+		let mut mock = MockDeliveryInterface::new();
+		let signer_clone = signer.clone();
+		mock.expect_submission_signer()
+			.returning(move |_| Some(signer_clone.clone()));
+		mock_large_balance(&mut mock);
+		mock.expect_get_receipt()
+			.with(eq(tip_hash.clone()), eq(1u64))
+			.times(1)
+			.returning(move |hash, _| {
+				let hash = hash.clone();
+				Box::pin(async move { Ok(receipt(hash, true)) })
+			});
+		mock.expect_submit().times(0);
+
+		let (svc, store, _storage, bus, _tmp) = test_service(cfg, mock);
+		let attempt = store
+			.record_planned_attempt(solver_delivery::PlannedAttemptInit {
+				scope: TransactionAttemptScope::system(scope_id),
+				signer: Some(signer),
+				tx_type: TransactionType::Approval,
+				tx: tx_with_fees(10_000_000_000),
+				attempt_id_override: Some("system-parent-preflight".into()),
+				replacement_of: None,
+			})
+			.await
+			.unwrap();
+		store
+			.update_attempt_status(
+				&attempt.id,
+				TransactionAttemptStatus::Indeterminate,
+				None,
+				|attempt| {
+					attempt.tx_hash = Some(tip_hash.clone());
+				},
+			)
+			.await
+			.unwrap();
+
+		let mut sub = bus.subscribe();
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		svc.tick().await.unwrap();
+		let attempt = store.get_attempt("system-parent-preflight").await.unwrap();
+		assert_eq!(attempt.status, TransactionAttemptStatus::Confirmed);
+		assert!(attempt.receipt.is_some());
+		let events = drain_bus_events(&mut sub);
+		assert!(
+			events.iter().any(|event| matches!(
+				event,
+				SolverEvent::Delivery(DeliveryEvent::BumpTipAlreadyMined {
+					attempt_id,
+					success: true,
+					..
+				}) if attempt_id == "system-parent-preflight"
+			)),
+			"expected successful BumpTipAlreadyMined, got: {events:?}"
+		);
+		assert!(
+			!events.iter().any(|event| matches!(
+				event,
+				SolverEvent::Delivery(DeliveryEvent::TransactionConfirmed { .. })
+			)),
+			"system preflight must not emit order confirmation events: {events:?}"
 		);
 	}
 
