@@ -10,9 +10,7 @@ use crate::bump::lineage::{lineage_components, lineage_tip};
 use crate::engine::event_bus::EventBus;
 use crate::order_preparation::order_requires_preparation;
 use crate::order_rehydration::intent_from_order;
-use crate::state::order::{
-	FAILED_STATUS_KIND_INDEX_VALUE, FINALIZED_STATUS_KIND_INDEX_VALUE, STATUS_KIND_INDEX_FIELD,
-};
+use crate::state::order::IS_TERMINAL_INDEX_FIELD;
 use crate::state::transaction_attempt::TransactionAttemptStore;
 use crate::state::OrderStateMachine;
 use solver_delivery::DeliveryService;
@@ -307,17 +305,15 @@ impl RecoveryService {
 	///
 	/// A vector of active orders that need recovery processing.
 	async fn load_active_orders(&self) -> Result<Vec<Order>, RecoveryError> {
-		let terminal_status_kinds = vec![
-			serde_json::json!(FINALIZED_STATUS_KIND_INDEX_VALUE),
-			serde_json::json!(FAILED_STATUS_KIND_INDEX_VALUE),
-		];
-
 		// Query for all non-terminal orders
 		let active_orders = self
 			.storage
 			.query::<Order>(
 				StorageKey::Orders.as_str(),
-				QueryFilter::NotIn(STATUS_KIND_INDEX_FIELD.to_string(), terminal_status_kinds),
+				QueryFilter::Equals(
+					IS_TERMINAL_INDEX_FIELD.to_string(),
+					serde_json::json!(false),
+				),
 			)
 			.await
 			.map_err(|e| RecoveryError::Storage(e.to_string()))?;
@@ -2880,7 +2876,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn load_active_orders_queries_canonical_status_kind_index() {
+	async fn load_active_orders_queries_is_terminal_index() {
 		let mut mock_storage = MockStorageInterface::new();
 
 		mock_storage
@@ -2892,13 +2888,8 @@ mod tests {
 
 				matches!(
 					filter,
-					QueryFilter::NotIn(field, values)
-						if field == "status_kind"
-							&& values
-								== &vec![
-									serde_json::json!("finalized"),
-									serde_json::json!("failed"),
-								]
+					QueryFilter::Equals(field, value)
+						if field == IS_TERMINAL_INDEX_FIELD && value == &serde_json::json!(false)
 				)
 			})
 			.times(1)
