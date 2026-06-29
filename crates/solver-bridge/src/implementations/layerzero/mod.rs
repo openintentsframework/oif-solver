@@ -8,8 +8,8 @@ pub mod contracts;
 pub mod types;
 
 use crate::types::{
-	BridgeDepositResult, BridgeRequest, BridgeTransferStatus, PendingBridgeTransfer,
-	TransferMetadata,
+	bridge_system_scope, BridgeDepositResult, BridgeRequest, BridgeTransferStatus,
+	PendingBridgeTransfer, TransferMetadata,
 };
 use crate::{BridgeError, BridgeInterface};
 use alloy_primitives::{Address, U256};
@@ -17,6 +17,7 @@ use alloy_sol_types::SolCall;
 use async_trait::async_trait;
 use contracts::{address_to_bytes32, encode_lz_receive_option};
 use solver_delivery::DeliveryService;
+use solver_types::TransactionType;
 use std::sync::Arc;
 use types::LayerZeroBridgeConfig;
 
@@ -30,6 +31,17 @@ pub struct LayerZeroBridge {
 /// Convert alloy Address to solver_types Address.
 fn to_solver_addr(addr: Address) -> solver_types::Address {
 	solver_types::Address(addr.as_slice().to_vec())
+}
+
+fn scoped_system_tx(
+	scope_id: Option<&str>,
+	operation: &str,
+	chain_id: u64,
+	transfer_id: Option<&str>,
+) -> String {
+	scope_id.map(str::to_string).unwrap_or_else(|| {
+		bridge_system_scope(operation, chain_id, transfer_id.unwrap_or("standalone"))
+	})
 }
 
 /// OFT send() is still kept on a fixed gas limit to avoid changing the
@@ -153,11 +165,17 @@ impl LayerZeroBridge {
 		&self,
 		tx: solver_types::Transaction,
 		label: &str,
+		scope_id: Option<&str>,
+		transfer_id: Option<&str>,
 	) -> Result<solver_types::TransactionHash, BridgeError> {
 		let chain_id = tx.chain_id;
 		let hash = self
 			.delivery
-			.deliver(tx, None)
+			.deliver_system(
+				tx,
+				scoped_system_tx(scope_id, label, chain_id, transfer_id),
+				TransactionType::Bridge,
+			)
 			.await
 			.map_err(|e| map_delivery_error(label, e))?;
 
@@ -195,6 +213,7 @@ impl LayerZeroBridge {
 	async fn bridge_via_composer(
 		&self,
 		request: &BridgeRequest,
+		metadata: &TransferMetadata,
 		route: Option<&types::LayerZeroBridgeRoute>,
 	) -> Result<BridgeDepositResult, BridgeError> {
 		// Per-pair route wins when present (correct for native-ETH pairs whose
@@ -275,14 +294,19 @@ impl LayerZeroBridge {
 					Some(ERC20_APPROVE_GAS_LIMIT),
 				);
 
-				self.submit_and_confirm(approve_tx, "Composer approve")
-					.await
-					.map_err(|e| match e {
-						BridgeError::InsufficientNativeGas(_) => e,
-						other => BridgeError::ApproveSubmitFailed {
-							error: other.to_string(),
-						},
-					})?;
+				self.submit_and_confirm(
+					approve_tx,
+					"Composer approve",
+					metadata.approve_scope_id.as_deref(),
+					metadata.transfer_id.as_deref(),
+				)
+				.await
+				.map_err(|e| match e {
+					BridgeError::InsufficientNativeGas(_) => e,
+					other => BridgeError::ApproveSubmitFailed {
+						error: other.to_string(),
+					},
+				})?;
 			}
 		}
 
@@ -321,7 +345,16 @@ impl LayerZeroBridge {
 		deposit_tx.gas_limit = Some(composer_gas_limit);
 		let tx_hash = self
 			.delivery
-			.deliver(deposit_tx, None)
+			.deliver_system(
+				deposit_tx,
+				scoped_system_tx(
+					metadata.tx_scope_id.as_deref(),
+					"deposit-and-send",
+					request.source_chain,
+					metadata.transfer_id.as_deref(),
+				),
+				TransactionType::Bridge,
+			)
 			.await
 			.map_err(|e| map_delivery_error("depositAndSend", e))?;
 
@@ -343,6 +376,7 @@ impl LayerZeroBridge {
 	async fn bridge_via_oft_send(
 		&self,
 		request: &BridgeRequest,
+		metadata: &TransferMetadata,
 		route: Option<&types::LayerZeroBridgeRoute>,
 	) -> Result<BridgeDepositResult, BridgeError> {
 		// Effective source token = wrapper for native sides, pair token otherwise.
@@ -413,14 +447,19 @@ impl LayerZeroBridge {
 					Some(ERC20_APPROVE_GAS_LIMIT),
 				);
 
-				self.submit_and_confirm(approve_tx, "OFT approve")
-					.await
-					.map_err(|e| match e {
-						BridgeError::InsufficientNativeGas(_) => e,
-						other => BridgeError::ApproveSubmitFailed {
-							error: other.to_string(),
-						},
-					})?;
+				self.submit_and_confirm(
+					approve_tx,
+					"OFT approve",
+					metadata.approve_scope_id.as_deref(),
+					metadata.transfer_id.as_deref(),
+				)
+				.await
+				.map_err(|e| match e {
+					BridgeError::InsufficientNativeGas(_) => e,
+					other => BridgeError::ApproveSubmitFailed {
+						error: other.to_string(),
+					},
+				})?;
 			}
 		}
 
@@ -464,7 +503,16 @@ impl LayerZeroBridge {
 		);
 		let tx_hash = self
 			.delivery
-			.deliver(send_tx, None)
+			.deliver_system(
+				send_tx,
+				scoped_system_tx(
+					metadata.tx_scope_id.as_deref(),
+					"oft-send",
+					request.source_chain,
+					metadata.transfer_id.as_deref(),
+				),
+				TransactionType::Bridge,
+			)
 			.await
 			.map_err(|e| map_delivery_error("OFT send", e))?;
 
@@ -659,9 +707,9 @@ impl BridgeInterface for LayerZeroBridge {
 			None => self.is_composer_flow(request.source_chain),
 		};
 		if is_composer {
-			self.bridge_via_composer(request, route_ref).await
+			self.bridge_via_composer(request, metadata, route_ref).await
 		} else {
-			self.bridge_via_oft_send(request, route_ref).await
+			self.bridge_via_oft_send(request, metadata, route_ref).await
 		}
 	}
 
@@ -927,7 +975,13 @@ impl BridgeInterface for LayerZeroBridge {
 				let tx =
 					Self::build_weth9_deposit_tx(transfer.source_chain, wrapper.address, amount);
 				self.delivery
-					.deliver(tx, None)
+					.deliver_system(
+						tx,
+						transfer.wrap_scope_id.clone().unwrap_or_else(|| {
+							bridge_system_scope("wrap-native", transfer.source_chain, &transfer.id)
+						}),
+						TransactionType::Bridge,
+					)
 					.await
 					.map_err(|e| map_delivery_error("wrap_native", e))
 			},
@@ -952,7 +1006,13 @@ impl BridgeInterface for LayerZeroBridge {
 				let tx =
 					Self::build_weth9_withdraw_tx(transfer.dest_chain, wrapper.address, amount);
 				self.delivery
-					.deliver(tx, None)
+					.deliver_system(
+						tx,
+						transfer.unwrap_scope_id.clone().unwrap_or_else(|| {
+							bridge_system_scope("unwrap-native", transfer.dest_chain, &transfer.id)
+						}),
+						TransactionType::Bridge,
+					)
 					.await
 					.map_err(|e| map_delivery_error("unwrap_native", e))
 			},
@@ -975,7 +1035,13 @@ impl BridgeInterface for LayerZeroBridge {
 			self.solver_address,
 		);
 		self.delivery
-			.deliver(tx, None)
+			.deliver_system(
+				tx,
+				transfer.redeem_scope_id.clone().unwrap_or_else(|| {
+					bridge_system_scope("redeem-shares", transfer.dest_chain, &transfer.id)
+				}),
+				TransactionType::Bridge,
+			)
 			.await
 			.map_err(|e| map_delivery_error("redeem_shares", e))
 	}
@@ -1669,7 +1735,9 @@ mod tests {
 		}
 
 		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
-		let result = bridge.bridge_via_composer(&request, Some(&route)).await;
+		let result = bridge
+			.bridge_via_composer(&request, &TransferMetadata::default(), Some(&route))
+			.await;
 
 		assert!(result.is_ok(), "composer bridge failed: {result:?}");
 		let submitted = submitted.lock().unwrap();
@@ -2476,7 +2544,9 @@ mod tests {
 		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
 		let request = bridge_request();
 
-		let result = bridge.bridge_via_composer(&request, None).await;
+		let result = bridge
+			.bridge_via_composer(&request, &TransferMetadata::default(), None)
+			.await;
 		assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
 	}
 
@@ -2502,7 +2572,9 @@ mod tests {
 		let bridge = bridge_with_two_chain_delivery(mock, Some(composer));
 		let request = bridge_request();
 
-		let result = bridge.bridge_via_composer(&request, None).await;
+		let result = bridge
+			.bridge_via_composer(&request, &TransferMetadata::default(), None)
+			.await;
 		let err = result.expect_err("expected Err");
 		match err {
 			BridgeError::ApproveSubmitFailed { error } => {
@@ -2609,7 +2681,9 @@ mod tests {
 		let bridge = bridge_with_two_chain_delivery(mock, None);
 		let request = bridge_request();
 
-		let result = bridge.bridge_via_oft_send(&request, None).await;
+		let result = bridge
+			.bridge_via_oft_send(&request, &TransferMetadata::default(), None)
+			.await;
 		assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
 	}
 
@@ -2634,7 +2708,9 @@ mod tests {
 		let bridge = bridge_with_two_chain_delivery(mock, None);
 		let request = bridge_request();
 
-		let result = bridge.bridge_via_oft_send(&request, None).await;
+		let result = bridge
+			.bridge_via_oft_send(&request, &TransferMetadata::default(), None)
+			.await;
 		let err = result.expect_err("expected Err");
 		match err {
 			BridgeError::ApproveSubmitFailed { error } => {

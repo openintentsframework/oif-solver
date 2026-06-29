@@ -78,6 +78,53 @@ pub struct Config {
 	pub tx_bump: TxBumpConfig,
 }
 
+/// Default source-chain finality depth for escrow-origin fill guards.
+pub const DEFAULT_SOURCE_FINALITY_BLOCKS: u64 = 20;
+
+fn finality_blocks_from_implementation_config(
+	value: &serde_json::Value,
+	chain_id: u64,
+) -> Option<u64> {
+	if let Some(depth) = value
+		.get("finality_blocks")
+		.and_then(|value| value.as_object())
+		.and_then(|object| object.get(&chain_id.to_string()))
+		.and_then(|value| value.as_u64())
+	{
+		return Some(depth);
+	}
+
+	value
+		.get("default_finality_blocks")
+		.and_then(|value| value.as_u64())
+}
+
+/// Resolve the source-chain finality depth used before filling escrow-origin
+/// orders. Settlement broadcaster settings are authoritative because they
+/// govern payment proof finality; discovery settings are retained as a fallback
+/// for deployments that configure discovery before broadcaster settlement.
+pub fn source_finality_blocks_for_config(config: &Config, chain_id: u64) -> u64 {
+	if let Some(depth) = config
+		.settlement
+		.implementations
+		.get("broadcaster")
+		.and_then(|broadcaster| finality_blocks_from_implementation_config(broadcaster, chain_id))
+	{
+		return depth;
+	}
+
+	if let Some(depth) = config
+		.discovery
+		.implementations
+		.get("onchain_eip7683")
+		.and_then(|onchain| finality_blocks_from_implementation_config(onchain, chain_id))
+	{
+		return depth;
+	}
+
+	DEFAULT_SOURCE_FINALITY_BLOCKS
+}
+
 /// Configuration specific to the solver instance.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SolverConfig {
@@ -1412,6 +1459,72 @@ mod tests {
 				"primary": settlement_primary
 			}
 		})
+	}
+
+	#[test]
+	fn source_finality_uses_broadcaster_override_before_discovery() {
+		let mut config = parse_json_fixture(base_config_json(
+			json!({
+				"137": test_network(137, "http://localhost:8545"),
+				"1": test_network(1, "http://localhost:8546")
+			}),
+			json!({
+				"eip7683": {}
+			}),
+			json!({
+				"broadcaster": {
+					"order": "eip7683",
+					"network_ids": [137],
+					"default_finality_blocks": 42,
+					"finality_blocks": { "137": 7 }
+				}
+			}),
+		))
+		.expect("config should parse");
+		config.discovery.implementations.insert(
+			"onchain_eip7683".to_string(),
+			json!({
+				"default_finality_blocks": 99,
+				"finality_blocks": { "137": 88 }
+			}),
+		);
+
+		assert_eq!(source_finality_blocks_for_config(&config, 137), 7);
+	}
+
+	#[test]
+	fn source_finality_falls_back_to_discovery_then_default() {
+		let mut config = parse_json_fixture(base_config_json(
+			json!({
+				"137": test_network(137, "http://localhost:8545"),
+				"1": test_network(1, "http://localhost:8546")
+			}),
+			json!({
+				"eip7683": {}
+			}),
+			json!({
+				"direct": {
+					"order": "eip7683",
+					"network_ids": [137, 1]
+				}
+			}),
+		))
+		.expect("config should parse");
+		config.discovery.implementations.insert(
+			"onchain_eip7683".to_string(),
+			json!({
+				"default_finality_blocks": 11,
+				"finality_blocks": { "137": 6 }
+			}),
+		);
+
+		assert_eq!(source_finality_blocks_for_config(&config, 137), 6);
+		assert_eq!(source_finality_blocks_for_config(&config, 1), 11);
+		config.discovery.implementations.clear();
+		assert_eq!(
+			source_finality_blocks_for_config(&config, 1),
+			DEFAULT_SOURCE_FINALITY_BLOCKS
+		);
 	}
 
 	#[test]

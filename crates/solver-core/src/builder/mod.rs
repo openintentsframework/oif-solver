@@ -248,6 +248,10 @@ impl SolverBuilder {
 		})?;
 
 		let storage = Arc::new(StorageService::new(storage_backend));
+		let transaction_attempt_recorder: Arc<dyn solver_delivery::TransactionAttemptRecorder> =
+			Arc::new(
+				crate::state::transaction_attempt::TransactionAttemptStore::new(storage.clone()),
+			);
 
 		// Create account implementations
 		let mut account_impls = HashMap::new();
@@ -400,12 +404,15 @@ impl SolverBuilder {
 			);
 		}
 
-		let delivery = Arc::new(DeliveryService::new(
-			delivery_implementations,
-			self.static_config.delivery.min_confirmations,
-			self.static_config.solver.monitoring_timeout_seconds,
-			self.static_config.delivery.tx_confirmation_timeout_seconds,
-		));
+		let delivery = Arc::new(
+			DeliveryService::new(
+				delivery_implementations,
+				self.static_config.delivery.min_confirmations,
+				self.static_config.solver.monitoring_timeout_seconds,
+				self.static_config.delivery.tx_confirmation_timeout_seconds,
+			)
+			.with_attempt_recorder(transaction_attempt_recorder.clone()),
+		);
 
 		// Create discovery implementations
 		let mut discovery_implementations = HashMap::new();
@@ -631,11 +638,14 @@ impl SolverBuilder {
 		let order = Arc::new(OrderService::new(order_impls, strategy));
 
 		// Create and initialize the TokenManager
-		let token_manager = Arc::new(crate::engine::token_manager::TokenManager::new(
-			self.static_config.networks.clone(),
-			delivery.clone(),
-			account.clone(),
-		));
+		let token_manager = Arc::new(
+			crate::engine::token_manager::TokenManager::new(
+				self.static_config.networks.clone(),
+				delivery.clone(),
+				account.clone(),
+			)
+			.with_attempt_recorder(transaction_attempt_recorder),
+		);
 
 		let empty_token_networks: Vec<u64> = self
 			.static_config

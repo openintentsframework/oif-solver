@@ -422,6 +422,45 @@ pub enum OrderStatus {
 	Failed(TransactionType, String),
 }
 
+/// Stable index value used for finalized orders.
+pub const FINALIZED_STATUS_KIND_INDEX_VALUE: &str = "finalized";
+/// Stable index value used for failed orders.
+pub const FAILED_STATUS_KIND_INDEX_VALUE: &str = "failed";
+/// Stable values used by storage backends for the order status-kind index.
+pub const ORDER_STATUS_KIND_INDEX_VALUES: &[&str] = &[
+	"created",
+	"pending",
+	"executing",
+	"executed",
+	"post_filled",
+	"pre_claimed",
+	"settled",
+	FINALIZED_STATUS_KIND_INDEX_VALUE,
+	FAILED_STATUS_KIND_INDEX_VALUE,
+];
+
+impl OrderStatus {
+	/// Returns the stable storage index value for this order status.
+	pub fn status_kind_index_value(&self) -> &'static str {
+		match self {
+			OrderStatus::Created => "created",
+			OrderStatus::Pending => "pending",
+			OrderStatus::Executing => "executing",
+			OrderStatus::Executed => "executed",
+			OrderStatus::PostFilled => "post_filled",
+			OrderStatus::PreClaimed => "pre_claimed",
+			OrderStatus::Settled => "settled",
+			OrderStatus::Finalized => FINALIZED_STATUS_KIND_INDEX_VALUE,
+			OrderStatus::Failed(_, _) => FAILED_STATUS_KIND_INDEX_VALUE,
+		}
+	}
+
+	/// Returns whether this status ends the solver order lifecycle.
+	pub fn is_terminal(&self) -> bool {
+		matches!(self, OrderStatus::Finalized | OrderStatus::Failed(_, _))
+	}
+}
+
 impl fmt::Display for OrderStatus {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {

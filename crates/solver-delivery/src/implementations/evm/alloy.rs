@@ -36,8 +36,8 @@ use async_trait::async_trait;
 use solver_account::AccountSigner;
 use solver_types::{
 	Address as SolverAddress, ConfigSchema, Field, FieldType, NetworksConfig, Schema,
-	Transaction as SolverTransaction, TransactionAttempt, TransactionAttemptStatus,
-	TransactionHash, TransactionReceipt, TransactionType,
+	Transaction as SolverTransaction, TransactionAttempt, TransactionAttemptScope,
+	TransactionAttemptStatus, TransactionHash, TransactionReceipt, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -398,6 +398,16 @@ fn solver_address_from_alloy(address: Address) -> SolverAddress {
 	SolverAddress(address.as_slice().to_vec())
 }
 
+fn tracking_scope(id: &str, tx_type: TransactionType) -> TransactionAttemptScope {
+	match tx_type {
+		TransactionType::Approval
+		| TransactionType::Withdrawal
+		| TransactionType::Bridge
+		| TransactionType::Pusher => TransactionAttemptScope::system(id.to_string()),
+		_ => TransactionAttemptScope::order(id.to_string()),
+	}
+}
+
 async fn record_planned_attempt(
 	tracking: &TransactionTrackingWithConfig,
 	signer: SolverAddress,
@@ -409,7 +419,7 @@ async fn record_planned_attempt(
 		.tracking
 		.attempt_recorder
 		.record_planned_attempt(PlannedAttemptInit {
-			order_id: tracking.tracking.id.clone(),
+			scope: tracking_scope(&tracking.tracking.id, tracking.tracking.tx_type),
 			signer: Some(signer),
 			tx_type: tracking.tracking.tx_type,
 			tx,
@@ -3416,6 +3426,21 @@ impl DeliveryInterface for AlloyDelivery {
 			.await
 			.map_err(|e| DeliveryError::Network(format!("Failed to get block number: {e}")))
 	}
+
+	async fn get_finality_tag_block_number(
+		&self,
+		chain_id: u64,
+		tag: BlockNumberOrTag,
+	) -> Result<Option<u64>, DeliveryError> {
+		let provider = self.get_provider(chain_id)?;
+
+		provider
+			.get_block_by_number(tag)
+			.await
+			.map(|block| block.map(|block| block.number()))
+			.map_err(|e| DeliveryError::Network(format!("Failed to get {tag:?} block number: {e}")))
+	}
+
 	async fn estimate_gas(&self, tx: SolverTransaction) -> Result<u64, DeliveryError> {
 		// Get the chain ID from the transaction
 		let chain_id = tx.chain_id;
@@ -3480,6 +3505,25 @@ impl DeliveryInterface for AlloyDelivery {
 			.call(request)
 			.await
 			.map_err(|e| DeliveryError::Network(format!("Failed to execute eth_call: {e}")))?;
+
+		Ok(result)
+	}
+
+	async fn eth_call_at_block(
+		&self,
+		tx: SolverTransaction,
+		block_number: u64,
+	) -> Result<Bytes, DeliveryError> {
+		let chain_id = tx.chain_id;
+		let provider = self.get_provider(chain_id)?;
+		let request: TransactionRequest = tx.into();
+		let block_id = BlockNumberOrTag::Number(block_number).into();
+
+		let result = provider.call(request).block(block_id).await.map_err(|e| {
+			DeliveryError::Network(format!(
+				"Failed to execute eth_call at block {block_number}: {e}"
+			))
+		})?;
 
 		Ok(result)
 	}
@@ -5248,6 +5292,10 @@ mod tests {
 				TransactionType::PostFill,
 				TransactionType::PreClaim,
 				TransactionType::Claim,
+				TransactionType::Approval,
+				TransactionType::Withdrawal,
+				TransactionType::Bridge,
+				TransactionType::Pusher,
 			];
 
 			for tx_type in types {
@@ -5273,6 +5321,10 @@ mod tests {
 							| TransactionType::PostFill
 							| TransactionType::PreClaim
 							| TransactionType::Claim
+							| TransactionType::Approval
+							| TransactionType::Withdrawal
+							| TransactionType::Bridge
+							| TransactionType::Pusher
 					));
 				}
 			}
@@ -6131,6 +6183,10 @@ mod tests {
 				TransactionType::PostFill,
 				TransactionType::PreClaim,
 				TransactionType::Claim,
+				TransactionType::Approval,
+				TransactionType::Withdrawal,
+				TransactionType::Bridge,
+				TransactionType::Pusher,
 			];
 
 			for tx_type in tx_types {

@@ -30,8 +30,6 @@ enum OrderStatusKind {
 
 pub(crate) const STATUS_KIND_INDEX_FIELD: &str = "status_kind";
 pub(crate) const IS_TERMINAL_INDEX_FIELD: &str = "is_terminal";
-pub(crate) const FINALIZED_STATUS_KIND_INDEX_VALUE: &str = "finalized";
-pub(crate) const FAILED_STATUS_KIND_INDEX_VALUE: &str = "failed";
 const ORDER_CAS_MAX_RETRIES: usize = 8;
 
 /// Errors that can occur during order state management.
@@ -394,6 +392,10 @@ impl OrderStateMachine {
 			TransactionType::PostFill => order.post_fill_tx_hash = Some(tx_hash.clone()),
 			TransactionType::PreClaim => order.pre_claim_tx_hash = Some(tx_hash.clone()),
 			TransactionType::Claim => order.claim_tx_hash = Some(tx_hash.clone()),
+			TransactionType::Approval
+			| TransactionType::Withdrawal
+			| TransactionType::Bridge
+			| TransactionType::Pusher => {},
 		})
 		.await
 	}
@@ -439,21 +441,11 @@ fn status_kind(status: &OrderStatus) -> OrderStatusKind {
 }
 
 pub(crate) fn status_kind_index_value(status: &OrderStatus) -> &'static str {
-	match status {
-		OrderStatus::Created => "created",
-		OrderStatus::Pending => "pending",
-		OrderStatus::Executing => "executing",
-		OrderStatus::Executed => "executed",
-		OrderStatus::PostFilled => "post_filled",
-		OrderStatus::PreClaimed => "pre_claimed",
-		OrderStatus::Settled => "settled",
-		OrderStatus::Finalized => FINALIZED_STATUS_KIND_INDEX_VALUE,
-		OrderStatus::Failed(_, _) => FAILED_STATUS_KIND_INDEX_VALUE,
-	}
+	status.status_kind_index_value()
 }
 
 pub(crate) fn is_terminal_status(status: &OrderStatus) -> bool {
-	matches!(status, OrderStatus::Finalized | OrderStatus::Failed(_, _))
+	status.is_terminal()
 }
 
 /// Whether reaching `status` may safely release a resource-lock order's

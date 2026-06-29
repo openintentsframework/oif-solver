@@ -126,6 +126,20 @@ pub struct NamespaceIndex {
 	pub indexes: HashMap<String, HashMap<serde_json::Value, HashSet<String>>>,
 }
 
+fn index_value_lookup_candidates(value: &serde_json::Value) -> Vec<serde_json::Value> {
+	let mut candidates = vec![value.clone()];
+	if !matches!(value, serde_json::Value::String(_)) {
+		let stringified = match value {
+			serde_json::Value::Bool(v) => v.to_string(),
+			serde_json::Value::Number(v) => v.to_string(),
+			serde_json::Value::Null => "null".to_string(),
+			_ => serde_json::to_string(value).unwrap_or_default(),
+		};
+		candidates.push(serde_json::Value::String(stringified));
+	}
+	candidates
+}
+
 /// TTL configuration for different storage keys.
 #[derive(Debug, Clone, Default)]
 pub struct TtlConfig {
@@ -757,17 +771,23 @@ impl StorageInterface for FileStorage {
 				}
 				all_keys.into_iter().collect()
 			},
-			QueryFilter::Equals(field, value) => namespace_index
-				.indexes
-				.get(&field)
-				.and_then(|m| m.get(&value))
-				.map(|keys| keys.iter().cloned().collect())
-				.unwrap_or_default(),
-			QueryFilter::NotEquals(field, value) => {
+			QueryFilter::Equals(field, value) => {
 				let mut keys = HashSet::new();
 				if let Some(field_index) = namespace_index.indexes.get(&field) {
+					for candidate in index_value_lookup_candidates(&value) {
+						if let Some(k) = field_index.get(&candidate) {
+							keys.extend(k.clone());
+						}
+					}
+				}
+				keys.into_iter().collect()
+			},
+			QueryFilter::NotEquals(field, value) => {
+				let mut keys = HashSet::new();
+				let excluded = index_value_lookup_candidates(&value);
+				if let Some(field_index) = namespace_index.indexes.get(&field) {
 					for (v, k) in field_index {
-						if v != &value {
+						if !excluded.contains(v) {
 							keys.extend(k.clone());
 						}
 					}
@@ -778,8 +798,10 @@ impl StorageInterface for FileStorage {
 				let mut keys = HashSet::new();
 				if let Some(field_index) = namespace_index.indexes.get(&field) {
 					for value in &values {
-						if let Some(k) = field_index.get(value) {
-							keys.extend(k.clone());
+						for candidate in index_value_lookup_candidates(value) {
+							if let Some(k) = field_index.get(&candidate) {
+								keys.extend(k.clone());
+							}
 						}
 					}
 				}
@@ -787,9 +809,13 @@ impl StorageInterface for FileStorage {
 			},
 			QueryFilter::NotIn(field, values) => {
 				let mut keys = HashSet::new();
+				let excluded: Vec<_> = values
+					.iter()
+					.flat_map(index_value_lookup_candidates)
+					.collect();
 				if let Some(field_index) = namespace_index.indexes.get(&field) {
 					for (value, k) in field_index {
-						if !values.contains(value) {
+						if !excluded.contains(value) {
 							keys.extend(k.clone());
 						}
 					}
@@ -1173,6 +1199,29 @@ mod tests {
 		// Query all
 		let all_orders = storage.query(namespace, QueryFilter::All).await.unwrap();
 		assert_eq!(all_orders.len(), 3);
+	}
+
+	#[tokio::test]
+	async fn file_query_matches_bool_index_after_index_reload() {
+		let (storage, _temp_dir) = create_test_storage_with_ttl();
+		let namespace = "orders";
+		let key = "orders:order1";
+		let indexes = StorageIndexes::new().with_field("is_terminal", false);
+
+		storage
+			.set_bytes(key, b"data".to_vec(), Some(indexes), None)
+			.await
+			.unwrap();
+
+		let active = storage
+			.query(
+				namespace,
+				QueryFilter::Equals("is_terminal".to_string(), serde_json::json!(false)),
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(active, vec![key.to_string()]);
 	}
 
 	#[tokio::test]

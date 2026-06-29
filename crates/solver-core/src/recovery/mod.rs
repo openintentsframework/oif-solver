@@ -10,9 +10,7 @@ use crate::bump::lineage::{lineage_components, lineage_tip};
 use crate::engine::event_bus::EventBus;
 use crate::order_preparation::order_requires_preparation;
 use crate::order_rehydration::intent_from_order;
-use crate::state::order::{
-	FAILED_STATUS_KIND_INDEX_VALUE, FINALIZED_STATUS_KIND_INDEX_VALUE, STATUS_KIND_INDEX_FIELD,
-};
+use crate::state::order::IS_TERMINAL_INDEX_FIELD;
 use crate::state::transaction_attempt::TransactionAttemptStore;
 use crate::state::OrderStateMachine;
 use solver_delivery::DeliveryService;
@@ -153,6 +151,10 @@ fn order_stage_hash(order: &Order, tx_type: TransactionType) -> Option<Transacti
 		TransactionType::PostFill => order.post_fill_tx_hash.clone(),
 		TransactionType::PreClaim => order.pre_claim_tx_hash.clone(),
 		TransactionType::Claim => order.claim_tx_hash.clone(),
+		TransactionType::Approval
+		| TransactionType::Withdrawal
+		| TransactionType::Bridge
+		| TransactionType::Pusher => None,
 	}
 }
 
@@ -175,6 +177,10 @@ fn set_order_stage_hash(order: &mut Order, tx_type: TransactionType, tx_hash: Tr
 		TransactionType::PostFill => order.post_fill_tx_hash = Some(tx_hash),
 		TransactionType::PreClaim => order.pre_claim_tx_hash = Some(tx_hash),
 		TransactionType::Claim => order.claim_tx_hash = Some(tx_hash),
+		TransactionType::Approval
+		| TransactionType::Withdrawal
+		| TransactionType::Bridge
+		| TransactionType::Pusher => {},
 	}
 }
 
@@ -299,17 +305,15 @@ impl RecoveryService {
 	///
 	/// A vector of active orders that need recovery processing.
 	async fn load_active_orders(&self) -> Result<Vec<Order>, RecoveryError> {
-		let terminal_status_kinds = vec![
-			serde_json::json!(FINALIZED_STATUS_KIND_INDEX_VALUE),
-			serde_json::json!(FAILED_STATUS_KIND_INDEX_VALUE),
-		];
-
 		// Query for all non-terminal orders
 		let active_orders = self
 			.storage
 			.query::<Order>(
 				StorageKey::Orders.as_str(),
-				QueryFilter::NotIn(STATUS_KIND_INDEX_FIELD.to_string(), terminal_status_kinds),
+				QueryFilter::Equals(
+					IS_TERMINAL_INDEX_FIELD.to_string(),
+					serde_json::json!(false),
+				),
 			)
 			.await
 			.map_err(|e| RecoveryError::Storage(e.to_string()))?;
@@ -412,7 +416,9 @@ impl RecoveryService {
 		receipt: &TransactionReceipt,
 	) {
 		match self.attempt_store.attempt_by_hash(tx_hash).await {
-			Ok(Some(attempt)) if attempt.order_id == order_id && attempt.tx_type == tx_type => {
+			Ok(Some(attempt))
+				if attempt.order_id() == Some(order_id) && attempt.tx_type == tx_type =>
+			{
 				if let Err(error) = self
 					.attempt_store
 					.mark_attempt_confirmed_from_receipt(
@@ -449,7 +455,7 @@ impl RecoveryService {
 				tracing::debug!(
 					%order_id,
 					attempt_id = %attempt.id,
-					attempt_order_id = %attempt.order_id,
+					attempt_scope_id = %attempt.scope_id(),
 					attempt_tx_type = ?attempt.tx_type,
 					expected_tx_type = ?tx_type,
 					?tx_hash,
@@ -849,6 +855,18 @@ impl RecoveryService {
 					"StageComplete classification on stage with no chain-probe support; treating as Failed"
 				);
 				ReconcileResult::Failed(tx_type)
+			},
+			TransactionType::Approval
+			| TransactionType::Withdrawal
+			| TransactionType::Bridge
+			| TransactionType::Pusher => {
+				tracing::warn!(
+					order_id = %order.id,
+					?tx_type,
+					?reason,
+					"StageComplete classification on system transaction type in order recovery; returning Unknown"
+				);
+				ReconcileResult::Unknown
 			},
 		}
 	}
@@ -2026,7 +2044,7 @@ mod tests {
 	) -> TransactionAttempt {
 		let mut attempt = TransactionAttempt::planned(
 			id.to_string(),
-			"test_order_123".to_string(),
+			solver_types::TransactionAttemptScope::order("test_order_123"),
 			Some(Address(vec![9; 20])),
 			tx_type,
 			Transaction {
@@ -2858,7 +2876,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn load_active_orders_queries_canonical_status_kind_index() {
+	async fn load_active_orders_queries_is_terminal_index() {
 		let mut mock_storage = MockStorageInterface::new();
 
 		mock_storage
@@ -2870,13 +2888,8 @@ mod tests {
 
 				matches!(
 					filter,
-					QueryFilter::NotIn(field, values)
-						if field == "status_kind"
-							&& values
-								== &vec![
-									serde_json::json!("finalized"),
-									serde_json::json!("failed"),
-								]
+					QueryFilter::Equals(field, value)
+						if field == IS_TERMINAL_INDEX_FIELD && value == &serde_json::json!(false)
 				)
 			})
 			.times(1)

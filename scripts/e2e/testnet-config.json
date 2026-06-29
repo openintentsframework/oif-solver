@@ -201,7 +201,9 @@
   "discovery": {
     "onchain": {
       "polling_interval_secs": 5,
-      "_comment": "0 means use WebSocket subscriptions"
+      "default_finality_blocks": 20,
+      "finality_blocks": {},
+      "_comment": "on-chain discovery polls only through a source-chain finality gate"
     }
   }
 }

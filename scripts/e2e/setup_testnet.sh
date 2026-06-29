@@ -225,7 +225,8 @@ generate_main_config() {
     local ttl_intents=$(get_config ".storage.file.ttl_intents" "86400")
     local ttl_order_by_tx_hash=$(get_config ".storage.file.ttl_order_by_tx_hash" "86400")
 
-    local onchain_polling=$(get_config ".discovery.onchain.polling_interval_secs" "0")
+    local onchain_polling=$(get_config ".discovery.onchain.polling_interval_secs" "5")
+    local onchain_default_finality_blocks=$(get_config ".discovery.onchain.default_finality_blocks" "20")
 
     local pricing_primary=$(get_config ".pricing.primary" "coingecko")
     local coingecko_cache=$(get_config ".pricing.coingecko.cache_duration_seconds" "60")
@@ -277,6 +278,7 @@ generate_main_config() {
         --arg origin_token_address "$origin_token_address" \
         --arg dest_token_address "$dest_token_address" \
         --argjson onchain_polling "$onchain_polling" \
+        --argjson onchain_default_finality_blocks "$onchain_default_finality_blocks" \
         --argjson max_gas_price_gwei "$max_gas_price_gwei" \
         --arg pricing_primary "$pricing_primary" \
         --argjson coingecko_cache "$coingecko_cache" \
@@ -369,7 +371,9 @@ generate_main_config() {
                 implementations: {
                     onchain_eip7683: {
                         network_ids: [$origin_id, $dest_id],
-                        polling_interval_secs: $onchain_polling
+                        polling_interval_secs: $onchain_polling,
+                        default_finality_blocks: $onchain_default_finality_blocks,
+                        finality_blocks: {}
                     },
                     offchain_eip7683: {
                         network_ids: [$origin_id, $dest_id]
@@ -639,6 +643,8 @@ append_hyperlane_settlement() {
     dest_mailbox=$(jq -r --arg dest_chain "$DEST_CHAIN" ".settlement.implementations[$impl_index].chains[\$dest_chain].mailbox // \"0x0000000000000000000000000000000000000000\"" "$CONFIG_FILE")
     origin_igp=$(jq -r --arg origin_chain "$ORIGIN_CHAIN" ".settlement.implementations[$impl_index].chains[\$origin_chain].igp // \"0x0000000000000000000000000000000000000000\"" "$CONFIG_FILE")
     dest_igp=$(jq -r --arg dest_chain "$DEST_CHAIN" ".settlement.implementations[$impl_index].chains[\$dest_chain].igp // \"0x0000000000000000000000000000000000000000\"" "$CONFIG_FILE")
+    origin_domain=$(jq -r --arg origin_chain "$ORIGIN_CHAIN" ".settlement.implementations[$impl_index].chains[\$origin_chain].domain // .settlement.implementations[$impl_index].chains[\$origin_chain].chain_id" "$CONFIG_FILE")
+    dest_domain=$(jq -r --arg dest_chain "$DEST_CHAIN" ".settlement.implementations[$impl_index].chains[\$dest_chain].domain // .settlement.implementations[$impl_index].chains[\$dest_chain].chain_id" "$CONFIG_FILE")
 
     local temp_file
     temp_file=$(mktemp)
@@ -646,6 +652,8 @@ append_hyperlane_settlement() {
         --arg order_type "$order_type" \
         --argjson origin_id "$origin_id" \
         --argjson dest_id "$dest_id" \
+        --argjson origin_domain "$origin_domain" \
+        --argjson dest_domain "$dest_domain" \
         --arg origin_oracle "$origin_oracle" \
         --arg dest_oracle "$dest_oracle" \
         --arg origin_mailbox "$origin_mailbox" \
@@ -683,6 +691,10 @@ append_hyperlane_settlement() {
             igp_addresses: {
                 ($origin_id | tostring): $origin_igp,
                 ($dest_id | tostring): $dest_igp
+            },
+            domains: {
+                ($origin_id | tostring): $origin_domain,
+                ($dest_id | tostring): $dest_domain
             }
         }
         ' "$PROJECT_ROOT/config/testnet.json" > "$temp_file"

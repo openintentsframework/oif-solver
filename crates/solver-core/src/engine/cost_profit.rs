@@ -181,6 +181,33 @@ fn first_hyperlane_oracle_for_quote(
 		})
 }
 
+fn hyperlane_domain_for_quote(
+	hyperlane_config: &serde_json::Value,
+	chain_id: u64,
+) -> Result<u32, APIError> {
+	let value = hyperlane_config
+		.get("domains")
+		.and_then(|domains| domains.get(chain_id.to_string()))
+		.ok_or_else(|| APIError::BadRequest {
+			error_type: ApiErrorType::InvalidRequest,
+			message: format!("Missing Hyperlane domain for chain {chain_id}"),
+			details: None,
+		})?;
+	let domain = value.as_u64().ok_or_else(|| APIError::BadRequest {
+		error_type: ApiErrorType::InvalidRequest,
+		message: format!("Hyperlane domain for chain {chain_id} must be an unsigned integer"),
+		details: None,
+	})?;
+	if domain == 0 || domain > u32::MAX as u64 {
+		return Err(APIError::BadRequest {
+			error_type: ApiErrorType::InvalidRequest,
+			message: format!("Hyperlane domain for chain {chain_id} must be in 1..=u32::MAX"),
+			details: None,
+		});
+	}
+	Ok(domain as u32)
+}
+
 /// Parameters for gas unit calculations
 #[derive(Debug, Clone)]
 pub struct GasUnits {
@@ -2591,9 +2618,10 @@ impl CostProfitService {
 		let payloads = vec![fill_description];
 		let total_payload_size: usize = payloads.iter().map(|p| p.len()).sum();
 		let message_gas_limit = quote_hyperlane_message_gas_limit(total_payload_size);
+		let origin_domain = hyperlane_domain_for_quote(hyperlane_config, origin_chain_id)?;
 
 		let call_data = IHyperlaneOracleForQuote::submitCall {
-			destinationDomain: origin_chain_id as u32,
+			destinationDomain: origin_domain,
 			recipientOracle: alloy_primitives::Address::from_slice(&recipient_oracle.0),
 			gasLimit: message_gas_limit,
 			customMetadata: vec![].into(),
@@ -6403,6 +6431,10 @@ mod tests {
 		config.settlement.implementations.insert(
 			"hyperlane".to_string(),
 			serde_json::json!({
+				"domains": {
+					"1": 10,
+					"137": 137
+				},
 				"oracles": {
 					"input": {
 						"1": ["0x1111111111111111111111111111111111111111"],
@@ -6419,6 +6451,92 @@ mod tests {
 			g.live_fill_estimate_enabled = live_enabled;
 		}
 		config
+	}
+
+	#[test]
+	fn hyperlane_domain_for_quote_rejects_missing_domain() {
+		let config = serde_json::json!({
+			"domains": {
+				"137": 137
+			}
+		});
+
+		let err = hyperlane_domain_for_quote(&config, 1).unwrap_err();
+
+		assert!(err
+			.to_string()
+			.contains("Missing Hyperlane domain for chain 1"));
+	}
+
+	#[test]
+	fn hyperlane_domain_for_quote_rejects_non_integer_domain() {
+		let config = serde_json::json!({
+			"domains": {
+				"1": "10"
+			}
+		});
+
+		let err = hyperlane_domain_for_quote(&config, 1).unwrap_err();
+
+		assert!(err
+			.to_string()
+			.contains("Hyperlane domain for chain 1 must be an unsigned integer"));
+	}
+
+	#[test]
+	fn hyperlane_domain_for_quote_rejects_zero_domain() {
+		let config = serde_json::json!({
+			"domains": {
+				"1": 0
+			}
+		});
+
+		let err = hyperlane_domain_for_quote(&config, 1).unwrap_err();
+
+		assert!(err
+			.to_string()
+			.contains("Hyperlane domain for chain 1 must be in 1..=u32::MAX"));
+	}
+
+	#[test]
+	fn hyperlane_domain_for_quote_rejects_oversized_domain() {
+		let config = serde_json::json!({
+			"domains": {
+				"1": u32::MAX as u64 + 1
+			}
+		});
+
+		let err = hyperlane_domain_for_quote(&config, 1).unwrap_err();
+
+		assert!(err
+			.to_string()
+			.contains("Hyperlane domain for chain 1 must be in 1..=u32::MAX"));
+	}
+
+	#[tokio::test]
+	async fn quote_post_fill_submit_uses_hyperlane_domain_not_chain_id() {
+		let service = cost_profit_service_no_delivery_chains();
+		let config = config_for_live_estimate(false);
+		let request = create_test_request(true);
+		let context = create_test_validated_context(true);
+		let resolved = resolved_amounts_for_request(&request, U256::from(950u64));
+		let solver = Address([0xAB; 20].to_vec());
+
+		let quote_tx = service
+			.build_post_fill_tx_for_quote(
+				&request,
+				&context,
+				&resolved,
+				&config,
+				&solver,
+				U256::from(123u64),
+			)
+			.await
+			.unwrap()
+			.expect("hyperlane quote tx");
+		let decoded = IHyperlaneOracleForQuote::submitCall::abi_decode(&quote_tx.tx.data).unwrap();
+
+		assert_eq!(decoded.destinationDomain, 10);
 	}
 
 	#[tokio::test]
