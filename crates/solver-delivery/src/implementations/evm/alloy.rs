@@ -5935,7 +5935,7 @@ mod tests {
 			};
 			let planned = TransactionAttempt::planned(
 				"attempt-1".to_string(),
-				"order-1".to_string(),
+				solver_types::TransactionAttemptScope::order("order-1"),
 				Some(solver_types::Address(from.to_vec())),
 				TransactionType::Fill,
 				tx.clone(),

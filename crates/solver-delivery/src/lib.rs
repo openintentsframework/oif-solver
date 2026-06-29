@@ -538,6 +538,8 @@ mod system_delivery_tests {
 	use solver_types::validation::ValidationError;
 	use std::sync::{Arc, Mutex};
 
+	type SeenTracking = (String, TransactionType, u64, u64, u64);
+
 	struct EmptySchema;
 
 	impl ConfigSchema for EmptySchema {
@@ -548,7 +550,7 @@ mod system_delivery_tests {
 
 	#[derive(Default)]
 	struct RecordingDelivery {
-		seen_tracking: Mutex<Option<(String, TransactionType, u64, u64, u64)>>,
+		seen_tracking: Mutex<Option<SeenTracking>>,
 	}
 
 	#[async_trait]
