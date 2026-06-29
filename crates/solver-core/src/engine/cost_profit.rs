@@ -962,52 +962,57 @@ impl CostProfitService {
 		let mut l1_data_fee_wei = U256::ZERO;
 		let mut l1_data_fee_buffer_wei = U256::ZERO;
 
-		match self
-			.build_fill_tx_for_quote(
-				request,
-				context,
-				&swap_amounts_with_info,
-				config,
-				solver_address,
-			)
-			.await
-		{
-			Ok(mut fill_tx) => {
-				fill_tx.gas_limit = Some(gas_units.fill_units);
-				let (raw, buffer) = self
-					.estimate_extra_native_fee_wei(config, dest_chain_id, &fill_tx)
-					.await?;
-				l1_data_fee_wei = l1_data_fee_wei.saturating_add(raw);
-				l1_data_fee_buffer_wei = l1_data_fee_buffer_wei.saturating_add(buffer);
-			},
-			Err(e) => {
-				fail_closed_on_extra_fee_build_error(config, dest_chain_id, "fill", e)?;
-			},
-		}
+		// Only chains with an extra_native_fee policy (OP Stack L1 data fee) need
+		// a per-transaction fee estimate. On every other chain the synthetic-tx
+		// builds below are pure waste (the estimate would be zero), so skip them.
+		if extra_native_fee_configured(config, dest_chain_id) {
+			match self
+				.build_fill_tx_for_quote(
+					request,
+					context,
+					&swap_amounts_with_info,
+					config,
+					solver_address,
+				)
+				.await
+			{
+				Ok(mut fill_tx) => {
+					fill_tx.gas_limit = Some(gas_units.fill_units);
+					let (raw, buffer) = self
+						.estimate_extra_native_fee_wei(config, dest_chain_id, &fill_tx)
+						.await?;
+					l1_data_fee_wei = l1_data_fee_wei.saturating_add(raw);
+					l1_data_fee_buffer_wei = l1_data_fee_buffer_wei.saturating_add(buffer);
+				},
+				Err(e) => {
+					fail_closed_on_extra_fee_build_error(config, dest_chain_id, "fill", e)?;
+				},
+			}
 
-		match self
-			.build_post_fill_tx_for_quote(
-				request,
-				context,
-				&swap_amounts_with_info,
-				config,
-				solver_address,
-				settlement_fee_wei,
-			)
-			.await
-		{
-			Ok(Some(mut post_fill)) => {
-				post_fill.tx.gas_limit = Some(gas_units.post_fill_units);
-				let (raw, buffer) = self
-					.estimate_extra_native_fee_wei(config, dest_chain_id, &post_fill.tx)
-					.await?;
-				l1_data_fee_wei = l1_data_fee_wei.saturating_add(raw);
-				l1_data_fee_buffer_wei = l1_data_fee_buffer_wei.saturating_add(buffer);
-			},
-			Ok(None) => {},
-			Err(e) => {
-				fail_closed_on_extra_fee_build_error(config, dest_chain_id, "post-fill", e)?;
-			},
+			match self
+				.build_post_fill_tx_for_quote(
+					request,
+					context,
+					&swap_amounts_with_info,
+					config,
+					solver_address,
+					settlement_fee_wei,
+				)
+				.await
+			{
+				Ok(Some(mut post_fill)) => {
+					post_fill.tx.gas_limit = Some(gas_units.post_fill_units);
+					let (raw, buffer) = self
+						.estimate_extra_native_fee_wei(config, dest_chain_id, &post_fill.tx)
+						.await?;
+					l1_data_fee_wei = l1_data_fee_wei.saturating_add(raw);
+					l1_data_fee_buffer_wei = l1_data_fee_buffer_wei.saturating_add(buffer);
+				},
+				Ok(None) => {},
+				Err(e) => {
+					fail_closed_on_extra_fee_build_error(config, dest_chain_id, "post-fill", e)?;
+				},
+			}
 		}
 
 		// Parse inputs/outputs to proper types for cost calculation
