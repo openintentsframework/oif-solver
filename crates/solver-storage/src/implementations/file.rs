@@ -1203,7 +1203,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn file_query_matches_bool_index_after_index_reload() {
-		let (storage, _temp_dir) = create_test_storage_with_ttl();
+		let (storage, _temp_dir) = create_test_storage();
 		let namespace = "orders";
 		let key = "orders:order1";
 		let indexes = StorageIndexes::new().with_field("is_terminal", false);
