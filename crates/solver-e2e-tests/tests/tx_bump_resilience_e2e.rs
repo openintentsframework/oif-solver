@@ -120,8 +120,12 @@ where
 		}
 		if Instant::now() >= deadline {
 			h.dump_solver_stderr();
+			let order_status = match h.stored_order(order_id).await {
+				Ok(order) => format!("{:?}", order.status),
+				Err(error) => format!("<unavailable: {error:#}>"),
+			};
 			return Err(anyhow!(
-				"timeout waiting for {tx_type:?} attempts on {order_id}; last={attempts:?}"
+				"timeout waiting for {tx_type:?} attempts on {order_id}; order_status={order_status}; last={attempts:?}"
 			));
 		}
 		tokio::time::sleep(POLL).await;
@@ -728,6 +732,17 @@ async fn many_pending_orders_sweeper_progresses_without_duplicate_offchain_event
 		let (order_id, _order) = open_default_order(&h, &format!("tx-bump-load-{index}")).await?;
 		let order_id_str = order_key(order_id);
 		order_ids.push((order_id, order_id_str));
+	}
+
+	for (_order_id, order_id_str) in &order_ids {
+		wait_for_attempts(
+			&h,
+			order_id_str,
+			TransactionType::Fill,
+			LOAD_WAIT,
+			|attempts| attempts.iter().any(is_fresh_root_attempt_with_hash),
+		)
+		.await?;
 	}
 
 	for (_order_id, order_id_str) in &order_ids {
