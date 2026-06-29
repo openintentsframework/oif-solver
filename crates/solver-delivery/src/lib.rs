@@ -108,6 +108,15 @@ mod transaction_attempt_recorder_tests {
 
 		assert_eq!(attempt.order_id, "order-1");
 	}
+
+	#[test]
+	fn extra_native_fee_estimate_default_is_zero() {
+		let estimate = ExtraNativeFeeEstimate::default();
+
+		assert_eq!(estimate.raw_fee_wei, "0");
+		assert_eq!(estimate.buffer_wei, "0");
+		assert_eq!(estimate.total_fee_wei, "0");
+	}
 }
 
 /// Errors that can occur during transaction delivery operations.

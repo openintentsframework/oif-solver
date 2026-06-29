@@ -5508,6 +5508,14 @@ mod tests {
 			})
 		}
 
+		fn rpc_success_quantity(value: u64) -> serde_json::Value {
+			serde_json::json!({
+				"jsonrpc": "2.0",
+				"id": 1,
+				"result": format!("0x{value:x}")
+			})
+		}
+
 		fn rpc_error(message: &str) -> serde_json::Value {
 			serde_json::json!({
 				"jsonrpc": "2.0",
@@ -5672,6 +5680,45 @@ mod tests {
 				.expect("unconfigured chain should not require oracle RPC");
 
 			assert_eq!(estimate, ExtraNativeFeeEstimate::default());
+		}
+
+		#[tokio::test]
+		async fn signed_op_stack_preflight_passes_when_balance_covers_execution_and_l1_fee() {
+			let rpc_url = start_json_rpc_with_responses(vec![
+				rpc_success_uint256(100),
+				rpc_success_quantity(50_000),
+			])
+			.await;
+			let delivery = delivery_with_op_stack_provider(rpc_url);
+			let provider = delivery.get_provider(10).expect("configured provider");
+			let from: Address = "0x00000000000000000000000000000000000000bb"
+				.parse()
+				.expect("valid signer");
+			let tx = SolverTransaction {
+				chain_id: 10,
+				to: Some(solver_types::Address(vec![0x22; 20])),
+				data: vec![0xab],
+				value: U256::from(3u64),
+				gas_limit: Some(21_000),
+				gas_price: Some(2),
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+				nonce: Some(4),
+			};
+
+			delivery
+				.ensure_signed_transaction_affordable(
+					10,
+					provider,
+					from,
+					&tx,
+					&[0x02, 0x03],
+					None,
+					None,
+					"test signed preflight",
+				)
+				.await
+				.expect("balance covers gas, value, and OP Stack L1 fee");
 		}
 
 		#[tokio::test]
