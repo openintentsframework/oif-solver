@@ -177,15 +177,15 @@ impl TransactionAttemptStore {
 			.query::<TransactionAttempt>(
 				StorageKey::TransactionAttempts.as_str(),
 				QueryFilter::Equals(
-					SCOPE_KIND_INDEX_FIELD.to_string(),
-					serde_json::json!(SCOPE_KIND_ORDER),
+					IS_TERMINAL_INDEX_FIELD.to_string(),
+					serde_json::json!(false),
 				),
 			)
 			.await?;
 		Ok(rows
 			.into_iter()
 			.map(|(_, attempt)| attempt)
-			.filter(|attempt| !attempt.is_terminal())
+			.filter(|attempt| matches!(attempt.scope, TransactionAttemptScope::Order { .. }))
 			.collect())
 	}
 

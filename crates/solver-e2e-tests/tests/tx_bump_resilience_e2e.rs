@@ -125,7 +125,8 @@ where
 				Err(error) => format!("<unavailable: {error:#}>"),
 			};
 			return Err(anyhow!(
-				"timeout waiting for {tx_type:?} attempts on {order_id}; order_status={order_status}; last={attempts:?}"
+				"timeout waiting for {tx_type:?} attempts on {order_id}; \
+				 order_status={order_status}; last={attempts:?}"
 			));
 		}
 		tokio::time::sleep(POLL).await;
