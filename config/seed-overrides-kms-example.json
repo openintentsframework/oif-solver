@@ -38,6 +38,16 @@
       ]
     }
   ],
+  "source_finality": {
+    "default_mode": "conservative",
+    "default_blocks": 20,
+    "default_block_time_seconds": 12,
+    "retry_grace_seconds": 10,
+    "chains": {
+      "11155420": { "mode": "numeric", "blocks": 30, "block_time_seconds": 2 },
+      "84532": { "mode": "numeric", "blocks": 30, "block_time_seconds": 2 }
+    }
+  },
   "admin": {
     "enabled": true,
     "domain": "localhost",

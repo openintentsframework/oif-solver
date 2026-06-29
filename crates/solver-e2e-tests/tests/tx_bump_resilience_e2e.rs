@@ -120,8 +120,13 @@ where
 		}
 		if Instant::now() >= deadline {
 			h.dump_solver_stderr();
+			let order_status = match h.stored_order(order_id).await {
+				Ok(order) => format!("{:?}", order.status),
+				Err(error) => format!("<unavailable: {error:#}>"),
+			};
 			return Err(anyhow!(
-				"timeout waiting for {tx_type:?} attempts on {order_id}; last={attempts:?}"
+				"timeout waiting for {tx_type:?} attempts on {order_id}; \
+				 order_status={order_status}; last={attempts:?}"
 			));
 		}
 		tokio::time::sleep(POLL).await;
@@ -148,6 +153,39 @@ where
 			return Err(anyhow!(
 				"timeout waiting for order {order_id}; last status={:?}",
 				order.status
+			));
+		}
+		tokio::time::sleep(POLL).await;
+	}
+}
+
+async fn wait_for_any_replacement(
+	h: &Harness,
+	order_ids: &[(B256, String)],
+	tx_type: TransactionType,
+	timeout: Duration,
+) -> Result<()> {
+	let deadline = Instant::now() + timeout;
+	loop {
+		let mut summaries = Vec::new();
+		for (_order_id, order_id_str) in order_ids {
+			let attempts = h.stored_attempts_by_type(order_id_str, tx_type).await?;
+			let replacement_count = attempts
+				.iter()
+				.filter(|attempt| attempt.replacement_of.is_some())
+				.count();
+			if replacement_count > 0 {
+				return Ok(());
+			}
+			summaries.push(format!(
+				"{order_id_str}: attempts={}, replacements={replacement_count}",
+				attempts.len()
+			));
+		}
+		if Instant::now() >= deadline {
+			h.dump_solver_stderr();
+			return Err(anyhow!(
+				"timeout waiting for any {tx_type:?} replacement under load; {summaries:?}"
 			));
 		}
 		tokio::time::sleep(POLL).await;
@@ -736,14 +774,12 @@ async fn many_pending_orders_sweeper_progresses_without_duplicate_offchain_event
 			order_id_str,
 			TransactionType::Fill,
 			LOAD_WAIT,
-			|attempts| {
-				attempts
-					.iter()
-					.any(|attempt| attempt.replacement_of.is_some())
-			},
+			|attempts| attempts.iter().any(is_fresh_root_attempt_with_hash),
 		)
 		.await?;
 	}
+
+	wait_for_any_replacement(&h, &order_ids, TransactionType::Fill, LOAD_WAIT).await?;
 
 	resume_mining(&h, DEST_CHAIN_ID).await?;
 	h.mine_blocks(DEST_CHAIN_ID, 5).await?;

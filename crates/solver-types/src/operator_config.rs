@@ -93,6 +93,10 @@ pub struct OperatorConfig {
 	/// chains into the same-nonce gas-bumping sweep loop.
 	#[serde(default)]
 	pub tx_bump: OperatorTxBumpConfig,
+
+	/// Source-chain finality policy used before escrow-origin fills.
+	#[serde(default)]
+	pub source_finality: Option<serde_json::Value>,
 }
 
 /// Account configuration for signing backends.
@@ -1202,6 +1206,7 @@ mod tests {
 			rebalance: None,
 			fee_policy: None,
 			tx_bump: OperatorTxBumpConfig::default(),
+			source_finality: None,
 		};
 
 		let json = serde_json::to_string_pretty(&config).unwrap();

@@ -911,6 +911,7 @@ mod tests {
 								gas_limit: Some(21_000),
 								max_fee_per_gas: Some(1),
 								gas_price: None,
+								extra_native_fee_wei: "0".to_string(),
 								value_wei: "0".to_string(),
 							},
 						)))

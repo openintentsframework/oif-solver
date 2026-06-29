@@ -1792,6 +1792,7 @@ mod tests {
 				gas_limit: Some(21_000),
 				max_fee_per_gas: Some(1),
 				gas_price: None,
+				extra_native_fee_wei: "0".to_string(),
 				value_wei: "0".to_string(),
 			},
 		))
@@ -2303,6 +2304,82 @@ mod tests {
 		assert!(matches!(
 			engine.state_machine.get_order(&order.id).await,
 			Err(crate::state::OrderStateError::Storage(_))
+		));
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_skips_escrow_source_finality_loop_when_next_retry_misses_deadline() {
+		let mut strategy = MockExecutionStrategy::new();
+		strategy.expect_should_execute().times(1).returning(|_, _| {
+			Box::pin(async move { ExecutionDecision::Defer(Duration::from_secs(60)) })
+		});
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let order = deferred_order_without_execution_params(LockType::Permit2Escrow, 30);
+		engine.state_machine.store_order(&order).await.unwrap();
+		let mut receiver = engine.event_bus.subscribe();
+
+		engine.retry_deferred_order_once(&order.id).await.unwrap();
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Skipped { order_id, reason }) => {
+				assert_eq!(order_id, order.id);
+				assert!(reason.contains("Deferred retry would miss fill deadline"));
+			},
+			_ => panic!("Expected Order::Skipped event"),
+		}
+		assert!(matches!(
+			engine.state_machine.get_order(&order.id).await,
+			Err(crate::state::OrderStateError::Storage(_))
+		));
+	}
+
+	#[test]
+	fn deferred_retry_skips_exact_deadline_boundary() {
+		let order_data = Eip7683OrderDataBuilder::new()
+			.origin_chain_id(alloy_primitives::U256::from(1))
+			.lock_type(LockType::Permit2Escrow)
+			.raw_order_data("0x1234")
+			.sponsor("0x1111111111111111111111111111111111111111")
+			.signature("0xabcdef")
+			.expires(165)
+			.fill_deadline(165)
+			.build();
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(order_data).unwrap())
+			.build();
+
+		assert!(!deferred_retry_would_miss_deadline(
+			&order,
+			Duration::from_secs(64),
+			100,
+		));
+		assert!(deferred_retry_would_miss_deadline(
+			&order,
+			Duration::from_secs(65),
+			100,
+		));
+	}
+
+	#[test]
+	fn deferred_retry_does_not_reapply_source_finality_delay() {
+		let order_data = Eip7683OrderDataBuilder::new()
+			.origin_chain_id(alloy_primitives::U256::from(1))
+			.lock_type(LockType::Permit2Escrow)
+			.raw_order_data("0x1234")
+			.sponsor("0x1111111111111111111111111111111111111111")
+			.signature("0xabcdef")
+			.expires(1_300)
+			.fill_deadline(1_300)
+			.build();
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(order_data).unwrap())
+			.build();
+
+		assert!(!deferred_retry_would_miss_deadline(
+			&order,
+			Duration::from_secs(1),
+			100,
 		));
 	}
 

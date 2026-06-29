@@ -30,7 +30,7 @@ pub(crate) mod post_fill_outcome {
 	pub const SKIPPED_UNSUPPORTED_CHAIN: &str = "skipped_unsupported_chain";
 }
 use rust_decimal::Decimal;
-use solver_config::Config;
+use solver_config::{source_finality_expected_delay_seconds, Config};
 use solver_delivery::{DeliveryService, FeeParams};
 use solver_pricing::PricingService;
 use solver_storage::StorageService;
@@ -82,6 +82,50 @@ fn quote_hyperlane_message_gas_limit(payload_size: usize) -> U256 {
 	let buffer = 100000usize;
 
 	U256::from(base_gas + (payload_size * gas_per_byte) + buffer)
+}
+
+fn extra_native_fee_configured(config: &Config, chain_id: u64) -> bool {
+	let chain_key = chain_id.to_string();
+	config
+		.delivery
+		.implementations
+		.values()
+		.any(|implementation| {
+			implementation
+				.get("fee_policy")
+				.and_then(|fee_policy| fee_policy.get("chains"))
+				.and_then(|chains| chains.get(&chain_key))
+				.and_then(|chain| chain.get("extra_native_fee"))
+				.is_some()
+		})
+}
+
+/// Decides what to do when a synthetic quote transaction cannot be built for
+/// extra-native-fee pricing. For chains that have an `extra_native_fee` policy
+/// configured (e.g. OP Stack L1 data fee), that fee is a required cost
+/// component, so we fail closed instead of silently pricing the leg at zero —
+/// otherwise a build edge case would reintroduce the M-14 under-pricing the fee
+/// model exists to prevent. For all other chains there is no extra fee to
+/// price, so we log and skip (price the leg at zero).
+fn fail_closed_on_extra_fee_build_error(
+	config: &Config,
+	chain_id: u64,
+	leg: &'static str,
+	error: impl std::fmt::Display,
+) -> Result<(), CostProfitError> {
+	if extra_native_fee_configured(config, chain_id) {
+		return Err(CostProfitError::Calculation(format!(
+			"Cannot build synthetic {leg} tx to price extra native fee for chain {chain_id}: {error}"
+		)));
+	}
+
+	tracing::warn!(
+		chain_id,
+		leg,
+		error = %error,
+		"Skipping extra native fee estimate: failed to build synthetic tx"
+	);
+	Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -729,6 +773,7 @@ impl CostProfitService {
 
 		// Get gas units for cost calculation
 		let mut gas_units = estimate_quote_gas_units_from_flow_keys(flow_keys, config);
+		let include_source_finality_delay = !flow_keys.iter().any(|flow| flow == "resource_lock");
 
 		// Optional: live-estimate destination-chain legs against the destination
 		// chain so quote-time costs track the transactions the solver will send.
@@ -765,6 +810,7 @@ impl CostProfitService {
 					&swap_amounts_with_info,
 					config,
 					solver_address,
+					include_source_finality_delay,
 				)
 				.await
 			{
@@ -915,6 +961,63 @@ impl CostProfitService {
 			gas_units.post_fill_units = live_units;
 		}
 
+		let mut l1_data_fee_wei = U256::ZERO;
+		let mut l1_data_fee_buffer_wei = U256::ZERO;
+
+		// Only chains with an extra_native_fee policy (OP Stack L1 data fee) need
+		// a per-transaction fee estimate. On every other chain the synthetic-tx
+		// builds below are pure waste (the estimate would be zero), so skip them.
+		if extra_native_fee_configured(config, dest_chain_id) {
+			match self
+				.build_fill_tx_for_quote(
+					request,
+					context,
+					&swap_amounts_with_info,
+					config,
+					solver_address,
+					include_source_finality_delay,
+				)
+				.await
+			{
+				Ok(mut fill_tx) => {
+					fill_tx.gas_limit = Some(gas_units.fill_units);
+					let (raw, buffer) = self
+						.estimate_extra_native_fee_wei(config, dest_chain_id, &fill_tx)
+						.await?;
+					l1_data_fee_wei = l1_data_fee_wei.saturating_add(raw);
+					l1_data_fee_buffer_wei = l1_data_fee_buffer_wei.saturating_add(buffer);
+				},
+				Err(e) => {
+					fail_closed_on_extra_fee_build_error(config, dest_chain_id, "fill", e)?;
+				},
+			}
+
+			match self
+				.build_post_fill_tx_for_quote(
+					request,
+					context,
+					&swap_amounts_with_info,
+					config,
+					solver_address,
+					settlement_fee_wei,
+				)
+				.await
+			{
+				Ok(Some(mut post_fill)) => {
+					post_fill.tx.gas_limit = Some(gas_units.post_fill_units);
+					let (raw, buffer) = self
+						.estimate_extra_native_fee_wei(config, dest_chain_id, &post_fill.tx)
+						.await?;
+					l1_data_fee_wei = l1_data_fee_wei.saturating_add(raw);
+					l1_data_fee_buffer_wei = l1_data_fee_buffer_wei.saturating_add(buffer);
+				},
+				Ok(None) => {},
+				Err(e) => {
+					fail_closed_on_extra_fee_build_error(config, dest_chain_id, "post-fill", e)?;
+				},
+			}
+		}
+
 		// Parse inputs/outputs to proper types for cost calculation
 		let mut parsed_inputs = Vec::new();
 		for input in inputs {
@@ -952,6 +1055,8 @@ impl CostProfitService {
 				dest_chain_id,
 				&gas_units,
 				settlement_fee_wei,
+				l1_data_fee_wei,
+				l1_data_fee_buffer_wei,
 			)
 			.await?;
 
@@ -1015,7 +1120,9 @@ impl CostProfitService {
 			cost_breakdown.gas_fill
 				+ cost_breakdown.gas_post_fill
 				+ cost_breakdown.settlement_fee
-				+ cost_breakdown.settlement_fee_buffer,
+				+ cost_breakdown.settlement_fee_buffer
+				+ cost_breakdown.l1_data_fee
+				+ cost_breakdown.l1_data_fee_buffer,
 		);
 
 		// Calculate adjusted amounts (swap amounts +/- costs based on swap type)
@@ -1077,6 +1184,8 @@ impl CostProfitService {
 		dest_chain_id: u64,
 		gas_units: &GasUnits,
 		settlement_fee_wei: U256,
+		l1_data_fee_wei: U256,
+		l1_data_fee_buffer_wei: U256,
 	) -> Result<CostBreakdown, CostProfitError> {
 		// Read gas_buffer_bps from solver config (hot-reloadable)
 		let gas_buffer_bps_value = config.solver.gas_buffer_bps;
@@ -1145,6 +1254,10 @@ impl CostProfitService {
 			Decimal::new(config.solver.settlement_fee_buffer_bps as i64, 0);
 		let settlement_fee_buffer =
 			(settlement_fee * settlement_fee_buffer_bps) / Decimal::from(10000);
+		let (l1_data_fee, l1_data_fee_buffer) = tokio::try_join!(
+			self.wei_to_usd(&l1_data_fee_wei),
+			self.wei_to_usd(&l1_data_fee_buffer_wei),
+		)?;
 
 		// Input and output valuations do not depend on each other.
 		let (total_input_value_usd, total_output_value_usd) = tokio::try_join!(
@@ -1176,6 +1289,8 @@ impl CostProfitService {
 				+ gas_claim + gas_buffer
 				+ settlement_fee
 				+ settlement_fee_buffer
+				+ l1_data_fee
+				+ l1_data_fee_buffer
 				+ rate_buffer;
 
 		// Calculate subtotal (actual costs only, excluding profit)
@@ -1193,6 +1308,8 @@ impl CostProfitService {
 			gas_buffer,
 			settlement_fee,
 			settlement_fee_buffer,
+			l1_data_fee,
+			l1_data_fee_buffer,
 			rate_buffer,
 			base_price,
 			min_profit,
@@ -1432,6 +1549,15 @@ impl CostProfitService {
 			None => U256::ZERO,
 		};
 
+		let (l1_data_fee_wei, l1_data_fee_buffer_wei) = if let Some(fill_tx) = fill_tx {
+			let mut fill_tx = fill_tx.clone();
+			fill_tx.gas_limit = Some(gas_units.fill_units);
+			self.estimate_extra_native_fee_wei(config, dest_chain_id, &fill_tx)
+				.await?
+		} else {
+			(U256::ZERO, U256::ZERO)
+		};
+
 		// Use the unified cost calculation method
 		let cost_breakdown = self
 			.calculate_total_cost(
@@ -1442,6 +1568,8 @@ impl CostProfitService {
 				dest_chain_id,
 				&gas_units,
 				settlement_fee_wei,
+				l1_data_fee_wei,
+				l1_data_fee_buffer_wei,
 			)
 			.await?;
 
@@ -2023,6 +2151,7 @@ impl CostProfitService {
 		resolved_amounts: &std::collections::HashMap<InteropAddress, TokenAmountInfo>,
 		config: &Config,
 		solver_address: &Address,
+		include_source_finality_delay: bool,
 	) -> Result<Transaction, APIError> {
 		let output = request
 			.intent
@@ -2137,12 +2266,33 @@ impl CostProfitService {
 		// configures a longer deadline, the settler's max-fill-window must
 		// already accept it, so the same value is safe here. If config is
 		// missing, fall back to 60s (the historical hardcoded default).
-		let fill_deadline_window = config
+		let configured_fill_deadline_window = config
 			.api
 			.as_ref()
 			.and_then(|a| a.quote.as_ref())
 			.map(|q| q.fill_deadline_seconds)
 			.unwrap_or(60);
+		let quote_validity_window = config
+			.api
+			.as_ref()
+			.and_then(|a| a.quote.as_ref())
+			.map(|q| q.validity_seconds)
+			.unwrap_or_else(|| solver_config::QuoteConfig::default().validity_seconds);
+		let origin_chain_id = request
+			.intent
+			.inputs
+			.first()
+			.and_then(|input| input.asset.ethereum_chain_id().ok());
+		let source_finality_window = if include_source_finality_delay {
+			origin_chain_id
+				.and_then(|chain_id| source_finality_expected_delay_seconds(config, chain_id))
+				.unwrap_or(0)
+				.saturating_add(config.source_finality.retry_grace_seconds)
+				.saturating_add(quote_validity_window)
+		} else {
+			0
+		};
+		let fill_deadline_window = configured_fill_deadline_window.max(source_finality_window);
 		let fill_deadline_secs = current_timestamp().saturating_add(fill_deadline_window);
 
 		let data = IOutputSettlerSimple::fillCall {
@@ -2563,6 +2713,35 @@ impl CostProfitService {
 				error_type: ApiErrorType::ServiceError,
 				message: format!("Failed to get fee params: {e}"),
 			})
+	}
+
+	async fn estimate_extra_native_fee_wei(
+		&self,
+		config: &Config,
+		chain_id: u64,
+		tx: &Transaction,
+	) -> Result<(U256, U256), CostProfitError> {
+		if !extra_native_fee_configured(config, chain_id) {
+			return Ok((U256::ZERO, U256::ZERO));
+		}
+
+		let estimate = self
+			.delivery_service
+			.estimate_extra_native_fee(chain_id, tx)
+			.await
+			.map_err(|e| APIError::InternalServerError {
+				error_type: ApiErrorType::ServiceError,
+				message: format!("Failed to estimate extra native fee: {e}"),
+			})?;
+		let raw = U256::from_str(&estimate.raw_fee_wei).map_err(|e| {
+			CostProfitError::Calculation(format!("Failed to parse extra native raw fee wei: {e}"))
+		})?;
+		let buffer = U256::from_str(&estimate.buffer_wei).map_err(|e| {
+			CostProfitError::Calculation(format!(
+				"Failed to parse extra native fee buffer wei: {e}"
+			))
+		})?;
+		Ok((raw, buffer))
 	}
 
 	async fn wei_to_usd(&self, value_wei: &U256) -> Result<Decimal, CostProfitError> {
@@ -3202,6 +3381,81 @@ mod tests {
 		}
 		config
 	}
+
+	#[test]
+	fn extra_native_fee_configured_detects_delivery_chain_policy() {
+		let mut config = create_test_config();
+		config.delivery.implementations.insert(
+			"evm".to_string(),
+			serde_json::json!({
+				"fee_policy": {
+					"chains": {
+						"8453": {
+							"extra_native_fee": {
+								"type": "op_stack_l1_data"
+							}
+						}
+					}
+				}
+			}),
+		);
+
+		assert!(extra_native_fee_configured(&config, 8453));
+		assert!(!extra_native_fee_configured(&config, 137));
+	}
+
+	#[test]
+	fn extra_fee_build_failure_fails_closed_for_configured_op_chain() {
+		let mut config = create_test_config();
+		config.delivery.implementations.insert(
+			"evm".to_string(),
+			serde_json::json!({
+				"fee_policy": {
+					"chains": {
+						"8453": {
+							"extra_native_fee": {
+								"type": "op_stack_l1_data"
+							}
+						}
+					}
+				}
+			}),
+		);
+
+		// A configured OP Stack chain must NOT silently price the leg at zero
+		// when the synthetic tx cannot be built; the L1 data fee is required.
+		let result = fail_closed_on_extra_fee_build_error(
+			&config,
+			8453,
+			"fill",
+			"synthetic fill build failed",
+		);
+
+		assert!(
+			result.is_err(),
+			"configured OP Stack chain must fail closed on synthetic-tx build failure"
+		);
+	}
+
+	#[test]
+	fn extra_fee_build_failure_skips_for_unconfigured_chain() {
+		let config = create_test_config();
+
+		// A chain with no extra_native_fee policy has no extra fee to price,
+		// so a build failure is logged and skipped (priced at zero), not fatal.
+		let result = fail_closed_on_extra_fee_build_error(
+			&config,
+			137,
+			"fill",
+			"synthetic fill build failed",
+		);
+
+		assert!(
+			result.is_ok(),
+			"non-OP chain should skip extra fee pricing on synthetic-tx build failure"
+		);
+	}
+
 	fn create_test_request(is_exact_input: bool) -> GetQuoteRequest {
 		GetQuoteRequest {
 			user: InteropAddress::new_ethereum(
@@ -3315,6 +3569,8 @@ mod tests {
 			gas_buffer: Decimal::from_str("0.004").unwrap(),
 			settlement_fee: Decimal::ZERO,
 			settlement_fee_buffer: Decimal::ZERO,
+			l1_data_fee: Decimal::ZERO,
+			l1_data_fee_buffer: Decimal::ZERO,
 			rate_buffer: Decimal::ZERO,
 			base_price: Decimal::ZERO,
 			min_profit: Decimal::from_str("5.00").unwrap(),
@@ -4161,11 +4417,11 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn test_calculate_total_cost_includes_optional_settlement_gas() {
+	async fn test_calculate_total_cost_includes_optional_settlement_and_l1_data_fees() {
 		let mut mock_pricing = MockPricingInterface::new();
 		mock_pricing
 			.expect_wei_to_currency()
-			.times(6)
+			.times(8)
 			.returning(|wei, _| {
 				let wei = wei.to_string();
 				Box::pin(async move { Ok(wei) })
@@ -4233,6 +4489,8 @@ mod tests {
 					claim_units: 5,
 				},
 				U256::from(10u64),
+				U256::from(7u64),
+				U256::from(8u64),
 			)
 			.await
 			.unwrap();
@@ -4245,7 +4503,9 @@ mod tests {
 		assert_eq!(breakdown.gas_buffer, Decimal::from(60));
 		assert_eq!(breakdown.settlement_fee, Decimal::from(10));
 		assert_eq!(breakdown.settlement_fee_buffer, Decimal::from(1));
-		assert_eq!(breakdown.operational_cost, Decimal::from(671));
+		assert_eq!(breakdown.l1_data_fee, Decimal::from(7));
+		assert_eq!(breakdown.l1_data_fee_buffer, Decimal::from(8));
+		assert_eq!(breakdown.operational_cost, Decimal::from(686));
 	}
 
 	// ============================================================================
@@ -4346,6 +4606,8 @@ mod tests {
 			gas_buffer: Decimal::from_str("0.004").unwrap(),
 			settlement_fee: Decimal::ZERO,
 			settlement_fee_buffer: Decimal::ZERO,
+			l1_data_fee: Decimal::ZERO,
+			l1_data_fee_buffer: Decimal::ZERO,
 			rate_buffer: Decimal::ZERO,
 			base_price: Decimal::ZERO,
 			min_profit,
@@ -6031,7 +6293,7 @@ mod tests {
 		let service = cost_profit_service_no_delivery_chains();
 
 		let tx = service
-			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver)
+			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver, true)
 			.await
 			.expect("synthetic fill tx should build");
 
@@ -6049,6 +6311,68 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn build_fill_tx_for_quote_skips_source_finality_delay_for_resource_lock() {
+		let config = config_with_output_settler_on_dest(QUOTE_OUTPUT_SETTLER);
+		let configured_fill_deadline_window = 60;
+		let solver = solver_types::Address(QUOTE_SOLVER.to_vec());
+		let request = quote_request_with_unresolved_amount();
+		let validated = create_test_validated_context(true);
+		let resolved = resolved_amounts_for_request(&request, U256::from(1_000_000u64));
+		let service = cost_profit_service_no_delivery_chains();
+
+		let before = current_timestamp();
+		let tx = service
+			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver, false)
+			.await
+			.expect("synthetic fill tx should build");
+		let after = current_timestamp();
+
+		let decoded =
+			IOutputSettlerSimple::fillCall::abi_decode(&tx.data).expect("fillCall should decode");
+		let fill_deadline = decoded.fillDeadline.to::<u64>();
+
+		assert!(
+			(before + configured_fill_deadline_window..=after + configured_fill_deadline_window)
+				.contains(&fill_deadline),
+			"ResourceLock synthetic fill must match the configured fill deadline, got {fill_deadline}"
+		);
+	}
+
+	#[tokio::test]
+	async fn build_fill_tx_for_quote_applies_source_finality_delay_for_escrow() {
+		let config = config_with_output_settler_on_dest(QUOTE_OUTPUT_SETTLER);
+		let configured_fill_deadline_window = 60;
+		let expected_delay =
+			source_finality_expected_delay_seconds(&config, 1).expect("default finality delay");
+		let solver = solver_types::Address(QUOTE_SOLVER.to_vec());
+		let request = quote_request_with_unresolved_amount();
+		let validated = create_test_validated_context(true);
+		let resolved = resolved_amounts_for_request(&request, U256::from(1_000_000u64));
+		let service = cost_profit_service_no_delivery_chains();
+
+		let before = current_timestamp();
+		let tx = service
+			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver, true)
+			.await
+			.expect("synthetic fill tx should build");
+		let after = current_timestamp();
+
+		let decoded =
+			IOutputSettlerSimple::fillCall::abi_decode(&tx.data).expect("fillCall should decode");
+		let fill_deadline = decoded.fillDeadline.to::<u64>();
+		let expected_window = configured_fill_deadline_window.max(
+			expected_delay
+				+ config.source_finality.retry_grace_seconds
+				+ solver_config::QuoteConfig::default().validity_seconds,
+		);
+
+		assert!(
+			(before + expected_window..=after + expected_window).contains(&fill_deadline),
+			"Escrow synthetic fill must include source finality delay, got {fill_deadline}"
+		);
+	}
+
+	#[tokio::test]
 	async fn build_fill_tx_for_quote_errors_when_chain_unknown() {
 		// Build a config with networks for chains 1 and 137, but mutate the
 		// request output's chain to 9999 (not in the config).
@@ -6063,7 +6387,7 @@ mod tests {
 		let service = cost_profit_service_no_delivery_chains();
 
 		let result = service
-			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver)
+			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver, true)
 			.await;
 		assert!(
 			result.is_err(),
@@ -6083,7 +6407,7 @@ mod tests {
 		let service = cost_profit_service_no_delivery_chains();
 
 		let result = service
-			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver)
+			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver, true)
 			.await;
 		assert!(
 			result.is_err(),
@@ -7559,7 +7883,7 @@ mod tests {
 		let service = cost_profit_service_no_delivery_chains();
 
 		let tx = service
-			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver)
+			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver, true)
 			.await
 			.expect("synthetic fill tx should build");
 

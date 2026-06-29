@@ -126,6 +126,7 @@ pub fn build_permit2_batch_witness_digest(
 		&input_oracle_for_timing,
 		origin_chain_id,
 		&[dest_chain_id],
+		true,
 	);
 	let timestamps = timing.timestamps(now_secs, request.intent.min_valid_until);
 
@@ -268,7 +269,10 @@ pub fn build_permit2_batch_witness_digest(
 mod tests {
 	use super::*;
 	use alloy_primitives::{address, U256};
-	use solver_config::{ApiConfig, Config, ConfigBuilder, QuoteConfig, SettlementConfig};
+	use solver_config::{
+		ApiConfig, Config, ConfigBuilder, QuoteConfig, SettlementConfig,
+		DEFAULT_SOURCE_FINALITY_EXPECTED_DELAY_SECONDS,
+	};
 	use solver_types::{
 		parse_address,
 		standards::eip7930::InteropAddress,
@@ -656,7 +660,7 @@ mod tests {
 
 		let (_digest, message_json) = result.unwrap();
 
-		// Verify that the deadline reflects the configured validity
+		// Verify that default conservative source finality extends escrow timing.
 		let deadline_str = message_json["deadline"].as_str().unwrap();
 		let _deadline = U256::from_str_radix(deadline_str, 10).unwrap();
 
@@ -664,10 +668,17 @@ mod tests {
 		let now = chrono::Utc::now().timestamp() as u32;
 
 		// Allow some tolerance for test execution time
+		let expected_expiry = (DEFAULT_SOURCE_FINALITY_EXPECTED_DELAY_SECONDS
+			+ config
+				.api
+				.as_ref()
+				.and_then(|api| api.quote.as_ref())
+				.map(|quote| quote.validity_seconds)
+				.unwrap_or_default()) as u32;
 		assert!(
-			expires_u32 >= now + 580 && expires_u32 <= now + 620,
+			expires_u32 >= now + expected_expiry - 20 && expires_u32 <= now + expected_expiry + 20,
 			"Expected expiry around {} seconds from now, got {}",
-			600,
+			expected_expiry,
 			expires_u32 - now
 		);
 	}
@@ -701,9 +712,15 @@ mod tests {
 			.unwrap();
 		let expires = message_json["witness"]["expires"].as_u64().unwrap();
 
-		assert_eq!(deadline, min_valid_until);
+		let expected_deadline = now
+			+ DEFAULT_SOURCE_FINALITY_EXPECTED_DELAY_SECONDS
+			+ solver_config::QuoteConfig::default().validity_seconds;
 		assert!(
-			expires >= now + 691_200,
+			deadline >= expected_deadline && deadline <= expected_deadline + 2,
+			"expected deadline around {expected_deadline}, got {deadline}"
+		);
+		assert!(
+			expires >= deadline + 691_200,
 			"expected expires to leave broadcaster settlement window, expires_in={}s",
 			expires.saturating_sub(now)
 		);

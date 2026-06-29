@@ -173,7 +173,7 @@ impl TransactionBumpService {
 	}
 
 	async fn phase_1_reconcile(&self) -> Result<(), BumpError> {
-		let active_orders = load_active_order_ids(&self.storage).await?;
+		let active_orders = load_bump_order_ids(&self.storage, &self.attempt_store).await?;
 		for order_id in active_orders {
 			let attempts = self
 				.attempt_store
@@ -200,7 +200,7 @@ impl TransactionBumpService {
 	}
 
 	async fn phase_2_dispatch(&self) -> Result<(), BumpError> {
-		let active_orders = load_active_order_ids(&self.storage).await?;
+		let active_orders = load_bump_order_ids(&self.storage, &self.attempt_store).await?;
 		for order_id in active_orders {
 			let attempts = self
 				.attempt_store
@@ -1230,7 +1230,54 @@ async fn load_active_order_ids(storage: &Arc<StorageService>) -> Result<Vec<Stri
 		)
 		.await
 		.map_err(|e| BumpError::Storage(e.to_string()))?;
-	Ok(rows.into_iter().map(|(id, _)| id).collect())
+	Ok(rows
+		.into_iter()
+		.filter_map(|(id, order)| (!order.status.is_terminal()).then_some(id))
+		.collect())
+}
+
+async fn load_bump_order_ids(
+	storage: &Arc<StorageService>,
+	attempt_store: &Arc<TransactionAttemptStore>,
+) -> Result<Vec<String>, BumpError> {
+	use solver_types::{Order, StorageKey};
+
+	let mut ids: std::collections::BTreeSet<String> =
+		load_active_order_ids(storage).await?.into_iter().collect();
+
+	let attempts = attempt_store
+		.non_terminal_order_attempts()
+		.await
+		.map_err(|e| BumpError::Storage(e.to_string()))?;
+
+	for attempt in attempts {
+		let Some(order_id) = attempt.order_id() else {
+			continue;
+		};
+		if ids.contains(order_id) {
+			continue;
+		}
+
+		match storage
+			.retrieve::<Order>(StorageKey::Orders.as_str(), order_id)
+			.await
+		{
+			Ok(order) if !order.status.is_terminal() => {
+				ids.insert(order_id.to_string());
+			},
+			Ok(_) => {},
+			Err(error) => {
+				tracing::debug!(
+					%order_id,
+					attempt_id = %attempt.id,
+					error = %error,
+					"tx_bump: non-terminal attempt references unavailable order; skipping"
+				);
+			},
+		}
+	}
+
+	Ok(ids.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -1244,7 +1291,7 @@ mod tests {
 	use solver_storage::implementations::file::{FileStorage, TtlConfig};
 	use solver_storage::{MockStorageInterface, QueryFilter};
 	use solver_types::{
-		utils::tests::builders::OrderBuilder, Address, BumpCapField, OrderStatus,
+		utils::tests::builders::OrderBuilder, Address, BumpCapField, OrderStatus, StorageKey,
 		TransactionAttempt, TransactionAttemptScope, TransactionAttemptStatus, TransactionHash,
 		TransactionType,
 	};
@@ -1535,6 +1582,8 @@ mod tests {
 			gas_buffer,
 			settlement_fee: Decimal::ZERO,
 			settlement_fee_buffer: Decimal::ZERO,
+			l1_data_fee: Decimal::ZERO,
+			l1_data_fee_buffer: Decimal::ZERO,
 			rate_buffer: Decimal::ZERO,
 			base_price: Decimal::ZERO,
 			min_profit,
@@ -1684,6 +1733,82 @@ mod tests {
 		assert_eq!(child.replacement_of.as_deref(), Some("parent-1"));
 		// 15% bump default: 10 gwei -> 11.5 gwei
 		assert_eq!(child.tx.max_fee_per_gas, Some(11_500_000_000));
+	}
+
+	#[tokio::test]
+	async fn order_scoped_attempt_dispatches_replacement_when_active_order_index_missing() {
+		let cfg = default_enabled_config();
+		let signer = Address(vec![9; 20]);
+		let (service, attempt_store, storage, _bus, _tmp) =
+			test_service(cfg, MockDeliveryInterface::new());
+
+		let order = OrderBuilder::new()
+			.with_id("order-1")
+			.with_status(OrderStatus::Executing)
+			.build();
+		storage
+			.store(StorageKey::Orders.as_str(), "order-1", &order, None)
+			.await
+			.unwrap();
+		let _parent = seed_attempt(
+			&attempt_store,
+			"parent-1",
+			TransactionAttemptStatus::Broadcast,
+			None,
+			Some(signer.clone()),
+			10_000_000_000,
+		)
+		.await;
+
+		let mut mock = MockDeliveryInterface::new();
+		let signer_clone = signer.clone();
+		mock.expect_submission_signer()
+			.returning(move |_| Some(signer_clone.clone()));
+		mock_large_balance(&mut mock);
+		let recorder: Arc<dyn TransactionAttemptRecorder> = attempt_store.clone();
+		let recorder_for_mock = recorder.clone();
+		mock.expect_submit()
+			.times(1)
+			.returning(move |tx, tracking| {
+				let recorder = recorder_for_mock.clone();
+				Box::pin(async move {
+					let tracking = tracking.expect("sweeper must supply tracking");
+					assert_eq!(tracking.tracking.id, "order-1");
+					let outcome: Result<TransactionHash, DeliveryError> =
+						Ok(TransactionHash(vec![0xef; 32]));
+					simulate_submit_recording(
+						&recorder,
+						&tracking,
+						&tx,
+						&outcome,
+						Some(Address(vec![9; 20])),
+					)
+					.await;
+					outcome
+				})
+			});
+
+		let delivery_impls: HashMap<u64, Arc<dyn DeliveryInterface>> =
+			HashMap::from([(1u64, Arc::new(mock) as Arc<dyn DeliveryInterface>)]);
+		let delivery_svc = Arc::new(DeliveryService::new(delivery_impls, 1, 20, 60));
+		let service = TransactionBumpService::new(
+			service.config.clone(),
+			storage.clone(),
+			attempt_store.clone(),
+			delivery_svc,
+			service.event_bus.clone(),
+			recorder.clone(),
+			test_pricing(),
+		);
+
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		service.tick().await.unwrap();
+
+		let all = attempt_store.attempts_for_order("order-1").await.unwrap();
+		assert_eq!(all.len(), 2, "should bump from the attempt ledger fallback");
+		assert!(all
+			.iter()
+			.any(|attempt| attempt.replacement_of.as_deref() == Some("parent-1")));
 	}
 
 	#[tokio::test]

@@ -11,7 +11,7 @@ use crate::engine::{
 };
 use crate::state::OrderStateMachine;
 use lru::LruCache;
-use solver_config::Config;
+use solver_config::{source_finality_expected_delay_seconds, Config};
 use solver_delivery::DeliveryService;
 use solver_order::OrderService;
 use solver_settlement::admission::estimate_required_expiry_window_seconds;
@@ -374,6 +374,21 @@ impl IntentHandler {
 					serde_json::from_value::<Eip7683OrderData>(order.data.clone())
 				{
 					let now = current_timestamp() as u32;
+					if intent.source == "off-chain" {
+						if let Err(reason) =
+							validate_source_finality_window(&order_data, &config, now)
+						{
+							tracing::warn!(order_id = %order.id, %reason, "Skipping order");
+							self.event_bus
+								.publish(SolverEvent::Order(OrderEvent::Skipped {
+									order_id: order.id.clone(),
+									reason,
+								}))
+								.ok();
+							return Ok(());
+						}
+					}
+
 					let expires_remaining = order_data.expires.saturating_sub(now) as u64;
 					if let Some((required_window, breakdown)) =
 						estimate_required_expiry_window_seconds(
@@ -382,9 +397,13 @@ impl IntentHandler {
 							config.settlement.settlement_poll_interval_seconds,
 							order.settlement_name.as_deref(),
 						) {
-						if expires_remaining < required_window {
+						let settlement_remaining =
+							order_data.expires.saturating_sub(order_data.fill_deadline) as u64;
+						if expires_remaining < required_window
+							|| settlement_remaining < required_window
+						{
 							let reason = format!(
-								"Insufficient settlement window: expires_in={expires_remaining}s required={required_window}s ({breakdown})"
+								"Insufficient settlement window: expires_in={expires_remaining}s settlement_after_fill={settlement_remaining}s required={required_window}s ({breakdown})"
 							);
 							tracing::warn!(order_id = %order.id, %reason, "Skipping order");
 							self.event_bus
@@ -714,6 +733,34 @@ fn prepare_gas_cap(open_units: u64) -> u64 {
 	open_units.saturating_mul(125).saturating_add(99) / 100
 }
 
+fn validate_source_finality_window(
+	order_data: &Eip7683OrderData,
+	config: &Config,
+	now: u32,
+) -> Result<(), String> {
+	if !matches!(order_data.lock_type, Some(lock_type) if lock_type.is_escrow()) {
+		return Ok(());
+	}
+	let origin_chain_id = u64::try_from(order_data.origin_chain_id).map_err(|_| {
+		format!(
+			"Invalid origin chain id for source finality validation: {}",
+			order_data.origin_chain_id
+		)
+	})?;
+	let Some(required_delay) = source_finality_expected_delay_seconds(config, origin_chain_id)
+	else {
+		return Ok(());
+	};
+	let required_delay = required_delay.saturating_add(config.source_finality.retry_grace_seconds);
+	let fill_remaining = order_data.fill_deadline.saturating_sub(now) as u64;
+	if fill_remaining < required_delay {
+		return Err(format!(
+			"Insufficient source finality window: fill_deadline_in={fill_remaining}s required={required_delay}s origin_chain_id={origin_chain_id}"
+		));
+	}
+	Ok(())
+}
+
 fn apply_prepare_gas_limit_from_config(order: &mut Order, source: &str, config: &Config) {
 	if source != "off-chain" {
 		return;
@@ -783,6 +830,16 @@ mod tests {
 			.build()
 	}
 
+	fn create_test_order_with_short_source_finality_deadline() -> Order {
+		let now = current_timestamp() as u32;
+		let mut order_data = Eip7683OrderDataBuilder::new().build();
+		order_data.lock_type = Some(LockType::Permit2Escrow);
+		order_data.origin_chain_id = U256::from(1);
+		order_data.fill_deadline = now.saturating_add(60);
+		order_data.expires = now.saturating_add(1_800);
+		create_test_order_from_data(order_data)
+	}
+
 	fn create_test_order_from_data(order_data: Eip7683OrderData) -> Order {
 		OrderBuilder::new()
 			.with_id("test_intent_123".to_string())
@@ -821,6 +878,88 @@ mod tests {
 	fn create_test_config() -> (Arc<RwLock<Config>>, Config) {
 		let config = ConfigBuilder::new().build();
 		(Arc::new(RwLock::new(config.clone())), config)
+	}
+
+	#[test]
+	fn validate_source_finality_window_rejects_default_conservative_short_deadline() {
+		let config = ConfigBuilder::new().build();
+		let now = 1_000;
+		let mut order_data = Eip7683OrderDataBuilder::new().build();
+		order_data.lock_type = Some(LockType::Permit2Escrow);
+		order_data.origin_chain_id = U256::from(1);
+		order_data.fill_deadline = now + 300;
+		order_data.expires = now + 1_800;
+
+		let err = validate_source_finality_window(&order_data, &config, now)
+			.expect_err("default conservative source finality should reject 5 minute deadline");
+
+		assert!(err.contains("Insufficient source finality window"));
+		assert!(err.contains("fill_deadline_in=300s"));
+		assert!(err.contains("required=1200s"));
+		assert!(err.contains("origin_chain_id=1"));
+	}
+
+	#[test]
+	fn validate_source_finality_window_requires_full_remaining_delay() {
+		let config = ConfigBuilder::new().build();
+		let now = 1_000;
+		let mut order_data = Eip7683OrderDataBuilder::new().build();
+		order_data.lock_type = Some(LockType::Permit2Escrow);
+		order_data.origin_chain_id = U256::from(1);
+		order_data.fill_deadline = now + 1_170;
+		order_data.expires = now + 2_400;
+
+		let err = validate_source_finality_window(&order_data, &config, now)
+			.expect_err("direct intake must require the full source finality delay");
+
+		assert!(err.contains("Insufficient source finality window"));
+		assert!(err.contains("fill_deadline_in=1170s"));
+		assert!(err.contains("required=1200s"));
+	}
+
+	#[test]
+	fn validate_source_finality_window_allows_full_remaining_delay() {
+		let config = ConfigBuilder::new().build();
+		let now = 1_000;
+		let mut order_data = Eip7683OrderDataBuilder::new().build();
+		order_data.lock_type = Some(LockType::Permit2Escrow);
+		order_data.origin_chain_id = U256::from(1);
+		order_data.fill_deadline = now + 1_200;
+		order_data.expires = now + 2_400;
+
+		validate_source_finality_window(&order_data, &config, now)
+			.expect("full source finality window should be accepted");
+	}
+
+	#[test]
+	fn validate_source_finality_window_rejects_unrepresentable_origin_chain_id() {
+		let config = ConfigBuilder::new().build();
+		let now = 1_000;
+		let mut order_data = Eip7683OrderDataBuilder::new().build();
+		order_data.lock_type = Some(LockType::Permit2Escrow);
+		order_data.origin_chain_id = U256::MAX;
+		order_data.fill_deadline = now + 1_800;
+		order_data.expires = now + 2_400;
+
+		let err = validate_source_finality_window(&order_data, &config, now)
+			.expect_err("unrepresentable chain id must not fall back to chain 0");
+
+		assert!(err.contains("Invalid origin chain id"));
+		assert!(err.contains(&U256::MAX.to_string()));
+	}
+
+	#[test]
+	fn validate_source_finality_window_skips_resource_lock_orders() {
+		let config = ConfigBuilder::new().build();
+		let now = 1_000;
+		let mut order_data = Eip7683OrderDataBuilder::new().build();
+		order_data.lock_type = Some(LockType::ResourceLock);
+		order_data.origin_chain_id = U256::MAX;
+		order_data.fill_deadline = now + 300;
+		order_data.expires = now + 1_800;
+
+		validate_source_finality_window(&order_data, &config, now)
+			.expect("source finality applies only to escrow orders");
 	}
 
 	fn create_test_config_with_gas_open(flow_key: &str, open: u64) -> Config {
@@ -1483,7 +1622,7 @@ mod tests {
 		let mut mock_order_interface = MockOrderInterface::new();
 		let mut mock_strategy = MockExecutionStrategy::new();
 
-		let intent = create_test_intent();
+		let intent = IntentBuilder::new().with_source("off-chain").build();
 		let solver_address = create_test_address();
 
 		mock_storage
@@ -1550,6 +1689,84 @@ mod tests {
 		match receiver.recv().await.unwrap() {
 			SolverEvent::Order(OrderEvent::Skipped { reason, .. }) => {
 				assert!(reason.contains("Token not supported"));
+			},
+			other => panic!("Expected OrderEvent::Skipped, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_handle_intent_skips_short_source_finality_deadline() {
+		let mut mock_storage = MockStorageInterface::new();
+		let mut mock_order_interface = MockOrderInterface::new();
+		let mut mock_strategy = MockExecutionStrategy::new();
+
+		let intent = IntentBuilder::new().with_source("off-chain").build();
+		let solver_address = create_test_address();
+
+		mock_storage
+			.expect_exists()
+			.with(eq("intents:0xtest_intent_123"))
+			.times(1)
+			.returning(|_| Box::pin(async move { Ok(false) }));
+		mock_storage
+			.expect_set_bytes()
+			.times(1)
+			.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+
+		mock_order_interface
+			.expect_validate_and_create_order()
+			.times(1)
+			.returning(move |_, _, _, _, _, _| {
+				Box::pin(async move { Ok(create_test_order_with_short_source_finality_deadline()) })
+			});
+		mock_order_interface
+			.expect_generate_fill_transaction()
+			.times(0);
+		mock_strategy.expect_should_execute().times(0);
+
+		let storage = Arc::new(StorageService::new(Box::new(mock_storage)));
+		let order_service = Arc::new(OrderService::new(
+			HashMap::from([(
+				"eip7683".to_string(),
+				Box::new(mock_order_interface) as Box<dyn solver_order::OrderInterface>,
+			)]),
+			Box::new(mock_strategy),
+		));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let token_manager = Arc::new(TokenManager::new(
+			Default::default(),
+			delivery.clone(),
+			Arc::new(solver_account::AccountService::new(Box::new(
+				MockAccountInterface::new(),
+			))),
+		));
+		let cost_profit_service = create_mock_cost_profit_service();
+		let (config, static_config) = create_test_config();
+
+		let handler = IntentHandler::new(
+			order_service,
+			storage,
+			state_machine,
+			event_bus,
+			delivery,
+			solver_address,
+			token_manager,
+			cost_profit_service,
+			config,
+			&static_config,
+		);
+
+		handler
+			.handle(intent)
+			.await
+			.expect("handler should skip source-finality-impossible intent without error");
+
+		match receiver.recv().await.unwrap() {
+			SolverEvent::Order(OrderEvent::Skipped { reason, .. }) => {
+				assert!(reason.contains("Insufficient source finality window"));
 			},
 			other => panic!("Expected OrderEvent::Skipped, got {other:?}"),
 		}

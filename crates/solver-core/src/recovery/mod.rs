@@ -11,7 +11,7 @@ use crate::engine::event_bus::EventBus;
 use crate::order_preparation::order_requires_preparation;
 use crate::order_rehydration::intent_from_order;
 use crate::state::order::IS_TERMINAL_INDEX_FIELD;
-use crate::state::transaction_attempt::TransactionAttemptStore;
+use crate::state::transaction_attempt::{TransactionAttemptStore, TransactionAttemptStoreError};
 use crate::state::OrderStateMachine;
 use solver_delivery::DeliveryService;
 use solver_settlement::{SettlementReadiness, SettlementService};
@@ -428,14 +428,29 @@ impl RecoveryService {
 					)
 					.await
 				{
-					tracing::error!(
-						%order_id,
-						attempt_id = %attempt.id,
-						?tx_type,
-						?tx_hash,
-						%error,
-						"Recovery proved transaction confirmed but attempt ledger update failed"
-					);
+					let error_message = error.to_string();
+					match error {
+						TransactionAttemptStoreError::TerminalAttempt(_) => {
+							tracing::debug!(
+								%order_id,
+								attempt_id = %attempt.id,
+								?tx_type,
+								?tx_hash,
+								error = %error_message,
+								"Recovery proved transaction confirmed but attempt ledger row is already terminal"
+							);
+						},
+						error => {
+							tracing::error!(
+								%order_id,
+								attempt_id = %attempt.id,
+								?tx_type,
+								?tx_hash,
+								%error,
+								"Recovery proved transaction confirmed but attempt ledger update failed"
+							);
+						},
+					}
 					self.event_bus
 						.publish(SolverEvent::Delivery(
 							DeliveryEvent::TransactionAttemptLedgerConflict {
@@ -444,7 +459,7 @@ impl RecoveryService {
 								tx_type,
 								tx_hash: Some(tx_hash.clone()),
 								attempted_status: TransactionAttemptStatus::Confirmed,
-								error: error.to_string(),
+								error: error_message,
 								context: "recovery mark confirmed".to_string(),
 							},
 						))
@@ -2379,7 +2394,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn recovery_terminal_attempt_conflict_is_operator_visible_not_silent() {
+	async fn recovery_terminal_attempt_conflict_emits_event_without_error_log() {
 		let temp_dir = tempfile::tempdir().unwrap();
 		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
 			temp_dir.path().to_path_buf(),

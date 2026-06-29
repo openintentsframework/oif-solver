@@ -11,10 +11,10 @@ use alloy_sol_types::sol;
 use alloy_sol_types::{SolEvent, SolValue};
 use async_trait::async_trait;
 use solver_types::{
-	create_http_provider, current_timestamp, select_finality_head,
+	create_http_provider, current_timestamp, select_source_finality_head,
 	standards::eip7683::{GasLimitOverrides, LockType, MandateOutput},
 	with_0x_prefix, ConfigSchema, Eip7683OrderData, Field, FieldType, Intent, IntentMetadata,
-	NetworksConfig, ProviderError, Schema,
+	NetworksConfig, ProviderError, Schema, SourceFinalityMode, SourceFinalityRule,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -84,6 +84,19 @@ fn finality_blocks_for_config(
 		.unwrap_or(default_finality_blocks)
 }
 
+fn legacy_source_finality_rule(
+	chain_id: u64,
+	default_finality_blocks: u64,
+	finality_blocks: &HashMap<u64, u64>,
+) -> SourceFinalityRule {
+	SourceFinalityRule {
+		mode: SourceFinalityMode::Conservative,
+		blocks: finality_blocks_for_config(chain_id, default_finality_blocks, finality_blocks),
+		block_time_seconds: 12,
+		expected_delay_seconds: None,
+	}
+}
+
 async fn block_number_for_tag(provider: &DynProvider, tag: BlockNumberOrTag) -> Option<u64> {
 	match provider.get_block_by_number(tag).await {
 		Ok(Some(block)) => Some(block.number()),
@@ -101,7 +114,7 @@ fn non_genesis_finality_tag(block: Option<u64>) -> Option<u64> {
 
 async fn resolve_finality_head(
 	provider: &DynProvider,
-	finality_blocks: u64,
+	finality_rule: SourceFinalityRule,
 ) -> Result<Option<u64>, DiscoveryError> {
 	let finalized_tag = block_number_for_tag(provider, BlockNumberOrTag::Finalized).await;
 	let finalized = non_genesis_finality_tag(finalized_tag);
@@ -122,11 +135,11 @@ async fn resolve_finality_head(
 		.await
 		.map_err(|e| DiscoveryError::Connection(format!("Failed to get block number: {e}")))?;
 
-	Ok(select_finality_head(
+	Ok(select_source_finality_head(
 		finalized,
 		safe,
 		latest,
-		finality_blocks,
+		finality_rule,
 	))
 }
 
@@ -183,6 +196,33 @@ fn parse_finality_blocks_config(config: &serde_json::Value) -> HashMap<u64, u64>
 		.unwrap_or_default()
 }
 
+fn parse_source_finality_rules_config(
+	config: &serde_json::Value,
+) -> Result<HashMap<u64, SourceFinalityRule>, DiscoveryError> {
+	let Some(value) = config.get("source_finality_rules") else {
+		return Ok(HashMap::new());
+	};
+	let object = value.as_object().ok_or_else(|| {
+		DiscoveryError::ValidationError("source_finality_rules must be an object".to_string())
+	})?;
+
+	let mut rules = HashMap::new();
+	for (chain_id, rule) in object {
+		let chain_id = chain_id.parse::<u64>().map_err(|e| {
+			DiscoveryError::ValidationError(format!(
+				"Invalid source_finality_rules chain id {chain_id}: {e}"
+			))
+		})?;
+		let rule = serde_json::from_value::<SourceFinalityRule>(rule.clone()).map_err(|e| {
+			DiscoveryError::ValidationError(format!(
+				"Invalid source_finality_rules.{chain_id}: {e}"
+			))
+		})?;
+		rules.insert(chain_id, rule);
+	}
+	Ok(rules)
+}
+
 /// Provider types for different transport modes.
 enum ProviderType {
 	/// HTTP provider for polling mode.
@@ -193,7 +233,7 @@ struct PollingMonitorContext {
 	networks: NetworksConfig,
 	last_blocks: Arc<Mutex<HashMap<u64, u64>>>,
 	polling_interval_secs: u64,
-	finality_blocks: u64,
+	finality_rule: SourceFinalityRule,
 }
 
 /// EIP-7683 on-chain discovery implementation.
@@ -224,6 +264,8 @@ pub struct Eip7683Discovery {
 	default_finality_blocks: u64,
 	/// Per-chain source finality depth overrides.
 	finality_blocks: HashMap<u64, u64>,
+	/// Per-chain source finality rules.
+	source_finality_rules: HashMap<u64, SourceFinalityRule>,
 }
 
 impl Eip7683Discovery {
@@ -236,6 +278,7 @@ impl Eip7683Discovery {
 		polling_interval_secs: Option<u64>,
 		default_finality_blocks: u64,
 		finality_blocks: HashMap<u64, u64>,
+		source_finality_rules: HashMap<u64, SourceFinalityRule>,
 	) -> Result<Self, DiscoveryError> {
 		// Validate at least one network
 		if network_ids.is_empty() {
@@ -263,13 +306,21 @@ impl Eip7683Discovery {
 				ProviderError::InvalidUrl(msg) => DiscoveryError::Connection(msg),
 			})?;
 
-			let finality_depth =
-				finality_blocks_for_config(*network_id, default_finality_blocks, &finality_blocks);
+			let finality_rule = source_finality_rules
+				.get(network_id)
+				.copied()
+				.unwrap_or_else(|| {
+					legacy_source_finality_rule(
+						*network_id,
+						default_finality_blocks,
+						&finality_blocks,
+					)
+				});
 
 			// Initialize with a bounded finalized lookback. Logs newer than
 			// the finality head are still left for a later poll, while events
 			// that arrived during solver startup remain discoverable.
-			let current_block = resolve_finality_head(&provider, finality_depth)
+			let current_block = resolve_finality_head(&provider, finality_rule)
 				.await
 				.map_err(|e| {
 					DiscoveryError::Connection(format!(
@@ -277,13 +328,14 @@ impl Eip7683Discovery {
 					))
 				})?
 				.unwrap_or(0);
-			let initial_cursor = initial_finality_cursor(current_block, finality_depth);
+			let initial_cursor = initial_finality_cursor(current_block, finality_rule.blocks);
 
 			tracing::info!(
 				chain = network_id,
 				current_block,
 				initial_cursor,
-				finality_depth,
+				finality_depth = finality_rule.blocks,
+				source_finality_mode = ?finality_rule.mode,
 				"Initialized on-chain discovery cursor with source finality lookback"
 			);
 
@@ -302,15 +354,21 @@ impl Eip7683Discovery {
 			polling_interval_secs: interval,
 			default_finality_blocks,
 			finality_blocks,
+			source_finality_rules,
 		})
 	}
 
-	fn finality_blocks_for_chain(&self, chain_id: u64) -> u64 {
-		finality_blocks_for_config(
-			chain_id,
-			self.default_finality_blocks,
-			&self.finality_blocks,
-		)
+	fn finality_rule_for_chain(&self, chain_id: u64) -> SourceFinalityRule {
+		self.source_finality_rules
+			.get(&chain_id)
+			.copied()
+			.unwrap_or_else(|| {
+				legacy_source_finality_rule(
+					chain_id,
+					self.default_finality_blocks,
+					&self.finality_blocks,
+				)
+			})
 	}
 
 	/// Creates a new EIP-7683 discovery instance with default finality settings.
@@ -328,6 +386,7 @@ impl Eip7683Discovery {
 			networks,
 			polling_interval_secs,
 			DEFAULT_FINALITY_BLOCKS,
+			HashMap::new(),
 			HashMap::new(),
 		)
 		.await
@@ -460,7 +519,7 @@ impl Eip7683Discovery {
 						*blocks.get(&chain_id).unwrap_or(&0)
 					};
 
-					let safe_to_block = match resolve_finality_head(&provider, context.finality_blocks).await {
+					let safe_to_block = match resolve_finality_head(&provider, context.finality_rule).await {
 						Ok(block) => block,
 						Err(e) => {
 							tracing::error!(chain = chain_id, "Failed to resolve finality head: {}", e);
@@ -621,7 +680,7 @@ impl DiscoveryInterface for Eip7683Discovery {
 				networks,
 				last_blocks: self.last_blocks.clone(),
 				polling_interval_secs: self.polling_interval_secs,
-				finality_blocks: self.finality_blocks_for_chain(chain_id),
+				finality_rule: self.finality_rule_for_chain(chain_id),
 			};
 			let handle = tokio::spawn(async move {
 				Self::monitor_chain_polling(provider, chain_id, context, sender, stop_rx).await;
@@ -712,6 +771,7 @@ pub fn create_discovery(
 		.and_then(|v| v.as_u64())
 		.unwrap_or(DEFAULT_FINALITY_BLOCKS);
 	let finality_blocks = parse_finality_blocks_config(config);
+	let source_finality_rules = parse_source_finality_rules_config(config)?;
 
 	// Create discovery service synchronously
 	let discovery = tokio::task::block_in_place(|| {
@@ -722,6 +782,7 @@ pub fn create_discovery(
 				polling_interval_secs,
 				default_finality_blocks,
 				finality_blocks,
+				source_finality_rules,
 			)
 			.await
 		})
@@ -749,6 +810,7 @@ mod tests {
 	use super::*;
 	use alloy_primitives::{Address as AlloyAddress, Bytes, B256, U256};
 	use alloy_rpc_types::Log;
+	use solver_types::select_finality_head;
 	use solver_types::utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder};
 	use solver_types::NetworksConfig;
 	use tokio::sync::mpsc;
@@ -912,6 +974,27 @@ mod tests {
 	#[test]
 	fn selected_finality_head_returns_none_before_depth_elapses() {
 		assert_eq!(select_finality_head(None, None, 2, 20), None);
+	}
+
+	#[test]
+	fn source_finality_rules_config_parses_per_chain_modes() {
+		let config = serde_json::json!({
+			"source_finality_rules": {
+				"11155420": {
+					"mode": "numeric",
+					"blocks": 120,
+					"block_time_seconds": 2,
+					"expected_delay_seconds": 240
+				}
+			}
+		});
+
+		let rules = parse_source_finality_rules_config(&config).unwrap();
+		let rule = rules.get(&11155420).unwrap();
+		assert_eq!(rule.mode, SourceFinalityMode::Numeric);
+		assert_eq!(rule.blocks, 120);
+		assert_eq!(rule.block_time_seconds, 2);
+		assert_eq!(rule.expected_delay_seconds, Some(240));
 	}
 
 	#[test]

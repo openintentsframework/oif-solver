@@ -169,6 +169,26 @@ impl TransactionAttemptStore {
 			.collect())
 	}
 
+	pub async fn non_terminal_order_attempts(
+		&self,
+	) -> Result<Vec<TransactionAttempt>, TransactionAttemptStoreError> {
+		let rows = self
+			.storage
+			.query::<TransactionAttempt>(
+				StorageKey::TransactionAttempts.as_str(),
+				QueryFilter::Equals(
+					IS_TERMINAL_INDEX_FIELD.to_string(),
+					serde_json::json!(false),
+				),
+			)
+			.await?;
+		Ok(rows
+			.into_iter()
+			.map(|(_, attempt)| attempt)
+			.filter(|attempt| matches!(attempt.scope, TransactionAttemptScope::Order { .. }))
+			.collect())
+	}
+
 	pub async fn attempts_for_system_scope(
 		&self,
 		scope_id: &str,

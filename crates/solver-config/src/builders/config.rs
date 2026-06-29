@@ -7,7 +7,8 @@ use rust_decimal::Decimal;
 
 use crate::{
 	AccountConfig, ApiConfig, Config, DeliveryConfig, DiscoveryConfig, GasConfig, NetworksConfig,
-	OrderConfig, SettlementConfig, SolverConfig, SolverIngressMode, StorageConfig, StrategyConfig,
+	OrderConfig, SettlementConfig, SolverConfig, SolverIngressMode, SourceFinalityConfig,
+	StorageConfig, StrategyConfig,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -31,6 +32,7 @@ pub struct ConfigBuilder {
 	strategy_primary: String,
 	api: Option<ApiConfig>,
 	settlement: Option<SettlementConfig>,
+	source_finality: SourceFinalityConfig,
 	networks: Option<NetworksConfig>,
 	deny_list: Option<String>,
 }
@@ -60,6 +62,7 @@ impl ConfigBuilder {
 			strategy_primary: "simple".to_string(),
 			api: None,
 			settlement: None,
+			source_finality: SourceFinalityConfig::default(),
 			networks: None,
 			deny_list: None,
 		}
@@ -134,6 +137,12 @@ impl ConfigBuilder {
 	/// Sets the settlement configuration.
 	pub fn settlement(mut self, settlement: SettlementConfig) -> Self {
 		self.settlement = Some(settlement);
+		self
+	}
+
+	/// Sets the source finality configuration.
+	pub fn source_finality(mut self, source_finality: SourceFinalityConfig) -> Self {
+		self.source_finality = source_finality;
 		self
 	}
 
@@ -214,6 +223,7 @@ impl ConfigBuilder {
 			}),
 			rebalance: None,
 			tx_bump: crate::TxBumpConfig::default(),
+			source_finality: self.source_finality,
 		}
 	}
 }

@@ -2600,6 +2600,7 @@ mod tests {
 				max_fee_per_gas: Some(2_000_000_000),
 				gas_price: None,
 				value_wei: "0".to_string(),
+				extra_native_fee_wei: "0".to_string(),
 			},
 		));
 

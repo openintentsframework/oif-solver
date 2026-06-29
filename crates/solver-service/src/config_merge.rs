@@ -177,14 +177,14 @@ fn validate_seedless_settlement_requirements(
 					match hyperlane.domains.get(chain_id) {
 						Some(0) => {
 							return Err(MergeError::Validation(format!(
-									"seedless mode requires non-zero settlement.hyperlane.domains for chain {chain_id}"
-								)))
+								"seedless mode requires non-zero settlement.hyperlane.domains for chain {chain_id}"
+							)));
 						},
 						Some(_) => {},
 						None => {
 							return Err(MergeError::Validation(format!(
-									"seedless mode requires settlement.hyperlane.domains for chain {chain_id}"
-								)))
+								"seedless mode requires settlement.hyperlane.domains for chain {chain_id}"
+							)));
 						},
 					}
 
@@ -192,13 +192,13 @@ fn validate_seedless_settlement_requirements(
 						Some(oracles) if !oracles.is_empty() => {},
 						Some(_) => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.hyperlane.oracles.input for chain {chain_id}"
-						)))
+								"seedless mode requires non-empty settlement.hyperlane.oracles.input for chain {chain_id}"
+							)));
 						},
 						None => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.hyperlane.oracles.input for chain {chain_id}"
-						)))
+								"seedless mode requires settlement.hyperlane.oracles.input for chain {chain_id}"
+							)));
 						},
 					}
 
@@ -206,13 +206,13 @@ fn validate_seedless_settlement_requirements(
 						Some(oracles) if !oracles.is_empty() => {},
 						Some(_) => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.hyperlane.oracles.output for chain {chain_id}"
-						)))
+								"seedless mode requires non-empty settlement.hyperlane.oracles.output for chain {chain_id}"
+							)));
 						},
 						None => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.hyperlane.oracles.output for chain {chain_id}"
-						)))
+								"seedless mode requires settlement.hyperlane.oracles.output for chain {chain_id}"
+							)));
 						},
 					}
 				}
@@ -234,26 +234,26 @@ fn validate_seedless_settlement_requirements(
 						Some(oracles) if !oracles.is_empty() => {},
 						Some(_) => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.direct.oracles.input for chain {chain_id}"
-						)))
+								"seedless mode requires non-empty settlement.direct.oracles.input for chain {chain_id}"
+							)));
 						},
 						None => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.direct.oracles.input for chain {chain_id}"
-						)))
+								"seedless mode requires settlement.direct.oracles.input for chain {chain_id}"
+							)));
 						},
 					}
 					match direct.oracles.output.get(chain_id) {
 						Some(oracles) if !oracles.is_empty() => {},
 						Some(_) => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.direct.oracles.output for chain {chain_id}"
-						)))
+								"seedless mode requires non-empty settlement.direct.oracles.output for chain {chain_id}"
+							)));
 						},
 						None => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.direct.oracles.output for chain {chain_id}"
-						)))
+								"seedless mode requires settlement.direct.oracles.output for chain {chain_id}"
+							)));
 						},
 					}
 				}
@@ -530,6 +530,7 @@ pub fn merge_to_operator_config(
 		// materialization time.
 		fee_policy: initializer.fee_policy.clone(),
 		tx_bump: initializer.tx_bump.unwrap_or_default(),
+		source_finality: initializer.source_finality.clone(),
 	};
 	validate_operator_tx_bump(&operator_config)?;
 	Ok(operator_config)
@@ -908,13 +909,13 @@ fn validate_hyperlane_domains(
 			Some(0) => {
 				return Err(MergeError::Validation(format!(
 					"{path} has zero domain for chain {chain_id}"
-				)))
+				)));
 			},
 			Some(_) => {},
 			None => {
 				return Err(MergeError::Validation(format!(
 					"{path} is missing chain {chain_id}"
-				)))
+				)));
 			},
 		}
 	}
@@ -1240,6 +1241,8 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 
 	let tx_bump = translate_tx_bump(&operator_config.tx_bump);
 	validate_tx_bump(&tx_bump, &chain_ids)?;
+	let source_finality = build_source_finality_config_from_operator(operator_config)?;
+	validate_source_finality_expected_delays(&source_finality, &chain_ids)?;
 
 	// Build the full config
 	let config = Config {
@@ -1262,6 +1265,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 		gas: Some(build_gas_config_from_operator(&operator_config.gas)),
 		rebalance: build_rebalance_config_from_operator(operator_config.rebalance.as_ref())?,
 		tx_bump,
+		source_finality,
 	};
 
 	Ok(config)
@@ -1282,6 +1286,87 @@ fn validate_tx_bump(
 	tx_bump
 		.validate_against_networks(&configured_chain_ids)
 		.map_err(MergeError::Validation)
+}
+
+fn build_source_finality_config_from_operator(
+	operator_config: &OperatorConfig,
+) -> Result<solver_config::SourceFinalityConfig, MergeError> {
+	let Some(source_finality) = &operator_config.source_finality else {
+		return Ok(solver_config::SourceFinalityConfig::default());
+	};
+
+	serde_json::from_value(source_finality.clone())
+		.map_err(|error| MergeError::Validation(format!("Invalid source_finality config: {error}")))
+}
+
+fn build_source_finality_rules_for_discovery(
+	operator_config: &OperatorConfig,
+	chain_ids: &[u64],
+) -> Result<serde_json::Value, MergeError> {
+	if operator_config.source_finality.is_none() {
+		return Ok(serde_json::Value::Object(serde_json::Map::new()));
+	}
+
+	let source_finality = build_source_finality_config_from_operator(operator_config)?;
+	let mut rules = serde_json::Map::new();
+	for chain_id in chain_ids {
+		let rule = source_finality_rule_from_config_only(&source_finality, *chain_id);
+		let rule = serde_json::to_value(rule).map_err(|error| {
+			MergeError::Validation(format!(
+				"Failed to serialize source finality rule for chain {chain_id}: {error}"
+			))
+		})?;
+		rules.insert(chain_id.to_string(), rule);
+	}
+	Ok(serde_json::Value::Object(rules))
+}
+
+fn source_finality_rule_from_config_only(
+	source_finality: &solver_config::SourceFinalityConfig,
+	chain_id: u64,
+) -> solver_types::SourceFinalityRule {
+	let chain = source_finality.chains.get(&chain_id);
+	let mode = chain
+		.and_then(|chain| chain.mode)
+		.unwrap_or(source_finality.default_mode);
+	let blocks = chain
+		.and_then(|chain| chain.blocks)
+		.unwrap_or(source_finality.default_blocks);
+	let block_time_seconds = chain
+		.and_then(|chain| chain.block_time_seconds)
+		.unwrap_or(source_finality.default_block_time_seconds);
+	let expected_delay_seconds = chain
+		.and_then(|chain| chain.expected_delay_seconds)
+		.or_else(|| {
+			matches!(mode, solver_types::SourceFinalityMode::Numeric)
+				.then_some(blocks.saturating_mul(block_time_seconds))
+		})
+		.or(source_finality.default_expected_delay_seconds);
+
+	solver_types::SourceFinalityRule {
+		mode,
+		blocks,
+		block_time_seconds,
+		expected_delay_seconds,
+	}
+}
+
+fn validate_source_finality_expected_delays(
+	source_finality: &solver_config::SourceFinalityConfig,
+	chain_ids: &[u64],
+) -> Result<(), MergeError> {
+	for chain_id in chain_ids {
+		let rule = source_finality_rule_from_config_only(source_finality, *chain_id);
+		if !matches!(rule.mode, solver_types::SourceFinalityMode::Numeric)
+			&& rule.expected_delay_seconds.is_none()
+		{
+			return Err(MergeError::Validation(format!(
+				"source_finality for chain {chain_id} uses {:?} mode but expected_delay_seconds is not configured",
+				rule.mode
+			)));
+		}
+	}
+	Ok(())
 }
 
 fn parse_solver_intake_disabled(raw: &str) -> Result<bool, MergeError> {
@@ -1538,6 +1623,17 @@ fn build_delivery_config_from_operator(
 			entry.insert("gas_price_cap".to_string(), serde_json::Value::String(cap));
 		}
 
+		if let Some(extra_native_fee) = override_entry.and_then(|e| e.extra_native_fee.as_ref()) {
+			entry.insert(
+				"extra_native_fee".to_string(),
+				serde_json::to_value(extra_native_fee)
+					.expect("ExtraNativeFeeOverride serializes to JSON"),
+			);
+		} else if let Some(default_extra_native_fee) = default_extra_native_fee_for_chain(*chain_id)
+		{
+			entry.insert("extra_native_fee".to_string(), default_extra_native_fee);
+		}
+
 		fee_policy_chains.insert(key, serde_json::Value::Object(entry));
 	}
 
@@ -1560,6 +1656,16 @@ fn build_delivery_config_from_operator(
 		implementations,
 		min_confirmations: 3,
 		tx_confirmation_timeout_seconds: 600,
+	}
+}
+
+fn default_extra_native_fee_for_chain(chain_id: u64) -> Option<serde_json::Value> {
+	match chain_id {
+		10 | 8453 | 11155420 | 84532 | 747474 => Some(json_object(vec![(
+			"type",
+			serde_json::Value::String("op_stack_l1_data".to_string()),
+		)])),
+		_ => None,
 	}
 }
 
@@ -1635,6 +1741,8 @@ fn build_discovery_config_from_operator(
 			)
 		})
 		.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+	let source_finality_rules =
+		build_source_finality_rules_for_discovery(operator_config, chain_ids)?;
 
 	// Onchain discovery - polls chain for new orders
 	let onchain_config = json_object(vec![
@@ -1645,6 +1753,7 @@ fn build_discovery_config_from_operator(
 			int(default_finality_blocks as i64),
 		),
 		("finality_blocks", finality_blocks),
+		("source_finality_rules", source_finality_rules),
 	]);
 	implementations.insert("onchain_eip7683".to_string(), onchain_config);
 
@@ -2678,6 +2787,18 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 
 	// Extract account config - only set if not using default local wallet
 	let account = extract_account_config(&config.account);
+	let source_finality =
+		if config.source_finality == solver_config::SourceFinalityConfig::default() {
+			None
+		} else {
+			Some(
+				serde_json::to_value(&config.source_finality).map_err(|error| {
+					MergeError::Validation(format!(
+						"Failed to serialize source_finality config: {error}"
+					))
+				})?,
+			)
+		};
 
 	Ok(OperatorConfig {
 		solver_id: config.solver.id.clone(),
@@ -2712,6 +2833,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		// here keeps OperatorConfig on the auto-generated defaults.
 		fee_policy: None,
 		tx_bump: solver_types::OperatorTxBumpConfig::default(),
+		source_finality,
 	})
 }
 
@@ -3707,6 +3829,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		}
 	}
 
@@ -3952,6 +4075,23 @@ mod tests {
 	}
 
 	#[test]
+	fn build_runtime_config_rejects_tag_source_finality_without_expected_delay() {
+		let overrides = test_seed_overrides();
+		let mut op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		op_config.source_finality = Some(serde_json::json!({
+			"default_mode": "safe",
+			"default_blocks": 20,
+			"default_block_time_seconds": 2,
+			"default_expected_delay_seconds": null
+		}));
+
+		let err = build_runtime_config(&op_config).unwrap_err();
+
+		assert!(err.to_string().contains("source_finality"));
+		assert!(err.to_string().contains("expected_delay_seconds"));
+	}
+
+	#[test]
 	fn test_parse_solver_intake_disabled_accepts_active() {
 		assert!(!parse_solver_intake_disabled("active").unwrap());
 	}
@@ -4068,6 +4208,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -4131,6 +4272,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -4188,6 +4330,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -4236,6 +4379,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -4330,6 +4474,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -4561,6 +4706,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -4630,6 +4776,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -4724,6 +4871,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -4793,6 +4941,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -4868,6 +5017,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -4994,6 +5144,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -5130,6 +5281,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -5205,6 +5357,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5272,6 +5425,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5374,6 +5528,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -5485,6 +5640,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -5656,6 +5812,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -5799,6 +5956,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5905,6 +6063,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -6034,6 +6193,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -6193,6 +6353,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -6243,6 +6404,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -6307,6 +6469,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -6364,6 +6527,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -6439,6 +6603,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -6714,6 +6879,7 @@ mod tests {
 			rebalance: None,
 			fee_policy: None,
 			tx_bump: solver_types::OperatorTxBumpConfig::default(),
+			source_finality: None,
 		};
 
 		// Add only one network
@@ -6815,6 +6981,10 @@ mod tests {
 		assert_eq!(
 			op_config.solver.monitoring_timeout_seconds,
 			config.solver.monitoring_timeout_seconds
+		);
+		assert!(
+			op_config.source_finality.is_none(),
+			"implicit runtime source finality defaults must not become explicit operator config"
 		);
 
 		// Check networks are preserved
@@ -7037,13 +7207,70 @@ mod tests {
 			// gas_price_cap is omitted by default (no ceiling).
 			assert!(entry.get("gas_price_cap").is_none());
 		}
+		assert!(
+			chains
+				.get("1")
+				.and_then(|entry| entry.get("extra_native_fee"))
+				.is_none(),
+			"Ethereum should not default to an OP Stack extra fee",
+		);
+		assert_eq!(
+			chains
+				.get("10")
+				.and_then(|entry| entry.get("extra_native_fee"))
+				.and_then(|extra| extra.get("type"))
+				.and_then(|v| v.as_str()),
+			Some("op_stack_l1_data"),
+			"Optimism should default to OP Stack L1 data fee",
+		);
+		assert!(
+			chains
+				.get("137")
+				.and_then(|entry| entry.get("extra_native_fee"))
+				.is_none(),
+			"Polygon should not default to an OP Stack extra fee",
+		);
+	}
+
+	#[test]
+	fn test_build_delivery_config_defaults_extra_native_fee_for_known_op_stack_chains() {
+		let chain_ids = vec![10, 8453, 11155420, 84532, 747474, 1, 137, 42161];
+		let delivery = build_delivery_config_from_operator(&chain_ids, None);
+		let evm = delivery.implementations.get("evm_alloy").unwrap();
+		let chains = evm
+			.get("fee_policy")
+			.and_then(|policy| policy.get("chains"))
+			.and_then(|v| v.as_object())
+			.unwrap();
+
+		for chain_id in [10_u64, 8453, 11155420, 84532, 747474] {
+			assert_eq!(
+				chains
+					.get(&chain_id.to_string())
+					.and_then(|entry| entry.get("extra_native_fee"))
+					.and_then(|extra| extra.get("type"))
+					.and_then(|v| v.as_str()),
+				Some("op_stack_l1_data"),
+				"chain {chain_id} should default to OP Stack L1 data fee",
+			);
+		}
+
+		for chain_id in [1_u64, 137, 42161] {
+			assert!(
+				chains
+					.get(&chain_id.to_string())
+					.and_then(|entry| entry.get("extra_native_fee"))
+					.is_none(),
+				"chain {chain_id} should not default to an OP Stack extra fee",
+			);
+		}
 	}
 
 	#[test]
 	fn test_build_delivery_config_applies_per_chain_override() {
 		// Bootstrap config can override defaults per-chain. Whatever the
 		// operator specifies replaces; whatever they omit keeps the default.
-		use solver_types::{FeePolicyChainOverride, FeePolicyOverride};
+		use solver_types::{ExtraNativeFeeOverride, FeePolicyChainOverride, FeePolicyOverride};
 		use std::collections::HashMap as StdHashMap;
 
 		let mut chains = StdHashMap::new();
@@ -7054,6 +7281,7 @@ mod tests {
 				priority_fee_fallback: None, // keep default
 				quote_cost_strategy: None,
 				gas_price_cap: Some("300000000000".to_string()),
+				extra_native_fee: None,
 			},
 		);
 		chains.insert(
@@ -7063,6 +7291,10 @@ mod tests {
 				priority_fee_fallback: Some("100000000".to_string()),
 				quote_cost_strategy: None,
 				gas_price_cap: None,
+				extra_native_fee: Some(ExtraNativeFeeOverride::OpStackL1Data {
+					oracle_address: None,
+					buffer_bps: Some(1500),
+				}),
 			},
 		);
 		let override_ = FeePolicyOverride {
@@ -7127,6 +7359,21 @@ mod tests {
 		assert_eq!(
 			katana.get("priority_fee_fallback").and_then(|v| v.as_str()),
 			Some("100000000")
+		);
+		assert_eq!(
+			katana
+				.get("extra_native_fee")
+				.and_then(|extra| extra.get("type"))
+				.and_then(|v| v.as_str()),
+			Some("op_stack_l1_data")
+		);
+		assert_eq!(
+			katana
+				.get("extra_native_fee")
+				.and_then(|extra| extra.get("buffer_bps"))
+				.and_then(|v| v.as_u64()),
+			Some(1500),
+			"operator-supplied extra native fee override should win",
 		);
 	}
 
@@ -7594,10 +7841,15 @@ mod tests {
 			&input_oracle,
 			1,
 			&[42161],
+			true,
 		);
 
-		assert_eq!(timing.fill_deadline_seconds, 300);
-		assert!(timing.expires_seconds >= 691_500);
+		assert_eq!(
+			timing.fill_deadline_seconds,
+			solver_config::DEFAULT_SOURCE_FINALITY_EXPECTED_DELAY_SECONDS
+				+ solver_config::QuoteConfig::default().validity_seconds
+		);
+		assert!(timing.expires_seconds >= 691_200 + timing.fill_deadline_seconds);
 	}
 
 	#[test]
@@ -8027,6 +8279,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		// Step 1: merge_config should create Config with KMS account
