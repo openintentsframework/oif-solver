@@ -68,7 +68,9 @@ pub use costs::{CostBreakdown, CostContext};
 pub use delivery::*;
 pub use discovery::*;
 pub use events::*;
-pub use finality::select_finality_head;
+pub use finality::{
+	select_finality_head, select_source_finality_head, SourceFinalityMode, SourceFinalityRule,
+};
 pub use networks::{NetworkConfig, NetworkType, NetworksConfig, TokenConfig};
 pub use operator_config::{
 	OperatorAccountConfig, OperatorAdminConfig, OperatorBroadcasterConfig, OperatorConfig,

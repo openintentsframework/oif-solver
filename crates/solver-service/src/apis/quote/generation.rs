@@ -758,6 +758,7 @@ impl QuoteGenerator {
 			&input_oracle,
 			input_chain_id,
 			&output_chain_ids,
+			true,
 		);
 		let timestamps = timing.timestamps(current_time, request.intent.min_valid_until);
 
@@ -1214,6 +1215,7 @@ impl QuoteGenerator {
 			&input_oracle,
 			origin_chain_id,
 			&output_chain_ids,
+			false,
 		);
 		let timestamps = timing.timestamps(current_time, request.intent.min_valid_until);
 		let fill_deadline_timestamp = timestamps.fill_deadline;

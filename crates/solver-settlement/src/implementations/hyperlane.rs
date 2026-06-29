@@ -536,6 +536,14 @@ impl HyperlaneSettlement {
 				message_id = %hex::encode(message_id),
 				"Hyperlane message proven"
 			);
+		} else {
+			tracing::info!(
+				order_id = %solver_types::utils::formatting::truncate_id(order_id),
+				message_id = %hex::encode(message_id),
+				origin_chain,
+				dest_chain,
+				"Hyperlane message not proven yet; claim readiness blocked on delivery"
+			);
 		}
 
 		Ok(is_proven)

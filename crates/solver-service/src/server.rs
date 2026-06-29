@@ -28,8 +28,9 @@ use axum::{
 	Router, ServiceExt,
 };
 use serde_json::Value;
-use solver_config::{ApiConfig, Config};
+use solver_config::{source_finality_expected_delay_seconds, ApiConfig, Config};
 use solver_core::SolverEngine;
+use solver_settlement::admission::estimate_required_expiry_window_seconds;
 use solver_storage::{
 	config_store::create_config_store,
 	create_storage_backend,
@@ -38,9 +39,10 @@ use solver_storage::{
 };
 use solver_types::{
 	api::PostOrderRequest,
+	current_timestamp,
 	standards::eip7683::{interfaces::StandardOrder, LockType},
-	APIError, Address, ApiErrorType, GetOrderResponse, GetQuoteRequest, GetQuoteResponse,
-	OperatorConfig, Order, OrderIdCallback, Transaction,
+	APIError, Address, ApiErrorType, Eip7683OrderData, GetOrderResponse, GetQuoteRequest,
+	GetQuoteResponse, OperatorConfig, Order, OrderIdCallback, Transaction,
 };
 use std::{convert::TryInto, net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
@@ -149,7 +151,9 @@ pub async fn start_server(
 	if let Some(ref name) = discovery_impl {
 		tracing::info!("Orders will be submitted in-process to discovery implementation: {name}");
 	} else {
-		tracing::warn!("No offchain_eip7683 discovery source configured - /orders endpoint will not be available");
+		tracing::warn!(
+			"No offchain_eip7683 discovery source configured - /orders endpoint will not be available"
+		);
 	}
 
 	// Initialize JWT service if auth config exists (needed for admin endpoints even if orders auth is disabled)
@@ -923,8 +927,99 @@ async fn validate_intent_request(
 	}
 
 	let order = result?;
+	{
+		let config = state.config.read().await;
+		validate_admission_windows_for_order(&order, &config)?;
+	}
 
 	Ok(order)
+}
+
+fn validate_admission_windows_for_order(order: &Order, config: &Config) -> Result<(), APIError> {
+	let Ok(order_data) = serde_json::from_value::<Eip7683OrderData>(order.data.clone()) else {
+		return Ok(());
+	};
+	validate_source_finality_window_for_order_data(&order_data, config)?;
+	validate_settlement_window_for_order_data(
+		&order_data,
+		order.settlement_name.as_deref(),
+		config,
+	)?;
+	Ok(())
+}
+
+fn validate_source_finality_window_for_order_data(
+	order_data: &Eip7683OrderData,
+	config: &Config,
+) -> Result<(), APIError> {
+	if !matches!(order_data.lock_type, Some(lock_type) if lock_type.is_escrow()) {
+		return Ok(());
+	}
+	let origin_chain_id =
+		u64::try_from(order_data.origin_chain_id).map_err(|_| APIError::BadRequest {
+			error_type: ApiErrorType::OrderValidationFailed,
+			message: format!(
+				"Order origin chain id is invalid for source finality validation: {}",
+				order_data.origin_chain_id
+			),
+			details: Some(serde_json::json!({
+				"origin_chain_id": order_data.origin_chain_id.to_string(),
+			})),
+		})?;
+	let Some(required_delay) = source_finality_expected_delay_seconds(config, origin_chain_id)
+	else {
+		return Ok(());
+	};
+	let required_delay = required_delay.saturating_add(config.source_finality.retry_grace_seconds);
+	let now = current_timestamp() as u32;
+	let fill_remaining = order_data.fill_deadline.saturating_sub(now) as u64;
+	if fill_remaining < required_delay {
+		return Err(APIError::BadRequest {
+			error_type: ApiErrorType::OrderValidationFailed,
+			message: format!(
+				"Order fill deadline is too short for configured source finality: fill_deadline_in={fill_remaining}s required={required_delay}s origin_chain_id={origin_chain_id}"
+			),
+			details: Some(serde_json::json!({
+				"fill_deadline_in_seconds": fill_remaining,
+				"required_source_finality_seconds": required_delay,
+				"origin_chain_id": origin_chain_id,
+			})),
+		});
+	}
+	Ok(())
+}
+
+fn validate_settlement_window_for_order_data(
+	order_data: &Eip7683OrderData,
+	settlement_name: Option<&str>,
+	config: &Config,
+) -> Result<(), APIError> {
+	let Some((required_window, breakdown)) = estimate_required_expiry_window_seconds(
+		order_data,
+		&config.settlement.implementations,
+		config.settlement.settlement_poll_interval_seconds,
+		settlement_name,
+	) else {
+		return Ok(());
+	};
+	let now = current_timestamp() as u32;
+	let expires_remaining = order_data.expires.saturating_sub(now) as u64;
+	let settlement_remaining = order_data.expires.saturating_sub(order_data.fill_deadline) as u64;
+	if expires_remaining < required_window || settlement_remaining < required_window {
+		return Err(APIError::BadRequest {
+			error_type: ApiErrorType::OrderValidationFailed,
+			message: format!(
+				"Order expiry is too short for configured settlement route: expires_in={expires_remaining}s settlement_after_fill={settlement_remaining}s required={required_window}s ({breakdown})"
+			),
+			details: Some(serde_json::json!({
+				"expires_in_seconds": expires_remaining,
+				"settlement_after_fill_seconds": settlement_remaining,
+				"required_settlement_seconds": required_window,
+				"breakdown": breakdown,
+			})),
+		});
+	}
+	Ok(())
 }
 
 /// Submits a validated order to the configured discovery implementation, in-process.
@@ -1039,7 +1134,9 @@ mod tests {
 	use solver_types::standards::eip7683::interfaces::{
 		IAllocator, ITheCompact, SolMandateOutput, StandardOrder as OifStandardOrder,
 	};
-	use solver_types::utils::tests::builders::{NetworkConfigBuilder, NetworksConfigBuilder};
+	use solver_types::utils::tests::builders::{
+		Eip7683OrderDataBuilder, NetworkConfigBuilder, NetworksConfigBuilder, OrderBuilder,
+	};
 	use solver_types::{
 		APIError, Address, ApiErrorType, AuthConfig, AuthScope, CostBreakdown, CostContext,
 		ErrorResponse, FailureHandlingMode, InteropAddress, Quote, QuotePreview, SecretString,
@@ -1732,6 +1829,176 @@ mod tests {
 		}
 	}
 
+	fn order_with_source_finality_window(
+		origin_chain_id: U256,
+		fill_deadline: u32,
+		expires: u32,
+	) -> Order {
+		let mut order_data = Eip7683OrderDataBuilder::new().build();
+		order_data.lock_type = Some(LockType::Permit2Escrow);
+		order_data.origin_chain_id = origin_chain_id;
+		order_data.fill_deadline = fill_deadline;
+		order_data.expires = expires;
+
+		OrderBuilder::new()
+			.with_data(serde_json::to_value(order_data).expect("serialize order data"))
+			.build()
+	}
+
+	#[test]
+	fn validate_admission_windows_for_order_rejects_default_conservative_short_deadline() {
+		let config = ConfigBuilder::new().build();
+		let now = current_timestamp() as u32;
+		let order = order_with_source_finality_window(U256::from(1), now + 300, now + 1_800);
+
+		let err = super::validate_admission_windows_for_order(&order, &config)
+			.expect_err("default conservative source finality should reject 5 minute deadline");
+
+		match err {
+			APIError::BadRequest {
+				error_type,
+				message,
+				details,
+			} => {
+				assert_eq!(error_type, ApiErrorType::OrderValidationFailed);
+				assert!(message.contains("fill deadline is too short"));
+				assert!(message.contains("required=1200s"));
+				assert_eq!(
+					details
+						.as_ref()
+						.and_then(|details| details.get("origin_chain_id"))
+						.and_then(serde_json::Value::as_u64),
+					Some(1)
+				);
+			},
+			other => panic!("unexpected error: {other:?}"),
+		}
+	}
+
+	#[test]
+	fn validate_admission_windows_for_order_requires_full_source_finality_window() {
+		let config = ConfigBuilder::new().build();
+		let now = current_timestamp() as u32;
+		let order = order_with_source_finality_window(U256::from(1), now + 1_170, now + 2_400);
+
+		let err = super::validate_admission_windows_for_order(&order, &config)
+			.expect_err("direct intake must require the full source finality delay");
+
+		match err {
+			APIError::BadRequest { message, .. } => {
+				assert!(message.contains("fill deadline is too short"));
+				assert!(message.contains("fill_deadline_in=1170s"));
+				assert!(message.contains("required=1200s"));
+			},
+			other => panic!("unexpected error: {other:?}"),
+		}
+	}
+
+	#[test]
+	fn validate_admission_windows_for_order_allows_full_source_finality_window() {
+		let config = ConfigBuilder::new().build();
+		let now = current_timestamp() as u32;
+		let order = order_with_source_finality_window(U256::from(1), now + 1_200, now + 2_400);
+
+		super::validate_admission_windows_for_order(&order, &config)
+			.expect("full source finality window should be accepted");
+	}
+
+	#[test]
+	fn validate_admission_windows_for_order_rejects_unrepresentable_origin_chain_id() {
+		let config = ConfigBuilder::new().build();
+		let now = current_timestamp() as u32;
+		let order = order_with_source_finality_window(U256::MAX, now + 1_800, now + 2_400);
+
+		let err = super::validate_admission_windows_for_order(&order, &config)
+			.expect_err("unrepresentable chain id must not fall back to chain 0");
+
+		match err {
+			APIError::BadRequest {
+				error_type,
+				message,
+				details,
+			} => {
+				let expected_chain_id = U256::MAX.to_string();
+				assert_eq!(error_type, ApiErrorType::OrderValidationFailed);
+				assert!(message.contains("origin chain id is invalid"));
+				assert_eq!(
+					details
+						.as_ref()
+						.and_then(|details| details.get("origin_chain_id"))
+						.and_then(serde_json::Value::as_str),
+					Some(expected_chain_id.as_str())
+				);
+			},
+			other => panic!("unexpected error: {other:?}"),
+		}
+	}
+
+	#[test]
+	fn validate_admission_windows_for_order_rejects_short_settlement_window() {
+		let mut config = ConfigBuilder::new().build();
+		config.settlement.implementations.insert(
+			"hyperlane".to_string(),
+			json!({
+				"oracles": {
+					"input": {
+						"1": ["0x0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A0A"]
+					},
+					"output": {
+						"137": ["0x1111111111111111111111111111111111111111"]
+					}
+				},
+				"routes": {
+					"1": [137]
+				},
+				"intent_min_expiry_seconds": 600
+			}),
+		);
+		let now = current_timestamp() as u32;
+		let order = order_with_source_finality_window(U256::from(1), now + 1_200, now + 1_500);
+
+		let err = super::validate_admission_windows_for_order(&order, &config)
+			.expect_err("post-fill settlement window must meet route minimum");
+
+		match err {
+			APIError::BadRequest {
+				error_type,
+				message,
+				details,
+			} => {
+				assert_eq!(error_type, ApiErrorType::OrderValidationFailed);
+				assert!(message.contains("expiry is too short"));
+				assert!(message.contains("settlement_after_fill=300s"));
+				assert!(message.contains("required=600s"));
+				assert_eq!(
+					details
+						.as_ref()
+						.and_then(|details| details.get("settlement_after_fill_seconds"))
+						.and_then(serde_json::Value::as_u64),
+					Some(300)
+				);
+			},
+			other => panic!("unexpected error: {other:?}"),
+		}
+	}
+
+	#[test]
+	fn validate_admission_windows_for_order_skips_resource_lock_source_finality() {
+		let config = ConfigBuilder::new().build();
+		let now = current_timestamp() as u32;
+		let mut order_data = Eip7683OrderDataBuilder::new().build();
+		order_data.lock_type = Some(LockType::ResourceLock);
+		order_data.origin_chain_id = U256::MAX;
+		order_data.fill_deadline = now + 300;
+		order_data.expires = now + 1_800;
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(order_data).expect("serialize order data"))
+			.build();
+
+		super::validate_admission_windows_for_order(&order, &config)
+			.expect("source finality applies only to escrow orders");
+	}
+
 	fn address_from_secret(secret: &SecretKey) -> alloy_primitives::Address {
 		let secp = Secp256k1::new();
 		let public_key = PublicKey::from_secret_key(&secp, secret);
@@ -1946,8 +2213,20 @@ mod tests {
 		secret: &SecretKey,
 	) -> PostOrderRequest {
 		let now = solver_types::current_timestamp();
-		let fill_deadline = now + 1_800;
-		let expires = now + 3_600;
+		sample_permit2_request_with_witness_user_and_deadlines(
+			witness_user,
+			secret,
+			now + 1_800,
+			now + 3_600,
+		)
+	}
+
+	fn sample_permit2_request_with_witness_user_and_deadlines(
+		witness_user: &str,
+		secret: &SecretKey,
+		fill_deadline: u64,
+		expires: u64,
+	) -> PostOrderRequest {
 		let payload = OrderPayload {
 			signature_type: SignatureType::Eip712,
 			domain: json!({
@@ -2536,6 +2815,79 @@ mod tests {
 			0,
 			"order must not reach discovery"
 		);
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn handle_order_rejects_short_source_finality_deadline_before_forwarding() {
+		let state = build_quote_redemption_test_app_state().await;
+		let now = solver_types::current_timestamp();
+		let secret = SecretKey::from_byte_array([0x31u8; 32]).expect("valid secret");
+		let request = sample_permit2_request_with_witness_user_and_deadlines(
+			"0x1111111111111111111111111111111111111111",
+			&secret,
+			now + 60,
+			now + 1_800,
+		);
+		let payload = to_value(request).expect("serialize request");
+
+		let response = super::handle_order(State(state), None, Json(payload)).await;
+
+		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+		let body_bytes = body::to_bytes(response.into_body(), usize::MAX)
+			.await
+			.expect("body");
+		let parsed: ErrorResponse = serde_json::from_slice(&body_bytes).expect("parse body");
+		assert_eq!(parsed.error, "ORDER_VALIDATION_FAILED");
+		assert!(parsed.message.contains("fill deadline is too short"));
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn handle_order_rejects_short_settlement_window_before_forwarding() {
+		let state = build_quote_redemption_test_app_state().await;
+		state
+			.config
+			.write()
+			.await
+			.settlement
+			.implementations
+			.insert(
+				"hyperlane".to_string(),
+				json!({
+					"oracles": {
+						"input": {
+							"1": ["0x2222222222222222222222222222222222222222"]
+						},
+						"output": {
+							"42161": ["0x3333333333333333333333333333333333333333"]
+						}
+					},
+					"routes": {
+						"1": [42161]
+					},
+					"intent_min_expiry_seconds": 600
+				}),
+			);
+		let now = solver_types::current_timestamp();
+		let secret = SecretKey::from_byte_array([0x32u8; 32]).expect("valid secret");
+		let request = sample_permit2_request_with_witness_user_and_deadlines(
+			"0x1111111111111111111111111111111111111111",
+			&secret,
+			now + 1_250,
+			now + 1_550,
+		);
+		let payload = to_value(request).expect("serialize request");
+
+		let response = super::handle_order(State(state), None, Json(payload)).await;
+
+		assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+		let body_bytes = body::to_bytes(response.into_body(), usize::MAX)
+			.await
+			.expect("body");
+		let parsed: ErrorResponse = serde_json::from_slice(&body_bytes).expect("parse body");
+		assert_eq!(parsed.error, "ORDER_VALIDATION_FAILED");
+		assert!(parsed.message.contains("expiry is too short"));
+		assert!(parsed.message.contains("settlement_after_fill=300s"));
+		assert!(parsed.message.contains("required=600s"));
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

@@ -158,6 +158,10 @@ pub struct SeedOverrides {
 	/// If omitted, transaction bumping remains disabled by default.
 	#[serde(default)]
 	pub tx_bump: Option<crate::OperatorTxBumpConfig>,
+
+	/// Optional source-chain finality policy used before escrow-origin fills.
+	#[serde(default)]
+	pub source_finality: Option<serde_json::Value>,
 }
 
 /// Top-level fee-policy override block.
@@ -768,6 +772,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let chain_ids = config.chain_ids();
@@ -809,6 +814,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		assert!(config.has_chain(10));
@@ -855,6 +861,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let network = config.get_network(10);
@@ -941,6 +948,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let json = serde_json::to_string(&config).unwrap();

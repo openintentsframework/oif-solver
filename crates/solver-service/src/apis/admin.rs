@@ -1851,6 +1851,7 @@ mod tests {
 			rebalance: None,
 			fee_policy: None,
 			tx_bump: solver_types::OperatorTxBumpConfig::default(),
+			source_finality: None,
 		}
 	}
 
@@ -3674,7 +3675,9 @@ mod tests {
 			},
 			Err(other) => panic!("expected NotAuthorized(settler), got {other:?}"),
 			Ok(_) => {
-				panic!("all-chains approval must be rejected when spender is not a settler on every chain")
+				panic!(
+					"all-chains approval must be rejected when spender is not a settler on every chain"
+				)
 			},
 		}
 	}

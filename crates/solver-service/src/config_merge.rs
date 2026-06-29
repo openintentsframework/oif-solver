@@ -177,14 +177,14 @@ fn validate_seedless_settlement_requirements(
 					match hyperlane.domains.get(chain_id) {
 						Some(0) => {
 							return Err(MergeError::Validation(format!(
-									"seedless mode requires non-zero settlement.hyperlane.domains for chain {chain_id}"
-								)))
+								"seedless mode requires non-zero settlement.hyperlane.domains for chain {chain_id}"
+							)));
 						},
 						Some(_) => {},
 						None => {
 							return Err(MergeError::Validation(format!(
-									"seedless mode requires settlement.hyperlane.domains for chain {chain_id}"
-								)))
+								"seedless mode requires settlement.hyperlane.domains for chain {chain_id}"
+							)));
 						},
 					}
 
@@ -192,13 +192,13 @@ fn validate_seedless_settlement_requirements(
 						Some(oracles) if !oracles.is_empty() => {},
 						Some(_) => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.hyperlane.oracles.input for chain {chain_id}"
-						)))
+								"seedless mode requires non-empty settlement.hyperlane.oracles.input for chain {chain_id}"
+							)));
 						},
 						None => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.hyperlane.oracles.input for chain {chain_id}"
-						)))
+								"seedless mode requires settlement.hyperlane.oracles.input for chain {chain_id}"
+							)));
 						},
 					}
 
@@ -206,13 +206,13 @@ fn validate_seedless_settlement_requirements(
 						Some(oracles) if !oracles.is_empty() => {},
 						Some(_) => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.hyperlane.oracles.output for chain {chain_id}"
-						)))
+								"seedless mode requires non-empty settlement.hyperlane.oracles.output for chain {chain_id}"
+							)));
 						},
 						None => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.hyperlane.oracles.output for chain {chain_id}"
-						)))
+								"seedless mode requires settlement.hyperlane.oracles.output for chain {chain_id}"
+							)));
 						},
 					}
 				}
@@ -234,26 +234,26 @@ fn validate_seedless_settlement_requirements(
 						Some(oracles) if !oracles.is_empty() => {},
 						Some(_) => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.direct.oracles.input for chain {chain_id}"
-						)))
+								"seedless mode requires non-empty settlement.direct.oracles.input for chain {chain_id}"
+							)));
 						},
 						None => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.direct.oracles.input for chain {chain_id}"
-						)))
+								"seedless mode requires settlement.direct.oracles.input for chain {chain_id}"
+							)));
 						},
 					}
 					match direct.oracles.output.get(chain_id) {
 						Some(oracles) if !oracles.is_empty() => {},
 						Some(_) => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.direct.oracles.output for chain {chain_id}"
-						)))
+								"seedless mode requires non-empty settlement.direct.oracles.output for chain {chain_id}"
+							)));
 						},
 						None => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.direct.oracles.output for chain {chain_id}"
-						)))
+								"seedless mode requires settlement.direct.oracles.output for chain {chain_id}"
+							)));
 						},
 					}
 				}
@@ -530,6 +530,7 @@ pub fn merge_to_operator_config(
 		// materialization time.
 		fee_policy: initializer.fee_policy.clone(),
 		tx_bump: initializer.tx_bump.unwrap_or_default(),
+		source_finality: initializer.source_finality.clone(),
 	};
 	validate_operator_tx_bump(&operator_config)?;
 	Ok(operator_config)
@@ -908,13 +909,13 @@ fn validate_hyperlane_domains(
 			Some(0) => {
 				return Err(MergeError::Validation(format!(
 					"{path} has zero domain for chain {chain_id}"
-				)))
+				)));
 			},
 			Some(_) => {},
 			None => {
 				return Err(MergeError::Validation(format!(
 					"{path} is missing chain {chain_id}"
-				)))
+				)));
 			},
 		}
 	}
@@ -1240,6 +1241,8 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 
 	let tx_bump = translate_tx_bump(&operator_config.tx_bump);
 	validate_tx_bump(&tx_bump, &chain_ids)?;
+	let source_finality = build_source_finality_config_from_operator(operator_config)?;
+	validate_source_finality_expected_delays(&source_finality, &chain_ids)?;
 
 	// Build the full config
 	let config = Config {
@@ -1262,6 +1265,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 		gas: Some(build_gas_config_from_operator(&operator_config.gas)),
 		rebalance: build_rebalance_config_from_operator(operator_config.rebalance.as_ref())?,
 		tx_bump,
+		source_finality,
 	};
 
 	Ok(config)
@@ -1282,6 +1286,87 @@ fn validate_tx_bump(
 	tx_bump
 		.validate_against_networks(&configured_chain_ids)
 		.map_err(MergeError::Validation)
+}
+
+fn build_source_finality_config_from_operator(
+	operator_config: &OperatorConfig,
+) -> Result<solver_config::SourceFinalityConfig, MergeError> {
+	let Some(source_finality) = &operator_config.source_finality else {
+		return Ok(solver_config::SourceFinalityConfig::default());
+	};
+
+	serde_json::from_value(source_finality.clone())
+		.map_err(|error| MergeError::Validation(format!("Invalid source_finality config: {error}")))
+}
+
+fn build_source_finality_rules_for_discovery(
+	operator_config: &OperatorConfig,
+	chain_ids: &[u64],
+) -> Result<serde_json::Value, MergeError> {
+	if operator_config.source_finality.is_none() {
+		return Ok(serde_json::Value::Object(serde_json::Map::new()));
+	}
+
+	let source_finality = build_source_finality_config_from_operator(operator_config)?;
+	let mut rules = serde_json::Map::new();
+	for chain_id in chain_ids {
+		let rule = source_finality_rule_from_config_only(&source_finality, *chain_id);
+		let rule = serde_json::to_value(rule).map_err(|error| {
+			MergeError::Validation(format!(
+				"Failed to serialize source finality rule for chain {chain_id}: {error}"
+			))
+		})?;
+		rules.insert(chain_id.to_string(), rule);
+	}
+	Ok(serde_json::Value::Object(rules))
+}
+
+fn source_finality_rule_from_config_only(
+	source_finality: &solver_config::SourceFinalityConfig,
+	chain_id: u64,
+) -> solver_types::SourceFinalityRule {
+	let chain = source_finality.chains.get(&chain_id);
+	let mode = chain
+		.and_then(|chain| chain.mode)
+		.unwrap_or(source_finality.default_mode);
+	let blocks = chain
+		.and_then(|chain| chain.blocks)
+		.unwrap_or(source_finality.default_blocks);
+	let block_time_seconds = chain
+		.and_then(|chain| chain.block_time_seconds)
+		.unwrap_or(source_finality.default_block_time_seconds);
+	let expected_delay_seconds = chain
+		.and_then(|chain| chain.expected_delay_seconds)
+		.or_else(|| {
+			matches!(mode, solver_types::SourceFinalityMode::Numeric)
+				.then_some(blocks.saturating_mul(block_time_seconds))
+		})
+		.or(source_finality.default_expected_delay_seconds);
+
+	solver_types::SourceFinalityRule {
+		mode,
+		blocks,
+		block_time_seconds,
+		expected_delay_seconds,
+	}
+}
+
+fn validate_source_finality_expected_delays(
+	source_finality: &solver_config::SourceFinalityConfig,
+	chain_ids: &[u64],
+) -> Result<(), MergeError> {
+	for chain_id in chain_ids {
+		let rule = source_finality_rule_from_config_only(source_finality, *chain_id);
+		if !matches!(rule.mode, solver_types::SourceFinalityMode::Numeric)
+			&& rule.expected_delay_seconds.is_none()
+		{
+			return Err(MergeError::Validation(format!(
+				"source_finality for chain {chain_id} uses {:?} mode but expected_delay_seconds is not configured",
+				rule.mode
+			)));
+		}
+	}
+	Ok(())
 }
 
 fn parse_solver_intake_disabled(raw: &str) -> Result<bool, MergeError> {
@@ -1656,6 +1741,8 @@ fn build_discovery_config_from_operator(
 			)
 		})
 		.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+	let source_finality_rules =
+		build_source_finality_rules_for_discovery(operator_config, chain_ids)?;
 
 	// Onchain discovery - polls chain for new orders
 	let onchain_config = json_object(vec![
@@ -1666,6 +1753,7 @@ fn build_discovery_config_from_operator(
 			int(default_finality_blocks as i64),
 		),
 		("finality_blocks", finality_blocks),
+		("source_finality_rules", source_finality_rules),
 	]);
 	implementations.insert("onchain_eip7683".to_string(), onchain_config);
 
@@ -2699,6 +2787,18 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 
 	// Extract account config - only set if not using default local wallet
 	let account = extract_account_config(&config.account);
+	let source_finality =
+		if config.source_finality == solver_config::SourceFinalityConfig::default() {
+			None
+		} else {
+			Some(
+				serde_json::to_value(&config.source_finality).map_err(|error| {
+					MergeError::Validation(format!(
+						"Failed to serialize source_finality config: {error}"
+					))
+				})?,
+			)
+		};
 
 	Ok(OperatorConfig {
 		solver_id: config.solver.id.clone(),
@@ -2733,6 +2833,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		// here keeps OperatorConfig on the auto-generated defaults.
 		fee_policy: None,
 		tx_bump: solver_types::OperatorTxBumpConfig::default(),
+		source_finality,
 	})
 }
 
@@ -3728,6 +3829,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		}
 	}
 
@@ -3973,6 +4075,23 @@ mod tests {
 	}
 
 	#[test]
+	fn build_runtime_config_rejects_tag_source_finality_without_expected_delay() {
+		let overrides = test_seed_overrides();
+		let mut op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		op_config.source_finality = Some(serde_json::json!({
+			"default_mode": "safe",
+			"default_blocks": 20,
+			"default_block_time_seconds": 2,
+			"default_expected_delay_seconds": null
+		}));
+
+		let err = build_runtime_config(&op_config).unwrap_err();
+
+		assert!(err.to_string().contains("source_finality"));
+		assert!(err.to_string().contains("expected_delay_seconds"));
+	}
+
+	#[test]
 	fn test_parse_solver_intake_disabled_accepts_active() {
 		assert!(!parse_solver_intake_disabled("active").unwrap());
 	}
@@ -4089,6 +4208,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -4152,6 +4272,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -4209,6 +4330,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -4257,6 +4379,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -4351,6 +4474,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -4582,6 +4706,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -4651,6 +4776,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -4745,6 +4871,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -4814,6 +4941,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -4889,6 +5017,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -5015,6 +5144,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -5151,6 +5281,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -5226,6 +5357,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5293,6 +5425,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5395,6 +5528,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -5506,6 +5640,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -5677,6 +5812,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -5820,6 +5956,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5926,6 +6063,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -6055,6 +6193,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -6214,6 +6353,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -6264,6 +6404,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -6328,6 +6469,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -6385,6 +6527,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -6460,6 +6603,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -6735,6 +6879,7 @@ mod tests {
 			rebalance: None,
 			fee_policy: None,
 			tx_bump: solver_types::OperatorTxBumpConfig::default(),
+			source_finality: None,
 		};
 
 		// Add only one network
@@ -6836,6 +6981,10 @@ mod tests {
 		assert_eq!(
 			op_config.solver.monitoring_timeout_seconds,
 			config.solver.monitoring_timeout_seconds
+		);
+		assert!(
+			op_config.source_finality.is_none(),
+			"implicit runtime source finality defaults must not become explicit operator config"
 		);
 
 		// Check networks are preserved
@@ -7692,10 +7841,15 @@ mod tests {
 			&input_oracle,
 			1,
 			&[42161],
+			true,
 		);
 
-		assert_eq!(timing.fill_deadline_seconds, 300);
-		assert!(timing.expires_seconds >= 691_500);
+		assert_eq!(
+			timing.fill_deadline_seconds,
+			solver_config::DEFAULT_SOURCE_FINALITY_EXPECTED_DELAY_SECONDS
+				+ solver_config::QuoteConfig::default().validity_seconds
+		);
+		assert!(timing.expires_seconds >= 691_200 + timing.fill_deadline_seconds);
 	}
 
 	#[test]
@@ -8125,6 +8279,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		// Step 1: merge_config should create Config with KMS account

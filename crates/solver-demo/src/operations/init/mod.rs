@@ -1213,6 +1213,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		}
 	}
 

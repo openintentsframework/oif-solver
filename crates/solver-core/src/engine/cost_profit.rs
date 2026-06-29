@@ -30,7 +30,7 @@ pub(crate) mod post_fill_outcome {
 	pub const SKIPPED_UNSUPPORTED_CHAIN: &str = "skipped_unsupported_chain";
 }
 use rust_decimal::Decimal;
-use solver_config::Config;
+use solver_config::{source_finality_expected_delay_seconds, Config};
 use solver_delivery::{DeliveryService, FeeParams};
 use solver_pricing::PricingService;
 use solver_storage::StorageService;
@@ -773,6 +773,7 @@ impl CostProfitService {
 
 		// Get gas units for cost calculation
 		let mut gas_units = estimate_quote_gas_units_from_flow_keys(flow_keys, config);
+		let include_source_finality_delay = !flow_keys.iter().any(|flow| flow == "resource_lock");
 
 		// Optional: live-estimate destination-chain legs against the destination
 		// chain so quote-time costs track the transactions the solver will send.
@@ -809,6 +810,7 @@ impl CostProfitService {
 					&swap_amounts_with_info,
 					config,
 					solver_address,
+					include_source_finality_delay,
 				)
 				.await
 			{
@@ -973,6 +975,7 @@ impl CostProfitService {
 					&swap_amounts_with_info,
 					config,
 					solver_address,
+					include_source_finality_delay,
 				)
 				.await
 			{
@@ -2148,6 +2151,7 @@ impl CostProfitService {
 		resolved_amounts: &std::collections::HashMap<InteropAddress, TokenAmountInfo>,
 		config: &Config,
 		solver_address: &Address,
+		include_source_finality_delay: bool,
 	) -> Result<Transaction, APIError> {
 		let output = request
 			.intent
@@ -2262,12 +2266,33 @@ impl CostProfitService {
 		// configures a longer deadline, the settler's max-fill-window must
 		// already accept it, so the same value is safe here. If config is
 		// missing, fall back to 60s (the historical hardcoded default).
-		let fill_deadline_window = config
+		let configured_fill_deadline_window = config
 			.api
 			.as_ref()
 			.and_then(|a| a.quote.as_ref())
 			.map(|q| q.fill_deadline_seconds)
 			.unwrap_or(60);
+		let quote_validity_window = config
+			.api
+			.as_ref()
+			.and_then(|a| a.quote.as_ref())
+			.map(|q| q.validity_seconds)
+			.unwrap_or_else(|| solver_config::QuoteConfig::default().validity_seconds);
+		let origin_chain_id = request
+			.intent
+			.inputs
+			.first()
+			.and_then(|input| input.asset.ethereum_chain_id().ok());
+		let source_finality_window = if include_source_finality_delay {
+			origin_chain_id
+				.and_then(|chain_id| source_finality_expected_delay_seconds(config, chain_id))
+				.unwrap_or(0)
+				.saturating_add(config.source_finality.retry_grace_seconds)
+				.saturating_add(quote_validity_window)
+		} else {
+			0
+		};
+		let fill_deadline_window = configured_fill_deadline_window.max(source_finality_window);
 		let fill_deadline_secs = current_timestamp().saturating_add(fill_deadline_window);
 
 		let data = IOutputSettlerSimple::fillCall {
@@ -6268,7 +6293,7 @@ mod tests {
 		let service = cost_profit_service_no_delivery_chains();
 
 		let tx = service
-			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver)
+			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver, true)
 			.await
 			.expect("synthetic fill tx should build");
 
@@ -6286,6 +6311,68 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn build_fill_tx_for_quote_skips_source_finality_delay_for_resource_lock() {
+		let config = config_with_output_settler_on_dest(QUOTE_OUTPUT_SETTLER);
+		let configured_fill_deadline_window = 60;
+		let solver = solver_types::Address(QUOTE_SOLVER.to_vec());
+		let request = quote_request_with_unresolved_amount();
+		let validated = create_test_validated_context(true);
+		let resolved = resolved_amounts_for_request(&request, U256::from(1_000_000u64));
+		let service = cost_profit_service_no_delivery_chains();
+
+		let before = current_timestamp();
+		let tx = service
+			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver, false)
+			.await
+			.expect("synthetic fill tx should build");
+		let after = current_timestamp();
+
+		let decoded =
+			IOutputSettlerSimple::fillCall::abi_decode(&tx.data).expect("fillCall should decode");
+		let fill_deadline = decoded.fillDeadline.to::<u64>();
+
+		assert!(
+			(before + configured_fill_deadline_window..=after + configured_fill_deadline_window)
+				.contains(&fill_deadline),
+			"ResourceLock synthetic fill must match the configured fill deadline, got {fill_deadline}"
+		);
+	}
+
+	#[tokio::test]
+	async fn build_fill_tx_for_quote_applies_source_finality_delay_for_escrow() {
+		let config = config_with_output_settler_on_dest(QUOTE_OUTPUT_SETTLER);
+		let configured_fill_deadline_window = 60;
+		let expected_delay =
+			source_finality_expected_delay_seconds(&config, 1).expect("default finality delay");
+		let solver = solver_types::Address(QUOTE_SOLVER.to_vec());
+		let request = quote_request_with_unresolved_amount();
+		let validated = create_test_validated_context(true);
+		let resolved = resolved_amounts_for_request(&request, U256::from(1_000_000u64));
+		let service = cost_profit_service_no_delivery_chains();
+
+		let before = current_timestamp();
+		let tx = service
+			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver, true)
+			.await
+			.expect("synthetic fill tx should build");
+		let after = current_timestamp();
+
+		let decoded =
+			IOutputSettlerSimple::fillCall::abi_decode(&tx.data).expect("fillCall should decode");
+		let fill_deadline = decoded.fillDeadline.to::<u64>();
+		let expected_window = configured_fill_deadline_window.max(
+			expected_delay
+				+ config.source_finality.retry_grace_seconds
+				+ solver_config::QuoteConfig::default().validity_seconds,
+		);
+
+		assert!(
+			(before + expected_window..=after + expected_window).contains(&fill_deadline),
+			"Escrow synthetic fill must include source finality delay, got {fill_deadline}"
+		);
+	}
+
+	#[tokio::test]
 	async fn build_fill_tx_for_quote_errors_when_chain_unknown() {
 		// Build a config with networks for chains 1 and 137, but mutate the
 		// request output's chain to 9999 (not in the config).
@@ -6300,7 +6387,7 @@ mod tests {
 		let service = cost_profit_service_no_delivery_chains();
 
 		let result = service
-			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver)
+			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver, true)
 			.await;
 		assert!(
 			result.is_err(),
@@ -6320,7 +6407,7 @@ mod tests {
 		let service = cost_profit_service_no_delivery_chains();
 
 		let result = service
-			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver)
+			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver, true)
 			.await;
 		assert!(
 			result.is_err(),
@@ -7796,7 +7883,7 @@ mod tests {
 		let service = cost_profit_service_no_delivery_chains();
 
 		let tx = service
-			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver)
+			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver, true)
 			.await
 			.expect("synthetic fill tx should build");
 

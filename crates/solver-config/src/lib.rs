@@ -11,7 +11,9 @@ pub use builders::config::ConfigBuilder;
 use regex::Regex;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use solver_types::{networks::deserialize_networks, NetworksConfig};
+use solver_types::{
+	networks::deserialize_networks, NetworksConfig, SourceFinalityMode, SourceFinalityRule,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
@@ -76,10 +78,15 @@ pub struct Config {
 	/// chains into the same-nonce gas-bumping sweep loop.
 	#[serde(default)]
 	pub tx_bump: TxBumpConfig,
+	/// Source-chain finality policy used before escrow-origin fills.
+	#[serde(default)]
+	pub source_finality: SourceFinalityConfig,
 }
 
 /// Default source-chain finality depth for escrow-origin fill guards.
 pub const DEFAULT_SOURCE_FINALITY_BLOCKS: u64 = 20;
+pub const DEFAULT_SOURCE_FINALITY_BLOCK_TIME_SECONDS: u64 = 12;
+pub const DEFAULT_SOURCE_FINALITY_EXPECTED_DELAY_SECONDS: u64 = 1_200;
 
 fn finality_blocks_from_implementation_config(
 	value: &serde_json::Value,
@@ -104,6 +111,11 @@ fn finality_blocks_from_implementation_config(
 /// govern payment proof finality; discovery settings are retained as a fallback
 /// for deployments that configure discovery before broadcaster settlement.
 pub fn source_finality_blocks_for_config(config: &Config, chain_id: u64) -> u64 {
+	let rule = source_finality_rule_for_config(config, chain_id);
+	rule.blocks
+}
+
+fn legacy_source_finality_blocks_for_config(config: &Config, chain_id: u64) -> u64 {
 	if let Some(depth) = config
 		.settlement
 		.implementations
@@ -123,6 +135,111 @@ pub fn source_finality_blocks_for_config(config: &Config, chain_id: u64) -> u64 
 	}
 
 	DEFAULT_SOURCE_FINALITY_BLOCKS
+}
+
+pub fn source_finality_rule_for_config(config: &Config, chain_id: u64) -> SourceFinalityRule {
+	let source_finality = &config.source_finality;
+	let chain = source_finality.chains.get(&chain_id);
+	let blocks = chain.and_then(|chain| chain.blocks).unwrap_or_else(|| {
+		if source_finality.has_explicit_config() {
+			source_finality.default_blocks
+		} else {
+			legacy_source_finality_blocks_for_config(config, chain_id)
+		}
+	});
+	let block_time_seconds = chain
+		.and_then(|chain| chain.block_time_seconds)
+		.unwrap_or(source_finality.default_block_time_seconds);
+	let mode = chain
+		.and_then(|chain| chain.mode)
+		.unwrap_or(source_finality.default_mode);
+	let expected_delay_seconds = chain
+		.and_then(|chain| chain.expected_delay_seconds)
+		.or_else(|| {
+			matches!(mode, SourceFinalityMode::Numeric)
+				.then_some(blocks.saturating_mul(block_time_seconds))
+		})
+		.or(source_finality.default_expected_delay_seconds);
+
+	SourceFinalityRule {
+		mode,
+		blocks,
+		block_time_seconds,
+		expected_delay_seconds,
+	}
+}
+
+pub fn source_finality_expected_delay_seconds(config: &Config, chain_id: u64) -> Option<u64> {
+	source_finality_rule_for_config(config, chain_id).expected_delay_seconds
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SourceFinalityConfig {
+	#[serde(default = "default_source_finality_mode")]
+	pub default_mode: SourceFinalityMode,
+	#[serde(default = "default_source_finality_blocks")]
+	pub default_blocks: u64,
+	#[serde(default = "default_source_finality_block_time_seconds")]
+	pub default_block_time_seconds: u64,
+	#[serde(default = "default_source_finality_expected_delay_seconds")]
+	pub default_expected_delay_seconds: Option<u64>,
+	#[serde(default)]
+	pub retry_grace_seconds: u64,
+	#[serde(default)]
+	pub chains: HashMap<u64, SourceFinalityChainConfig>,
+}
+
+impl SourceFinalityConfig {
+	fn has_explicit_config(&self) -> bool {
+		self.default_mode != default_source_finality_mode()
+			|| self.default_blocks != default_source_finality_blocks()
+			|| self.default_block_time_seconds != default_source_finality_block_time_seconds()
+			|| self.default_expected_delay_seconds
+				!= default_source_finality_expected_delay_seconds()
+			|| self.retry_grace_seconds != 0
+			|| !self.chains.is_empty()
+	}
+}
+
+impl Default for SourceFinalityConfig {
+	fn default() -> Self {
+		Self {
+			default_mode: default_source_finality_mode(),
+			default_blocks: default_source_finality_blocks(),
+			default_block_time_seconds: default_source_finality_block_time_seconds(),
+			default_expected_delay_seconds: default_source_finality_expected_delay_seconds(),
+			retry_grace_seconds: 0,
+			chains: HashMap::new(),
+		}
+	}
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SourceFinalityChainConfig {
+	#[serde(default)]
+	pub mode: Option<SourceFinalityMode>,
+	#[serde(default)]
+	pub blocks: Option<u64>,
+	#[serde(default)]
+	pub block_time_seconds: Option<u64>,
+	#[serde(default)]
+	pub expected_delay_seconds: Option<u64>,
+}
+
+fn default_source_finality_mode() -> SourceFinalityMode {
+	SourceFinalityMode::Conservative
+}
+
+fn default_source_finality_blocks() -> u64 {
+	DEFAULT_SOURCE_FINALITY_BLOCKS
+}
+
+fn default_source_finality_block_time_seconds() -> u64 {
+	DEFAULT_SOURCE_FINALITY_BLOCK_TIME_SECONDS
+}
+
+fn default_source_finality_expected_delay_seconds() -> Option<u64> {
+	Some(DEFAULT_SOURCE_FINALITY_EXPECTED_DELAY_SECONDS)
 }
 
 /// Configuration specific to the solver instance.
@@ -1524,6 +1641,138 @@ mod tests {
 		assert_eq!(
 			source_finality_blocks_for_config(&config, 1),
 			DEFAULT_SOURCE_FINALITY_BLOCKS
+		);
+	}
+
+	#[test]
+	fn source_finality_rule_defaults_to_legacy_conservative_depth() {
+		let config = parse_json_fixture(base_config_json(
+			json!({
+				"137": test_network(137, "http://localhost:8545"),
+				"1": test_network(1, "http://localhost:8546")
+			}),
+			json!({
+				"eip7683": {}
+			}),
+			json!({
+				"broadcaster": {
+					"order": "eip7683",
+					"network_ids": [137],
+					"default_finality_blocks": 42,
+					"finality_blocks": { "137": 7 }
+				}
+			}),
+		))
+		.expect("config should parse");
+
+		let rule = source_finality_rule_for_config(&config, 137);
+		assert_eq!(rule.mode, SourceFinalityMode::Conservative);
+		assert_eq!(rule.blocks, 7);
+		assert_eq!(
+			rule.block_time_seconds,
+			DEFAULT_SOURCE_FINALITY_BLOCK_TIME_SECONDS
+		);
+		assert_eq!(
+			rule.expected_delay_seconds,
+			Some(DEFAULT_SOURCE_FINALITY_EXPECTED_DELAY_SECONDS)
+		);
+	}
+
+	#[test]
+	fn source_finality_rule_uses_per_chain_override() {
+		let mut config = parse_json_fixture(base_config_json(
+			json!({
+				"137": test_network(137, "http://localhost:8545"),
+				"1": test_network(1, "http://localhost:8546")
+			}),
+			json!({
+				"eip7683": {}
+			}),
+			json!({
+				"direct": {
+					"order": "eip7683",
+					"network_ids": [137, 1]
+				}
+			}),
+		))
+		.expect("config should parse");
+		config.source_finality = SourceFinalityConfig {
+			default_mode: SourceFinalityMode::Conservative,
+			default_blocks: 20,
+			default_block_time_seconds: 12,
+			default_expected_delay_seconds: None,
+			retry_grace_seconds: 10,
+			chains: HashMap::from([(
+				137,
+				SourceFinalityChainConfig {
+					mode: Some(SourceFinalityMode::Safe),
+					blocks: Some(120),
+					block_time_seconds: Some(2),
+					expected_delay_seconds: Some(300),
+				},
+			)]),
+		};
+
+		let rule = source_finality_rule_for_config(&config, 137);
+		assert_eq!(rule.mode, SourceFinalityMode::Safe);
+		assert_eq!(rule.blocks, 120);
+		assert_eq!(rule.block_time_seconds, 2);
+		assert_eq!(rule.expected_delay_seconds, Some(300));
+	}
+
+	#[test]
+	fn source_finality_numeric_derives_expected_delay() {
+		let mut config = ConfigBuilder::new().build();
+		config.source_finality = SourceFinalityConfig {
+			default_mode: SourceFinalityMode::Numeric,
+			default_blocks: 64,
+			default_block_time_seconds: 2,
+			default_expected_delay_seconds: Some(DEFAULT_SOURCE_FINALITY_EXPECTED_DELAY_SECONDS),
+			retry_grace_seconds: 0,
+			chains: HashMap::new(),
+		};
+
+		let rule = source_finality_rule_for_config(&config, 137);
+		assert_eq!(rule.expected_delay_seconds, Some(128));
+		assert_eq!(
+			source_finality_expected_delay_seconds(&config, 137),
+			Some(128)
+		);
+	}
+
+	#[test]
+	fn source_finality_deserialization_preserves_default_expected_delay_when_omitted() {
+		let config = parse_json_fixture({
+			let mut value = base_config_json(
+				json!({
+					"137": test_network(137, "http://localhost:8545"),
+					"1": test_network(1, "http://localhost:8546")
+				}),
+				json!({
+					"eip7683": {}
+				}),
+				json!({
+					"direct": {
+						"order": "eip7683",
+						"network_ids": [137, 1]
+					}
+				}),
+			);
+			value["source_finality"] = json!({
+				"default_mode": "conservative",
+				"default_blocks": 20,
+				"default_block_time_seconds": 12,
+				"chains": {
+					"137": { "mode": "safe" }
+				}
+			});
+			value
+		})
+		.expect("config should parse");
+
+		assert_eq!(
+			source_finality_expected_delay_seconds(&config, 137),
+			Some(DEFAULT_SOURCE_FINALITY_EXPECTED_DELAY_SECONDS)
 		);
 	}
 

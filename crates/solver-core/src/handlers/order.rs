@@ -11,7 +11,7 @@ use crate::state::OrderStateMachine;
 use alloy_primitives::{hex, B256, U256};
 use alloy_rpc_types::BlockNumberOrTag;
 use alloy_sol_types::SolCall;
-use solver_config::{source_finality_blocks_for_config, Config};
+use solver_config::{source_finality_rule_for_config, Config};
 use solver_delivery::{
 	DeliveryService, RevertClassification, TransactionAttemptRecorder, TransactionMonitoringEvent,
 	TransactionTracking,
@@ -19,7 +19,7 @@ use solver_delivery::{
 use solver_order::OrderService;
 use solver_storage::StorageService;
 use solver_types::{
-	select_finality_head,
+	select_source_finality_head,
 	standards::eip7683::{interfaces::IInputSettlerEscrow, LockType},
 	truncate_id,
 	utils::conversion::hex_to_alloy_address,
@@ -357,7 +357,7 @@ impl OrderHandler {
 
 		let origin_chain_id = u64::try_from(order_data.origin_chain_id)
 			.map_err(|_| OrderError::Service("Invalid origin chain ID".to_string()))?;
-		let (input_settler_address, finality_blocks) = {
+		let (input_settler_address, finality_rule) = {
 			let config = self.dynamic_config.read().await;
 			let input_settler_address = config
 				.networks
@@ -368,8 +368,8 @@ impl OrderHandler {
 						"Escrow fill aborted: input settler not configured for origin chain {origin_chain_id}"
 					))
 				})?;
-			let finality_blocks = source_finality_blocks_for_config(&config, origin_chain_id);
-			(input_settler_address, finality_blocks)
+			let finality_rule = source_finality_rule_for_config(&config, origin_chain_id);
+			(input_settler_address, finality_rule)
 		};
 
 		let finalized = self
@@ -421,14 +421,17 @@ impl OrderHandler {
 			Err(_) => return Ok(EscrowDepositReadiness::Defer(SOURCE_FINALITY_RETRY_AFTER)),
 		};
 		let Some(confirmed_block) =
-			select_finality_head(finalized, safe, latest_block, finality_blocks)
+			select_source_finality_head(finalized, safe, latest_block, finality_rule)
 		else {
 			tracing::info!(
 				order_id = %order.id,
 				origin_chain_id,
 				latest_block,
-				finality_blocks,
-				"Escrow fill deferred: origin chain {origin_chain_id} has not reached configured finality depth {finality_blocks}"
+				finalized,
+				safe,
+				source_finality_mode = ?finality_rule.mode,
+				finality_blocks = finality_rule.blocks,
+				"Escrow fill deferred: origin chain {origin_chain_id} has not reached configured source finality"
 			);
 			return Ok(EscrowDepositReadiness::Defer(SOURCE_FINALITY_RETRY_AFTER));
 		};
@@ -809,8 +812,8 @@ mod tests {
 	fn source_finality_falls_back_to_discovery_config_when_broadcaster_settlement_is_absent() {
 		let config = create_test_config_with_discovery_finality(0, 7);
 
-		assert_eq!(source_finality_blocks_for_config(&config, 137), 7);
-		assert_eq!(source_finality_blocks_for_config(&config, 1), 0);
+		assert_eq!(source_finality_rule_for_config(&config, 137).blocks, 7);
+		assert_eq!(source_finality_rule_for_config(&config, 1).blocks, 0);
 	}
 
 	fn deposited_status_return() -> alloy_primitives::Bytes {
@@ -1991,6 +1994,97 @@ mod tests {
 			err.to_string().contains("expected Deposited"),
 			"unexpected error: {err}"
 		);
+	}
+
+	#[tokio::test]
+	async fn handle_execution_numeric_source_finality_ignores_lagging_tags() {
+		let order = eip7683_order_with_lock(LockType::Permit2Escrow, false, None);
+		let params = create_test_execution_params();
+		let fill_tx = create_test_transaction();
+		let fill_tx_hash = create_test_tx_hash();
+		let status_order = order.clone();
+		let mut config = create_test_config_with_broadcaster_finality(42, 7);
+		config.source_finality = solver_config::SourceFinalityConfig {
+			default_mode: solver_types::SourceFinalityMode::Numeric,
+			default_blocks: 7,
+			default_block_time_seconds: 2,
+			default_expected_delay_seconds: None,
+			retry_grace_seconds: 0,
+			chains: HashMap::new(),
+		};
+
+		let (handler, _event_rx) = create_test_handler_with_config(
+			|mock_order| {
+				let fill_tx = fill_tx.clone();
+				mock_order
+					.expect_generate_fill_transaction()
+					.times(1)
+					.returning(move |_, _| {
+						let tx = fill_tx.clone();
+						Box::pin(async move { Ok(tx) })
+					});
+			},
+			|mock_delivery| {
+				let fill_tx_hash = fill_tx_hash.clone();
+				mock_delivery
+					.expect_get_finality_tag_block_number()
+					.times(2)
+					.returning(|_, tag| {
+						Box::pin(async move {
+							Ok(match tag {
+								alloy_rpc_types::BlockNumberOrTag::Finalized => Some(80),
+								alloy_rpc_types::BlockNumberOrTag::Safe => Some(90),
+								_ => None,
+							})
+						})
+					});
+				mock_delivery
+					.expect_get_block_number()
+					.times(1)
+					.withf(|chain_id| *chain_id == 137)
+					.returning(|_| Box::pin(async { Ok(100) }));
+				mock_delivery
+					.expect_eth_call_at_block()
+					.times(1)
+					.withf(move |tx, block| {
+						tx.chain_id == 137
+							&& *block == 93 && is_expected_escrow_status_call(tx, &status_order)
+					})
+					.returning(|_, _| Box::pin(async { Ok(deposited_status_return()) }));
+				mock_delivery
+					.expect_submit()
+					.times(1)
+					.returning(move |_, _| {
+						let hash = fill_tx_hash.clone();
+						Box::pin(async move { Ok(hash) })
+					});
+			},
+			|mock_storage| {
+				let order = order.clone();
+				mock_storage
+					.expect_set_bytes()
+					.times(1)
+					.returning(|_, _, _, _| Box::pin(async { Ok(()) }));
+				mock_storage
+					.expect_exists()
+					.returning(|_| Box::pin(async { Ok(true) }));
+				mock_storage.expect_get_bytes().returning(move |_| {
+					let order = order.clone();
+					Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+				});
+				mock_storage
+					.expect_compare_and_swap_with_indexes()
+					.times(1)
+					.returning(|_, _, _, _, _| Box::pin(async { Ok(true) }));
+			},
+			config,
+		)
+		.await;
+
+		handler
+			.handle_execution(order, params)
+			.await
+			.expect("numeric source finality should allow fill at latest-depth");
 	}
 
 	#[tokio::test]

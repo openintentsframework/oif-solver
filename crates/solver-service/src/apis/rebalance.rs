@@ -1115,6 +1115,7 @@ mod tests {
 			}),
 			fee_policy: None,
 			tx_bump: solver_types::OperatorTxBumpConfig::default(),
+			source_finality: None,
 		}
 	}
 
