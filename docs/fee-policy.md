@@ -81,6 +81,8 @@ Known OP Stack chains default to this policy automatically when present in `netw
 - `buffer_bps` is optional, defaults to `1000` (10%), and must be at most `10000`.
 - Quote-time estimates call the chain oracle with conservative synthetic signed transaction bytes.
 - Submit-time native gas preflight calls the oracle with the exact signed transaction bytes before raw broadcast.
+- Quote-time L1 data fee is priced for the destination **fill** and **post-fill** legs (where calldata-heavy fills dominate the cost). Origin legs (open/claim) on an OP Stack chain are not currently priced into the quote; the submit-time preflight still applies on every OP Stack broadcast regardless of leg.
+- If the synthetic transaction for a configured OP Stack leg cannot be built, the quote fails closed rather than pricing that leg at zero.
 
 ### Speed → percentile mapping
 

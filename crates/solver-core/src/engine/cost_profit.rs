@@ -100,6 +100,34 @@ fn extra_native_fee_configured(config: &Config, chain_id: u64) -> bool {
 		})
 }
 
+/// Decides what to do when a synthetic quote transaction cannot be built for
+/// extra-native-fee pricing. For chains that have an `extra_native_fee` policy
+/// configured (e.g. OP Stack L1 data fee), that fee is a required cost
+/// component, so we fail closed instead of silently pricing the leg at zero —
+/// otherwise a build edge case would reintroduce the M-14 under-pricing the fee
+/// model exists to prevent. For all other chains there is no extra fee to
+/// price, so we log and skip (price the leg at zero).
+fn fail_closed_on_extra_fee_build_error(
+	config: &Config,
+	chain_id: u64,
+	leg: &'static str,
+	error: impl std::fmt::Display,
+) -> Result<(), CostProfitError> {
+	if extra_native_fee_configured(config, chain_id) {
+		return Err(CostProfitError::Calculation(format!(
+			"Cannot build synthetic {leg} tx to price extra native fee for chain {chain_id}: {error}"
+		)));
+	}
+
+	tracing::warn!(
+		chain_id,
+		leg,
+		error = %error,
+		"Skipping extra native fee estimate: failed to build synthetic tx"
+	);
+	Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_quote_hyperlane_fill_description(
 	solver_identifier: [u8; 32],
@@ -953,11 +981,7 @@ impl CostProfitService {
 				l1_data_fee_buffer_wei = l1_data_fee_buffer_wei.saturating_add(buffer);
 			},
 			Err(e) => {
-				tracing::warn!(
-					chain_id = dest_chain_id,
-					error = %e,
-					"Skipping fill extra native fee estimate: failed to build synthetic fill tx"
-				);
+				fail_closed_on_extra_fee_build_error(config, dest_chain_id, "fill", e)?;
 			},
 		}
 
@@ -982,11 +1006,7 @@ impl CostProfitService {
 			},
 			Ok(None) => {},
 			Err(e) => {
-				tracing::warn!(
-					chain_id = dest_chain_id,
-					error = %e,
-					"Skipping post-fill extra native fee estimate: failed to build synthetic post-fill tx"
-				);
+				fail_closed_on_extra_fee_build_error(config, dest_chain_id, "post-fill", e)?;
 			},
 		}
 
@@ -3352,6 +3372,58 @@ mod tests {
 
 		assert!(extra_native_fee_configured(&config, 8453));
 		assert!(!extra_native_fee_configured(&config, 137));
+	}
+
+	#[test]
+	fn extra_fee_build_failure_fails_closed_for_configured_op_chain() {
+		let mut config = create_test_config();
+		config.delivery.implementations.insert(
+			"evm".to_string(),
+			serde_json::json!({
+				"fee_policy": {
+					"chains": {
+						"8453": {
+							"extra_native_fee": {
+								"type": "op_stack_l1_data"
+							}
+						}
+					}
+				}
+			}),
+		);
+
+		// A configured OP Stack chain must NOT silently price the leg at zero
+		// when the synthetic tx cannot be built; the L1 data fee is required.
+		let result = fail_closed_on_extra_fee_build_error(
+			&config,
+			8453,
+			"fill",
+			"synthetic fill build failed",
+		);
+
+		assert!(
+			result.is_err(),
+			"configured OP Stack chain must fail closed on synthetic-tx build failure"
+		);
+	}
+
+	#[test]
+	fn extra_fee_build_failure_skips_for_unconfigured_chain() {
+		let config = create_test_config();
+
+		// A chain with no extra_native_fee policy has no extra fee to price,
+		// so a build failure is logged and skipped (priced at zero), not fatal.
+		let result = fail_closed_on_extra_fee_build_error(
+			&config,
+			137,
+			"fill",
+			"synthetic fill build failed",
+		);
+
+		assert!(
+			result.is_ok(),
+			"non-OP chain should skip extra fee pricing on synthetic-tx build failure"
+		);
 	}
 
 	fn create_test_request(is_exact_input: bool) -> GetQuoteRequest {
