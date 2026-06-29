@@ -2016,6 +2016,7 @@ fn build_seed_overrides(
 		live_post_fill_estimate_chain_ids: None,
 		fee_policy: None,
 		tx_bump: options.tx_bump.clone(),
+		source_finality: None,
 	})
 }
 
