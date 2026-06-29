@@ -3331,6 +3331,29 @@ mod tests {
 		}
 		config
 	}
+
+	#[test]
+	fn extra_native_fee_configured_detects_delivery_chain_policy() {
+		let mut config = create_test_config();
+		config.delivery.implementations.insert(
+			"evm".to_string(),
+			serde_json::json!({
+				"fee_policy": {
+					"chains": {
+						"8453": {
+							"extra_native_fee": {
+								"type": "op_stack_l1_data"
+							}
+						}
+					}
+				}
+			}),
+		);
+
+		assert!(extra_native_fee_configured(&config, 8453));
+		assert!(!extra_native_fee_configured(&config, 137));
+	}
+
 	fn create_test_request(is_exact_input: bool) -> GetQuoteRequest {
 		GetQuoteRequest {
 			user: InteropAddress::new_ethereum(

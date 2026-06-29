@@ -686,6 +686,44 @@ mod system_delivery_tests {
 			))
 		);
 	}
+
+	#[tokio::test]
+	async fn default_extra_native_fee_estimate_is_zero() {
+		let delivery = RecordingDelivery::default();
+		let estimate = delivery
+			.estimate_extra_native_fee(8453, &system_tx())
+			.await
+			.unwrap();
+
+		assert_eq!(estimate, ExtraNativeFeeEstimate::default());
+	}
+
+	#[tokio::test]
+	async fn service_routes_extra_native_fee_estimate() {
+		let delivery = Arc::new(RecordingDelivery::default());
+		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+		implementations.insert(8453, delivery);
+		let service = DeliveryService::new(implementations, 3, 300, 45);
+
+		let estimate = service
+			.estimate_extra_native_fee(8453, &system_tx())
+			.await
+			.unwrap();
+
+		assert_eq!(estimate, ExtraNativeFeeEstimate::default());
+	}
+
+	#[tokio::test]
+	async fn service_extra_native_fee_requires_chain_implementation() {
+		let service = DeliveryService::new(HashMap::new(), 3, 300, 45);
+
+		let err = service
+			.estimate_extra_native_fee(8453, &system_tx())
+			.await
+			.unwrap_err();
+
+		assert!(matches!(err, DeliveryError::NoImplementationAvailable));
+	}
 }
 
 /// Trait defining the interface for transaction delivery implementations.
