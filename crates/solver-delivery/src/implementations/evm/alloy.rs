@@ -942,6 +942,40 @@ impl AlloyDelivery {
 	}
 
 	#[allow(clippy::too_many_arguments)]
+	async fn reject_signed_preflight_before_broadcast(
+		&self,
+		chain_id: u64,
+		provider: &DynProvider,
+		from: Address,
+		tx: &SolverTransaction,
+		tracking: Option<&TransactionTrackingWithConfig>,
+		planned_attempt: Option<&TransactionAttempt>,
+		context: &'static str,
+		error: String,
+	) -> Result<(), DeliveryError> {
+		if let (Some(tracking_ref), Some(planned)) = (tracking, planned_attempt) {
+			record_attempt_update_best_effort(
+				tracking_ref.tracking.attempt_recorder.clone(),
+				Some(&tracking_ref.tracking.callback),
+				&tracking_ref.tracking.id,
+				planned.id.clone(),
+				tracking_ref.tracking.tx_type,
+				TransactionAttemptStatus::SubmitRejected,
+				None,
+				None,
+				Some(error),
+				context,
+			)
+			.await;
+		}
+
+		self.rollback_nonce_after_pre_broadcast_rejection(
+			chain_id, provider, from, tx.nonce, context,
+		)
+		.await
+	}
+
+	#[allow(clippy::too_many_arguments)]
 	async fn ensure_signed_transaction_affordable(
 		&self,
 		chain_id: u64,
@@ -957,46 +991,100 @@ impl AlloyDelivery {
 			return Ok(());
 		}
 
-		let estimate = self
+		let estimate = match self
 			.estimate_extra_native_fee_for_signed_bytes(chain_id, Bytes::copy_from_slice(encoded))
-			.await?;
-		let extra_native_fee_wei = estimate.total_fee_wei.parse::<U256>().map_err(|err| {
-			DeliveryError::Network(format!(
-				"Invalid extra native fee estimate on chain {chain_id}: {err}"
-			))
-		})?;
-		let budget = native_gas_budget_wei(tx, extra_native_fee_wei).ok_or_else(|| {
-			DeliveryError::Network(format!(
-				"Cannot calculate signed native gas budget on chain {chain_id}"
-			))
-		})?;
-		let balance = provider.get_balance(from).await.map_err(|err| {
-			DeliveryError::Network(format!(
-				"Failed to read signer balance for OP Stack fee preflight on chain {chain_id}: {err}"
-			))
-		})?;
+			.await
+		{
+			Ok(estimate) => estimate,
+			Err(err) => {
+				self.reject_signed_preflight_before_broadcast(
+					chain_id,
+					provider,
+					from,
+					tx,
+					tracking,
+					planned_attempt,
+					context,
+					err.to_string(),
+				)
+				.await?;
+				return Err(err);
+			},
+		};
+		let extra_native_fee_wei = match estimate.total_fee_wei.parse::<U256>() {
+			Ok(fee) => fee,
+			Err(err) => {
+				let err = DeliveryError::Network(format!(
+					"Invalid extra native fee estimate on chain {chain_id}: {err}"
+				));
+				self.reject_signed_preflight_before_broadcast(
+					chain_id,
+					provider,
+					from,
+					tx,
+					tracking,
+					planned_attempt,
+					context,
+					err.to_string(),
+				)
+				.await?;
+				return Err(err);
+			},
+		};
+		let budget = match native_gas_budget_wei(tx, extra_native_fee_wei) {
+			Some(budget) => budget,
+			None => {
+				let err = DeliveryError::Network(format!(
+					"Cannot calculate signed native gas budget on chain {chain_id}"
+				));
+				self.reject_signed_preflight_before_broadcast(
+					chain_id,
+					provider,
+					from,
+					tx,
+					tracking,
+					planned_attempt,
+					context,
+					err.to_string(),
+				)
+				.await?;
+				return Err(err);
+			},
+		};
+		let balance = match provider.get_balance(from).await {
+			Ok(balance) => balance,
+			Err(err) => {
+				let err = DeliveryError::Network(format!(
+					"Failed to read signer balance for OP Stack fee preflight on chain {chain_id}: {err}"
+				));
+				self.reject_signed_preflight_before_broadcast(
+					chain_id,
+					provider,
+					from,
+					tx,
+					tracking,
+					planned_attempt,
+					context,
+					err.to_string(),
+				)
+				.await?;
+				return Err(err);
+			},
+		};
 
 		if let Some(shortfall) = native_gas_shortfall(balance, budget.required_wei) {
 			let err_msg =
 				signed_preflight_shortfall_message(balance, budget.required_wei, shortfall);
-			if let (Some(tracking_ref), Some(planned)) = (tracking, planned_attempt) {
-				record_attempt_update_best_effort(
-					tracking_ref.tracking.attempt_recorder.clone(),
-					Some(&tracking_ref.tracking.callback),
-					&tracking_ref.tracking.id,
-					planned.id.clone(),
-					tracking_ref.tracking.tx_type,
-					TransactionAttemptStatus::SubmitRejected,
-					None,
-					None,
-					Some(err_msg.clone()),
-					context,
-				)
-				.await;
-			}
 
-			self.rollback_nonce_after_pre_broadcast_rejection(
-				chain_id, provider, from, tx.nonce, context,
+			self.reject_signed_preflight_before_broadcast(
+				chain_id,
+				provider,
+				from,
+				tx,
+				tracking,
+				planned_attempt,
+				context,
+				err_msg.clone(),
 			)
 			.await?;
 
@@ -5547,6 +5635,37 @@ mod tests {
 			}
 		}
 
+		#[derive(Default)]
+		struct RecordingRecorder {
+			updates: std::sync::Mutex<Vec<(String, TransactionAttemptStatus, Option<String>)>>,
+		}
+
+		#[async_trait::async_trait]
+		impl TransactionAttemptRecorder for RecordingRecorder {
+			async fn record_planned_attempt(
+				&self,
+				_init: PlannedAttemptInit,
+			) -> Result<TransactionAttempt, crate::TransactionAttemptRecorderError> {
+				unreachable!("not used by this test")
+			}
+
+			async fn record_attempt_update(
+				&self,
+				attempt_id: &str,
+				status: TransactionAttemptStatus,
+				_tx_hash: Option<TransactionHash>,
+				_receipt: Option<TransactionReceipt>,
+				error: Option<String>,
+			) -> Result<(), crate::TransactionAttemptRecorderError> {
+				self.updates.lock().expect("updates mutex poisoned").push((
+					attempt_id.to_string(),
+					status,
+					error,
+				));
+				Ok(())
+			}
+		}
+
 		#[tokio::test]
 		async fn op_stack_l1_data_fee_estimate_decodes_oracle_response_and_applies_buffer() {
 			let rpc_url = start_json_rpc_with_responses(vec![rpc_success_uint256(500)]).await;
@@ -5719,6 +5838,81 @@ mod tests {
 				)
 				.await
 				.expect("balance covers gas, value, and OP Stack L1 fee");
+		}
+
+		#[tokio::test]
+		async fn signed_op_stack_preflight_marks_planned_attempt_rejected_on_oracle_error() {
+			let rpc_url = start_json_rpc_with_responses(vec![
+				rpc_error("oracle unavailable"),
+				rpc_error("oracle still unavailable"),
+				rpc_success_quantity(4),
+			])
+			.await;
+			let mut delivery = delivery_with_op_stack_provider(rpc_url);
+			let from: Address = "0x00000000000000000000000000000000000000bb"
+				.parse()
+				.expect("valid signer");
+			let nonce_manager = ResettableNonceManager::new();
+			nonce_manager.set_next_nonce(from, 5);
+			delivery.nonce_managers.insert(10, nonce_manager);
+			let provider = delivery.get_provider(10).expect("configured provider");
+			let recorder = Arc::new(RecordingRecorder::default());
+			let tracking = TransactionTrackingWithConfig {
+				tracking: crate::TransactionTracking {
+					id: "order-1".to_string(),
+					tx_type: TransactionType::Fill,
+					attempt_recorder: recorder.clone(),
+					callback: Box::new(|_| {}),
+					attempt_id: None,
+					replacement_of: None,
+				},
+				min_confirmations: 1,
+				monitoring_timeout_seconds: 1,
+				tx_confirmation_timeout_seconds: 1,
+			};
+			let tx = SolverTransaction {
+				chain_id: 10,
+				to: Some(solver_types::Address(vec![0x22; 20])),
+				data: vec![0xab],
+				value: U256::from(3u64),
+				gas_limit: Some(21_000),
+				gas_price: Some(2),
+				max_fee_per_gas: None,
+				max_priority_fee_per_gas: None,
+				nonce: Some(4),
+			};
+			let planned = TransactionAttempt::planned(
+				"attempt-1".to_string(),
+				"order-1".to_string(),
+				Some(solver_types::Address(from.to_vec())),
+				TransactionType::Fill,
+				tx.clone(),
+			);
+
+			let err = delivery
+				.ensure_signed_transaction_affordable(
+					10,
+					provider,
+					from,
+					&tx,
+					&[0x02, 0x03],
+					Some(&tracking),
+					Some(&planned),
+					"test signed preflight",
+				)
+				.await
+				.expect_err("oracle error should abort preflight");
+
+			assert!(matches!(err, DeliveryError::Network(_)));
+			let updates = recorder.updates.lock().expect("updates mutex poisoned");
+			assert_eq!(updates.len(), 1);
+			assert_eq!(updates[0].0, "attempt-1");
+			assert_eq!(updates[0].1, TransactionAttemptStatus::SubmitRejected);
+			assert!(updates[0]
+				.2
+				.as_ref()
+				.expect("error recorded")
+				.contains("Failed to estimate OP Stack L1 data fee"));
 		}
 
 		#[tokio::test]
