@@ -600,7 +600,7 @@ impl BroadcasterSettlement {
 			.get_transaction_receipt(FixedBytes::<32>::from_slice(&fill_tx_hash.0))
 			.await
 			.map_err(|e| {
-				SettlementError::ValidationFailed(format!("Failed to get fill receipt: {e}"))
+				SettlementError::BackendUnavailable(format!("Failed to get fill receipt: {e}"))
 			})?
 			.ok_or_else(|| {
 				SettlementError::ValidationFailed("Fill transaction not found".to_string())
@@ -642,7 +642,7 @@ impl BroadcasterSettlement {
 			.get_transaction_receipt(FixedBytes::<32>::from_slice(&tx_hash.0))
 			.await
 			.map_err(|e| {
-				SettlementError::ValidationFailed(format!(
+				SettlementError::BackendUnavailable(format!(
 					"Failed to get {label} receipt on chain {chain_id}: {e}"
 				))
 			})?;
@@ -715,7 +715,7 @@ impl BroadcasterSettlement {
 				)
 			})?;
 		let current_block = provider.get_block_number().await.map_err(|e| {
-			SettlementError::ValidationFailed(format!(
+			SettlementError::BackendUnavailable(format!(
 				"Failed to get current block for broadcaster recovery: {e}"
 			))
 		})?;
@@ -736,7 +736,7 @@ impl BroadcasterSettlement {
 			.from_block(from_block)
 			.to_block(current_block);
 		let logs = provider.get_logs(&filter).await.map_err(|e| {
-			SettlementError::ValidationFailed(format!(
+			SettlementError::BackendUnavailable(format!(
 				"Failed to scan broadcaster logs for recovery: {e}"
 			))
 		})?;
@@ -831,6 +831,19 @@ impl BroadcasterSettlement {
 		let state = match self.load_or_recover_state(order).await {
 			Ok(Some(state)) => state,
 			Ok(None) => return SettlementReadiness::Waiting(WaitingReason::NoSubmissionState),
+			// A recoverable state-load/storage/backend failure must keep the order
+			// retryable; recovery re-emits StartMonitoring for Waiting(_), whereas
+			// PermanentFailure would terminally fail an order that may have made
+			// on-chain progress (H-02).
+			Err(SettlementError::BackendUnavailable(e))
+			| Err(SettlementError::StorageUnavailable(e)) => {
+				tracing::warn!(
+					order_id = %order.id,
+					error = %e,
+					"Broadcaster readiness state load failed; waiting and retrying"
+				);
+				return SettlementReadiness::Waiting(WaitingReason::StorageUnavailable);
+			},
 			Err(e) => return SettlementReadiness::PermanentFailure(e.to_string()),
 		};
 
@@ -1207,7 +1220,9 @@ impl SettlementInterface for BroadcasterSettlement {
 		let receipt = provider
 			.get_transaction_receipt(FixedBytes::<32>::from_slice(&tx_hash.0))
 			.await
-			.map_err(|e| SettlementError::ValidationFailed(format!("Failed to get receipt: {e}")))?
+			.map_err(|e| {
+				SettlementError::BackendUnavailable(format!("Failed to get receipt: {e}"))
+			})?
 			.ok_or_else(|| {
 				SettlementError::ValidationFailed("Transaction not found".to_string())
 			})?;
@@ -1222,7 +1237,9 @@ impl SettlementInterface for BroadcasterSettlement {
 		let block = provider
 			.get_block_by_number(BlockNumberOrTag::Number(tx_block))
 			.await
-			.map_err(|e| SettlementError::ValidationFailed(format!("Failed to get block: {e}")))?;
+			.map_err(|e| {
+				SettlementError::BackendUnavailable(format!("Failed to get block: {e}"))
+			})?;
 
 		let block_timestamp = block
 			.ok_or_else(|| SettlementError::ValidationFailed("Block not found".to_string()))?
@@ -1343,9 +1360,7 @@ impl SettlementInterface for BroadcasterSettlement {
 					error = %e,
 					"isProven check failed in pre-claim path; will retry"
 				);
-				return Err(SettlementError::ValidationFailed(format!(
-					"isProven RPC error: {e}"
-				)));
+				return Err(e);
 			},
 		}
 
@@ -1827,6 +1842,113 @@ mod tests {
 		Arc::new(StorageService::new(Box::new(
 			solver_storage::implementations::memory::MemoryStorage::new(),
 		)))
+	}
+
+	#[derive(Clone, Copy)]
+	enum FailingStorageMode {
+		Backend,
+		Serialization,
+	}
+
+	/// A storage backend whose reads always fail. Used to exercise recoverable
+	/// and permanent storage failure paths. Only `get_bytes` is exercised by the
+	/// load path; the remaining methods return the same error so any accidental
+	/// use is loud rather than silent.
+	struct FailingStorage {
+		mode: FailingStorageMode,
+	}
+
+	impl FailingStorage {
+		fn backend() -> Self {
+			Self {
+				mode: FailingStorageMode::Backend,
+			}
+		}
+
+		fn serialization() -> Self {
+			Self {
+				mode: FailingStorageMode::Serialization,
+			}
+		}
+
+		fn error(&self) -> solver_storage::StorageError {
+			match self.mode {
+				FailingStorageMode::Backend => {
+					solver_storage::StorageError::Backend("simulated storage outage".to_string())
+				},
+				FailingStorageMode::Serialization => solver_storage::StorageError::Serialization(
+					"simulated corrupt state".to_string(),
+				),
+			}
+		}
+	}
+
+	#[async_trait]
+	impl solver_storage::StorageInterface for FailingStorage {
+		async fn get_bytes(&self, _key: &str) -> Result<Vec<u8>, solver_storage::StorageError> {
+			Err(self.error())
+		}
+		async fn set_bytes(
+			&self,
+			_key: &str,
+			_value: Vec<u8>,
+			_indexes: Option<solver_storage::StorageIndexes>,
+			_ttl: Option<Duration>,
+		) -> Result<(), solver_storage::StorageError> {
+			Err(self.error())
+		}
+		async fn delete(&self, _key: &str) -> Result<(), solver_storage::StorageError> {
+			Err(self.error())
+		}
+		async fn exists(&self, _key: &str) -> Result<bool, solver_storage::StorageError> {
+			Err(self.error())
+		}
+		async fn query(
+			&self,
+			_namespace: &str,
+			_filter: solver_storage::QueryFilter,
+		) -> Result<Vec<String>, solver_storage::StorageError> {
+			Err(self.error())
+		}
+		async fn get_batch(
+			&self,
+			_keys: &[String],
+		) -> Result<Vec<(String, Vec<u8>)>, solver_storage::StorageError> {
+			Err(self.error())
+		}
+		fn config_schema(&self) -> Box<dyn ConfigSchema> {
+			Box::new(solver_storage::implementations::memory::MemoryStorageSchema)
+		}
+		async fn set_nx(
+			&self,
+			_key: &str,
+			_value: Vec<u8>,
+			_ttl: Option<Duration>,
+		) -> Result<bool, solver_storage::StorageError> {
+			Err(self.error())
+		}
+		async fn compare_and_swap(
+			&self,
+			_key: &str,
+			_expected: &[u8],
+			_new_value: Vec<u8>,
+			_ttl: Option<Duration>,
+		) -> Result<bool, solver_storage::StorageError> {
+			Err(self.error())
+		}
+		async fn compare_and_swap_with_indexes(
+			&self,
+			_key: &str,
+			_expected: &[u8],
+			_new_value: Vec<u8>,
+			_indexes: Option<solver_storage::StorageIndexes>,
+			_ttl: Option<Duration>,
+		) -> Result<bool, solver_storage::StorageError> {
+			Err(self.error())
+		}
+		async fn delete_if_exists(&self, _key: &str) -> Result<bool, solver_storage::StorageError> {
+			Err(self.error())
+		}
 	}
 
 	fn test_settlement(oracle_config: OracleConfig) -> BroadcasterSettlement {
@@ -3083,6 +3205,277 @@ mod tests {
 			SettlementReadiness::PermanentFailure(ref msg)
 				if msg.contains("Stored output oracle does not match order-bound output oracle")
 		));
+	}
+
+	#[tokio::test]
+	async fn broadcaster_readiness_storage_failure_waits_instead_of_permanent_failure() {
+		// A recoverable storage outage during the readiness state load must keep
+		// the order retryable (Waiting), not terminally fail it (PermanentFailure).
+		// Recovery re-emits StartMonitoring for Waiting(_), so the order stays
+		// non-terminal and can be re-driven once storage recovers (H-02).
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let output_oracle = solver_types::Address(vec![0x44; 20]);
+		let order = OrderBuilder::new()
+			.with_id("readiness-storage-outage-order")
+			.with_input_chain_ids(vec![421614])
+			.with_output_chain_ids(vec![11155111])
+			.with_data(make_eip7683_order_data(
+				&input_oracle,
+				vec![make_output(11155111, address_to_bytes32(&output_oracle))],
+			))
+			.build();
+
+		let mut settlement = test_settlement(OracleConfig {
+			input_oracles: HashMap::from([(421614u64, vec![input_oracle])]),
+			output_oracles: HashMap::from([(11155111u64, vec![output_oracle])]),
+			routes: HashMap::from([(421614u64, vec![11155111u64])]),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		// Swap in a message tracker whose storage reads always fail. The fresh
+		// tracker has an empty cache, so the readiness load hits storage and the
+		// simulated outage surfaces as StorageUnavailable.
+		settlement.message_tracker = Arc::new(BroadcasterMessageTracker::new(Arc::new(
+			StorageService::new(Box::new(FailingStorage::backend())),
+		)));
+
+		let readiness = settlement
+			.readiness(
+				&order,
+				&FillProof {
+					tx_hash: TransactionHash(vec![0xaa; 32]),
+					block_number: 1,
+					oracle_address: with_0x_prefix(&hex::encode(vec![0x33; 20])),
+					attestation_data: None,
+					filled_timestamp: now_seconds(),
+				},
+			)
+			.await;
+
+		assert!(
+			matches!(
+				readiness,
+				SettlementReadiness::Waiting(WaitingReason::StorageUnavailable)
+			),
+			"expected Waiting(StorageUnavailable), got {readiness:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn broadcaster_readiness_permanent_storage_failure_is_permanent_failure() {
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let output_oracle = solver_types::Address(vec![0x44; 20]);
+		let order = OrderBuilder::new()
+			.with_id("readiness-corrupt-storage-order")
+			.with_input_chain_ids(vec![421614])
+			.with_output_chain_ids(vec![11155111])
+			.with_data(make_eip7683_order_data(
+				&input_oracle,
+				vec![make_output(11155111, address_to_bytes32(&output_oracle))],
+			))
+			.build();
+
+		let mut settlement = test_settlement(OracleConfig {
+			input_oracles: HashMap::from([(421614u64, vec![input_oracle])]),
+			output_oracles: HashMap::from([(11155111u64, vec![output_oracle])]),
+			routes: HashMap::from([(421614u64, vec![11155111u64])]),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		settlement.message_tracker = Arc::new(BroadcasterMessageTracker::new(Arc::new(
+			StorageService::new(Box::new(FailingStorage::serialization())),
+		)));
+
+		let readiness = settlement
+			.readiness(
+				&order,
+				&FillProof {
+					tx_hash: TransactionHash(vec![0xaa; 32]),
+					block_number: 1,
+					oracle_address: with_0x_prefix(&hex::encode(vec![0x33; 20])),
+					attestation_data: None,
+					filled_timestamp: now_seconds(),
+				},
+			)
+			.await;
+
+		assert!(
+			matches!(readiness, SettlementReadiness::PermanentFailure(_)),
+			"expected PermanentFailure, got {readiness:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn broadcaster_fill_receipt_transport_error_is_retryable_backend_unavailable() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.respond_with(ResponseTemplate::new(500))
+			.mount(&server)
+			.await;
+
+		let destination_chain = 11155111u64;
+		let networks = test_networks_with_http(&[destination_chain], &server.uri());
+		let settlement = BroadcasterSettlement {
+			providers: create_providers_for_chains(&[destination_chain], &networks).unwrap(),
+			..test_settlement(empty_oracle_config())
+		};
+		let order = OrderBuilder::new()
+			.with_output_chain_ids(vec![destination_chain])
+			.with_fill_tx_hash(Some(TransactionHash(vec![0xaa; 32])))
+			.build();
+
+		let err = settlement
+			.fetch_fill_receipt_logs(&order, destination_chain)
+			.await
+			.expect_err("receipt transport failure must surface as retryable");
+		assert!(
+			matches!(err, SettlementError::BackendUnavailable(_)),
+			"expected BackendUnavailable, got {err:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn broadcaster_recovery_receipt_transport_error_is_retryable_backend_unavailable() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.respond_with(ResponseTemplate::new(500))
+			.mount(&server)
+			.await;
+
+		let destination_chain = 11155111u64;
+		let networks = test_networks_with_http(&[destination_chain], &server.uri());
+		let settlement = BroadcasterSettlement {
+			providers: create_providers_for_chains(&[destination_chain], &networks).unwrap(),
+			..test_settlement(empty_oracle_config())
+		};
+
+		let err = settlement
+			.fetch_transaction_receipt(
+				destination_chain,
+				&TransactionHash(vec![0xbb; 32]),
+				"post-fill",
+			)
+			.await
+			.expect_err("receipt transport failure must surface as retryable");
+		assert!(
+			matches!(err, SettlementError::BackendUnavailable(_)),
+			"expected BackendUnavailable, got {err:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn broadcaster_get_attestation_transport_error_is_retryable_backend_unavailable() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.respond_with(ResponseTemplate::new(500))
+			.mount(&server)
+			.await;
+
+		let source_chain = 421614u64;
+		let destination_chain = 11155111u64;
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let output_oracle = solver_types::Address(vec![0x44; 20]);
+		let order = OrderBuilder::new()
+			.with_input_chain_ids(vec![source_chain])
+			.with_output_chain_ids(vec![destination_chain])
+			.with_data(make_eip7683_order_data(
+				&input_oracle,
+				vec![make_output(
+					destination_chain,
+					address_to_bytes32(&output_oracle),
+				)],
+			))
+			.build();
+		let networks = test_networks_with_http(&[destination_chain], &server.uri());
+		let settlement = BroadcasterSettlement {
+			providers: create_providers_for_chains(&[destination_chain], &networks).unwrap(),
+			..test_settlement(OracleConfig {
+				input_oracles: HashMap::from([(source_chain, vec![input_oracle])]),
+				output_oracles: HashMap::from([(destination_chain, vec![output_oracle])]),
+				routes: HashMap::from([(source_chain, vec![destination_chain])]),
+				selection_strategy: OracleSelectionStrategy::First,
+			})
+		};
+
+		let err = settlement
+			.get_attestation(&order, &TransactionHash(vec![0xcc; 32]))
+			.await
+			.expect_err("receipt transport failure must surface as retryable");
+		assert!(
+			matches!(err, SettlementError::BackendUnavailable(_)),
+			"expected BackendUnavailable, got {err:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn broadcaster_pre_claim_is_proven_transport_error_stays_retryable() {
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.respond_with(ResponseTemplate::new(500))
+			.mount(&server)
+			.await;
+
+		let source_chain = 421614u64;
+		let destination_chain = 11155111u64;
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let output_oracle = solver_types::Address(vec![0x44; 20]);
+		let order = OrderBuilder::new()
+			.with_id("pre-claim-is-proven-rpc-error-order")
+			.with_input_chain_ids(vec![source_chain])
+			.with_output_chain_ids(vec![destination_chain])
+			.with_data(make_eip7683_order_data(
+				&input_oracle,
+				vec![make_output(
+					destination_chain,
+					address_to_bytes32(&output_oracle),
+				)],
+			))
+			.build();
+		let networks = test_networks_with_http(&[source_chain], &server.uri());
+		let settlement = BroadcasterSettlement {
+			providers: create_providers_for_chains(&[source_chain], &networks).unwrap(),
+			..test_settlement(OracleConfig {
+				input_oracles: HashMap::from([(source_chain, vec![input_oracle.clone()])]),
+				output_oracles: HashMap::from([(destination_chain, vec![output_oracle.clone()])]),
+				routes: HashMap::from([(source_chain, vec![destination_chain])]),
+				selection_strategy: OracleSelectionStrategy::First,
+			})
+		};
+		settlement
+			.message_tracker
+			.track_submission(
+				&order.id,
+				BroadcasterSubmission {
+					source_chain,
+					destination_chain,
+					submission_tx_hash: TransactionHash(vec![0x55; 32]),
+					submission_timestamp: 1,
+					submission_block_number: Some(12345),
+					payload_hash: [0x66; 32],
+					message: [0x77; 32],
+					message_data: vec![0x88],
+					application: solver_types::Address(vec![0x99; 20]),
+					remote_oracle: output_oracle,
+				},
+			)
+			.await
+			.unwrap();
+
+		let err = settlement
+			.generate_pre_claim_transaction(
+				&order,
+				&FillProof {
+					tx_hash: TransactionHash(vec![0xaa; 32]),
+					block_number: 1,
+					oracle_address: with_0x_prefix(&hex::encode(&input_oracle.0)),
+					attestation_data: None,
+					filled_timestamp: now_seconds(),
+				},
+			)
+			.await
+			.expect_err("isProven transport failure must surface as retryable");
+		assert!(
+			matches!(err, SettlementError::BackendUnavailable(_)),
+			"expected BackendUnavailable, got {err:?}"
+		);
 	}
 
 	#[tokio::test]

@@ -188,6 +188,8 @@ fn settlement_failure_policy(
 			},
 			SettlementServiceError::ProverUnavailable(_) => SettlementFailurePolicy::RetryLater,
 			SettlementServiceError::SlotDerivationMismatch => SettlementFailurePolicy::FailOrder,
+			SettlementServiceError::BackendUnavailable(_) => SettlementFailurePolicy::RetryLater,
+			SettlementServiceError::StorageUnavailable(_) => SettlementFailurePolicy::RetryLater,
 		},
 		SettlementError::Storage(_) | SettlementError::Service(_) | SettlementError::State(_) => {
 			SettlementFailurePolicy::FailOrder
@@ -2484,6 +2486,57 @@ mod tests {
 				"expected {error:?} to be permanent"
 			);
 		}
+	}
+
+	#[test]
+	fn settlement_policy_retries_backend_infrastructure_errors() {
+		let errors = vec![
+			crate::handlers::settlement::SettlementError::SettlementService(
+				solver_settlement::SettlementError::BackendUnavailable("rpc down".to_string()),
+			),
+			crate::handlers::settlement::SettlementError::SettlementService(
+				solver_settlement::SettlementError::StorageUnavailable("storage down".to_string()),
+			),
+		];
+
+		for error in errors {
+			for stage in [
+				TransactionType::PostFill,
+				TransactionType::PreClaim,
+				TransactionType::Claim,
+			] {
+				assert_eq!(
+					settlement_failure_policy(stage, &error),
+					SettlementFailurePolicy::RetryLater,
+					"expected {error:?} at {stage:?} to be retryable"
+				);
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn post_fill_ready_backend_error_leaves_order_retryable() {
+		let engine = create_test_engine().await;
+		let order = OrderBuilder::new()
+			.with_id("post-fill-backend-error-order".to_string())
+			.with_status(OrderStatus::Executed)
+			.build();
+		engine.state_machine.store_order(&order).await.unwrap();
+
+		let result = engine
+			.handle_settlement_stage_error(
+				&order.id,
+				TransactionType::PostFill,
+				"PostFillReady",
+				crate::handlers::settlement::SettlementError::SettlementService(
+					solver_settlement::SettlementError::BackendUnavailable("rpc down".to_string()),
+				),
+			)
+			.await;
+
+		assert!(result.is_err());
+		let stored = engine.state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(stored.status, OrderStatus::Executed);
 	}
 
 	#[tokio::test]
