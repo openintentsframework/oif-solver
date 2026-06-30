@@ -835,7 +835,8 @@ impl BroadcasterSettlement {
 			// retryable; recovery re-emits StartMonitoring for Waiting(_), whereas
 			// PermanentFailure would terminally fail an order that may have made
 			// on-chain progress (H-02).
-			Err(e) => {
+			Err(SettlementError::BackendUnavailable(e))
+			| Err(SettlementError::StorageUnavailable(e)) => {
 				tracing::warn!(
 					order_id = %order.id,
 					error = %e,
@@ -843,6 +844,7 @@ impl BroadcasterSettlement {
 				);
 				return SettlementReadiness::Waiting(WaitingReason::StorageUnavailable);
 			},
+			Err(e) => return SettlementReadiness::PermanentFailure(e.to_string()),
 		};
 
 		let submission = match state.submission.as_ref() {
@@ -1842,18 +1844,49 @@ mod tests {
 		)))
 	}
 
-	/// A storage backend whose reads always fail with a backend (non-NotFound)
-	/// error. Used to exercise the recoverable storage-unavailable path. Only
-	/// `get_bytes` is exercised by the load path; the remaining methods return
-	/// the same backend error so any accidental use is loud rather than silent.
-	struct FailingStorage;
+	#[derive(Clone, Copy)]
+	enum FailingStorageMode {
+		Backend,
+		Serialization,
+	}
+
+	/// A storage backend whose reads always fail. Used to exercise recoverable
+	/// and permanent storage failure paths. Only `get_bytes` is exercised by the
+	/// load path; the remaining methods return the same error so any accidental
+	/// use is loud rather than silent.
+	struct FailingStorage {
+		mode: FailingStorageMode,
+	}
+
+	impl FailingStorage {
+		fn backend() -> Self {
+			Self {
+				mode: FailingStorageMode::Backend,
+			}
+		}
+
+		fn serialization() -> Self {
+			Self {
+				mode: FailingStorageMode::Serialization,
+			}
+		}
+
+		fn error(&self) -> solver_storage::StorageError {
+			match self.mode {
+				FailingStorageMode::Backend => {
+					solver_storage::StorageError::Backend("simulated storage outage".to_string())
+				},
+				FailingStorageMode::Serialization => solver_storage::StorageError::Serialization(
+					"simulated corrupt state".to_string(),
+				),
+			}
+		}
+	}
 
 	#[async_trait]
 	impl solver_storage::StorageInterface for FailingStorage {
 		async fn get_bytes(&self, _key: &str) -> Result<Vec<u8>, solver_storage::StorageError> {
-			Err(solver_storage::StorageError::Backend(
-				"simulated storage outage".to_string(),
-			))
+			Err(self.error())
 		}
 		async fn set_bytes(
 			&self,
@@ -1862,36 +1895,26 @@ mod tests {
 			_indexes: Option<solver_storage::StorageIndexes>,
 			_ttl: Option<Duration>,
 		) -> Result<(), solver_storage::StorageError> {
-			Err(solver_storage::StorageError::Backend(
-				"simulated storage outage".to_string(),
-			))
+			Err(self.error())
 		}
 		async fn delete(&self, _key: &str) -> Result<(), solver_storage::StorageError> {
-			Err(solver_storage::StorageError::Backend(
-				"simulated storage outage".to_string(),
-			))
+			Err(self.error())
 		}
 		async fn exists(&self, _key: &str) -> Result<bool, solver_storage::StorageError> {
-			Err(solver_storage::StorageError::Backend(
-				"simulated storage outage".to_string(),
-			))
+			Err(self.error())
 		}
 		async fn query(
 			&self,
 			_namespace: &str,
 			_filter: solver_storage::QueryFilter,
 		) -> Result<Vec<String>, solver_storage::StorageError> {
-			Err(solver_storage::StorageError::Backend(
-				"simulated storage outage".to_string(),
-			))
+			Err(self.error())
 		}
 		async fn get_batch(
 			&self,
 			_keys: &[String],
 		) -> Result<Vec<(String, Vec<u8>)>, solver_storage::StorageError> {
-			Err(solver_storage::StorageError::Backend(
-				"simulated storage outage".to_string(),
-			))
+			Err(self.error())
 		}
 		fn config_schema(&self) -> Box<dyn ConfigSchema> {
 			Box::new(solver_storage::implementations::memory::MemoryStorageSchema)
@@ -1902,9 +1925,7 @@ mod tests {
 			_value: Vec<u8>,
 			_ttl: Option<Duration>,
 		) -> Result<bool, solver_storage::StorageError> {
-			Err(solver_storage::StorageError::Backend(
-				"simulated storage outage".to_string(),
-			))
+			Err(self.error())
 		}
 		async fn compare_and_swap(
 			&self,
@@ -1913,9 +1934,7 @@ mod tests {
 			_new_value: Vec<u8>,
 			_ttl: Option<Duration>,
 		) -> Result<bool, solver_storage::StorageError> {
-			Err(solver_storage::StorageError::Backend(
-				"simulated storage outage".to_string(),
-			))
+			Err(self.error())
 		}
 		async fn compare_and_swap_with_indexes(
 			&self,
@@ -1925,14 +1944,10 @@ mod tests {
 			_indexes: Option<solver_storage::StorageIndexes>,
 			_ttl: Option<Duration>,
 		) -> Result<bool, solver_storage::StorageError> {
-			Err(solver_storage::StorageError::Backend(
-				"simulated storage outage".to_string(),
-			))
+			Err(self.error())
 		}
 		async fn delete_if_exists(&self, _key: &str) -> Result<bool, solver_storage::StorageError> {
-			Err(solver_storage::StorageError::Backend(
-				"simulated storage outage".to_string(),
-			))
+			Err(self.error())
 		}
 	}
 
@@ -3220,7 +3235,7 @@ mod tests {
 		// tracker has an empty cache, so the readiness load hits storage and the
 		// simulated outage surfaces as StorageUnavailable.
 		settlement.message_tracker = Arc::new(BroadcasterMessageTracker::new(Arc::new(
-			StorageService::new(Box::new(FailingStorage)),
+			StorageService::new(Box::new(FailingStorage::backend())),
 		)));
 
 		let readiness = settlement
@@ -3242,6 +3257,49 @@ mod tests {
 				SettlementReadiness::Waiting(WaitingReason::StorageUnavailable)
 			),
 			"expected Waiting(StorageUnavailable), got {readiness:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn broadcaster_readiness_permanent_storage_failure_is_permanent_failure() {
+		let input_oracle = solver_types::Address(vec![0x33; 20]);
+		let output_oracle = solver_types::Address(vec![0x44; 20]);
+		let order = OrderBuilder::new()
+			.with_id("readiness-corrupt-storage-order")
+			.with_input_chain_ids(vec![421614])
+			.with_output_chain_ids(vec![11155111])
+			.with_data(make_eip7683_order_data(
+				&input_oracle,
+				vec![make_output(11155111, address_to_bytes32(&output_oracle))],
+			))
+			.build();
+
+		let mut settlement = test_settlement(OracleConfig {
+			input_oracles: HashMap::from([(421614u64, vec![input_oracle])]),
+			output_oracles: HashMap::from([(11155111u64, vec![output_oracle])]),
+			routes: HashMap::from([(421614u64, vec![11155111u64])]),
+			selection_strategy: OracleSelectionStrategy::First,
+		});
+		settlement.message_tracker = Arc::new(BroadcasterMessageTracker::new(Arc::new(
+			StorageService::new(Box::new(FailingStorage::serialization())),
+		)));
+
+		let readiness = settlement
+			.readiness(
+				&order,
+				&FillProof {
+					tx_hash: TransactionHash(vec![0xaa; 32]),
+					block_number: 1,
+					oracle_address: with_0x_prefix(&hex::encode(vec![0x33; 20])),
+					attestation_data: None,
+					filled_timestamp: now_seconds(),
+				},
+			)
+			.await;
+
+		assert!(
+			matches!(readiness, SettlementReadiness::PermanentFailure(_)),
+			"expected PermanentFailure, got {readiness:?}"
 		);
 	}
 
