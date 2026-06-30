@@ -299,14 +299,31 @@ impl SettlementHandler {
 					.await
 					.map_err(map_delivery_error)?;
 
-				// Store tx hash
-				self.state_machine
+				// The post-fill transaction is now on-chain. The following metadata
+				// writes are best-effort: a failure here must NOT terminally fail the
+				// order, otherwise a transient storage hiccup would strand the submitted
+				// transaction outside recovery. Recovery reconstructs the stage tx hash
+				// from the transaction attempt ledger (which delivery persists before
+				// broadcast) and re-drives the order while it remains non-terminal.
+
+				// Store tx hash (best-effort)
+				if let Err(e) = self
+					.state_machine
 					.set_transaction_hash(&order_id, tx_hash.clone(), TransactionType::PostFill)
 					.await
-					.map_err(|e| SettlementError::State(e.to_string()))?;
+				{
+					tracing::warn!(
+						order_id = %truncate_id(&order_id),
+						tx_type = ?TransactionType::PostFill,
+						tx_hash = %truncate_id(&hex::encode(&tx_hash.0)),
+						error = %e,
+						"post-fill transaction submitted but tx hash persistence failed; recovery will use attempt ledger"
+					);
+				}
 
-				// Store reverse mapping
-				self.storage
+				// Store reverse mapping (best-effort)
+				if let Err(e) = self
+					.storage
 					.store(
 						StorageKey::OrderByTxHash.as_str(),
 						&hex::encode(&tx_hash.0),
@@ -314,7 +331,15 @@ impl SettlementHandler {
 						None,
 					)
 					.await
-					.map_err(|e| SettlementError::Storage(e.to_string()))?;
+				{
+					tracing::warn!(
+						order_id = %truncate_id(&order_id),
+						tx_type = ?TransactionType::PostFill,
+						tx_hash = %truncate_id(&hex::encode(&tx_hash.0)),
+						error = %e,
+						"post-fill transaction submitted but reverse tx index persistence failed"
+					);
+				}
 
 				// Publish pending event
 				self.event_bus
@@ -481,14 +506,31 @@ impl SettlementHandler {
 					.await
 					.map_err(map_delivery_error)?;
 
-				// Store tx hash
-				self.state_machine
+				// The pre-claim transaction is now on-chain. The following metadata
+				// writes are best-effort: a failure here must NOT terminally fail the
+				// order, otherwise a transient storage hiccup would strand the submitted
+				// transaction outside recovery. Recovery reconstructs the stage tx hash
+				// from the transaction attempt ledger (which delivery persists before
+				// broadcast) and re-drives the order while it remains non-terminal.
+
+				// Store tx hash (best-effort)
+				if let Err(e) = self
+					.state_machine
 					.set_transaction_hash(&order_id, tx_hash.clone(), TransactionType::PreClaim)
 					.await
-					.map_err(|e| SettlementError::State(e.to_string()))?;
+				{
+					tracing::warn!(
+						order_id = %truncate_id(&order_id),
+						tx_type = ?TransactionType::PreClaim,
+						tx_hash = %truncate_id(&hex::encode(&tx_hash.0)),
+						error = %e,
+						"pre-claim transaction submitted but tx hash persistence failed; recovery will use attempt ledger"
+					);
+				}
 
-				// Store reverse mapping
-				self.storage
+				// Store reverse mapping (best-effort)
+				if let Err(e) = self
+					.storage
 					.store(
 						StorageKey::OrderByTxHash.as_str(),
 						&hex::encode(&tx_hash.0),
@@ -496,7 +538,15 @@ impl SettlementHandler {
 						None,
 					)
 					.await
-					.map_err(|e| SettlementError::Storage(e.to_string()))?;
+				{
+					tracing::warn!(
+						order_id = %truncate_id(&order_id),
+						tx_type = ?TransactionType::PreClaim,
+						tx_hash = %truncate_id(&hex::encode(&tx_hash.0)),
+						error = %e,
+						"pre-claim transaction submitted but reverse tx index persistence failed"
+					);
+				}
 
 				// Publish pending event
 				self.event_bus
@@ -667,16 +717,31 @@ impl SettlementHandler {
 				}))
 				.ok();
 
-			// Update order with claim transaction hash
-			self.state_machine
+			// The claim transaction is now on-chain. The following metadata writes are
+			// best-effort: a failure here must NOT terminally fail the order, otherwise
+			// a transient storage hiccup would strand the submitted transaction outside
+			// recovery. Recovery reconstructs the stage tx hash from the transaction
+			// attempt ledger (which delivery persists before broadcast) and re-drives
+			// the order while it remains non-terminal.
+
+			// Update order with claim transaction hash (best-effort)
+			if let Err(e) = self
+				.state_machine
 				.set_transaction_hash(&order.id, claim_tx_hash.clone(), TransactionType::Claim)
 				.await
-				.map_err(|e| {
-					ClaimBatchError::new(&order_id, SettlementError::State(e.to_string()))
-				})?;
+			{
+				tracing::warn!(
+					order_id = %truncate_id(&order.id),
+					tx_type = ?TransactionType::Claim,
+					tx_hash = %truncate_id(&hex::encode(&claim_tx_hash.0)),
+					error = %e,
+					"claim transaction submitted but tx hash persistence failed; recovery will use attempt ledger"
+				);
+			}
 
-			// Store reverse mapping: tx_hash -> order_id
-			self.storage
+			// Store reverse mapping: tx_hash -> order_id (best-effort)
+			if let Err(e) = self
+				.storage
 				.store(
 					StorageKey::OrderByTxHash.as_str(),
 					&hex::encode(&claim_tx_hash.0),
@@ -684,9 +749,15 @@ impl SettlementHandler {
 					None,
 				)
 				.await
-				.map_err(|e| {
-					ClaimBatchError::new(&order_id, SettlementError::Storage(e.to_string()))
-				})?;
+			{
+				tracing::warn!(
+					order_id = %truncate_id(&order.id),
+					tx_type = ?TransactionType::Claim,
+					tx_hash = %truncate_id(&hex::encode(&claim_tx_hash.0)),
+					error = %e,
+					"claim transaction submitted but reverse tx index persistence failed"
+				);
+			}
 		}
 		Ok(())
 	}
@@ -1284,5 +1355,419 @@ mod tests {
 			.await;
 		assert!(result.is_err());
 		assert!(matches!(result.unwrap_err(), SettlementError::Service(_)));
+	}
+
+	/// Drains all currently-available events from the receiver and returns `true`
+	/// if a `TransactionPending` event for the given transaction type was published.
+	fn drained_has_transaction_pending(
+		receiver: &mut broadcast::Receiver<SolverEvent>,
+		expected_type: TransactionType,
+	) -> bool {
+		let mut found = false;
+		while let Ok(event) = receiver.try_recv() {
+			if let SolverEvent::Delivery(DeliveryEvent::TransactionPending { tx_type, .. }) = event
+			{
+				if tx_type == expected_type {
+					found = true;
+				}
+			}
+		}
+		found
+	}
+
+	// M-24: After delivery succeeds, the stage tx-hash persistence
+	// (`set_transaction_hash`) is best-effort. A failure there must NOT terminally
+	// fail the order, because the transaction is already on-chain and recovery can
+	// reconstruct the stage hash from the transaction attempt ledger.
+	#[tokio::test]
+	async fn test_handle_post_fill_ready_state_write_failure_after_submit_is_non_terminal() {
+		let (handler, mut receiver) = create_test_handler_with_mocks(
+			|mock_storage| {
+				// Initial retrieval + the read inside set_transaction_hash.
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_standard("eip7683")
+							.with_fill_tx_hash(Some(TransactionHash(vec![0x11; 32])))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+				// set_transaction_hash CAS fails AFTER the tx is already submitted.
+				mock_storage
+					.expect_compare_and_swap_with_indexes()
+					.times(1)
+					.returning(|_, _, _, _, _| {
+						Box::pin(async move {
+							Err(StorageError::Backend("cas backend down".to_string()))
+						})
+					});
+				// The best-effort reverse-index write still runs after the failed
+				// state write; let it succeed so the state-write failure is isolated.
+				mock_storage
+					.expect_set_bytes()
+					.times(1)
+					.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+			},
+			|mock_settlement| {
+				mock_settlement
+					.expect_recover_post_fill_state()
+					.times(1)
+					.returning(|_| Box::pin(async move { Ok(false) }));
+				mock_settlement
+					.expect_generate_post_fill_transaction()
+					.times(1)
+					.returning(|_, _| {
+						let tx = create_test_transaction();
+						Box::pin(async move { Ok(Some(tx)) })
+					});
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_receipt()
+					.with(eq(TransactionHash(vec![0x11; 32])), eq(137u64))
+					.times(1)
+					.returning(|_, _| {
+						let receipt = create_test_receipt();
+						Box::pin(async move { Ok(receipt) })
+					});
+				mock_delivery.expect_submit().times(1).returning(|_, _| {
+					let hash = TransactionHash(vec![0x33; 32]);
+					Box::pin(async move { Ok(hash) })
+				});
+			},
+			|_| {},
+		)
+		.await;
+
+		let result = handler
+			.handle_post_fill_ready("test_order_123".to_string())
+			.await;
+
+		assert!(
+			result.is_ok(),
+			"post-submit state-write failure must be non-terminal, got: {result:?}"
+		);
+		// PostFill publishes TransactionPending after the best-effort metadata writes.
+		assert!(
+			drained_has_transaction_pending(&mut receiver, TransactionType::PostFill),
+			"TransactionPending should still be published after best-effort state write"
+		);
+	}
+
+	// M-24: After delivery succeeds, the `OrderByTxHash` reverse-index write is
+	// best-effort. A failure there must NOT terminally fail the order.
+	#[tokio::test]
+	async fn test_handle_post_fill_ready_reverse_map_failure_after_submit_is_non_terminal() {
+		let (handler, mut receiver) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_standard("eip7683")
+							.with_fill_tx_hash(Some(TransactionHash(vec![0x11; 32])))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+				// set_transaction_hash succeeds.
+				mock_storage
+					.expect_compare_and_swap_with_indexes()
+					.times(1)
+					.returning(|_, _, _, _, _| Box::pin(async move { Ok(true) }));
+				// Reverse-index write fails AFTER the tx is already submitted.
+				mock_storage
+					.expect_set_bytes()
+					.times(1)
+					.returning(|_, _, _, _| {
+						Box::pin(async move {
+							Err(StorageError::Backend("index backend down".to_string()))
+						})
+					});
+			},
+			|mock_settlement| {
+				mock_settlement
+					.expect_recover_post_fill_state()
+					.times(1)
+					.returning(|_| Box::pin(async move { Ok(false) }));
+				mock_settlement
+					.expect_generate_post_fill_transaction()
+					.times(1)
+					.returning(|_, _| {
+						let tx = create_test_transaction();
+						Box::pin(async move { Ok(Some(tx)) })
+					});
+			},
+			|mock_delivery| {
+				mock_delivery
+					.expect_get_receipt()
+					.with(eq(TransactionHash(vec![0x11; 32])), eq(137u64))
+					.times(1)
+					.returning(|_, _| {
+						let receipt = create_test_receipt();
+						Box::pin(async move { Ok(receipt) })
+					});
+				mock_delivery.expect_submit().times(1).returning(|_, _| {
+					let hash = TransactionHash(vec![0x33; 32]);
+					Box::pin(async move { Ok(hash) })
+				});
+			},
+			|_| {},
+		)
+		.await;
+
+		let result = handler
+			.handle_post_fill_ready("test_order_123".to_string())
+			.await;
+
+		assert!(
+			result.is_ok(),
+			"post-submit reverse-map failure must be non-terminal, got: {result:?}"
+		);
+		assert!(
+			drained_has_transaction_pending(&mut receiver, TransactionType::PostFill),
+			"TransactionPending should still be published after best-effort reverse-map write"
+		);
+	}
+
+	// M-24: PreClaim stage tx-hash persistence is best-effort after submit.
+	#[tokio::test]
+	async fn test_handle_pre_claim_ready_state_write_failure_after_submit_is_non_terminal() {
+		let (handler, mut receiver) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_standard("eip7683")
+							.with_fill_proof(Some(create_test_fill_proof()))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+				mock_storage
+					.expect_compare_and_swap_with_indexes()
+					.times(1)
+					.returning(|_, _, _, _, _| {
+						Box::pin(async move {
+							Err(StorageError::Backend("cas backend down".to_string()))
+						})
+					});
+				// The best-effort reverse-index write still runs after the failed
+				// state write; let it succeed so the state-write failure is isolated.
+				mock_storage
+					.expect_set_bytes()
+					.times(1)
+					.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+			},
+			|mock_settlement| {
+				mock_settlement
+					.expect_generate_pre_claim_transaction()
+					.times(1)
+					.returning(|_, _| Box::pin(async move { Ok(Some(create_test_transaction())) }));
+			},
+			|mock_delivery| {
+				mock_delivery.expect_submit().times(1).returning(|_, _| {
+					let hash = TransactionHash(vec![0x33; 32]);
+					Box::pin(async move { Ok(hash) })
+				});
+			},
+			|_| {},
+		)
+		.await;
+
+		let result = handler
+			.handle_pre_claim_ready("test_order_123".to_string())
+			.await;
+
+		assert!(
+			result.is_ok(),
+			"post-submit state-write failure must be non-terminal, got: {result:?}"
+		);
+		// PreClaim publishes TransactionPending after the best-effort metadata writes.
+		assert!(
+			drained_has_transaction_pending(&mut receiver, TransactionType::PreClaim),
+			"TransactionPending should still be published after best-effort state write"
+		);
+	}
+
+	// M-24: PreClaim reverse-index write is best-effort after submit.
+	#[tokio::test]
+	async fn test_handle_pre_claim_ready_reverse_map_failure_after_submit_is_non_terminal() {
+		let (handler, mut receiver) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_standard("eip7683")
+							.with_fill_proof(Some(create_test_fill_proof()))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+				mock_storage
+					.expect_compare_and_swap_with_indexes()
+					.times(1)
+					.returning(|_, _, _, _, _| Box::pin(async move { Ok(true) }));
+				mock_storage
+					.expect_set_bytes()
+					.times(1)
+					.returning(|_, _, _, _| {
+						Box::pin(async move {
+							Err(StorageError::Backend("index backend down".to_string()))
+						})
+					});
+			},
+			|mock_settlement| {
+				mock_settlement
+					.expect_generate_pre_claim_transaction()
+					.times(1)
+					.returning(|_, _| Box::pin(async move { Ok(Some(create_test_transaction())) }));
+			},
+			|mock_delivery| {
+				mock_delivery.expect_submit().times(1).returning(|_, _| {
+					let hash = TransactionHash(vec![0x33; 32]);
+					Box::pin(async move { Ok(hash) })
+				});
+			},
+			|_| {},
+		)
+		.await;
+
+		let result = handler
+			.handle_pre_claim_ready("test_order_123".to_string())
+			.await;
+
+		assert!(
+			result.is_ok(),
+			"post-submit reverse-map failure must be non-terminal, got: {result:?}"
+		);
+		assert!(
+			drained_has_transaction_pending(&mut receiver, TransactionType::PreClaim),
+			"TransactionPending should still be published after best-effort reverse-map write"
+		);
+	}
+
+	// M-24: Claim stage tx-hash persistence is best-effort after submit. The batch
+	// handler must return Ok(()) rather than wrapping the failure in ClaimBatchError.
+	#[tokio::test]
+	async fn test_process_claim_batch_state_write_failure_after_submit_is_non_terminal() {
+		let (handler, mut receiver) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_id("test_order_123".to_string())
+							.with_standard("eip7683")
+							.with_fill_proof(Some(create_test_fill_proof()))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+				mock_storage
+					.expect_compare_and_swap_with_indexes()
+					.times(1)
+					.returning(|_, _, _, _, _| {
+						Box::pin(async move {
+							Err(StorageError::Backend("cas backend down".to_string()))
+						})
+					});
+				// The best-effort reverse-index write still runs after the failed
+				// state write; let it succeed so the state-write failure is isolated.
+				mock_storage
+					.expect_set_bytes()
+					.times(1)
+					.returning(|_, _, _, _| Box::pin(async move { Ok(()) }));
+			},
+			|_| {},
+			|mock_delivery| {
+				mock_delivery.expect_submit().times(1).returning(|_, _| {
+					let hash = TransactionHash(vec![0x33; 32]);
+					Box::pin(async move { Ok(hash) })
+				});
+			},
+			|mock_order| {
+				mock_order
+					.expect_generate_claim_transaction()
+					.times(1)
+					.returning(|_, _| Box::pin(async move { Ok(create_test_transaction()) }));
+			},
+		)
+		.await;
+
+		let mut batch = vec!["test_order_123".to_string()];
+		let result = handler.process_claim_batch(&mut batch).await;
+
+		assert!(
+			result.is_ok(),
+			"post-submit state-write failure must be non-terminal, got: {result:?}"
+		);
+		// Claim publishes TransactionPending before the best-effort metadata writes.
+		assert!(
+			drained_has_transaction_pending(&mut receiver, TransactionType::Claim),
+			"TransactionPending should still be published for the claim"
+		);
+	}
+
+	// M-24: Claim reverse-index write is best-effort after submit.
+	#[tokio::test]
+	async fn test_process_claim_batch_reverse_map_failure_after_submit_is_non_terminal() {
+		let (handler, mut receiver) = create_test_handler_with_mocks(
+			|mock_storage| {
+				mock_storage
+					.expect_get_bytes()
+					.with(eq("orders:test_order_123"))
+					.returning(|_| {
+						let order = OrderBuilder::new()
+							.with_id("test_order_123".to_string())
+							.with_standard("eip7683")
+							.with_fill_proof(Some(create_test_fill_proof()))
+							.build();
+						Box::pin(async move { Ok(serde_json::to_vec(&order).unwrap()) })
+					});
+				mock_storage
+					.expect_compare_and_swap_with_indexes()
+					.times(1)
+					.returning(|_, _, _, _, _| Box::pin(async move { Ok(true) }));
+				mock_storage
+					.expect_set_bytes()
+					.times(1)
+					.returning(|_, _, _, _| {
+						Box::pin(async move {
+							Err(StorageError::Backend("index backend down".to_string()))
+						})
+					});
+			},
+			|_| {},
+			|mock_delivery| {
+				mock_delivery.expect_submit().times(1).returning(|_, _| {
+					let hash = TransactionHash(vec![0x33; 32]);
+					Box::pin(async move { Ok(hash) })
+				});
+			},
+			|mock_order| {
+				mock_order
+					.expect_generate_claim_transaction()
+					.times(1)
+					.returning(|_, _| Box::pin(async move { Ok(create_test_transaction()) }));
+			},
+		)
+		.await;
+
+		let mut batch = vec!["test_order_123".to_string()];
+		let result = handler.process_claim_batch(&mut batch).await;
+
+		assert!(
+			result.is_ok(),
+			"post-submit reverse-map failure must be non-terminal, got: {result:?}"
+		);
+		assert!(
+			drained_has_transaction_pending(&mut receiver, TransactionType::Claim),
+			"TransactionPending should still be published for the claim"
+		);
 	}
 }
