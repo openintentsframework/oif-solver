@@ -319,10 +319,9 @@ pub async fn check_is_proven(
 		..Default::default()
 	};
 
-	let result = provider
-		.call(request)
-		.await
-		.map_err(|e| SettlementError::ValidationFailed(format!("Failed to call isProven: {e}")))?;
+	let result = provider.call(request).await.map_err(|e| {
+		SettlementError::BackendUnavailable(format!("Failed to call isProven: {e}"))
+	})?;
 
 	Ok(result.len() >= 32 && result[31] != 0)
 }
@@ -374,7 +373,7 @@ where
 				Ok(Some(state))
 			},
 			Err(StorageError::NotFound(_)) => Ok(None),
-			Err(e) => Err(SettlementError::ValidationFailed(format!(
+			Err(e) => Err(SettlementError::StorageUnavailable(format!(
 				"Failed to load settlement message state for namespace '{}' key '{}': {e}",
 				self.namespace, key
 			))),
@@ -399,7 +398,7 @@ where
 			)
 			.await
 			.map_err(|e| {
-				SettlementError::ValidationFailed(format!("Failed to persist message state: {e}"))
+				SettlementError::StorageUnavailable(format!("Failed to persist message state: {e}"))
 			})?;
 
 		let mut cache = self.cache.write().await;
@@ -438,6 +437,130 @@ fn validate_routes(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use async_trait::async_trait;
+	use solver_types::ConfigSchema;
+
+	/// Storage backend whose reads/writes always fail with a backend
+	/// (non-`NotFound`) error, used to exercise the storage-unavailable mapping.
+	struct FailingStorage;
+
+	#[async_trait]
+	impl solver_storage::StorageInterface for FailingStorage {
+		async fn get_bytes(&self, _key: &str) -> Result<Vec<u8>, StorageError> {
+			Err(StorageError::Backend(
+				"simulated storage outage".to_string(),
+			))
+		}
+		async fn set_bytes(
+			&self,
+			_key: &str,
+			_value: Vec<u8>,
+			_indexes: Option<solver_storage::StorageIndexes>,
+			_ttl: Option<Duration>,
+		) -> Result<(), StorageError> {
+			Err(StorageError::Backend(
+				"simulated storage outage".to_string(),
+			))
+		}
+		async fn delete(&self, _key: &str) -> Result<(), StorageError> {
+			Err(StorageError::Backend(
+				"simulated storage outage".to_string(),
+			))
+		}
+		async fn exists(&self, _key: &str) -> Result<bool, StorageError> {
+			Err(StorageError::Backend(
+				"simulated storage outage".to_string(),
+			))
+		}
+		async fn query(
+			&self,
+			_namespace: &str,
+			_filter: solver_storage::QueryFilter,
+		) -> Result<Vec<String>, StorageError> {
+			Err(StorageError::Backend(
+				"simulated storage outage".to_string(),
+			))
+		}
+		async fn get_batch(
+			&self,
+			_keys: &[String],
+		) -> Result<Vec<(String, Vec<u8>)>, StorageError> {
+			Err(StorageError::Backend(
+				"simulated storage outage".to_string(),
+			))
+		}
+		fn config_schema(&self) -> Box<dyn ConfigSchema> {
+			Box::new(solver_storage::implementations::memory::MemoryStorageSchema)
+		}
+		async fn set_nx(
+			&self,
+			_key: &str,
+			_value: Vec<u8>,
+			_ttl: Option<Duration>,
+		) -> Result<bool, StorageError> {
+			Err(StorageError::Backend(
+				"simulated storage outage".to_string(),
+			))
+		}
+		async fn compare_and_swap(
+			&self,
+			_key: &str,
+			_expected: &[u8],
+			_new_value: Vec<u8>,
+			_ttl: Option<Duration>,
+		) -> Result<bool, StorageError> {
+			Err(StorageError::Backend(
+				"simulated storage outage".to_string(),
+			))
+		}
+		async fn compare_and_swap_with_indexes(
+			&self,
+			_key: &str,
+			_expected: &[u8],
+			_new_value: Vec<u8>,
+			_indexes: Option<solver_storage::StorageIndexes>,
+			_ttl: Option<Duration>,
+		) -> Result<bool, StorageError> {
+			Err(StorageError::Backend(
+				"simulated storage outage".to_string(),
+			))
+		}
+		async fn delete_if_exists(&self, _key: &str) -> Result<bool, StorageError> {
+			Err(StorageError::Backend(
+				"simulated storage outage".to_string(),
+			))
+		}
+	}
+
+	#[tokio::test]
+	async fn message_tracker_load_maps_backend_error_to_storage_unavailable() {
+		let storage = Arc::new(StorageService::new(Box::new(FailingStorage)));
+		let tracker = SettlementMessageTracker::<String>::new(storage, "test-namespace");
+
+		let err = tracker
+			.load("order-1")
+			.await
+			.expect_err("backend outage must surface as an error");
+		assert!(
+			matches!(err, SettlementError::StorageUnavailable(_)),
+			"expected StorageUnavailable, got {err:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn message_tracker_save_maps_backend_error_to_storage_unavailable() {
+		let storage = Arc::new(StorageService::new(Box::new(FailingStorage)));
+		let tracker = SettlementMessageTracker::<String>::new(storage, "test-namespace");
+
+		let err = tracker
+			.save("order-1", &"state".to_string(), None)
+			.await
+			.expect_err("backend outage must surface as an error");
+		assert!(
+			matches!(err, SettlementError::StorageUnavailable(_)),
+			"expected StorageUnavailable, got {err:?}"
+		);
+	}
 
 	#[test]
 	fn test_parse_selection_strategy() {

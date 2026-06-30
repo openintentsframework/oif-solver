@@ -3817,6 +3817,83 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn recovery_keeps_order_non_terminal_on_broadcaster_readiness_retry() {
+		// H-02 regression: a recoverable (non-terminal) Broadcaster readiness
+		// result during claim recovery must keep the order retryable, not
+		// transition it to terminal Failed(Claim). Waiting(_) re-emits
+		// StartMonitoring; only PermanentFailure transitions to Failed.
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let mut order = create_test_order_with_status(OrderStatus::PreClaimed);
+		order.fill_tx_hash = Some(TransactionHash(vec![0xbb; 32]));
+		order.settlement_name = Some("broadcaster".to_string());
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		state_machine.store_order(&order).await.unwrap();
+
+		let mut mock_settlement = MockSettlementInterface::new();
+		mock_settlement
+			.expect_readiness()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					SettlementReadiness::Waiting(
+						solver_settlement::WaitingReason::StorageUnavailable,
+					)
+				})
+			});
+
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::from([(
+				"broadcaster".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]);
+		let settlement = Arc::new(SettlementService::new(
+			settlement_impls,
+			"broadcaster".to_string(),
+			20,
+		));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
+
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine.clone(),
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+			empty_networks_config(),
+		);
+
+		recovery_service
+			.publish_recovery_event(
+				order.clone(),
+				ReconcileResult::NeedsClaim {
+					fill_proof: Some(create_test_fill_proof()),
+				},
+			)
+			.await;
+
+		// The order must stay non-terminal (still PreClaimed), not Failed(Claim).
+		let stored = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(stored.status, OrderStatus::PreClaimed);
+
+		// A retryable readiness result re-emits StartMonitoring rather than failing.
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Settlement(SettlementEvent::StartMonitoring { order_id, .. }) => {
+				assert_eq!(order_id, order.id);
+			},
+			other => panic!("Expected StartMonitoring event, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
 	async fn test_publish_recovery_event_needs_execution() {
 		let temp_dir = tempfile::tempdir().unwrap();
 		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(

@@ -701,7 +701,7 @@ impl HyperlaneSettlement {
 			.block(alloy_rpc_types::eth::BlockId::latest())
 			.await
 			.map_err(|e| {
-				SettlementError::ValidationFailed(format!("Failed to quote gas payment: {e}"))
+				SettlementError::BackendUnavailable(format!("Failed to quote gas payment: {e}"))
 			})?;
 
 		// Decode the result
@@ -772,7 +772,7 @@ impl HyperlaneSettlement {
 			.get_transaction_receipt(FixedBytes::<32>::from_slice(&fill_tx_hash.0))
 			.await
 			.map_err(|e| {
-				SettlementError::ValidationFailed(format!("Failed to get fill receipt: {e}"))
+				SettlementError::BackendUnavailable(format!("Failed to get fill receipt: {e}"))
 			})?
 			.ok_or_else(|| {
 				SettlementError::ValidationFailed("Fill transaction not found".to_string())
@@ -999,7 +999,9 @@ impl SettlementInterface for HyperlaneSettlement {
 		let receipt = provider
 			.get_transaction_receipt(hash)
 			.await
-			.map_err(|e| SettlementError::ValidationFailed(format!("Failed to get receipt: {e}")))?
+			.map_err(|e| {
+				SettlementError::BackendUnavailable(format!("Failed to get receipt: {e}"))
+			})?
 			.ok_or_else(|| {
 				SettlementError::ValidationFailed("Transaction not found".to_string())
 			})?;
@@ -1016,7 +1018,9 @@ impl SettlementInterface for HyperlaneSettlement {
 		let block = provider
 			.get_block_by_number(alloy_rpc_types::BlockNumberOrTag::Number(tx_block))
 			.await
-			.map_err(|e| SettlementError::ValidationFailed(format!("Failed to get block: {e}")))?;
+			.map_err(|e| {
+				SettlementError::BackendUnavailable(format!("Failed to get block: {e}"))
+			})?;
 
 		let block_timestamp = block
 			.ok_or_else(|| SettlementError::ValidationFailed("Block not found".to_string()))?
@@ -1068,7 +1072,7 @@ impl SettlementInterface for HyperlaneSettlement {
 			.get_transaction_receipt(FixedBytes::<32>::from_slice(&post_fill_tx_hash.0))
 			.await
 			.map_err(|e| {
-				SettlementError::ValidationFailed(format!("Failed to get post-fill receipt: {e}"))
+				SettlementError::BackendUnavailable(format!("Failed to get post-fill receipt: {e}"))
 			})?
 			.ok_or_else(|| {
 				SettlementError::ValidationFailed("Post-fill transaction not found".to_string())
@@ -2320,6 +2324,64 @@ mod tests {
 		assert_eq!(
 			settlement.message_tracker.get_message_id(&order.id).await,
 			Some(expected_message_id)
+		);
+	}
+
+	#[tokio::test]
+	async fn hyperlane_recover_post_fill_state_maps_rpc_transport_error_to_backend_unavailable() {
+		let server = MockServer::start().await;
+		let origin_chain = 1u64;
+		let dest_chain = 2u64;
+		let fill_tx_hash = TransactionHash(vec![0xfa; 32]);
+		let post_fill_tx_hash = TransactionHash(vec![0xfb; 32]);
+		let order_id = [0x42; 32];
+		let (order, _output, _output_settler) = make_hyperlane_recovery_order(
+			order_id,
+			origin_chain,
+			dest_chain,
+			fill_tx_hash.clone(),
+			post_fill_tx_hash.clone(),
+		);
+
+		// The destination RPC is unreachable/erroring: every eth_getTransactionReceipt
+		// returns HTTP 500, which alloy surfaces as a transport error. This must be
+		// classified as a retryable backend failure, not a terminal validation error.
+		Mock::given(method("POST"))
+			.respond_with(ResponseTemplate::new(500))
+			.mount(&server)
+			.await;
+
+		let provider = ProviderBuilder::new()
+			.connect_http(server.uri().parse().expect("valid RPC URL"))
+			.erased();
+		let domains = HashMap::from([
+			(origin_chain, origin_chain as u32),
+			(dest_chain, dest_chain as u32),
+		]);
+		let settlement = test_hyperlane_settlement_with_providers(
+			OracleConfig {
+				input_oracles: HashMap::from([(
+					origin_chain,
+					vec![solver_types::Address(vec![0x33; 20])],
+				)]),
+				output_oracles: HashMap::from([(
+					dest_chain,
+					vec![solver_types::Address(vec![0x44; 20])],
+				)]),
+				routes: HashMap::from([(origin_chain, vec![dest_chain])]),
+				selection_strategy: OracleSelectionStrategy::First,
+			},
+			HashMap::from([(dest_chain, provider)]),
+			domains,
+		);
+
+		let err = settlement
+			.recover_post_fill_state(&order)
+			.await
+			.expect_err("RPC transport failure must surface as an error");
+		assert!(
+			matches!(err, SettlementError::BackendUnavailable(_)),
+			"expected BackendUnavailable, got {err:?}"
 		);
 	}
 
