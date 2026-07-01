@@ -450,15 +450,12 @@ impl HyperlaneSettlement {
 		let order_id = &order.id;
 
 		// Load message state
+		// Propagate the typed error (StorageUnavailable is retryable); do not
+		// collapse a transient storage fault into terminal ValidationFailed.
 		let mut state = self
 			.message_tracker
 			.load_message(order_id)
-			.await
-			.map_err(|e| {
-				SettlementError::ValidationFailed(format!(
-					"Failed to load hyperlane message state for order {order_id}: {e}"
-				))
-			})?
+			.await?
 			.unwrap_or(HyperlaneMessageState {
 				submitted: None,
 				delivered: None,
@@ -2535,6 +2532,45 @@ mod tests {
 		assert!(
 			matches!(err, SettlementError::StorageUnavailable(_)),
 			"transient storage fault must stay retryable (StorageUnavailable), got: {err:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn check_delivery_preserves_transient_storage_error() {
+		use solver_storage::{MockStorageInterface, StorageError};
+
+		// HyperlaneSettlement whose message tracker fails every read with a
+		// transient backend fault (the shape of a momentary Redis outage).
+		let mut backend = MockStorageInterface::new();
+		backend.expect_get_bytes().returning(|_| {
+			Box::pin(async { Err(StorageError::Backend("simulated redis outage".to_string())) })
+		});
+		let settlement = HyperlaneSettlement {
+			providers: HashMap::new(),
+			oracle_config: OracleConfig {
+				input_oracles: HashMap::new(),
+				output_oracles: HashMap::new(),
+				routes: HashMap::new(),
+				selection_strategy: OracleSelectionStrategy::First,
+			},
+			mailbox_addresses: HashMap::new(),
+			igp_addresses: HashMap::new(),
+			domains: HashMap::new(),
+			message_tracker: Arc::new(MessageTracker::new(Arc::new(StorageService::new(
+				Box::new(backend),
+			)))),
+			default_gas_limit: 500_000,
+		};
+		let order = test_order_with_chains(1, 137);
+
+		let err = settlement
+			.check_delivery(&order, [0u8; 32])
+			.await
+			.expect_err("a transient storage fault must surface as an error");
+
+		assert!(
+			matches!(err, SettlementError::StorageUnavailable(_)),
+			"check_delivery must stay retryable (StorageUnavailable), got: {err:?}"
 		);
 	}
 
