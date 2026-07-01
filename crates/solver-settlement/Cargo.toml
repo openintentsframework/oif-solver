@@ -29,4 +29,5 @@ tracing = "0.1"
 uuid = { workspace = true }
 
 [dev-dependencies]
+solver-storage = { path = "../solver-storage", features = ["testing"] }
 wiremock = "0.5"

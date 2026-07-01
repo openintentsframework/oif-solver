@@ -281,14 +281,11 @@ impl MessageTracker {
 		};
 
 		// Load existing state or create new
+		// Propagate the typed error (StorageUnavailable is retryable); do not
+		// collapse a transient storage fault into terminal ValidationFailed.
 		let mut state = self
 			.load_message(&order_id)
-			.await
-			.map_err(|e| {
-				SettlementError::ValidationFailed(format!(
-					"Failed to load hyperlane submission state for order {order_id}: {e}"
-				))
-			})?
+			.await?
 			.unwrap_or(HyperlaneMessageState {
 				submitted: None,
 				delivered: None,
@@ -2504,6 +2501,40 @@ mod tests {
 		assert_eq!(
 			settlement.message_tracker.get_message_id(&order.id).await,
 			Some(expected_message_id)
+		);
+	}
+
+	#[tokio::test]
+	async fn track_submission_preserves_transient_storage_error() {
+		use solver_storage::{MockStorageInterface, StorageError};
+
+		// A storage backend that fails every read with a transient backend fault
+		// (the shape produced by a momentary Redis outage).
+		let mut backend = MockStorageInterface::new();
+		backend.expect_get_bytes().returning(|_| {
+			Box::pin(async { Err(StorageError::Backend("simulated redis outage".to_string())) })
+		});
+		let storage = Arc::new(StorageService::new(Box::new(backend)));
+		let tracker = MessageTracker::new(storage);
+
+		let err = tracker
+			.track_submission(
+				"order-transient".to_string(),
+				[0u8; 32], // message_id
+				1,         // origin_chain
+				2,         // destination_chain
+				TransactionHash(vec![0u8; 32]),
+				U256::ZERO, // gas_payment
+				[0u8; 32],  // payload_hash
+				[0u8; 32],  // solver_identifier
+				0,          // fill_timestamp
+			)
+			.await
+			.expect_err("a transient storage fault must surface as an error");
+
+		assert!(
+			matches!(err, SettlementError::StorageUnavailable(_)),
+			"transient storage fault must stay retryable (StorageUnavailable), got: {err:?}"
 		);
 	}
 
