@@ -146,7 +146,7 @@ mod tests {
 	) -> TransactionAttempt {
 		let mut a = TransactionAttempt::planned(
 			id.into(),
-			"order-1".into(),
+			solver_types::TransactionAttemptScope::order("order-1"),
 			Some(Address(vec![9; 20])),
 			TransactionType::Fill,
 			tx_with_fees(max_fee, max_fee / 10),

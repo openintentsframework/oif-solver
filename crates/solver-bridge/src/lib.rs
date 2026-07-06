@@ -18,10 +18,10 @@ mod test_support;
 pub mod threshold;
 pub mod types;
 
-use crate::storage::BridgeStorage;
+use crate::storage::{retire_system_attempt_scope, BridgeStorage};
 use crate::types::{
-	BridgeDepositResult, BridgeRequest, BridgeTransferStatus, PendingBridgeTransfer,
-	RebalanceTrigger, TransferMetadata,
+	bridge_system_scope, BridgeDepositResult, BridgeRequest, BridgeTransferStatus,
+	PendingBridgeTransfer, RebalanceTrigger, TransferMetadata,
 };
 use alloy_primitives::U256;
 use async_trait::async_trait;
@@ -283,7 +283,7 @@ impl BridgeService {
 		bridge_impl: &str,
 		request: &BridgeRequest,
 		trigger: RebalanceTrigger,
-		metadata: types::TransferMetadata,
+		mut metadata: types::TransferMetadata,
 	) -> Result<PendingBridgeTransfer, BridgeError> {
 		let bridge = self.get_implementation(bridge_impl)?;
 
@@ -327,6 +327,14 @@ impl BridgeService {
 		transfer.recipient_address =
 			Some(format!("0x{}", hex::encode(request.recipient.as_slice())));
 		transfer.min_amount = request.min_amount.map(|m| m.to_string());
+		let transfer_id = transfer.id.clone();
+		let approve_scope_id = bridge_system_scope("approve", request.source_chain, &transfer_id);
+		let tx_scope_id = bridge_system_scope("deposit", request.source_chain, &transfer_id);
+		transfer.approve_scope_id = Some(approve_scope_id.clone());
+		transfer.tx_scope_id = Some(tx_scope_id.clone());
+		metadata.transfer_id = Some(transfer_id.clone());
+		metadata.approve_scope_id = Some(approve_scope_id);
+		metadata.tx_scope_id = Some(tx_scope_id);
 
 		// CRASH-WINDOW GUARD: persist `bridge_submit_attempted = true` BEFORE the
 		// bridge_asset call. If we crash between the call and the next save (which
@@ -355,6 +363,11 @@ impl BridgeService {
 		{
 			transfer.status = BridgeTransferStatus::WrapPending;
 			transfer.wrap_submit_attempted = true;
+			transfer.wrap_scope_id = Some(bridge_system_scope(
+				"wrap-native",
+				request.source_chain,
+				&transfer.id,
+			));
 			self.storage.save_transfer(&transfer).await?;
 
 			match bridge.wrap_native(&transfer).await {
@@ -462,6 +475,14 @@ impl BridgeService {
 			},
 			Err(BridgeError::ApproveSubmitFailed { error }) => {
 				transfer.bridge_submit_attempted = false; // ROLLBACK: deposit never attempted.
+				if let Some(scope_id) = transfer.approve_scope_id.as_deref() {
+					retire_system_attempt_scope(
+						&self.storage.storage_service(),
+						scope_id,
+						"approve submit failed before bridge deposit",
+					)
+					.await?;
+				}
 				transfer.transition_to(BridgeTransferStatus::Failed(format!(
 					"approve failed before deposit attempt: {error}"
 				)));
@@ -643,16 +664,39 @@ impl BridgeService {
 				// would immediately re-escalate the transfer back to
 				// NeedsIntervention on the next tick.
 				transfer.bridge_submit_attempted = false;
+				let attempt_storage = self.storage.storage_service();
+				for scope_id in [
+					transfer.wrap_scope_id.clone(),
+					transfer.tx_scope_id.clone(),
+					transfer.approve_scope_id.clone(),
+					transfer.redeem_scope_id.clone(),
+					transfer.unwrap_scope_id.clone(),
+				]
+				.into_iter()
+				.flatten()
+				{
+					retire_system_attempt_scope(
+						&attempt_storage,
+						&scope_id,
+						"admin retry cleared bridge phase scope",
+					)
+					.await?;
+				}
 				transfer.wrap_submit_attempted = false;
 				transfer.wrap_tx_hash = None;
+				transfer.wrap_scope_id = None;
 				transfer.wrap_missing_checks = 0;
 				transfer.redeem_submit_attempted = false;
 				transfer.redeem_tx_hash = None;
+				transfer.redeem_scope_id = None;
 				transfer.redeem_missing_checks = 0;
 				transfer.redeem_missing_since = None;
 				transfer.unwrap_submit_attempted = false;
 				transfer.unwrap_tx_hash = None;
+				transfer.unwrap_scope_id = None;
 				transfer.unwrap_missing_checks = 0;
+				transfer.tx_scope_id = None;
+				transfer.approve_scope_id = None;
 				if let Some(prev_status) = transfer.status_before_intervention.take() {
 					transfer.status = prev_status;
 				} else {
@@ -735,8 +779,14 @@ pub fn get_all_implementations() -> Result<Vec<(&'static str, BridgeFactory)>, B
 mod tests {
 	use super::*;
 	use crate::test_support::{bridge_request, pending_transfer, storage_service_from_mock};
-	use solver_storage::{MockStorageInterface, StorageError};
+	use solver_storage::implementations::file::{FileStorage, TtlConfig};
+	use solver_storage::{MockStorageInterface, StorageError, StorageIndexes};
+	use solver_types::{
+		Address as DeliveryAddress, StorageKey, Transaction, TransactionAttempt,
+		TransactionAttemptScope, TransactionAttemptStatus, TransactionType,
+	};
 	use std::sync::{Arc, Mutex};
+	use uuid::Uuid;
 
 	#[derive(Default)]
 	struct TestBridge {
@@ -749,6 +799,55 @@ mod tests {
 	impl TestBridge {
 		fn new() -> Self {
 			Self::default()
+		}
+	}
+
+	struct ApproveSubmitFailedBridge {
+		storage: Arc<StorageService>,
+	}
+
+	#[async_trait]
+	impl BridgeInterface for ApproveSubmitFailedBridge {
+		fn supported_routes(&self) -> Vec<(u64, u64)> {
+			vec![(1, 747474)]
+		}
+
+		async fn bridge_asset(
+			&self,
+			request: &BridgeRequest,
+			metadata: &TransferMetadata,
+		) -> Result<BridgeDepositResult, BridgeError> {
+			let scope_id = metadata
+				.approve_scope_id
+				.clone()
+				.expect("rebalance_token must provide approve scope");
+			let mut attempt = TransactionAttempt::planned(
+				"approve-timeout-attempt".to_string(),
+				TransactionAttemptScope::system(scope_id),
+				Some(DeliveryAddress(vec![0x99; 20])),
+				TransactionType::Bridge,
+				sample_attempt_tx(request.source_chain),
+			);
+			attempt.status = TransactionAttemptStatus::Broadcast;
+			store_system_attempt(&self.storage, &attempt).await;
+			Err(BridgeError::ApproveSubmitFailed {
+				error: "approve receipt timeout".to_string(),
+			})
+		}
+
+		async fn check_status(
+			&self,
+			_transfer: &PendingBridgeTransfer,
+		) -> Result<BridgeTransferStatus, BridgeError> {
+			Ok(BridgeTransferStatus::Submitted)
+		}
+
+		async fn estimate_fee(
+			&self,
+			_request: &BridgeRequest,
+			_metadata: &TransferMetadata,
+		) -> Result<U256, BridgeError> {
+			Ok(U256::ZERO)
 		}
 	}
 
@@ -837,6 +936,53 @@ mod tests {
 			storage_service_from_mock(storage),
 			"solver-a".to_string(),
 		)
+	}
+
+	fn file_storage_service() -> Arc<StorageService> {
+		let base_path =
+			std::env::temp_dir().join(format!("solver-bridge-service-test-{}", Uuid::new_v4()));
+		Arc::new(StorageService::new(Box::new(FileStorage::new(
+			base_path,
+			TtlConfig::default(),
+		))))
+	}
+
+	fn make_service_with_storage(
+		bridge: Arc<dyn BridgeInterface>,
+		storage: Arc<StorageService>,
+	) -> BridgeService {
+		let implementations = HashMap::from([("mock-bridge".to_string(), bridge)]);
+		BridgeService::new(implementations, storage, "solver-a".to_string())
+	}
+
+	fn sample_attempt_tx(chain_id: u64) -> Transaction {
+		Transaction {
+			to: Some(DeliveryAddress(vec![0xbb; 20])),
+			data: vec![0x12, 0x34],
+			value: U256::ZERO,
+			chain_id,
+			nonce: Some(5),
+			gas_limit: Some(100000),
+			gas_price: None,
+			max_fee_per_gas: Some(100),
+			max_priority_fee_per_gas: Some(2),
+		}
+	}
+
+	async fn store_system_attempt(storage: &Arc<StorageService>, attempt: &TransactionAttempt) {
+		let indexes = StorageIndexes::new()
+			.with_field("scope_kind", "system")
+			.with_field("scope_id", attempt.scope.scope_id())
+			.with_field("is_terminal", attempt.is_terminal());
+		storage
+			.store(
+				StorageKey::TransactionAttempts.as_str(),
+				&attempt.id,
+				attempt,
+				Some(indexes),
+			)
+			.await
+			.unwrap();
 	}
 
 	fn bridge_metadata() -> types::TransferMetadata {
@@ -1231,6 +1377,17 @@ mod tests {
 					})
 				});
 		}
+		storage
+			.expect_query()
+			.times(1)
+			.returning(|namespace, _filter| {
+				assert_eq!(namespace, StorageKey::TransactionAttempts.as_str());
+				Box::pin(async move { Ok(Vec::new()) })
+			});
+		storage.expect_get_batch().times(1).returning(|keys| {
+			assert!(keys.is_empty());
+			Box::pin(async move { Ok(Vec::new()) })
+		});
 
 		let bridge = Arc::new(TestBridge {
 			bridge_asset_result: Mutex::new(Some(Err(BridgeError::ApproveSubmitFailed {
@@ -1893,6 +2050,103 @@ mod tests {
 		assert!(saved.redeem_tx_hash.is_none());
 		assert!(!saved.unwrap_submit_attempted);
 		assert!(saved.unwrap_tx_hash.is_none());
+	}
+
+	#[tokio::test]
+	async fn test_resolve_transfer_retry_retires_cleared_system_attempt_scopes() {
+		let storage = file_storage_service();
+		let service = make_service_with_storage(Arc::new(TestBridge::new()), storage.clone());
+		let mut transfer = pending_transfer(BridgeTransferStatus::NeedsIntervention(
+			"native retry requested".to_string(),
+		));
+		transfer.status_before_intervention = Some(BridgeTransferStatus::WrapPending);
+		transfer.wrap_scope_id = Some("system:bridge:wrap:transfer-1".to_string());
+		transfer.tx_scope_id = Some("system:bridge:deposit:transfer-1".to_string());
+		transfer.approve_scope_id = Some("system:bridge:approve:transfer-1".to_string());
+		transfer.redeem_scope_id = Some("system:bridge:redeem:transfer-1".to_string());
+		transfer.unwrap_scope_id = Some("system:bridge:unwrap:transfer-1".to_string());
+		service.storage.save_transfer(&transfer).await.unwrap();
+
+		let mut pending = TransactionAttempt::planned(
+			"attempt-wrap".to_string(),
+			TransactionAttemptScope::system(transfer.wrap_scope_id.clone().unwrap()),
+			Some(DeliveryAddress(vec![0x99; 20])),
+			TransactionType::Bridge,
+			sample_attempt_tx(1),
+		);
+		pending.status = TransactionAttemptStatus::Broadcast;
+		store_system_attempt(&storage, &pending).await;
+		let mut confirmed = TransactionAttempt::planned(
+			"attempt-confirmed".to_string(),
+			TransactionAttemptScope::system(transfer.tx_scope_id.clone().unwrap()),
+			Some(DeliveryAddress(vec![0x99; 20])),
+			TransactionType::Bridge,
+			sample_attempt_tx(1),
+		);
+		confirmed.status = TransactionAttemptStatus::Confirmed;
+		store_system_attempt(&storage, &confirmed).await;
+
+		let resolved = service
+			.resolve_transfer(&transfer.id, "retry", "operator verified phases")
+			.await
+			.unwrap();
+
+		assert!(matches!(resolved.status, BridgeTransferStatus::WrapPending));
+		assert!(resolved.wrap_scope_id.is_none());
+		assert!(resolved.tx_scope_id.is_none());
+		assert!(resolved.approve_scope_id.is_none());
+		assert!(resolved.redeem_scope_id.is_none());
+		assert!(resolved.unwrap_scope_id.is_none());
+		let retired: TransactionAttempt = storage
+			.retrieve(StorageKey::TransactionAttempts.as_str(), "attempt-wrap")
+			.await
+			.unwrap();
+		assert_eq!(retired.status, TransactionAttemptStatus::Replaced);
+		assert_eq!(
+			retired.error.as_deref(),
+			Some("admin retry cleared bridge phase scope")
+		);
+		let untouched: TransactionAttempt = storage
+			.retrieve(
+				StorageKey::TransactionAttempts.as_str(),
+				"attempt-confirmed",
+			)
+			.await
+			.unwrap();
+		assert_eq!(untouched.status, TransactionAttemptStatus::Confirmed);
+	}
+
+	#[tokio::test]
+	async fn rebalance_token_retires_approve_scope_on_submit_failed_terminal_transfer() {
+		let storage = file_storage_service();
+		let bridge = Arc::new(ApproveSubmitFailedBridge {
+			storage: storage.clone(),
+		});
+		let service = make_service_with_storage(bridge, storage.clone());
+
+		let err = service
+			.rebalance_token(
+				"mock-bridge",
+				&bridge_request(),
+				RebalanceTrigger::Auto,
+				bridge_metadata(),
+			)
+			.await
+			.expect_err("approve submit failure should be returned");
+
+		assert!(matches!(err, BridgeError::ApproveSubmitFailed { .. }));
+		let attempt: TransactionAttempt = storage
+			.retrieve(
+				StorageKey::TransactionAttempts.as_str(),
+				"approve-timeout-attempt",
+			)
+			.await
+			.unwrap();
+		assert_eq!(attempt.status, TransactionAttemptStatus::Replaced);
+		assert_eq!(
+			attempt.error.as_deref(),
+			Some("approve submit failed before bridge deposit")
+		);
 	}
 
 	#[tokio::test]

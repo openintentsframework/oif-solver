@@ -268,7 +268,11 @@ async fn convert_eip7683_order_to_response(
 			// Fill succeeded but later transaction failed
 			OrderStatus::Failed(TransactionType::PostFill, _)
 			| OrderStatus::Failed(TransactionType::PreClaim, _)
-			| OrderStatus::Failed(TransactionType::Claim, _) => FillTransactionStatus::Executed,
+			| OrderStatus::Failed(TransactionType::Claim, _)
+			| OrderStatus::Failed(TransactionType::Approval, _)
+			| OrderStatus::Failed(TransactionType::Withdrawal, _)
+			| OrderStatus::Failed(TransactionType::Bridge, _)
+			| OrderStatus::Failed(TransactionType::Pusher, _) => FillTransactionStatus::Executed,
 		};
 
 		FillTransactionInfo {
@@ -981,6 +985,22 @@ mod tests {
 			),
 			(
 				OrderStatus::Failed(TransactionType::Claim, "Claim failed".to_string()),
+				FillTransactionStatus::Executed,
+			),
+			(
+				OrderStatus::Failed(TransactionType::Approval, "Approval failed".to_string()),
+				FillTransactionStatus::Executed,
+			),
+			(
+				OrderStatus::Failed(TransactionType::Withdrawal, "Withdrawal failed".to_string()),
+				FillTransactionStatus::Executed,
+			),
+			(
+				OrderStatus::Failed(TransactionType::Bridge, "Bridge failed".to_string()),
+				FillTransactionStatus::Executed,
+			),
+			(
+				OrderStatus::Failed(TransactionType::Pusher, "Pusher failed".to_string()),
 				FillTransactionStatus::Executed,
 			),
 		];

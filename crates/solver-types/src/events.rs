@@ -297,6 +297,14 @@ pub enum TransactionType {
 	PreClaim,
 	/// Transaction that claims rewards on the origin chain.
 	Claim,
+	/// ERC-20 approval submitted by token management/admin flows.
+	Approval,
+	/// Native or ERC-20 withdrawal submitted by admin flows.
+	Withdrawal,
+	/// Solver-owned bridge or rebalance transaction.
+	Bridge,
+	/// Solver-owned block-buffer pusher transaction.
+	Pusher,
 }
 
 #[cfg(test)]

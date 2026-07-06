@@ -1262,6 +1262,8 @@ mod tests {
 				gas_buffer: rust_decimal::Decimal::new(4, 3), // 0.004
 				settlement_fee: rust_decimal::Decimal::ZERO,
 				settlement_fee_buffer: rust_decimal::Decimal::ZERO,
+				l1_data_fee: rust_decimal::Decimal::ZERO,
+				l1_data_fee_buffer: rust_decimal::Decimal::ZERO,
 				rate_buffer: rust_decimal::Decimal::ZERO,
 				base_price: rust_decimal::Decimal::ZERO,
 				min_profit: rust_decimal::Decimal::new(5, 0), // 5.0

@@ -225,6 +225,18 @@ impl JwtService {
 		&self,
 		refresh_token: &str,
 	) -> Result<(String, String, JwtClaims), AuthError> {
+		self.refresh_access_token_with_scopes(refresh_token, None)
+			.await
+	}
+
+	/// Decodes a refresh token and verifies it is refresh-typed, returning its
+	/// claims without minting new tokens.
+	///
+	/// Used by the refresh endpoint to inspect the embedded scope/subject so it
+	/// can re-validate admin-scoped tokens against the LIVE admin whitelist
+	/// before issuing a replacement — closing the gap where a removed or
+	/// demoted admin could keep self-renewing access by copying stale claims.
+	pub fn decode_refresh_claims(&self, refresh_token: &str) -> Result<JwtClaims, AuthError> {
 		let claims = self.decode_claims(refresh_token, |msg| {
 			AuthError::InvalidRefreshToken(msg.to_string())
 		})?;
@@ -235,6 +247,28 @@ impl JwtService {
 			));
 		}
 
+		Ok(claims)
+	}
+
+	/// Like [`refresh_access_token`], but allows the caller to override the
+	/// scopes minted into the new tokens.
+	///
+	/// When `scope_override` is `Some`, the provided scopes are used instead of
+	/// the scopes embedded in the refresh token. The refresh endpoint passes a
+	/// freshly-resolved scope for admin tokens (re-derived from the live
+	/// whitelist) so a demoted admin's refreshed token carries the reduced
+	/// scope rather than the stale embedded one. `None` preserves the legacy
+	/// behavior of copying the embedded scopes (used for non-admin client
+	/// tokens).
+	pub async fn refresh_access_token_with_scopes(
+		&self,
+		refresh_token: &str,
+		scope_override: Option<Vec<AuthScope>>,
+	) -> Result<(String, String, JwtClaims), AuthError> {
+		let claims = self.decode_refresh_claims(refresh_token)?;
+
+		let scopes = scope_override.unwrap_or(claims.scope);
+
 		// Build access-token claims once and use them for both the encoded
 		// token and the response body — see `build_access_claims` for why.
 		let access_ttl = self
@@ -242,13 +276,11 @@ impl JwtService {
 			.access_token_expiry_hours
 			.saturating_mul(3600)
 			.max(1);
-		let access_claims = self.build_access_claims(&claims.sub, claims.scope.clone(), access_ttl);
+		let access_claims = self.build_access_claims(&claims.sub, scopes.clone(), access_ttl);
 		let access_token = self.encode_claims(&access_claims)?;
 
 		// Generate new refresh token (token rotation for security)
-		let new_refresh_token = self
-			.generate_refresh_token(&claims.sub, claims.scope)
-			.await?;
+		let new_refresh_token = self.generate_refresh_token(&claims.sub, scopes).await?;
 
 		Ok((access_token, new_refresh_token, access_claims))
 	}

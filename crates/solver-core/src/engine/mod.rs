@@ -14,12 +14,19 @@ pub mod startup_readiness;
 pub mod token_manager;
 
 use self::{
+	context::ContextBuilder,
 	cost_profit::CostProfitService,
 	startup_readiness::{SharedStartupReadiness, StartupReadiness},
 	token_manager::TokenManager,
 };
-use crate::handlers::{IntentHandler, OrderHandler, SettlementHandler, TransactionHandler};
-use crate::recovery::RecoveryService;
+use crate::handlers::{
+	compact_reservation::release_compact_reservations, IntentHandler, OrderHandler,
+	SettlementHandler, TransactionHandler,
+};
+use crate::order_preparation::order_requires_preparation;
+use crate::order_rehydration::intent_from_order;
+use crate::recovery::{ReconcileResult, RecoveryService};
+use crate::state::order::is_terminal_status;
 use crate::state::transaction_attempt::TransactionAttemptStore;
 use crate::state::OrderStateMachine;
 use alloy_primitives::hex;
@@ -32,8 +39,9 @@ use solver_pricing::PricingService;
 use solver_settlement::SettlementService;
 use solver_storage::StorageService;
 use solver_types::{
-	truncate_id, Address, DeliveryEvent, Intent, Order, OrderEvent, SettlementEvent, SolverEvent,
-	StorageKey, TransactionType,
+	standards::eip7683::Eip7683OrderData, truncate_id, with_0x_prefix, Address, DeliveryEvent,
+	ExecutionDecision, Intent, Order, OrderEvent, SettlementEvent, SolverEvent, StorageKey,
+	TransactionType,
 };
 use std::future::Future;
 use std::sync::Arc;
@@ -43,6 +51,23 @@ use tokio::sync::{mpsc, RwLock, Semaphore};
 use tracing::instrument;
 
 const INTENT_QUEUE_CAPACITY: usize = 1024;
+
+/// Upper bound on handler tasks that have been spawned but not yet completed.
+///
+/// `spawn_handler` acquires one of these permits BEFORE `tokio::spawn` and the
+/// spawned task holds it for its whole lifetime. This caps the number of
+/// in-flight (including parked) handler tasks, so a bounded intake — the H-09
+/// intent queue / event bus — cannot be drained into unlimited parked
+/// semaphore-waiter tasks (unbounded memory growth).
+///
+/// Sized to match `INTENT_QUEUE_CAPACITY`: the queue can hold at most that many
+/// pending items, so allowing the same number of concurrent handlers means the
+/// common path never blocks on this bound — backpressure only engages at true
+/// saturation. It is far above the single-permit `transaction_semaphore`, so a
+/// merely contended transaction permit never blocks dispatch (preserving the
+/// M-13 property that a held transaction permit cannot stall the event loop).
+const MAX_INFLIGHT_HANDLERS: usize = INTENT_QUEUE_CAPACITY;
+const DEFERRED_RETRY_RECONCILE_UNKNOWN_DELAY: Duration = Duration::from_secs(60);
 
 /// Errors that can occur during engine operations.
 ///
@@ -163,6 +188,8 @@ fn settlement_failure_policy(
 			},
 			SettlementServiceError::ProverUnavailable(_) => SettlementFailurePolicy::RetryLater,
 			SettlementServiceError::SlotDerivationMismatch => SettlementFailurePolicy::FailOrder,
+			SettlementServiceError::BackendUnavailable(_) => SettlementFailurePolicy::RetryLater,
+			SettlementServiceError::StorageUnavailable(_) => SettlementFailurePolicy::RetryLater,
 		},
 		SettlementError::Storage(_) | SettlementError::Service(_) | SettlementError::State(_) => {
 			SettlementFailurePolicy::FailOrder
@@ -416,6 +443,12 @@ impl SolverEngine {
 		let transaction_semaphore = Arc::new(Semaphore::new(1)); // Serialize transaction submissions
 		let general_semaphore = Arc::new(Semaphore::new(100)); // Allow concurrent non-tx operations
 
+		// Bounds the number of spawned-but-not-yet-completed handler tasks. Each
+		// `spawn_handler` call acquires a permit before spawning and holds it for
+		// the task's lifetime, so a bounded intake cannot fan out into unlimited
+		// parked semaphore-waiter tasks. See `MAX_INFLIGHT_HANDLERS`.
+		let dispatch_semaphore = Arc::new(Semaphore::new(MAX_INFLIGHT_HANDLERS));
+
 		let rebalance_handle = if let Some(bridge_service) = &self.bridge_service {
 			// Rebalance preflight: cross-check operator-declared route data
 			// against on-chain state before starting the monitor. Catches wrong
@@ -576,13 +609,12 @@ impl SolverEngine {
 			tokio::select! {
 				// Handle discovered intents
 				Some(intent) = intent_rx.recv() => {
-					self.spawn_handler(&general_semaphore, move |engine| async move {
+					self.spawn_handler(&dispatch_semaphore, &general_semaphore, move |engine| async move {
 						if let Err(e) = engine.intent_handler.handle(intent).await {
 							return Err(EngineError::Service(format!("Failed to handle intent: {e}")));
 						}
 						Ok(())
-					})
-					.await;
+					}).await;
 				}
 
 				// Handle events
@@ -590,7 +622,7 @@ impl SolverEngine {
 					match event {
 						SolverEvent::Order(OrderEvent::Preparing { intent, order, params }) => {
 							// Preparing sends a prepare transaction - use transaction semaphore
-							self.spawn_handler(&transaction_semaphore, move |engine| async move {
+							self.spawn_handler(&dispatch_semaphore, &transaction_semaphore, move |engine| async move {
 								let order_id = order.id.clone();
 								if let Err(e) = engine.order_handler.handle_preparation(intent.source, order, params).await {
 									let error_msg = format!("Failed to handle order preparation: {e}");
@@ -604,8 +636,7 @@ impl SolverEngine {
 									return Err(EngineError::Service(error_msg));
 								}
 								Ok(())
-							})
-							.await;
+							}).await;
 						}
 						SolverEvent::Order(OrderEvent::Executing { order, params }) => {
 							tracing::info!(
@@ -614,7 +645,7 @@ impl SolverEngine {
 								"Handling order execution event"
 							);
 							// Executing sends a fill transaction - use transaction semaphore
-							self.spawn_handler(&transaction_semaphore, move |engine| async move {
+							self.spawn_handler(&dispatch_semaphore, &transaction_semaphore, move |engine| async move {
 								let order_id = order.id.clone();
 								if let Err(e) = engine.order_handler.handle_execution(order, params).await {
 									let error_msg = format!("Failed to handle order execution: {e}");
@@ -628,8 +659,10 @@ impl SolverEngine {
 									return Err(EngineError::Service(error_msg));
 								}
 								Ok(())
-							})
-							.await;
+							}).await;
+						}
+						SolverEvent::Order(OrderEvent::Deferred { order_id, retry_after }) => {
+							self.spawn_delayed_deferred_retry(&dispatch_semaphore, order_id, retry_after);
 						}
 
 						SolverEvent::Delivery(DeliveryEvent::TransactionPending { order_id, tx_hash, tx_type, tx_chain_id: _ }) => {
@@ -650,7 +683,7 @@ impl SolverEngine {
 							);
 							// Confirmation handling doesn't directly send transactions - use general semaphore
 							// Note: This may trigger OrderEvent::Executing which will be serialized separately
-							self.spawn_handler(&general_semaphore, move |engine| async move {
+							self.spawn_handler(&dispatch_semaphore, &general_semaphore, move |engine| async move {
 								let order_id_clone = order_id.clone();
 								match engine.transaction_handler.handle_confirmed(order_id, tx_hash, tx_type, receipt).await {
 									Ok(()) => Ok(()),
@@ -674,8 +707,7 @@ impl SolverEngine {
 										Err(EngineError::Service(error_msg))
 									}
 								}
-							})
-							.await;
+							}).await;
 						}
 
 						SolverEvent::Delivery(DeliveryEvent::TransactionFailed { order_id, tx_hash, tx_type, error }) => {
@@ -687,13 +719,12 @@ impl SolverEngine {
 								"Transaction failed"
 							);
 							// Failure handling doesn't send transactions - use general semaphore
-							self.spawn_handler(&general_semaphore, move |engine| async move {
+							self.spawn_handler(&dispatch_semaphore, &general_semaphore, move |engine| async move {
 								if let Err(e) = engine.transaction_handler.handle_failed(order_id, tx_hash, tx_type, error).await {
 									return Err(EngineError::Service(format!("Failed to handle transaction failure: {e}")));
 								}
 								Ok(())
-							})
-							.await;
+							}).await;
 						}
 
 						// Handle PostFillReady - use settlement handler
@@ -703,7 +734,7 @@ impl SolverEngine {
 								order_id = %order_id,
 								"Handling post-fill readiness event"
 							);
-							self.spawn_handler(&transaction_semaphore, move |engine| async move {
+							self.spawn_handler(&dispatch_semaphore, &transaction_semaphore, move |engine| async move {
 								let order_id_clone = order_id.clone();
 								if let Err(e) = engine.settlement_handler.handle_post_fill_ready(order_id).await {
 									return engine.handle_settlement_stage_error(
@@ -714,13 +745,12 @@ impl SolverEngine {
 									).await;
 								}
 								Ok(())
-							})
-							.await;
+							}).await;
 						}
 
 						// Handle PreClaimReady - use settlement handler
 						SolverEvent::Settlement(SettlementEvent::PreClaimReady { order_id }) => {
-							self.spawn_handler(&transaction_semaphore, move |engine| async move {
+							self.spawn_handler(&dispatch_semaphore, &transaction_semaphore, move |engine| async move {
 								let order_id_clone = order_id.clone();
 								if let Err(e) = engine.settlement_handler.handle_pre_claim_ready(order_id).await {
 									return engine.handle_settlement_stage_error(
@@ -731,8 +761,7 @@ impl SolverEngine {
 									).await;
 								}
 								Ok(())
-							})
-							.await;
+							}).await;
 						}
 
 						// Handle StartMonitoring - spawn settlement monitor
@@ -760,7 +789,7 @@ impl SolverEngine {
 								let mut batch = std::mem::take(&mut claim_batch);
 								claim_batch.clear();
 								// Claim sends a transaction - use transaction semaphore
-								self.spawn_handler(&transaction_semaphore, move |engine| async move {
+								self.spawn_handler(&dispatch_semaphore, &transaction_semaphore, move |engine| async move {
 									if let Err(e) = engine.settlement_handler.process_claim_batch(&mut batch).await {
 										return engine.handle_settlement_stage_error(
 											&e.order_id,
@@ -770,8 +799,7 @@ impl SolverEngine {
 										).await;
 									}
 									Ok(())
-								})
-								.await;
+								}).await;
 							}
 						}
 
@@ -955,30 +983,355 @@ impl SolverEngine {
 
 	/// Helper method to spawn handler tasks with semaphore-based concurrency control.
 	///
-	/// This method:
-	/// 1. Acquires a permit from the semaphore to limit concurrent tasks
-	/// 2. Clones the engine and spawns the handler in a new task
-	/// 3. Handles errors by logging them appropriately
-	async fn spawn_handler<F, Fut>(&self, semaphore: &Arc<Semaphore>, handler: F)
-	where
+	/// Two semaphores cooperate here, with distinct responsibilities:
+	///
+	/// * `dispatch` (capacity `MAX_INFLIGHT_HANDLERS`) — acquired BEFORE
+	///   `tokio::spawn` and held for the spawned task's whole lifetime. This
+	///   bounds the number of spawned-but-not-yet-completed handler tasks, so a
+	///   bounded intake (the H-09 intent queue / event bus) cannot be drained
+	///   into unlimited parked waiter tasks (unbounded memory growth, M-13
+	///   regression). Sized well above the single transaction permit, so the
+	///   common path finds a permit immediately and this `.await` does not park
+	///   the event loop; the loop only blocks here at TRUE saturation.
+	/// * `semaphore` (the per-event-type `transaction_semaphore` /
+	///   `general_semaphore`) — acquired INSIDE the spawned task, so a merely
+	///   contended transaction permit can no longer park the `select!` event loop
+	///   (the original M-13 fix). This serializes nonce allocation on the
+	///   single-permit `transaction_semaphore` via mutual exclusion; ordering
+	///   among already-spawned waiters becomes tokio's fair acquisition queue
+	///   rather than event-arrival order, which is acceptable because nonce
+	///   allocation only requires mutual exclusion, not a specific order.
+	///
+	/// Net effect: bounded in-flight memory WITHOUT reintroducing the per-event
+	/// stall — backpressure engages only when `MAX_INFLIGHT_HANDLERS` tasks are
+	/// already in flight, not on every contended single transaction permit.
+	/// Handler errors are logged.
+	async fn spawn_handler<F, Fut>(
+		&self,
+		dispatch: &Arc<Semaphore>,
+		semaphore: &Arc<Semaphore>,
+		handler: F,
+	) where
 		F: FnOnce(SolverEngine) -> Fut + Send + 'static,
 		Fut: Future<Output = Result<(), EngineError>> + Send,
 	{
 		let engine = self.clone();
-		match semaphore.clone().acquire_owned().await {
-			Ok(permit) => {
-				tokio::spawn(async move {
+		let semaphore = semaphore.clone();
+
+		// Acquire the dispatch permit BEFORE spawning. This bounds the number of
+		// spawned-but-not-yet-completed handler tasks to the dispatch capacity
+		// (`MAX_INFLIGHT_HANDLERS`), so a bounded intake cannot be drained into
+		// unlimited parked semaphore-waiter tasks (the H-09 memory-exhaustion
+		// concern). Under normal load a permit is immediately available, so this
+		// `.await` completes synchronously and does NOT park the event loop;
+		// crucially, a merely contended single transaction permit never consumes
+		// a dispatch permit at acquisition time, so it cannot stall dispatch
+		// (preserving the M-13 property). The loop only blocks here at TRUE
+		// saturation — `MAX_INFLIGHT_HANDLERS` tasks already in flight — which is
+		// correct, bounded backpressure rather than the original per-event stall.
+		let dispatch_permit = match dispatch.clone().acquire_owned().await {
+			Ok(permit) => permit,
+			Err(e) => {
+				tracing::error!("Failed to acquire dispatch permit: {}", e);
+				return;
+			},
+		};
+
+		tokio::spawn(async move {
+			// Hold the dispatch permit for the whole task lifetime; it is
+			// released on completion, freeing a slot for the next dispatch.
+			let _dispatch_permit = dispatch_permit;
+			match semaphore.acquire_owned().await {
+				Ok(permit) => {
 					let _permit = permit; // Keep permit alive for duration of task
 					if let Err(e) = handler(engine).await {
 						tracing::error!("Handler error: {}", e);
 					}
-				});
+				},
+				Err(e) => {
+					tracing::error!("Failed to acquire semaphore permit: {}", e);
+				},
+			}
+		});
+	}
+
+	fn spawn_delayed_deferred_retry(
+		&self,
+		dispatch: &Arc<Semaphore>,
+		order_id: String,
+		retry_after: Duration,
+	) {
+		let engine = self.clone();
+		let dispatch = dispatch.clone();
+		tokio::spawn(async move {
+			tokio::time::sleep(retry_after).await;
+
+			let dispatch_permit = match dispatch.acquire_owned().await {
+				Ok(permit) => permit,
+				Err(e) => {
+					tracing::error!(
+						"Failed to acquire dispatch permit for deferred retry: {}",
+						e
+					);
+					return;
+				},
+			};
+
+			tokio::spawn(async move {
+				let _dispatch_permit = dispatch_permit;
+				if let Err(e) = engine.retry_deferred_order_once(&order_id).await {
+					tracing::error!(
+						order_id = %order_id,
+						error = %e,
+						"Deferred order retry failed"
+					);
+				}
+			});
+		});
+	}
+
+	async fn retry_deferred_order_once(&self, order_id: &str) -> Result<(), EngineError> {
+		let order: Order = match self
+			.storage
+			.retrieve(StorageKey::Orders.as_str(), order_id)
+			.await
+		{
+			Ok(order) => order,
+			Err(solver_storage::StorageError::NotFound(_)) => {
+				tracing::debug!(
+					order_id = %order_id,
+					"Deferred retry skipped because order is no longer stored"
+				);
+				return Ok(());
 			},
 			Err(e) => {
-				tracing::error!("Failed to acquire semaphore permit: {}", e);
+				return Err(EngineError::Service(format!(
+					"Failed to retrieve deferred order {order_id}: {e}"
+				)));
+			},
+		};
+
+		if is_terminal_status(&order.status) {
+			return Ok(());
+		}
+		if deferred_order_deadline_elapsed(&order, solver_types::current_timestamp()) {
+			return self
+				.skip_deferred_order(order, "Deferred order reached fill deadline".to_string())
+				.await;
+		}
+
+		let Some(intent) = intent_from_order(&order) else {
+			return self
+				.skip_deferred_order(
+					order,
+					"Deferred order cannot be rehydrated for retry".to_string(),
+				)
+				.await;
+		};
+
+		let attempt_store = Arc::new(TransactionAttemptStore::new(self.storage.clone()));
+		let recovery = RecoveryService::new(
+			self.storage.clone(),
+			self.state_machine.clone(),
+			self.delivery.clone(),
+			self.settlement.clone(),
+			self.event_bus.clone(),
+			attempt_store,
+			Arc::new(self.static_config.networks.clone()),
+		);
+		let (order, result) = match recovery.reconcile_with_blockchain(&order).await {
+			Ok(result) => result,
+			Err(e) => {
+				tracing::warn!(
+					order_id = %order.id,
+					error = %e,
+					"Deferred retry reconciliation failed; scheduling another retry"
+				);
+				return self
+					.republish_deferred_or_skip(order, DEFERRED_RETRY_RECONCILE_UNKNOWN_DELAY)
+					.await;
+			},
+		};
+
+		match result {
+			ReconcileResult::NeedsPrepare | ReconcileResult::NeedsExecution => {
+				if order.execution_params.is_some() {
+					return self
+						.publish_recovery_event_or_skip_expired(order, result, &recovery)
+						.await;
+				}
+			},
+			ReconcileResult::Unknown => {
+				return self
+					.republish_deferred_or_skip(order, DEFERRED_RETRY_RECONCILE_UNKNOWN_DELAY)
+					.await;
+			},
+			ReconcileResult::NeedsFill
+			| ReconcileResult::NeedsPostFill
+			| ReconcileResult::NeedsMonitoring
+			| ReconcileResult::NeedsPreClaim { .. }
+			| ReconcileResult::NeedsClaim { .. }
+			| ReconcileResult::Failed(_)
+			| ReconcileResult::Finalized => {
+				recovery.publish_recovery_event(order, result).await;
+				return Ok(());
 			},
 		}
+
+		if deferred_order_deadline_elapsed(&order, solver_types::current_timestamp()) {
+			return self
+				.skip_deferred_order(order, "Deferred order reached fill deadline".to_string())
+				.await;
+		}
+
+		let context = ContextBuilder::new(
+			self.delivery.clone(),
+			self.solver_address.clone(),
+			self.token_manager.clone(),
+			self.dynamic_config.read().await.clone(),
+		)
+		.build_execution_context(&intent)
+		.await
+		.map_err(|e| EngineError::Service(format!("Failed to build execution context: {e}")))?;
+
+		match self.order.should_execute(&order, &context).await {
+			ExecutionDecision::Execute(params) => {
+				let updated_order = self
+					.state_machine
+					.set_execution_params(&order.id, params.clone())
+					.await
+					.map_err(|e| {
+						EngineError::Service(format!(
+							"Failed to persist execution params for deferred order {}: {e}",
+							order.id
+						))
+					})?;
+
+				if order_requires_preparation(&updated_order)
+					&& updated_order.prepare_tx_hash.is_none()
+				{
+					self.event_bus
+						.publish(SolverEvent::Order(OrderEvent::Preparing {
+							intent,
+							order: updated_order,
+							params,
+						}))
+						.ok();
+				} else {
+					self.event_bus
+						.publish(SolverEvent::Order(OrderEvent::Executing {
+							order: updated_order,
+							params,
+						}))
+						.ok();
+				}
+				Ok(())
+			},
+			ExecutionDecision::Defer(retry_after) => {
+				self.republish_deferred_or_skip(order, retry_after).await
+			},
+			ExecutionDecision::Skip(reason) => self.skip_deferred_order(order, reason).await,
+		}
 	}
+
+	async fn publish_recovery_event_or_skip_expired(
+		&self,
+		order: Order,
+		result: ReconcileResult,
+		recovery: &RecoveryService,
+	) -> Result<(), EngineError> {
+		if deferred_order_deadline_elapsed(&order, solver_types::current_timestamp()) {
+			return self
+				.skip_deferred_order(order, "Deferred order reached fill deadline".to_string())
+				.await;
+		}
+
+		recovery.publish_recovery_event(order, result).await;
+		Ok(())
+	}
+
+	async fn republish_deferred_or_skip(
+		&self,
+		order: Order,
+		retry_after: Duration,
+	) -> Result<(), EngineError> {
+		if deferred_retry_would_miss_deadline(
+			&order,
+			retry_after,
+			solver_types::current_timestamp(),
+		) {
+			self.skip_deferred_order(order, "Deferred retry would miss fill deadline".to_string())
+				.await
+		} else {
+			self.event_bus
+				.publish(SolverEvent::Order(OrderEvent::Deferred {
+					order_id: order.id,
+					retry_after,
+				}))
+				.ok();
+			Ok(())
+		}
+	}
+
+	async fn skip_deferred_order(&self, order: Order, reason: String) -> Result<(), EngineError> {
+		self.event_bus
+			.publish(SolverEvent::Order(OrderEvent::Skipped {
+				order_id: order.id.clone(),
+				reason,
+			}))
+			.ok();
+		release_compact_reservations(
+			&self.state_machine.compact_reservations(),
+			&order,
+			"deferred retry skip",
+		)
+		.await;
+		remove_if_present(
+			&self.storage,
+			StorageKey::Orders.as_str(),
+			&order.id,
+			"order",
+		)
+		.await?;
+		let intent_id = with_0x_prefix(&order.id);
+		remove_if_present(
+			&self.storage,
+			StorageKey::Intents.as_str(),
+			&intent_id,
+			"intent",
+		)
+		.await?;
+		Ok(())
+	}
+}
+
+async fn remove_if_present(
+	storage: &StorageService,
+	namespace: &str,
+	id: &str,
+	label: &str,
+) -> Result<(), EngineError> {
+	match storage.remove(namespace, id).await {
+		Ok(()) | Err(solver_storage::StorageError::NotFound(_)) => Ok(()),
+		Err(e) => Err(EngineError::Service(format!(
+			"Failed to remove deferred {label} {id}: {e}"
+		))),
+	}
+}
+
+fn deferred_retry_deadline(order: &Order) -> Option<u64> {
+	let order_data: Eip7683OrderData = serde_json::from_value(order.data.clone()).ok()?;
+	Some(u64::from(order_data.fill_deadline).min(u64::from(order_data.expires)))
+}
+
+fn deferred_order_deadline_elapsed(order: &Order, now: u64) -> bool {
+	deferred_retry_deadline(order).is_some_and(|deadline| now >= deadline)
+}
+
+fn deferred_retry_would_miss_deadline(order: &Order, retry_after: Duration, now: u64) -> bool {
+	deferred_retry_deadline(order).is_some_and(|deadline| {
+		now >= deadline || now.saturating_add(retry_after.as_secs()) >= deadline
+	})
 }
 
 #[cfg(test)]
@@ -987,13 +1340,21 @@ mod tests {
 	use crate::engine::event_bus::EventBus;
 	use solver_account::AccountService;
 	use solver_config::{Config, ConfigBuilder};
-	use solver_delivery::{DeliveryError, DeliveryService, InsufficientNativeGasInfo};
+	use solver_delivery::{
+		DeliveryError, DeliveryInterface, DeliveryService, InsufficientNativeGasInfo,
+		MockDeliveryInterface,
+	};
 	use solver_discovery::DiscoveryService;
-	use solver_order::OrderService;
+	use solver_order::{MockExecutionStrategy, OrderService};
 	use solver_settlement::SettlementService;
 	use solver_storage::StorageService;
-	use solver_types::utils::tests::builders::OrderBuilder;
-	use solver_types::{Address, OrderStatus, TransactionType};
+	use solver_types::{
+		standards::eip7683::{Eip7683OrderData, LockType},
+		utils::tests::builders::{
+			Eip7683OrderDataBuilder, NetworkConfigBuilder, NetworksConfigBuilder, OrderBuilder,
+		},
+		Address, ExecutionParams, OrderStatus, TransactionType,
+	};
 	use std::sync::Arc;
 	use tokio::sync::Semaphore;
 
@@ -1259,13 +1620,146 @@ mod tests {
 		);
 
 		let semaphore = Arc::new(Semaphore::new(1));
+		let dispatch = Arc::new(Semaphore::new(64));
 
 		// Test handler that returns an error - should be logged but not panic
 		engine
-			.spawn_handler(&semaphore, move |_engine| async move {
+			.spawn_handler(&dispatch, &semaphore, move |_engine| async move {
 				Err(EngineError::Service("Test error".to_string()))
 			})
 			.await;
+	}
+
+	/// M-13: dispatching a second handler must not block the event loop while a
+	/// contended permit is held. The `transaction_semaphore` is `Semaphore::new(1)`
+	/// to serialize nonce allocation; if the permit is acquired INLINE (before the
+	/// spawn) then a second tx event parks the whole `select!` loop until the
+	/// in-flight handler releases the permit. Permit acquisition must therefore
+	/// happen INSIDE the spawned task, so `spawn_handler` returns immediately.
+	#[tokio::test]
+	async fn spawn_handler_does_not_block_when_permit_contended() {
+		let engine = create_test_engine().await;
+
+		// Single-permit semaphore mirrors the transaction_semaphore.
+		let semaphore = Arc::new(Semaphore::new(1));
+		// Ample dispatch capacity so the M-13 dispatch path under test never
+		// parks on dispatch backpressure — we are isolating the transaction
+		// permit contention, not the saturation bound.
+		let dispatch = Arc::new(Semaphore::new(64));
+
+		// Hold the only permit for the duration of the dispatch under test.
+		let held = semaphore.clone().acquire_owned().await.unwrap();
+
+		// Signals when the spawned handler actually begins executing.
+		let (ran_tx, mut ran_rx) = tokio::sync::oneshot::channel::<()>();
+
+		// Dispatching a handler must return promptly even though no transaction
+		// permit is available — the spawned task waits for the permit, the caller
+		// does not. If transaction-permit acquisition happened INLINE (pre-fix),
+		// this call would block the caller until `held` is released, so the
+		// timeout below would elapse.
+		tokio::time::timeout(std::time::Duration::from_secs(2), async {
+			engine
+				.spawn_handler(&dispatch, &semaphore, move |_engine| async move {
+					let _ = ran_tx.send(());
+					Ok(())
+				})
+				.await;
+		})
+		.await
+		.expect("spawn_handler must dispatch without blocking on a contended permit");
+
+		// While the permit is held the spawned handler must NOT have run — it is
+		// parked on the semaphore inside its own task, not in the caller.
+		assert!(
+			matches!(
+				ran_rx.try_recv(),
+				Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+			),
+			"handler must not run while the permit is held",
+		);
+
+		// Releasing the permit lets the queued task acquire it and run, proving
+		// serialization is preserved (mutual exclusion via the semaphore).
+		drop(held);
+		tokio::time::timeout(std::time::Duration::from_secs(2), ran_rx)
+			.await
+			.expect("handler must run once the permit is released")
+			.expect("handler completion signal");
+	}
+
+	/// M-13 regression: the number of spawned-but-not-yet-completed handler
+	/// tasks must be bounded by the dispatch semaphore capacity, even when a
+	/// held transaction permit keeps every handler parked.
+	///
+	/// Without a bound, a bounded intake (the H-09 intent queue / event bus) can
+	/// be drained into UNLIMITED parked semaphore-waiter tasks → unbounded
+	/// memory growth. With a dispatch permit acquired BEFORE `tokio::spawn`, the
+	/// `(cap + 1)`th dispatch must block until an earlier in-flight task
+	/// completes — so no more than `cap` tasks are ever live at once.
+	#[tokio::test]
+	async fn spawn_handler_bounds_inflight_tasks() {
+		use std::sync::atomic::{AtomicUsize, Ordering};
+
+		let engine = create_test_engine().await;
+
+		// Tiny dispatch capacity so we can saturate it cheaply.
+		const CAP: usize = 2;
+		let dispatch = Arc::new(Semaphore::new(CAP));
+
+		// Single-permit transaction semaphore, held for the whole test so every
+		// spawned handler parks on it and therefore never releases its dispatch
+		// permit. This is the worst case for memory: maximal parked waiters.
+		let tx_semaphore = Arc::new(Semaphore::new(1));
+		let held = tx_semaphore.clone().acquire_owned().await.unwrap();
+
+		// Counts handler tasks that have actually been spawned (dispatched).
+		let dispatched = Arc::new(AtomicUsize::new(0));
+
+		// Drive far more dispatches than the cap from a background task. Each
+		// `spawn_handler` call acquires a dispatch permit before spawning; once
+		// CAP permits are held by parked tasks, further calls must block here.
+		let n = CAP * 8;
+		let driver = {
+			let engine = engine.clone();
+			let dispatch = dispatch.clone();
+			let tx_semaphore = tx_semaphore.clone();
+			let dispatched = dispatched.clone();
+			tokio::spawn(async move {
+				for _ in 0..n {
+					let dispatched = dispatched.clone();
+					engine
+						.spawn_handler(&dispatch, &tx_semaphore, move |_engine| async move {
+							dispatched.fetch_add(1, Ordering::SeqCst);
+							Ok(())
+						})
+						.await;
+				}
+			})
+		};
+
+		// Give the driver ample time to run as far as it can. Pre-fix (no bound)
+		// it dispatches all `n` tasks. Post-fix it stalls after `CAP`.
+		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+		let live = dispatched.load(Ordering::SeqCst);
+		assert!(
+			live <= CAP,
+			"in-flight handler tasks must be bounded by the dispatch capacity: \
+			 expected <= {CAP}, observed {live}",
+		);
+		assert!(
+			!driver.is_finished(),
+			"driver must be blocked on the dispatch semaphore, not have dispatched all {n} tasks",
+		);
+
+		// Releasing the transaction permit lets parked tasks complete, freeing
+		// dispatch permits so the driver can finish all `n` dispatches.
+		drop(held);
+		tokio::time::timeout(std::time::Duration::from_secs(5), driver)
+			.await
+			.expect("driver must finish once parked tasks complete")
+			.expect("driver task must not panic");
 	}
 
 	#[test]
@@ -1300,6 +1794,7 @@ mod tests {
 				gas_limit: Some(21_000),
 				max_fee_per_gas: Some(1),
 				gas_price: None,
+				extra_native_fee_wei: "0".to_string(),
 				value_wei: "0".to_string(),
 			},
 		))
@@ -1336,6 +1831,579 @@ mod tests {
 			token_manager,
 			None,
 		)
+	}
+
+	async fn create_test_engine_with_strategy(
+		strategy: Box<dyn solver_order::ExecutionStrategy>,
+	) -> SolverEngine {
+		let (
+			dynamic_config,
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			_order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+		) = create_mock_services().await;
+		let order = Arc::new(OrderService::new(
+			std::collections::HashMap::new(),
+			strategy,
+		));
+
+		SolverEngine::new(
+			dynamic_config,
+			config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+			None,
+		)
+	}
+
+	async fn create_test_engine_with_strategy_delivery_and_config(
+		strategy: Box<dyn solver_order::ExecutionStrategy>,
+		delivery: Arc<DeliveryService>,
+		static_config: Config,
+	) -> SolverEngine {
+		let (
+			_dynamic_config,
+			_config,
+			storage,
+			account,
+			solver_address,
+			_delivery,
+			discovery,
+			_order,
+			settlement,
+			pricing,
+			event_bus,
+			_token_manager,
+		) = create_mock_services().await;
+		let order = Arc::new(OrderService::new(
+			std::collections::HashMap::new(),
+			strategy,
+		));
+		let dynamic_config = Arc::new(RwLock::new(static_config.clone()));
+		let token_manager = Arc::new(TokenManager::new(
+			static_config.networks.clone(),
+			delivery.clone(),
+			account.clone(),
+		));
+
+		SolverEngine::new(
+			dynamic_config,
+			static_config,
+			storage,
+			account,
+			solver_address,
+			delivery,
+			discovery,
+			order,
+			settlement,
+			pricing,
+			event_bus,
+			token_manager,
+			None,
+		)
+	}
+
+	fn config_with_recovery_networks() -> Config {
+		let networks = NetworksConfigBuilder::new()
+			.add_network(1, NetworkConfigBuilder::new().build())
+			.add_network(137, NetworkConfigBuilder::new().build())
+			.build();
+		ConfigBuilder::new().networks(networks).build()
+	}
+
+	fn compact_reservation_for_order(
+		order: &Order,
+	) -> solver_storage::compact_reservations::DepositReservation {
+		let order_data: Eip7683OrderData = serde_json::from_value(order.data.clone()).unwrap();
+		let [token_id, amount] = order_data.inputs[0];
+		solver_storage::compact_reservations::DepositReservation {
+			chain_id: u64::try_from(order_data.origin_chain_id).unwrap(),
+			owner: order_data.user,
+			token_id,
+			amount,
+			available_balance: amount,
+		}
+	}
+
+	fn deferred_order_without_execution_params(
+		lock_type: LockType,
+		seconds_until_deadline: u64,
+	) -> Order {
+		let now = solver_types::current_timestamp();
+		let deadline = now.saturating_add(seconds_until_deadline) as u32;
+		let mut builder = Eip7683OrderDataBuilder::new()
+			.lock_type(lock_type)
+			.raw_order_data("0x1234")
+			.expires(deadline)
+			.fill_deadline(deadline);
+		if matches!(lock_type, LockType::Permit2Escrow | LockType::Eip3009Escrow) {
+			builder = builder
+				.sponsor("0x1111111111111111111111111111111111111111")
+				.signature("0xabcdef");
+		}
+		let order_data = builder.build();
+
+		OrderBuilder::new()
+			.with_id("0x1111111111111111111111111111111111111111111111111111111111111111")
+			.with_status(OrderStatus::Pending)
+			.with_data(serde_json::to_value(order_data).unwrap())
+			.with_execution_params(None)
+			.with_prepare_tx_hash(None)
+			.with_fill_tx_hash(None)
+			.with_post_fill_tx_hash(None)
+			.with_pre_claim_tx_hash(None)
+			.with_claim_tx_hash(None)
+			.build()
+	}
+
+	fn test_execution_params() -> ExecutionParams {
+		ExecutionParams {
+			gas_price: alloy_primitives::U256::from(1_000_000_000u64),
+			priority_fee: Some(alloy_primitives::U256::from(1_000_000u64)),
+		}
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_persists_params_and_publishes_preparing_when_strategy_executes() {
+		let params = test_execution_params();
+		let mut strategy = MockExecutionStrategy::new();
+		let expected_params = params.clone();
+		strategy
+			.expect_should_execute()
+			.times(1)
+			.returning(move |_, _| {
+				let params = expected_params.clone();
+				Box::pin(async move { ExecutionDecision::Execute(params) })
+			});
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let order = deferred_order_without_execution_params(LockType::Permit2Escrow, 600);
+		engine.state_machine.store_order(&order).await.unwrap();
+		let mut receiver = engine.event_bus.subscribe();
+
+		engine.retry_deferred_order_once(&order.id).await.unwrap();
+
+		let stored = engine.state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(
+			stored.execution_params.as_ref().unwrap().gas_price,
+			params.gas_price
+		);
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Preparing {
+				intent,
+				order: event_order,
+				params: event_params,
+			}) => {
+				assert_eq!(intent.id, order.id);
+				assert_eq!(event_order.id, order.id);
+				assert_eq!(event_params.gas_price, params.gas_price);
+			},
+			_ => panic!("Expected Order::Preparing event"),
+		}
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_publishes_executing_for_resource_lock_when_strategy_executes() {
+		let params = test_execution_params();
+		let mut strategy = MockExecutionStrategy::new();
+		let expected_params = params.clone();
+		strategy
+			.expect_should_execute()
+			.times(1)
+			.returning(move |_, _| {
+				let params = expected_params.clone();
+				Box::pin(async move { ExecutionDecision::Execute(params) })
+			});
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let order = deferred_order_without_execution_params(LockType::ResourceLock, 600);
+		engine.state_machine.store_order(&order).await.unwrap();
+		let mut receiver = engine.event_bus.subscribe();
+
+		engine.retry_deferred_order_once(&order.id).await.unwrap();
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Executing {
+				order: event_order,
+				params: event_params,
+			}) => {
+				assert_eq!(event_order.id, order.id);
+				assert_eq!(event_params.gas_price, params.gas_price);
+			},
+			_ => panic!("Expected Order::Executing event"),
+		}
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_republishes_execution_when_params_are_already_stored() {
+		let params = test_execution_params();
+		let mut strategy = MockExecutionStrategy::new();
+		strategy.expect_should_execute().times(0);
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let mut order = deferred_order_without_execution_params(LockType::ResourceLock, 600);
+		order.execution_params = Some(params.clone());
+		engine.state_machine.store_order(&order).await.unwrap();
+		let mut receiver = engine.event_bus.subscribe();
+
+		engine.retry_deferred_order_once(&order.id).await.unwrap();
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Executing {
+				order: event_order,
+				params: event_params,
+			}) => {
+				assert_eq!(event_order.id, order.id);
+				assert_eq!(event_params.gas_price, params.gas_price);
+			},
+			_ => panic!("Expected Order::Executing event"),
+		}
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_recovery_publish_skips_when_deadline_elapsed_after_reconcile() {
+		let params = test_execution_params();
+		let mut strategy = MockExecutionStrategy::new();
+		strategy.expect_should_execute().times(0);
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let mut order = deferred_order_without_execution_params(LockType::ResourceLock, 0);
+		order.execution_params = Some(params);
+		engine.state_machine.store_order(&order).await.unwrap();
+		let mut receiver = engine.event_bus.subscribe();
+		let recovery = RecoveryService::new(
+			engine.storage.clone(),
+			engine.state_machine.clone(),
+			engine.delivery.clone(),
+			engine.settlement.clone(),
+			engine.event_bus.clone(),
+			Arc::new(TransactionAttemptStore::new(engine.storage.clone())),
+			Arc::new(engine.static_config.networks.clone()),
+		);
+
+		engine
+			.publish_recovery_event_or_skip_expired(
+				order.clone(),
+				ReconcileResult::NeedsExecution,
+				&recovery,
+			)
+			.await
+			.unwrap();
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Skipped { order_id, reason }) => {
+				assert_eq!(order_id, order.id);
+				assert!(reason.contains("fill deadline"));
+			},
+			_ => panic!("Expected Order::Skipped event"),
+		}
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_republishes_deferred_when_strategy_defers_within_deadline() {
+		let mut strategy = MockExecutionStrategy::new();
+		strategy.expect_should_execute().times(1).returning(|_, _| {
+			Box::pin(async move { ExecutionDecision::Defer(Duration::from_secs(30)) })
+		});
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let order = deferred_order_without_execution_params(LockType::ResourceLock, 600);
+		engine.state_machine.store_order(&order).await.unwrap();
+		let mut receiver = engine.event_bus.subscribe();
+
+		engine.retry_deferred_order_once(&order.id).await.unwrap();
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Deferred {
+				order_id,
+				retry_after,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(retry_after, Duration::from_secs(30));
+			},
+			_ => panic!("Expected Order::Deferred event"),
+		}
+		assert!(engine.state_machine.get_order(&order.id).await.is_ok());
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_republishes_when_reconcile_returns_unknown() {
+		let mut strategy = MockExecutionStrategy::new();
+		strategy.expect_should_execute().times(0);
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_block_number()
+			.with(mockall::predicate::eq(1u64))
+			.times(1)
+			.returning(|_| {
+				Box::pin(async move { Err(DeliveryError::Network("rpc unavailable".to_string())) })
+			});
+		let delivery = Arc::new(DeliveryService::new(
+			std::collections::HashMap::from([(
+				1u64,
+				Arc::new(mock_delivery) as Arc<dyn DeliveryInterface>,
+			)]),
+			1,
+			20,
+			60,
+		));
+		let engine = create_test_engine_with_strategy_delivery_and_config(
+			Box::new(strategy),
+			delivery,
+			config_with_recovery_networks(),
+		)
+		.await;
+		let order = deferred_order_without_execution_params(LockType::ResourceLock, 600);
+		engine.state_machine.store_order(&order).await.unwrap();
+		let mut receiver = engine.event_bus.subscribe();
+
+		engine.retry_deferred_order_once(&order.id).await.unwrap();
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Deferred {
+				order_id,
+				retry_after,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(retry_after, DEFERRED_RETRY_RECONCILE_UNKNOWN_DELAY);
+			},
+			_ => panic!("Expected Order::Deferred event"),
+		}
+		assert!(
+			engine.state_machine.get_order(&order.id).await.is_ok(),
+			"Unknown reconciliation must re-defer, not drop the order"
+		);
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_skips_and_removes_order_and_intent_when_deadline_elapsed() {
+		let mut strategy = MockExecutionStrategy::new();
+		strategy.expect_should_execute().times(0);
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let order = deferred_order_without_execution_params(LockType::ResourceLock, 0);
+		let intent_key = with_0x_prefix(&order.id);
+		engine.state_machine.store_order(&order).await.unwrap();
+		engine
+			.storage
+			.store(
+				StorageKey::Intents.as_str(),
+				&intent_key,
+				&serde_json::json!({"seen": true}),
+				None,
+			)
+			.await
+			.unwrap();
+		let mut receiver = engine.event_bus.subscribe();
+
+		engine.retry_deferred_order_once(&order.id).await.unwrap();
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Skipped { order_id, reason }) => {
+				assert_eq!(order_id, order.id);
+				assert!(reason.contains("deadline"));
+			},
+			_ => panic!("Expected Order::Skipped event"),
+		}
+		assert!(matches!(
+			engine.state_machine.get_order(&order.id).await,
+			Err(crate::state::OrderStateError::Storage(_))
+		));
+		assert!(matches!(
+			engine
+				.storage
+				.retrieve::<serde_json::Value>(StorageKey::Intents.as_str(), &intent_key)
+				.await,
+			Err(solver_storage::StorageError::NotFound(_))
+		));
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_skip_releases_held_compact_reservation() {
+		use solver_storage::compact_reservations::ReservationError;
+
+		let mut strategy = MockExecutionStrategy::new();
+		strategy.expect_should_execute().times(1).returning(|_, _| {
+			Box::pin(async move { ExecutionDecision::Defer(Duration::from_secs(60)) })
+		});
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let order = deferred_order_without_execution_params(LockType::ResourceLock, 30);
+		let deposit = compact_reservation_for_order(&order);
+		let reservations = engine.state_machine.compact_reservations();
+		engine.state_machine.store_order(&order).await.unwrap();
+		reservations
+			.reserve_order(
+				&order.id,
+				solver_types::current_timestamp() + 3600,
+				&[deposit.clone()],
+			)
+			.await
+			.unwrap();
+		let before_skip = reservations
+			.reserve_order(
+				"rl-other-before-skip",
+				solver_types::current_timestamp() + 3600,
+				&[deposit.clone()],
+			)
+			.await
+			.expect_err("held reservation should block a second order before skip");
+		assert!(matches!(
+			before_skip,
+			ReservationError::Oversubscribed { .. }
+		));
+
+		engine.retry_deferred_order_once(&order.id).await.unwrap();
+
+		reservations
+			.reserve_order(
+				"rl-other-after-skip",
+				solver_types::current_timestamp() + 3600,
+				&[deposit],
+			)
+			.await
+			.expect("skip must release the compact reservation for reuse");
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_skips_when_strategy_defer_would_miss_deadline() {
+		let mut strategy = MockExecutionStrategy::new();
+		strategy.expect_should_execute().times(1).returning(|_, _| {
+			Box::pin(async move { ExecutionDecision::Defer(Duration::from_secs(60)) })
+		});
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let order = deferred_order_without_execution_params(LockType::ResourceLock, 30);
+		engine.state_machine.store_order(&order).await.unwrap();
+		let mut receiver = engine.event_bus.subscribe();
+
+		engine.retry_deferred_order_once(&order.id).await.unwrap();
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Skipped { order_id, reason }) => {
+				assert_eq!(order_id, order.id);
+				assert!(reason.contains("deadline"));
+			},
+			_ => panic!("Expected Order::Skipped event"),
+		}
+		assert!(matches!(
+			engine.state_machine.get_order(&order.id).await,
+			Err(crate::state::OrderStateError::Storage(_))
+		));
+	}
+
+	#[tokio::test]
+	async fn deferred_retry_skips_escrow_source_finality_loop_when_next_retry_misses_deadline() {
+		let mut strategy = MockExecutionStrategy::new();
+		strategy.expect_should_execute().times(1).returning(|_, _| {
+			Box::pin(async move { ExecutionDecision::Defer(Duration::from_secs(60)) })
+		});
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let order = deferred_order_without_execution_params(LockType::Permit2Escrow, 30);
+		engine.state_machine.store_order(&order).await.unwrap();
+		let mut receiver = engine.event_bus.subscribe();
+
+		engine.retry_deferred_order_once(&order.id).await.unwrap();
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Skipped { order_id, reason }) => {
+				assert_eq!(order_id, order.id);
+				assert!(reason.contains("Deferred retry would miss fill deadline"));
+			},
+			_ => panic!("Expected Order::Skipped event"),
+		}
+		assert!(matches!(
+			engine.state_machine.get_order(&order.id).await,
+			Err(crate::state::OrderStateError::Storage(_))
+		));
+	}
+
+	#[test]
+	fn deferred_retry_skips_exact_deadline_boundary() {
+		let order_data = Eip7683OrderDataBuilder::new()
+			.origin_chain_id(alloy_primitives::U256::from(1))
+			.lock_type(LockType::Permit2Escrow)
+			.raw_order_data("0x1234")
+			.sponsor("0x1111111111111111111111111111111111111111")
+			.signature("0xabcdef")
+			.expires(165)
+			.fill_deadline(165)
+			.build();
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(order_data).unwrap())
+			.build();
+
+		assert!(!deferred_retry_would_miss_deadline(
+			&order,
+			Duration::from_secs(64),
+			100,
+		));
+		assert!(deferred_retry_would_miss_deadline(
+			&order,
+			Duration::from_secs(65),
+			100,
+		));
+	}
+
+	#[test]
+	fn deferred_retry_does_not_reapply_source_finality_delay() {
+		let order_data = Eip7683OrderDataBuilder::new()
+			.origin_chain_id(alloy_primitives::U256::from(1))
+			.lock_type(LockType::Permit2Escrow)
+			.raw_order_data("0x1234")
+			.sponsor("0x1111111111111111111111111111111111111111")
+			.signature("0xabcdef")
+			.expires(1_300)
+			.fill_deadline(1_300)
+			.build();
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(order_data).unwrap())
+			.build();
+
+		assert!(!deferred_retry_would_miss_deadline(
+			&order,
+			Duration::from_secs(1),
+			100,
+		));
+	}
+
+	#[tokio::test]
+	async fn spawn_delayed_deferred_retry_does_not_hold_dispatch_permit_while_sleeping() {
+		let mut strategy = MockExecutionStrategy::new();
+		strategy.expect_should_execute().times(0);
+		let engine = create_test_engine_with_strategy(Box::new(strategy)).await;
+		let dispatch = Arc::new(Semaphore::new(1));
+
+		engine.spawn_delayed_deferred_retry(
+			&dispatch,
+			"missing-order".to_string(),
+			Duration::from_secs(60),
+		);
+
+		let permit =
+			tokio::time::timeout(Duration::from_millis(100), dispatch.clone().acquire_owned())
+				.await
+				.expect("dispatch permit must remain available while delayed retry sleeps")
+				.expect("dispatch semaphore open");
+		drop(permit);
 	}
 
 	#[test]
@@ -1418,6 +2486,57 @@ mod tests {
 				"expected {error:?} to be permanent"
 			);
 		}
+	}
+
+	#[test]
+	fn settlement_policy_retries_backend_infrastructure_errors() {
+		let errors = vec![
+			crate::handlers::settlement::SettlementError::SettlementService(
+				solver_settlement::SettlementError::BackendUnavailable("rpc down".to_string()),
+			),
+			crate::handlers::settlement::SettlementError::SettlementService(
+				solver_settlement::SettlementError::StorageUnavailable("storage down".to_string()),
+			),
+		];
+
+		for error in errors {
+			for stage in [
+				TransactionType::PostFill,
+				TransactionType::PreClaim,
+				TransactionType::Claim,
+			] {
+				assert_eq!(
+					settlement_failure_policy(stage, &error),
+					SettlementFailurePolicy::RetryLater,
+					"expected {error:?} at {stage:?} to be retryable"
+				);
+			}
+		}
+	}
+
+	#[tokio::test]
+	async fn post_fill_ready_backend_error_leaves_order_retryable() {
+		let engine = create_test_engine().await;
+		let order = OrderBuilder::new()
+			.with_id("post-fill-backend-error-order".to_string())
+			.with_status(OrderStatus::Executed)
+			.build();
+		engine.state_machine.store_order(&order).await.unwrap();
+
+		let result = engine
+			.handle_settlement_stage_error(
+				&order.id,
+				TransactionType::PostFill,
+				"PostFillReady",
+				crate::handlers::settlement::SettlementError::SettlementService(
+					solver_settlement::SettlementError::BackendUnavailable("rpc down".to_string()),
+				),
+			)
+			.await;
+
+		assert!(result.is_err());
+		let stored = engine.state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(stored.status, OrderStatus::Executed);
 	}
 
 	#[tokio::test]

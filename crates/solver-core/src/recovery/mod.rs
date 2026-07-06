@@ -9,19 +9,17 @@ mod chain_evidence;
 use crate::bump::lineage::{lineage_components, lineage_tip};
 use crate::engine::event_bus::EventBus;
 use crate::order_preparation::order_requires_preparation;
-use crate::state::order::{
-	FAILED_STATUS_KIND_INDEX_VALUE, FINALIZED_STATUS_KIND_INDEX_VALUE, STATUS_KIND_INDEX_FIELD,
-};
-use crate::state::transaction_attempt::TransactionAttemptStore;
+use crate::order_rehydration::intent_from_order;
+use crate::state::order::IS_TERMINAL_INDEX_FIELD;
+use crate::state::transaction_attempt::{TransactionAttemptStore, TransactionAttemptStoreError};
 use crate::state::OrderStateMachine;
-use alloy_primitives::hex;
 use solver_delivery::DeliveryService;
 use solver_settlement::{SettlementReadiness, SettlementService};
 use solver_storage::{QueryFilter, StorageService};
 use solver_types::{
-	standards::eip7683::Eip7683OrderData, with_0x_prefix, DeliveryEvent, Intent, IntentMetadata,
-	Order, OrderEvent, OrderStatus, SettlementEvent, SolverEvent, StorageKey, TransactionAttempt,
-	TransactionAttemptStatus, TransactionHash, TransactionReceipt, TransactionType,
+	with_0x_prefix, DeliveryEvent, Intent, Order, OrderEvent, OrderStatus, SettlementEvent,
+	SolverEvent, StorageKey, TransactionAttempt, TransactionAttemptStatus, TransactionHash,
+	TransactionReceipt, TransactionType,
 };
 use std::sync::Arc;
 use thiserror::Error;
@@ -45,7 +43,7 @@ pub enum RecoveryError {
 /// This enum represents the different states an order can be in after
 /// comparing its stored state with the actual blockchain state during recovery.
 #[derive(Debug)]
-enum ReconcileResult {
+pub(crate) enum ReconcileResult {
 	/// Off-chain escrow order needs origin-chain prepare/openFor before fill.
 	NeedsPrepare,
 	/// Order needs initial execution (no transactions yet)
@@ -82,7 +80,13 @@ enum ReconcileResult {
 	Finalized,
 }
 
-fn choose_recovery_attempt_hash(
+/// Returns the hash of a `Confirmed`-lineage attempt for this stage, if any.
+///
+/// A confirmed-lineage hash is **authoritative**: the chain accepted exactly
+/// one transaction for the stage's nonce, and this is its hash. It outranks a
+/// possibly-stale order field, which may still point at a superseded
+/// replacement that confirmed while the solver was down.
+fn confirmed_recovery_attempt_hash(
 	attempts: &[TransactionAttempt],
 	tx_type: TransactionType,
 ) -> Option<TransactionHash> {
@@ -103,6 +107,25 @@ fn choose_recovery_attempt_hash(
 			}
 		}
 	}
+
+	None
+}
+
+fn choose_recovery_attempt_hash(
+	attempts: &[TransactionAttempt],
+	tx_type: TransactionType,
+) -> Option<TransactionHash> {
+	// A confirmed-lineage hash wins over any merely-pending tip.
+	if let Some(hash) = confirmed_recovery_attempt_hash(attempts, tx_type) {
+		return Some(hash);
+	}
+
+	let stage_attempts: Vec<TransactionAttempt> = attempts
+		.iter()
+		.filter(|attempt| attempt.tx_type == tx_type)
+		.cloned()
+		.collect();
+	let components = lineage_components(&stage_attempts);
 
 	components
 		.iter()
@@ -128,6 +151,10 @@ fn order_stage_hash(order: &Order, tx_type: TransactionType) -> Option<Transacti
 		TransactionType::PostFill => order.post_fill_tx_hash.clone(),
 		TransactionType::PreClaim => order.pre_claim_tx_hash.clone(),
 		TransactionType::Claim => order.claim_tx_hash.clone(),
+		TransactionType::Approval
+		| TransactionType::Withdrawal
+		| TransactionType::Bridge
+		| TransactionType::Pusher => None,
 	}
 }
 
@@ -150,6 +177,10 @@ fn set_order_stage_hash(order: &mut Order, tx_type: TransactionType, tx_hash: Tr
 		TransactionType::PostFill => order.post_fill_tx_hash = Some(tx_hash),
 		TransactionType::PreClaim => order.pre_claim_tx_hash = Some(tx_hash),
 		TransactionType::Claim => order.claim_tx_hash = Some(tx_hash),
+		TransactionType::Approval
+		| TransactionType::Withdrawal
+		| TransactionType::Bridge
+		| TransactionType::Pusher => {},
 	}
 }
 
@@ -274,17 +305,15 @@ impl RecoveryService {
 	///
 	/// A vector of active orders that need recovery processing.
 	async fn load_active_orders(&self) -> Result<Vec<Order>, RecoveryError> {
-		let terminal_status_kinds = vec![
-			serde_json::json!(FINALIZED_STATUS_KIND_INDEX_VALUE),
-			serde_json::json!(FAILED_STATUS_KIND_INDEX_VALUE),
-		];
-
 		// Query for all non-terminal orders
 		let active_orders = self
 			.storage
 			.query::<Order>(
 				StorageKey::Orders.as_str(),
-				QueryFilter::NotIn(STATUS_KIND_INDEX_FIELD.to_string(), terminal_status_kinds),
+				QueryFilter::Equals(
+					IS_TERMINAL_INDEX_FIELD.to_string(),
+					serde_json::json!(false),
+				),
 			)
 			.await
 			.map_err(|e| RecoveryError::Storage(e.to_string()))?;
@@ -387,7 +416,9 @@ impl RecoveryService {
 		receipt: &TransactionReceipt,
 	) {
 		match self.attempt_store.attempt_by_hash(tx_hash).await {
-			Ok(Some(attempt)) if attempt.order_id == order_id && attempt.tx_type == tx_type => {
+			Ok(Some(attempt))
+				if attempt.order_id() == Some(order_id) && attempt.tx_type == tx_type =>
+			{
 				if let Err(error) = self
 					.attempt_store
 					.mark_attempt_confirmed_from_receipt(
@@ -397,14 +428,29 @@ impl RecoveryService {
 					)
 					.await
 				{
-					tracing::error!(
-						%order_id,
-						attempt_id = %attempt.id,
-						?tx_type,
-						?tx_hash,
-						%error,
-						"Recovery proved transaction confirmed but attempt ledger update failed"
-					);
+					let error_message = error.to_string();
+					match error {
+						TransactionAttemptStoreError::TerminalAttempt(_) => {
+							tracing::debug!(
+								%order_id,
+								attempt_id = %attempt.id,
+								?tx_type,
+								?tx_hash,
+								error = %error_message,
+								"Recovery proved transaction confirmed but attempt ledger row is already terminal"
+							);
+						},
+						error => {
+							tracing::error!(
+								%order_id,
+								attempt_id = %attempt.id,
+								?tx_type,
+								?tx_hash,
+								%error,
+								"Recovery proved transaction confirmed but attempt ledger update failed"
+							);
+						},
+					}
 					self.event_bus
 						.publish(SolverEvent::Delivery(
 							DeliveryEvent::TransactionAttemptLedgerConflict {
@@ -413,7 +459,7 @@ impl RecoveryService {
 								tx_type,
 								tx_hash: Some(tx_hash.clone()),
 								attempted_status: TransactionAttemptStatus::Confirmed,
-								error: error.to_string(),
+								error: error_message,
 								context: "recovery mark confirmed".to_string(),
 							},
 						))
@@ -424,7 +470,7 @@ impl RecoveryService {
 				tracing::debug!(
 					%order_id,
 					attempt_id = %attempt.id,
-					attempt_order_id = %attempt.order_id,
+					attempt_scope_id = %attempt.scope_id(),
 					attempt_tx_type = ?attempt.tx_type,
 					expected_tx_type = ?tx_type,
 					?tx_hash,
@@ -825,6 +871,18 @@ impl RecoveryService {
 				);
 				ReconcileResult::Failed(tx_type)
 			},
+			TransactionType::Approval
+			| TransactionType::Withdrawal
+			| TransactionType::Bridge
+			| TransactionType::Pusher => {
+				tracing::warn!(
+					order_id = %order.id,
+					?tx_type,
+					?reason,
+					"StageComplete classification on system transaction type in order recovery; returning Unknown"
+				);
+				ReconcileResult::Unknown
+			},
 		}
 	}
 
@@ -878,12 +936,31 @@ impl RecoveryService {
 		attempts: &[TransactionAttempt],
 		tx_type: TransactionType,
 	) -> StageResolution {
+		// Layer 0: authoritative confirmed-lineage hash.
+		//
+		// A same-nonce replacement may have confirmed while the solver was
+		// down, in which case the order field was never corrected live and
+		// still points at a superseded hash. The confirmed-lineage hash is
+		// the canonical on-chain transaction for the stage's nonce, so it
+		// outranks the order field for ALL stages (not just Fill). When it
+		// differs from the stale field, repair the field before returning.
+		// Only a CONFIRMED hash is authoritative here — a merely-pending
+		// ledger tip must never override a present field (handled by Layer 1
+		// taking precedence over the pending fallback below).
+		if let Some(tx_hash) = confirmed_recovery_attempt_hash(attempts, tx_type) {
+			if order_stage_hash(order, tx_type).as_ref() != Some(&tx_hash) {
+				self.write_repaired_hash(order, tx_type, tx_hash.clone())
+					.await;
+			}
+			return StageResolution::Hash(tx_hash);
+		}
+
 		// Layer 1: order field
 		if let Some(tx_hash) = order_stage_hash(order, tx_type) {
 			return StageResolution::Hash(tx_hash);
 		}
 
-		// Layer 2: attempt ledger fallback
+		// Layer 2: attempt ledger fallback (pending tip; no field present)
 		if let Some(tx_hash) = choose_recovery_attempt_hash(attempts, tx_type) {
 			self.write_repaired_hash(order, tx_type, tx_hash.clone())
 				.await;
@@ -962,7 +1039,7 @@ impl RecoveryService {
 	/// # Returns
 	///
 	/// A `ReconcileResult` indicating what action should be taken next.
-	async fn reconcile_with_blockchain(
+	pub(crate) async fn reconcile_with_blockchain(
 		&self,
 		order: &Order,
 	) -> Result<(Order, ReconcileResult), RecoveryError> {
@@ -1433,32 +1510,6 @@ impl RecoveryService {
 		}
 	}
 
-	fn recovery_intent_for_prepare(order: &Order) -> Option<Intent> {
-		let order_data: Eip7683OrderData = serde_json::from_value(order.data.clone()).ok()?;
-		let raw_order_data = order_data.raw_order_data.as_ref()?;
-		let lock_type = order_data.lock_type?;
-		let order_bytes = alloy_primitives::Bytes::from(
-			hex::decode(solver_types::without_0x_prefix(raw_order_data)).ok()?,
-		);
-
-		// `handle_preparation` consumes only `source`; remaining fields keep the
-		// transient recovery intent complete for event consumers.
-		Some(Intent {
-			id: order.id.clone(),
-			source: "off-chain".to_string(),
-			standard: order.standard.clone(),
-			metadata: IntentMetadata {
-				requires_auction: false,
-				exclusive_until: None,
-				discovered_at: solver_types::current_timestamp(),
-			},
-			data: order.data.clone(),
-			order_bytes,
-			quote_id: order.quote_id.clone(),
-			lock_type: lock_type.to_string(),
-		})
-	}
-
 	/// Publishes appropriate event based on reconciliation result.
 	///
 	/// This method converts the reconciliation result into the appropriate
@@ -1469,19 +1520,25 @@ impl RecoveryService {
 	///
 	/// * `order` - The order being recovered
 	/// * `result` - The result of blockchain reconciliation
-	async fn publish_recovery_event(&self, order: Order, result: ReconcileResult) {
+	pub(crate) async fn publish_recovery_event(&self, order: Order, result: ReconcileResult) {
 		// First ensure the order is in the correct state
 		let order = self.ensure_correct_state(order, &result).await;
 		match result {
 			ReconcileResult::NeedsPrepare => {
 				let Some(params) = order.execution_params.clone() else {
-					tracing::error!(
-						"Order {} missing execution params, cannot resume preparation",
-						order.id
+					tracing::info!(
+						order_id = %order.id,
+						"Order missing execution params during recovery; re-driving deferred strategy"
 					);
+					self.event_bus
+						.publish(SolverEvent::Order(OrderEvent::Deferred {
+							order_id: order.id,
+							retry_after: std::time::Duration::ZERO,
+						}))
+						.ok();
 					return;
 				};
-				let Some(intent) = Self::recovery_intent_for_prepare(&order) else {
+				let Some(intent) = intent_from_order(&order) else {
 					tracing::error!(
 						"Order {} missing recovery intent data, cannot resume preparation",
 						order.id
@@ -1504,7 +1561,16 @@ impl RecoveryService {
 						.publish(SolverEvent::Order(OrderEvent::Executing { order, params }))
 						.ok();
 				} else {
-					tracing::error!("Order {} missing execution params, cannot resume", order.id);
+					tracing::info!(
+						order_id = %order.id,
+						"Order missing execution params during recovery; re-driving deferred strategy"
+					);
+					self.event_bus
+						.publish(SolverEvent::Order(OrderEvent::Deferred {
+							order_id: order.id,
+							retry_after: std::time::Duration::ZERO,
+						}))
+						.ok();
 				}
 			},
 
@@ -1993,7 +2059,7 @@ mod tests {
 	) -> TransactionAttempt {
 		let mut attempt = TransactionAttempt::planned(
 			id.to_string(),
-			"test_order_123".to_string(),
+			solver_types::TransactionAttemptScope::order("test_order_123"),
 			Some(Address(vec![9; 20])),
 			tx_type,
 			Transaction {
@@ -2328,7 +2394,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn recovery_terminal_attempt_conflict_is_operator_visible_not_silent() {
+	async fn recovery_terminal_attempt_conflict_emits_event_without_error_log() {
 		let temp_dir = tempfile::tempdir().unwrap();
 		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
 			temp_dir.path().to_path_buf(),
@@ -2594,6 +2660,134 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn resolve_stage_prefers_confirmed_lineage_over_stale_order_field_non_fill() {
+		// A same-nonce replacement confirmed while the solver was DOWN. The
+		// order field still holds the SUPERSEDED hash (never corrected live),
+		// but the attempt ledger holds the CONFIRMED replacement. Resolution
+		// must prefer the confirmed-lineage hash and repair the stale field —
+		// not return the stale hash (which would later 404 the receipt probe
+		// and stall a non-Fill stage forever).
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
+
+		let stale_hash = TransactionHash(vec![0xa1; 32]);
+		let confirmed_hash = TransactionHash(vec![0xc2; 32]);
+
+		let mut order = create_test_order_with_status(OrderStatus::Executed);
+		// Stale order-field hash for a NON-Fill stage (PostFill).
+		order.post_fill_tx_hash = Some(stale_hash.clone());
+		state_machine.store_order(&order).await.unwrap();
+
+		// Ledger lineage: superseded parent (stale) -> Confirmed replacement.
+		let mut superseded = sample_attempt(
+			"superseded",
+			TransactionType::PostFill,
+			TransactionAttemptStatus::Replaced,
+			Some(0xa1),
+			100,
+		);
+		let mut confirmed = sample_attempt(
+			"confirmed",
+			TransactionType::PostFill,
+			TransactionAttemptStatus::Confirmed,
+			Some(0xc2),
+			200,
+		);
+		confirmed.replacement_of = Some("superseded".to_string());
+		superseded.replaced_by = Some("confirmed".to_string());
+		let attempts = vec![superseded, confirmed];
+
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let event_bus = EventBus::new(100);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine.clone(),
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+			empty_networks_config(),
+		);
+
+		let resolution = recovery_service
+			.resolve_stage(&mut order, &attempts, TransactionType::PostFill)
+			.await;
+
+		match resolution {
+			StageResolution::Hash(h) => assert_eq!(
+				h, confirmed_hash,
+				"resolution must return the CONFIRMED replacement, not the stale order field"
+			),
+			other => panic!("expected Hash, got {:?}", std::mem::discriminant(&other)),
+		}
+		// The stale order field must be repaired to the confirmed hash, both
+		// in memory and in persisted storage.
+		assert_eq!(order.post_fill_tx_hash, Some(confirmed_hash.clone()));
+		let stored = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(stored.post_fill_tx_hash, Some(confirmed_hash));
+	}
+
+	#[tokio::test]
+	async fn resolve_stage_keeps_order_field_when_ledger_only_pending() {
+		// Guard against over-correction: a merely-PENDING ledger hash must NOT
+		// override a present order field. Only a CONFIRMED-lineage hash is
+		// authoritative over the field.
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
+
+		let field_hash = TransactionHash(vec![0xf0; 32]);
+
+		let mut order = create_test_order_with_status(OrderStatus::Executed);
+		order.post_fill_tx_hash = Some(field_hash.clone());
+
+		// Ledger has only a Broadcast (pending) attempt with a different hash.
+		let attempts = vec![sample_attempt(
+			"pending",
+			TransactionType::PostFill,
+			TransactionAttemptStatus::Broadcast,
+			Some(0xbb),
+			100,
+		)];
+
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let event_bus = EventBus::new(100);
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine.clone(),
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+			empty_networks_config(),
+		);
+
+		let resolution = recovery_service
+			.resolve_stage(&mut order, &attempts, TransactionType::PostFill)
+			.await;
+
+		match resolution {
+			StageResolution::Hash(h) => assert_eq!(
+				h, field_hash,
+				"a pending ledger hash must not override the present order field"
+			),
+			other => panic!("expected Hash, got {:?}", std::mem::discriminant(&other)),
+		}
+		assert_eq!(order.post_fill_tx_hash, Some(field_hash));
+	}
+
+	#[tokio::test]
 	async fn test_recover_state_no_orders() {
 		let mut mock_storage = MockStorageInterface::new();
 
@@ -2697,7 +2891,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn load_active_orders_queries_canonical_status_kind_index() {
+	async fn load_active_orders_queries_is_terminal_index() {
 		let mut mock_storage = MockStorageInterface::new();
 
 		mock_storage
@@ -2709,13 +2903,8 @@ mod tests {
 
 				matches!(
 					filter,
-					QueryFilter::NotIn(field, values)
-						if field == "status_kind"
-							&& values
-								== &vec![
-									serde_json::json!("finalized"),
-									serde_json::json!("failed"),
-								]
+					QueryFilter::Equals(field, value)
+						if field == IS_TERMINAL_INDEX_FIELD && value == &serde_json::json!(false)
 				)
 			})
 			.times(1)
@@ -3628,6 +3817,83 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn recovery_keeps_order_non_terminal_on_broadcaster_readiness_retry() {
+		// H-02 regression: a recoverable (non-terminal) Broadcaster readiness
+		// result during claim recovery must keep the order retryable, not
+		// transition it to terminal Failed(Claim). Waiting(_) re-emits
+		// StartMonitoring; only PermanentFailure transitions to Failed.
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let mut order = create_test_order_with_status(OrderStatus::PreClaimed);
+		order.fill_tx_hash = Some(TransactionHash(vec![0xbb; 32]));
+		order.settlement_name = Some("broadcaster".to_string());
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		state_machine.store_order(&order).await.unwrap();
+
+		let mut mock_settlement = MockSettlementInterface::new();
+		mock_settlement
+			.expect_readiness()
+			.times(1)
+			.returning(|_, _| {
+				Box::pin(async move {
+					SettlementReadiness::Waiting(
+						solver_settlement::WaitingReason::StorageUnavailable,
+					)
+				})
+			});
+
+		let settlement_impls: HashMap<String, Box<dyn solver_settlement::SettlementInterface>> =
+			HashMap::from([(
+				"broadcaster".to_string(),
+				Box::new(mock_settlement) as Box<dyn solver_settlement::SettlementInterface>,
+			)]);
+		let settlement = Arc::new(SettlementService::new(
+			settlement_impls,
+			"broadcaster".to_string(),
+			20,
+		));
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
+
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine.clone(),
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+			empty_networks_config(),
+		);
+
+		recovery_service
+			.publish_recovery_event(
+				order.clone(),
+				ReconcileResult::NeedsClaim {
+					fill_proof: Some(create_test_fill_proof()),
+				},
+			)
+			.await;
+
+		// The order must stay non-terminal (still PreClaimed), not Failed(Claim).
+		let stored = state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(stored.status, OrderStatus::PreClaimed);
+
+		// A retryable readiness result re-emits StartMonitoring rather than failing.
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Settlement(SettlementEvent::StartMonitoring { order_id, .. }) => {
+				assert_eq!(order_id, order.id);
+			},
+			other => panic!("Expected StartMonitoring event, got {other:?}"),
+		}
+	}
+
+	#[tokio::test]
 	async fn test_publish_recovery_event_needs_execution() {
 		let temp_dir = tempfile::tempdir().unwrap();
 		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
@@ -3677,6 +3943,50 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn publish_recovery_event_needs_execution_without_params_defers_for_strategy_retry() {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let mut order = create_test_order_with_status(OrderStatus::Created);
+		order.execution_params = None;
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		state_machine.store_order(&order).await.unwrap();
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
+
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+			empty_networks_config(),
+		);
+
+		recovery_service
+			.publish_recovery_event(order.clone(), ReconcileResult::NeedsExecution)
+			.await;
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Deferred {
+				order_id,
+				retry_after,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(retry_after, std::time::Duration::ZERO);
+			},
+			_ => panic!("Expected Order::Deferred event"),
+		}
+	}
+
+	#[tokio::test]
 	async fn publish_recovery_event_needs_prepare_emits_preparing() {
 		let temp_dir = tempfile::tempdir().unwrap();
 		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
@@ -3721,6 +4031,50 @@ mod tests {
 				assert_eq!(params.priority_fee, expected_params.priority_fee);
 			},
 			_ => panic!("Expected Order::Preparing event"),
+		}
+	}
+
+	#[tokio::test]
+	async fn publish_recovery_event_needs_prepare_without_params_defers_for_strategy_retry() {
+		let temp_dir = tempfile::tempdir().unwrap();
+		let storage = Arc::new(StorageService::new(Box::new(FileStorage::new(
+			temp_dir.path().to_path_buf(),
+			TtlConfig::default(),
+		))));
+		let mut order = offchain_escrow_order_with_status(OrderStatus::Pending);
+		order.execution_params = None;
+		let state_machine = Arc::new(OrderStateMachine::new(storage.clone()));
+		state_machine.store_order(&order).await.unwrap();
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		let settlement = Arc::new(SettlementService::new(HashMap::new(), String::new(), 20));
+		let event_bus = EventBus::new(100);
+		let mut receiver = event_bus.subscribe();
+		let (attempt_store, _attempts_tmp) = empty_attempt_store();
+
+		let recovery_service = RecoveryService::new(
+			storage.clone(),
+			state_machine,
+			delivery,
+			settlement,
+			event_bus,
+			attempt_store,
+			empty_networks_config(),
+		);
+
+		recovery_service
+			.publish_recovery_event(order.clone(), ReconcileResult::NeedsPrepare)
+			.await;
+
+		let event = receiver.try_recv().unwrap();
+		match event {
+			SolverEvent::Order(OrderEvent::Deferred {
+				order_id,
+				retry_after,
+			}) => {
+				assert_eq!(order_id, order.id);
+				assert_eq!(retry_after, std::time::Duration::ZERO);
+			},
+			_ => panic!("Expected Order::Deferred event"),
 		}
 	}
 

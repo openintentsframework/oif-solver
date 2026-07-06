@@ -166,26 +166,39 @@ fn validate_seedless_settlement_requirements(
 				for chain_id in chain_ids {
 					if !hyperlane.mailboxes.contains_key(chain_id) {
 						return Err(MergeError::Validation(format!(
-						"seedless mode requires settlement.hyperlane.mailboxes for chain {chain_id}"
-					)));
+							"seedless mode requires settlement.hyperlane.mailboxes for chain {chain_id}"
+						)));
 					}
 					if !hyperlane.igp_addresses.contains_key(chain_id) {
 						return Err(MergeError::Validation(format!(
-						"seedless mode requires settlement.hyperlane.igp_addresses for chain {chain_id}"
-					)));
+							"seedless mode requires settlement.hyperlane.igp_addresses for chain {chain_id}"
+						)));
+					}
+					match hyperlane.domains.get(chain_id) {
+						Some(0) => {
+							return Err(MergeError::Validation(format!(
+								"seedless mode requires non-zero settlement.hyperlane.domains for chain {chain_id}"
+							)));
+						},
+						Some(_) => {},
+						None => {
+							return Err(MergeError::Validation(format!(
+								"seedless mode requires settlement.hyperlane.domains for chain {chain_id}"
+							)));
+						},
 					}
 
 					match hyperlane.oracles.input.get(chain_id) {
 						Some(oracles) if !oracles.is_empty() => {},
 						Some(_) => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.hyperlane.oracles.input for chain {chain_id}"
-						)))
+								"seedless mode requires non-empty settlement.hyperlane.oracles.input for chain {chain_id}"
+							)));
 						},
 						None => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.hyperlane.oracles.input for chain {chain_id}"
-						)))
+								"seedless mode requires settlement.hyperlane.oracles.input for chain {chain_id}"
+							)));
 						},
 					}
 
@@ -193,13 +206,13 @@ fn validate_seedless_settlement_requirements(
 						Some(oracles) if !oracles.is_empty() => {},
 						Some(_) => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.hyperlane.oracles.output for chain {chain_id}"
-						)))
+								"seedless mode requires non-empty settlement.hyperlane.oracles.output for chain {chain_id}"
+							)));
 						},
 						None => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.hyperlane.oracles.output for chain {chain_id}"
-						)))
+								"seedless mode requires settlement.hyperlane.oracles.output for chain {chain_id}"
+							)));
 						},
 					}
 				}
@@ -221,26 +234,26 @@ fn validate_seedless_settlement_requirements(
 						Some(oracles) if !oracles.is_empty() => {},
 						Some(_) => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.direct.oracles.input for chain {chain_id}"
-						)))
+								"seedless mode requires non-empty settlement.direct.oracles.input for chain {chain_id}"
+							)));
 						},
 						None => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.direct.oracles.input for chain {chain_id}"
-						)))
+								"seedless mode requires settlement.direct.oracles.input for chain {chain_id}"
+							)));
 						},
 					}
 					match direct.oracles.output.get(chain_id) {
 						Some(oracles) if !oracles.is_empty() => {},
 						Some(_) => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires non-empty settlement.direct.oracles.output for chain {chain_id}"
-						)))
+								"seedless mode requires non-empty settlement.direct.oracles.output for chain {chain_id}"
+							)));
 						},
 						None => {
 							return Err(MergeError::Validation(format!(
-							"seedless mode requires settlement.direct.oracles.output for chain {chain_id}"
-						)))
+								"seedless mode requires settlement.direct.oracles.output for chain {chain_id}"
+							)));
 						},
 					}
 				}
@@ -517,6 +530,7 @@ pub fn merge_to_operator_config(
 		// materialization time.
 		fee_policy: initializer.fee_policy.clone(),
 		tx_bump: initializer.tx_bump.unwrap_or_default(),
+		source_finality: initializer.source_finality.clone(),
 	};
 	validate_operator_tx_bump(&operator_config)?;
 	Ok(operator_config)
@@ -732,6 +746,17 @@ fn build_operator_settlement_config(
 			},
 		}
 	}
+	if broadcaster.is_none() {
+		if let Some(broadcaster_override) = initializer
+			.settlement
+			.as_ref()
+			.and_then(|s| s.broadcaster.as_ref())
+		{
+			broadcaster = Some(build_operator_broadcaster_finality_config_from_override(
+				broadcaster_override,
+			));
+		}
+	}
 
 	let settlement_type = match primary_settlement {
 		SettlementTypeOverride::Hyperlane => OperatorSettlementType::Hyperlane,
@@ -827,6 +852,7 @@ fn build_operator_hyperlane_config_from_seed(
 			.collect();
 		routes.insert(*chain_id, other_chains);
 	}
+	let domains = build_identity_hyperlane_domains(chain_ids, "seed Hyperlane identity domain")?;
 
 	Ok(OperatorHyperlaneConfig {
 		default_gas_limit: seed.defaults.hyperlane_default_gas_limit,
@@ -834,6 +860,7 @@ fn build_operator_hyperlane_config_from_seed(
 		finalization_required: seed.defaults.hyperlane_finalization_required,
 		mailboxes,
 		igp_addresses,
+		domains,
 		oracles: OperatorOracleConfig {
 			input: input_oracles,
 			output: output_oracles,
@@ -870,6 +897,47 @@ fn build_full_mesh_routes(chain_ids: &[u64]) -> HashMap<u64, Vec<u64>> {
 		routes.insert(*chain_id, other_chains);
 	}
 	routes
+}
+
+fn validate_hyperlane_domains(
+	domains: &HashMap<u64, u32>,
+	chain_ids: &[u64],
+	path: &str,
+) -> Result<(), MergeError> {
+	for chain_id in chain_ids {
+		match domains.get(chain_id) {
+			Some(0) => {
+				return Err(MergeError::Validation(format!(
+					"{path} has zero domain for chain {chain_id}"
+				)));
+			},
+			Some(_) => {},
+			None => {
+				return Err(MergeError::Validation(format!(
+					"{path} is missing chain {chain_id}"
+				)));
+			},
+		}
+	}
+	Ok(())
+}
+
+fn build_identity_hyperlane_domains(
+	chain_ids: &[u64],
+	context: &str,
+) -> Result<HashMap<u64, u32>, MergeError> {
+	chain_ids
+		.iter()
+		.map(|chain_id| {
+			u32::try_from(*chain_id)
+				.map(|domain| (*chain_id, domain))
+				.map_err(|_| {
+					MergeError::Validation(format!(
+						"{context} for chain {chain_id} exceeds u32::MAX"
+					))
+				})
+		})
+		.collect()
 }
 
 fn validate_routes(
@@ -981,6 +1049,17 @@ fn build_operator_hyperlane_config_from_override(
 		override_cfg.routes.clone()
 	};
 
+	let domains = if override_cfg.domains.is_empty() {
+		build_identity_hyperlane_domains(chain_ids, "legacy Hyperlane override identity domain")?
+	} else {
+		validate_hyperlane_domains(
+			&override_cfg.domains,
+			chain_ids,
+			"settlement.hyperlane.domains",
+		)?;
+		override_cfg.domains.clone()
+	};
+
 	Ok(OperatorHyperlaneConfig {
 		default_gas_limit: override_cfg
 			.default_gas_limit
@@ -993,6 +1072,7 @@ fn build_operator_hyperlane_config_from_override(
 			.unwrap_or(seed.defaults.hyperlane_finalization_required),
 		mailboxes: override_cfg.mailboxes.clone(),
 		igp_addresses: override_cfg.igp_addresses.clone(),
+		domains,
 		oracles: OperatorOracleConfig {
 			input: override_cfg.oracles.input.clone(),
 			output: override_cfg.oracles.output.clone(),
@@ -1110,6 +1190,31 @@ fn build_operator_broadcaster_config_from_override(
 	})
 }
 
+fn build_operator_broadcaster_finality_config_from_override(
+	override_cfg: &BroadcasterSettlementOverride,
+) -> OperatorBroadcasterConfig {
+	OperatorBroadcasterConfig {
+		oracles: OperatorOracleConfig {
+			input: HashMap::new(),
+			output: HashMap::new(),
+		},
+		routes: HashMap::new(),
+		broadcaster_addresses: HashMap::new(),
+		receiver_addresses: HashMap::new(),
+		broadcaster_ids: HashMap::new(),
+		proof_service_url: String::new(),
+		proof_wait_time_seconds: 30,
+		storage_proof_timeout_seconds: 30,
+		default_finality_blocks: override_cfg.default_finality_blocks.unwrap_or(20),
+		finality_blocks: override_cfg.finality_blocks.clone(),
+		chain_block_time_seconds: HashMap::new(),
+		intent_safety_buffer_seconds: None,
+		intent_min_expiry_seconds: None,
+		oracle_selection_strategy: OperatorOracleSelectionStrategy::First,
+		pusher_directions: Vec::new(),
+	}
+}
+
 /// Builds runtime Config from OperatorConfig.
 ///
 /// Called on every boot (after first boot) and on hot reload.
@@ -1136,6 +1241,8 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 
 	let tx_bump = translate_tx_bump(&operator_config.tx_bump);
 	validate_tx_bump(&tx_bump, &chain_ids)?;
+	let source_finality = build_source_finality_config_from_operator(operator_config)?;
+	validate_source_finality_expected_delays(&source_finality, &chain_ids)?;
 
 	// Build the full config
 	let config = Config {
@@ -1147,7 +1254,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 			operator_config.fee_policy.as_ref(),
 		),
 		account: build_account_config_from_operator(operator_config.account.as_ref()),
-		discovery: build_discovery_config_from_operator(&chain_ids)?,
+		discovery: build_discovery_config_from_operator(operator_config, &chain_ids)?,
 		order: build_order_config_from_operator(),
 		settlement: build_settlement_config_from_operator(operator_config, &chain_ids)?,
 		pricing: Some(build_pricing_config_from_operator(&operator_config.pricing)),
@@ -1158,6 +1265,7 @@ pub fn build_runtime_config(operator_config: &OperatorConfig) -> Result<Config, 
 		gas: Some(build_gas_config_from_operator(&operator_config.gas)),
 		rebalance: build_rebalance_config_from_operator(operator_config.rebalance.as_ref())?,
 		tx_bump,
+		source_finality,
 	};
 
 	Ok(config)
@@ -1178,6 +1286,87 @@ fn validate_tx_bump(
 	tx_bump
 		.validate_against_networks(&configured_chain_ids)
 		.map_err(MergeError::Validation)
+}
+
+fn build_source_finality_config_from_operator(
+	operator_config: &OperatorConfig,
+) -> Result<solver_config::SourceFinalityConfig, MergeError> {
+	let Some(source_finality) = &operator_config.source_finality else {
+		return Ok(solver_config::SourceFinalityConfig::default());
+	};
+
+	serde_json::from_value(source_finality.clone())
+		.map_err(|error| MergeError::Validation(format!("Invalid source_finality config: {error}")))
+}
+
+fn build_source_finality_rules_for_discovery(
+	operator_config: &OperatorConfig,
+	chain_ids: &[u64],
+) -> Result<serde_json::Value, MergeError> {
+	if operator_config.source_finality.is_none() {
+		return Ok(serde_json::Value::Object(serde_json::Map::new()));
+	}
+
+	let source_finality = build_source_finality_config_from_operator(operator_config)?;
+	let mut rules = serde_json::Map::new();
+	for chain_id in chain_ids {
+		let rule = source_finality_rule_from_config_only(&source_finality, *chain_id);
+		let rule = serde_json::to_value(rule).map_err(|error| {
+			MergeError::Validation(format!(
+				"Failed to serialize source finality rule for chain {chain_id}: {error}"
+			))
+		})?;
+		rules.insert(chain_id.to_string(), rule);
+	}
+	Ok(serde_json::Value::Object(rules))
+}
+
+fn source_finality_rule_from_config_only(
+	source_finality: &solver_config::SourceFinalityConfig,
+	chain_id: u64,
+) -> solver_types::SourceFinalityRule {
+	let chain = source_finality.chains.get(&chain_id);
+	let mode = chain
+		.and_then(|chain| chain.mode)
+		.unwrap_or(source_finality.default_mode);
+	let blocks = chain
+		.and_then(|chain| chain.blocks)
+		.unwrap_or(source_finality.default_blocks);
+	let block_time_seconds = chain
+		.and_then(|chain| chain.block_time_seconds)
+		.unwrap_or(source_finality.default_block_time_seconds);
+	let expected_delay_seconds = chain
+		.and_then(|chain| chain.expected_delay_seconds)
+		.or_else(|| {
+			matches!(mode, solver_types::SourceFinalityMode::Numeric)
+				.then_some(blocks.saturating_mul(block_time_seconds))
+		})
+		.or(source_finality.default_expected_delay_seconds);
+
+	solver_types::SourceFinalityRule {
+		mode,
+		blocks,
+		block_time_seconds,
+		expected_delay_seconds,
+	}
+}
+
+fn validate_source_finality_expected_delays(
+	source_finality: &solver_config::SourceFinalityConfig,
+	chain_ids: &[u64],
+) -> Result<(), MergeError> {
+	for chain_id in chain_ids {
+		let rule = source_finality_rule_from_config_only(source_finality, *chain_id);
+		if !matches!(rule.mode, solver_types::SourceFinalityMode::Numeric)
+			&& rule.expected_delay_seconds.is_none()
+		{
+			return Err(MergeError::Validation(format!(
+				"source_finality for chain {chain_id} uses {:?} mode but expected_delay_seconds is not configured",
+				rule.mode
+			)));
+		}
+	}
+	Ok(())
 }
 
 fn parse_solver_intake_disabled(raw: &str) -> Result<bool, MergeError> {
@@ -1434,6 +1623,17 @@ fn build_delivery_config_from_operator(
 			entry.insert("gas_price_cap".to_string(), serde_json::Value::String(cap));
 		}
 
+		if let Some(extra_native_fee) = override_entry.and_then(|e| e.extra_native_fee.as_ref()) {
+			entry.insert(
+				"extra_native_fee".to_string(),
+				serde_json::to_value(extra_native_fee)
+					.expect("ExtraNativeFeeOverride serializes to JSON"),
+			);
+		} else if let Some(default_extra_native_fee) = default_extra_native_fee_for_chain(*chain_id)
+		{
+			entry.insert("extra_native_fee".to_string(), default_extra_native_fee);
+		}
+
 		fee_policy_chains.insert(key, serde_json::Value::Object(entry));
 	}
 
@@ -1456,6 +1656,16 @@ fn build_delivery_config_from_operator(
 		implementations,
 		min_confirmations: 3,
 		tx_confirmation_timeout_seconds: 600,
+	}
+}
+
+fn default_extra_native_fee_for_chain(chain_id: u64) -> Option<serde_json::Value> {
+	match chain_id {
+		10 | 8453 | 11155420 | 84532 | 747474 => Some(json_object(vec![(
+			"type",
+			serde_json::Value::String("op_stack_l1_data".to_string()),
+		)])),
+		_ => None,
 	}
 }
 
@@ -1508,16 +1718,42 @@ fn build_account_config_from_operator(
 }
 
 /// Builds DiscoveryConfig from operator config.
-fn build_discovery_config_from_operator(chain_ids: &[u64]) -> Result<DiscoveryConfig, MergeError> {
+fn build_discovery_config_from_operator(
+	operator_config: &OperatorConfig,
+	chain_ids: &[u64],
+) -> Result<DiscoveryConfig, MergeError> {
 	let mut implementations = HashMap::new();
 
 	let network_ids_array =
 		serde_json::Value::Array(chain_ids.iter().map(|id| int(*id as i64)).collect());
+	let broadcaster = operator_config.settlement.broadcaster.as_ref();
+	let default_finality_blocks = broadcaster
+		.map(|config| config.default_finality_blocks)
+		.unwrap_or(20);
+	let finality_blocks = broadcaster
+		.map(|config| {
+			serde_json::Value::Object(
+				config
+					.finality_blocks
+					.iter()
+					.map(|(chain_id, depth)| (chain_id.to_string(), int(*depth as i64)))
+					.collect(),
+			)
+		})
+		.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+	let source_finality_rules =
+		build_source_finality_rules_for_discovery(operator_config, chain_ids)?;
 
 	// Onchain discovery - polls chain for new orders
 	let onchain_config = json_object(vec![
 		("network_ids", network_ids_array.clone()),
 		("polling_interval_secs", int(5)),
+		(
+			"default_finality_blocks",
+			int(default_finality_blocks as i64),
+		),
+		("finality_blocks", finality_blocks),
+		("source_finality_rules", source_finality_rules),
 	]);
 	implementations.insert("onchain_eip7683".to_string(), onchain_config);
 
@@ -1598,7 +1834,7 @@ fn build_settlement_config_from_operator(
 								.to_string(),
 						)
 					})?;
-				let hyperlane_config = build_hyperlane_json_from_operator(hyperlane, chain_ids);
+				let hyperlane_config = build_hyperlane_json_from_operator(hyperlane, chain_ids)?;
 				implementations.insert("hyperlane".to_string(), hyperlane_config);
 			},
 			OperatorSettlementType::Direct => {
@@ -1643,7 +1879,7 @@ fn build_settlement_config_from_operator(
 fn build_hyperlane_json_from_operator(
 	hyperlane: &OperatorHyperlaneConfig,
 	chain_ids: &[u64],
-) -> serde_json::Value {
+) -> Result<serde_json::Value, MergeError> {
 	let mut table = serde_json::Map::new();
 
 	// Basic settings
@@ -1744,7 +1980,30 @@ fn build_hyperlane_json_from_operator(
 		serde_json::Value::Object(igp_addresses),
 	);
 
-	serde_json::Value::Object(table)
+	let resolved_domains = resolve_operator_hyperlane_domains(hyperlane, chain_ids)?;
+	let mut domains = serde_json::Map::new();
+	for (chain_id, domain) in resolved_domains {
+		domains.insert(chain_id.to_string(), int(domain as i64));
+	}
+	table.insert("domains".to_string(), serde_json::Value::Object(domains));
+
+	Ok(serde_json::Value::Object(table))
+}
+
+fn resolve_operator_hyperlane_domains(
+	hyperlane: &OperatorHyperlaneConfig,
+	chain_ids: &[u64],
+) -> Result<HashMap<u64, u32>, MergeError> {
+	if hyperlane.domains.is_empty() {
+		return build_identity_hyperlane_domains(chain_ids, "legacy Hyperlane identity domain");
+	}
+
+	validate_hyperlane_domains(
+		&hyperlane.domains,
+		chain_ids,
+		"settlement.hyperlane.domains",
+	)?;
+	Ok(hyperlane.domains.clone())
 }
 
 /// Builds direct settlement JSON config from OperatorDirectConfig.
@@ -2399,7 +2658,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 			},
 			"hyperlane" => {
 				settlement_priority.push(OperatorSettlementType::Hyperlane);
-				hyperlane = Some(extract_hyperlane_config(&config.settlement, &chain_ids));
+				hyperlane = Some(extract_hyperlane_config(&config.settlement, &chain_ids)?);
 			},
 			"direct" => {
 				settlement_priority.push(OperatorSettlementType::Direct);
@@ -2422,7 +2681,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 			direct = Some(extract_direct_config(&config.settlement, &chain_ids));
 		} else {
 			settlement_priority.push(OperatorSettlementType::Hyperlane);
-			hyperlane = Some(extract_hyperlane_config(&config.settlement, &chain_ids));
+			hyperlane = Some(extract_hyperlane_config(&config.settlement, &chain_ids)?);
 		}
 	}
 
@@ -2528,6 +2787,18 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 
 	// Extract account config - only set if not using default local wallet
 	let account = extract_account_config(&config.account);
+	let source_finality =
+		if config.source_finality == solver_config::SourceFinalityConfig::default() {
+			None
+		} else {
+			Some(
+				serde_json::to_value(&config.source_finality).map_err(|error| {
+					MergeError::Validation(format!(
+						"Failed to serialize source_finality config: {error}"
+					))
+				})?,
+			)
+		};
 
 	Ok(OperatorConfig {
 		solver_id: config.solver.id.clone(),
@@ -2562,6 +2833,7 @@ pub fn config_to_operator_config(config: &Config) -> Result<OperatorConfig, Merg
 		// here keeps OperatorConfig on the auto-generated defaults.
 		fee_policy: None,
 		tx_bump: solver_types::OperatorTxBumpConfig::default(),
+		source_finality,
 	})
 }
 
@@ -2779,7 +3051,7 @@ fn json_clone(value: &serde_json::Value) -> serde_json::Value {
 fn extract_hyperlane_config(
 	settlement: &SettlementConfig,
 	chain_ids: &[u64],
-) -> OperatorHyperlaneConfig {
+) -> Result<OperatorHyperlaneConfig, MergeError> {
 	use alloy_primitives::Address;
 
 	let hyperlane_json = settlement.implementations.get("hyperlane");
@@ -2846,6 +3118,36 @@ fn extract_hyperlane_config(
 					igp_addresses.insert(chain_id, addr);
 				}
 			}
+		}
+	}
+
+	let mut domains = HashMap::new();
+	if let Some(json_domains) = hyperlane_json
+		.and_then(|h| h.get("domains"))
+		.and_then(|v| v.as_object())
+	{
+		for (chain_id_str, domain_val) in json_domains {
+			let chain_id = chain_id_str.parse::<u64>().map_err(|e| {
+				MergeError::Validation(format!(
+					"settlement.hyperlane.domains has invalid chain ID '{chain_id_str}': {e}"
+				))
+			})?;
+			let domain = domain_val.as_u64().ok_or_else(|| {
+				MergeError::Validation(format!(
+					"settlement.hyperlane.domains for chain {chain_id} must be an unsigned integer"
+				))
+			})?;
+			if domain == 0 {
+				return Err(MergeError::Validation(format!(
+					"settlement.hyperlane.domains has zero domain for chain {chain_id}"
+				)));
+			}
+			if domain > u32::MAX as u64 {
+				return Err(MergeError::Validation(format!(
+					"settlement.hyperlane.domains domain for chain {chain_id} exceeds u32::MAX"
+				)));
+			}
+			domains.insert(chain_id, domain as u32);
 		}
 	}
 
@@ -2919,19 +3221,20 @@ fn extract_hyperlane_config(
 		}
 	}
 
-	OperatorHyperlaneConfig {
+	Ok(OperatorHyperlaneConfig {
 		default_gas_limit,
 		message_timeout_seconds,
 		finalization_required,
 		mailboxes,
 		igp_addresses,
+		domains,
 		oracles: OperatorOracleConfig {
 			input: input_oracles,
 			output: output_oracles,
 		},
 		routes,
 		intent_min_expiry_seconds,
-	}
+	})
 }
 
 /// Extracts direct settlement config from settlement JSON config.
@@ -3526,6 +3829,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		}
 	}
 
@@ -3771,6 +4075,23 @@ mod tests {
 	}
 
 	#[test]
+	fn build_runtime_config_rejects_tag_source_finality_without_expected_delay() {
+		let overrides = test_seed_overrides();
+		let mut op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		op_config.source_finality = Some(serde_json::json!({
+			"default_mode": "safe",
+			"default_blocks": 20,
+			"default_block_time_seconds": 2,
+			"default_expected_delay_seconds": null
+		}));
+
+		let err = build_runtime_config(&op_config).unwrap_err();
+
+		assert!(err.to_string().contains("source_finality"));
+		assert!(err.to_string().contains("expected_delay_seconds"));
+	}
+
+	#[test]
 	fn test_parse_solver_intake_disabled_accepts_active() {
 		assert!(!parse_solver_intake_disabled("active").unwrap());
 	}
@@ -3887,6 +4208,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -3950,6 +4272,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -4007,6 +4330,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -4055,6 +4379,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -4149,6 +4474,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -4380,6 +4706,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_config(overrides, &TESTNET_SEED);
@@ -4449,6 +4776,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let config = merge_config(overrides, &TESTNET_SEED).unwrap();
@@ -4543,6 +4871,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -4612,6 +4941,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -4687,6 +5017,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -4761,6 +5092,7 @@ mod tests {
 							address!("6000000000000000000000000000000000000006"),
 						),
 					]),
+					domains: HashMap::from([(11155420, 11155420), (non_seed_chain_id, 654321)]),
 					oracles: solver_types::OracleOverrides {
 						input: HashMap::from([
 							(
@@ -4812,6 +5144,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -4899,6 +5232,7 @@ mod tests {
 							address!("dddddddddddddddddddddddddddddddddddddddd"),
 						),
 					]),
+					domains: HashMap::from([(chain_a, 1001), (chain_b, 1002)]),
 					oracles: solver_types::OracleOverrides {
 						input: HashMap::from([
 							(
@@ -4947,6 +5281,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -4959,6 +5294,8 @@ mod tests {
 		let hyperlane = op_config.settlement.hyperlane.unwrap();
 		assert_eq!(hyperlane.routes.get(&chain_a), Some(&vec![chain_b]));
 		assert_eq!(hyperlane.routes.get(&chain_b), Some(&vec![chain_a]));
+		assert_eq!(hyperlane.domains.get(&chain_a), Some(&1001));
+		assert_eq!(hyperlane.domains.get(&chain_b), Some(&1002));
 		assert_eq!(
 			op_config.gas.resource_lock.fill,
 			COMMON_DEFAULTS.gas_resource_lock.fill
@@ -5020,6 +5357,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5087,6 +5425,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5189,6 +5528,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -5300,6 +5640,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -5388,6 +5729,7 @@ mod tests {
 							address!("8888888888888888888888888888888888888888"),
 						),
 					]),
+					domains: HashMap::from([(chain_a, chain_a as u32), (chain_b, chain_b as u32)]),
 					oracles: solver_types::OracleOverrides {
 						input: HashMap::from([
 							(
@@ -5470,6 +5812,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config_seedless(overrides).unwrap();
@@ -5564,6 +5907,7 @@ mod tests {
 							address!("8888888888888888888888888888888888888888"),
 						),
 					]),
+					domains: HashMap::from([(chain_a, chain_a as u32), (chain_b, chain_b as u32)]),
 					oracles: solver_types::OracleOverrides {
 						input: HashMap::from([
 							(
@@ -5612,6 +5956,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5718,6 +6063,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -5795,6 +6141,7 @@ mod tests {
 							address!("dddddddddddddddddddddddddddddddddddddddd"),
 						),
 					]),
+					domains: HashMap::from([(chain_a, chain_a as u32), (chain_b, chain_b as u32)]),
 					oracles: solver_types::OracleOverrides {
 						input: HashMap::from([
 							(
@@ -5846,6 +6193,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config_seedless(overrides);
@@ -6005,6 +6353,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -6055,6 +6404,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED);
@@ -6119,6 +6469,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -6176,6 +6527,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let result = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -6251,6 +6603,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -6351,6 +6704,67 @@ mod tests {
 	}
 
 	#[test]
+	fn test_merge_to_operator_config_backfills_legacy_hyperlane_override_domains() {
+		let mut overrides = test_seed_overrides();
+		overrides.settlement = Some(solver_types::SettlementOverride {
+			settlement_type: SettlementTypeOverride::Hyperlane,
+			priority: None,
+			hyperlane: Some(HyperlaneSettlementOverride {
+				mailboxes: HashMap::from([
+					(
+						11155420,
+						address!("3000000000000000000000000000000000000003"),
+					),
+					(84532, address!("4000000000000000000000000000000000000004")),
+				]),
+				igp_addresses: HashMap::from([
+					(
+						11155420,
+						address!("5000000000000000000000000000000000000005"),
+					),
+					(84532, address!("6000000000000000000000000000000000000006")),
+				]),
+				domains: HashMap::new(),
+				oracles: solver_types::OracleOverrides {
+					input: HashMap::from([
+						(
+							11155420,
+							vec![address!("7000000000000000000000000000000000000007")],
+						),
+						(
+							84532,
+							vec![address!("8000000000000000000000000000000000000008")],
+						),
+					]),
+					output: HashMap::from([
+						(
+							11155420,
+							vec![address!("7000000000000000000000000000000000000007")],
+						),
+						(
+							84532,
+							vec![address!("8000000000000000000000000000000000000008")],
+						),
+					]),
+				},
+				routes: HashMap::new(),
+				default_gas_limit: None,
+				message_timeout_seconds: None,
+				finalization_required: None,
+				intent_min_expiry_seconds: None,
+			}),
+			direct: None,
+			broadcaster: None,
+		});
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		let hyperlane = op_config.settlement.hyperlane.as_ref().unwrap();
+
+		assert_eq!(hyperlane.domains.get(&11155420), Some(&11155420));
+		assert_eq!(hyperlane.domains.get(&84532), Some(&84532));
+	}
+
+	#[test]
 	fn test_merge_to_operator_config_gas() {
 		let overrides = test_seed_overrides();
 		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
@@ -6386,6 +6800,29 @@ mod tests {
 	}
 
 	#[test]
+	fn test_build_runtime_config_backfills_legacy_empty_hyperlane_domains() {
+		let overrides = test_seed_overrides();
+		let mut op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		op_config
+			.settlement
+			.hyperlane
+			.as_mut()
+			.unwrap()
+			.domains
+			.clear();
+
+		let config = build_runtime_config(&op_config).unwrap();
+		let hyperlane = config.settlement.implementations.get("hyperlane").unwrap();
+		let domains = hyperlane.get("domains").unwrap().as_object().unwrap();
+
+		assert_eq!(
+			domains.get("11155420").and_then(|v| v.as_u64()),
+			Some(11155420)
+		);
+		assert_eq!(domains.get("84532").and_then(|v| v.as_u64()), Some(84532));
+	}
+
+	#[test]
 	fn test_build_runtime_config_insufficient_networks() {
 		// Create an OperatorConfig with only 1 network (invalid)
 		let mut op_config = OperatorConfig {
@@ -6402,6 +6839,7 @@ mod tests {
 					finalization_required: true,
 					mailboxes: HashMap::new(),
 					igp_addresses: HashMap::new(),
+					domains: HashMap::new(),
 					oracles: OperatorOracleConfig {
 						input: HashMap::new(),
 						output: HashMap::new(),
@@ -6441,6 +6879,7 @@ mod tests {
 			rebalance: None,
 			fee_policy: None,
 			tx_bump: solver_types::OperatorTxBumpConfig::default(),
+			source_finality: None,
 		};
 
 		// Add only one network
@@ -6543,6 +6982,10 @@ mod tests {
 			op_config.solver.monitoring_timeout_seconds,
 			config.solver.monitoring_timeout_seconds
 		);
+		assert!(
+			op_config.source_finality.is_none(),
+			"implicit runtime source finality defaults must not become explicit operator config"
+		);
 
 		// Check networks are preserved
 		assert_eq!(op_config.networks.len(), config.networks.len());
@@ -6604,6 +7047,99 @@ mod tests {
 		// Check routes exist for both chains
 		assert!(hyperlane.routes.contains_key(&11155420));
 		assert!(hyperlane.routes.contains_key(&84532));
+		assert_eq!(hyperlane.domains.get(&11155420), Some(&11155420));
+		assert_eq!(hyperlane.domains.get(&84532), Some(&84532));
+	}
+
+	#[test]
+	fn test_config_to_operator_config_rejects_zero_hyperlane_domain() {
+		let overrides = test_seed_overrides();
+		let mut config = merge_config(overrides, &TESTNET_SEED).unwrap();
+		config
+			.settlement
+			.implementations
+			.get_mut("hyperlane")
+			.unwrap()
+			.get_mut("domains")
+			.unwrap()
+			.as_object_mut()
+			.unwrap()
+			.insert("11155420".to_string(), serde_json::json!(0));
+
+		let err = config_to_operator_config(&config).unwrap_err();
+
+		assert!(
+			matches!(err, MergeError::Validation(msg) if msg.contains("zero domain for chain 11155420"))
+		);
+	}
+
+	#[test]
+	fn test_config_to_operator_config_rejects_oversized_hyperlane_domain() {
+		let overrides = test_seed_overrides();
+		let mut config = merge_config(overrides, &TESTNET_SEED).unwrap();
+		config
+			.settlement
+			.implementations
+			.get_mut("hyperlane")
+			.unwrap()
+			.get_mut("domains")
+			.unwrap()
+			.as_object_mut()
+			.unwrap()
+			.insert(
+				"11155420".to_string(),
+				serde_json::json!(u32::MAX as u64 + 1),
+			);
+
+		let err = config_to_operator_config(&config).unwrap_err();
+
+		assert!(
+			matches!(err, MergeError::Validation(msg) if msg.contains("domain for chain 11155420 exceeds u32::MAX"))
+		);
+	}
+
+	#[test]
+	fn test_config_to_operator_config_rejects_invalid_hyperlane_domain_chain_id() {
+		let overrides = test_seed_overrides();
+		let mut config = merge_config(overrides, &TESTNET_SEED).unwrap();
+		config
+			.settlement
+			.implementations
+			.get_mut("hyperlane")
+			.unwrap()
+			.get_mut("domains")
+			.unwrap()
+			.as_object_mut()
+			.unwrap()
+			.insert("not-a-chain".to_string(), serde_json::json!(10));
+
+		let err = config_to_operator_config(&config).unwrap_err();
+
+		assert!(
+			matches!(err, MergeError::Validation(msg) if msg.contains("invalid chain ID 'not-a-chain'"))
+		);
+	}
+
+	#[test]
+	fn test_config_to_operator_config_rejects_non_integer_hyperlane_domain() {
+		let overrides = test_seed_overrides();
+		let mut config = merge_config(overrides, &TESTNET_SEED).unwrap();
+		config
+			.settlement
+			.implementations
+			.get_mut("hyperlane")
+			.unwrap()
+			.get_mut("domains")
+			.unwrap()
+			.as_object_mut()
+			.unwrap()
+			.insert("11155420".to_string(), serde_json::json!("11155420"));
+
+		let err = config_to_operator_config(&config).unwrap_err();
+
+		assert!(
+			matches!(err, MergeError::Validation(msg) if msg.contains("domains for chain 11155420 must be an unsigned integer"))
+		);
 	}
 
 	// ===== Tests for helper functions =====
@@ -6671,13 +7207,70 @@ mod tests {
 			// gas_price_cap is omitted by default (no ceiling).
 			assert!(entry.get("gas_price_cap").is_none());
 		}
+		assert!(
+			chains
+				.get("1")
+				.and_then(|entry| entry.get("extra_native_fee"))
+				.is_none(),
+			"Ethereum should not default to an OP Stack extra fee",
+		);
+		assert_eq!(
+			chains
+				.get("10")
+				.and_then(|entry| entry.get("extra_native_fee"))
+				.and_then(|extra| extra.get("type"))
+				.and_then(|v| v.as_str()),
+			Some("op_stack_l1_data"),
+			"Optimism should default to OP Stack L1 data fee",
+		);
+		assert!(
+			chains
+				.get("137")
+				.and_then(|entry| entry.get("extra_native_fee"))
+				.is_none(),
+			"Polygon should not default to an OP Stack extra fee",
+		);
+	}
+
+	#[test]
+	fn test_build_delivery_config_defaults_extra_native_fee_for_known_op_stack_chains() {
+		let chain_ids = vec![10, 8453, 11155420, 84532, 747474, 1, 137, 42161];
+		let delivery = build_delivery_config_from_operator(&chain_ids, None);
+		let evm = delivery.implementations.get("evm_alloy").unwrap();
+		let chains = evm
+			.get("fee_policy")
+			.and_then(|policy| policy.get("chains"))
+			.and_then(|v| v.as_object())
+			.unwrap();
+
+		for chain_id in [10_u64, 8453, 11155420, 84532, 747474] {
+			assert_eq!(
+				chains
+					.get(&chain_id.to_string())
+					.and_then(|entry| entry.get("extra_native_fee"))
+					.and_then(|extra| extra.get("type"))
+					.and_then(|v| v.as_str()),
+				Some("op_stack_l1_data"),
+				"chain {chain_id} should default to OP Stack L1 data fee",
+			);
+		}
+
+		for chain_id in [1_u64, 137, 42161] {
+			assert!(
+				chains
+					.get(&chain_id.to_string())
+					.and_then(|entry| entry.get("extra_native_fee"))
+					.is_none(),
+				"chain {chain_id} should not default to an OP Stack extra fee",
+			);
+		}
 	}
 
 	#[test]
 	fn test_build_delivery_config_applies_per_chain_override() {
 		// Bootstrap config can override defaults per-chain. Whatever the
 		// operator specifies replaces; whatever they omit keeps the default.
-		use solver_types::{FeePolicyChainOverride, FeePolicyOverride};
+		use solver_types::{ExtraNativeFeeOverride, FeePolicyChainOverride, FeePolicyOverride};
 		use std::collections::HashMap as StdHashMap;
 
 		let mut chains = StdHashMap::new();
@@ -6688,6 +7281,7 @@ mod tests {
 				priority_fee_fallback: None, // keep default
 				quote_cost_strategy: None,
 				gas_price_cap: Some("300000000000".to_string()),
+				extra_native_fee: None,
 			},
 		);
 		chains.insert(
@@ -6697,6 +7291,10 @@ mod tests {
 				priority_fee_fallback: Some("100000000".to_string()),
 				quote_cost_strategy: None,
 				gas_price_cap: None,
+				extra_native_fee: Some(ExtraNativeFeeOverride::OpStackL1Data {
+					oracle_address: None,
+					buffer_bps: Some(1500),
+				}),
 			},
 		);
 		let override_ = FeePolicyOverride {
@@ -6762,18 +7360,44 @@ mod tests {
 			katana.get("priority_fee_fallback").and_then(|v| v.as_str()),
 			Some("100000000")
 		);
+		assert_eq!(
+			katana
+				.get("extra_native_fee")
+				.and_then(|extra| extra.get("type"))
+				.and_then(|v| v.as_str()),
+			Some("op_stack_l1_data")
+		);
+		assert_eq!(
+			katana
+				.get("extra_native_fee")
+				.and_then(|extra| extra.get("buffer_bps"))
+				.and_then(|v| v.as_u64()),
+			Some(1500),
+			"operator-supplied extra native fee override should win",
+		);
 	}
 
 	#[test]
 	fn test_build_discovery_config_from_operator() {
 		let chain_ids = vec![1, 10];
-		let discovery = build_discovery_config_from_operator(&chain_ids).unwrap();
+		let op_config = merge_to_operator_config(test_seed_overrides(), &TESTNET_SEED).unwrap();
+		let discovery = build_discovery_config_from_operator(&op_config, &chain_ids).unwrap();
 
 		assert!(discovery.implementations.contains_key("onchain_eip7683"));
 		assert!(discovery.implementations.contains_key("offchain_eip7683"));
 
 		let onchain = discovery.implementations.get("onchain_eip7683").unwrap();
 		assert!(onchain.get("polling_interval_secs").is_some());
+		assert_eq!(
+			onchain
+				.get("default_finality_blocks")
+				.and_then(|v| v.as_i64()),
+			Some(20)
+		);
+		assert!(onchain
+			.get("finality_blocks")
+			.and_then(|v| v.as_object())
+			.is_some());
 
 		// Offchain ingests in-process via /orders; it carries only network_ids
 		// (no api_host/api_port — the HTTP listener was removed in C-04).
@@ -6781,6 +7405,128 @@ mod tests {
 		assert!(offchain.get("network_ids").is_some());
 		assert!(offchain.get("api_host").is_none());
 		assert!(offchain.get("api_port").is_none());
+	}
+
+	#[test]
+	fn test_build_discovery_config_reuses_broadcaster_finality() {
+		let mut op_config = merge_to_operator_config(test_seed_overrides(), &TESTNET_SEED).unwrap();
+		op_config.settlement.broadcaster = Some(OperatorBroadcasterConfig {
+			oracles: OperatorOracleConfig {
+				input: HashMap::new(),
+				output: HashMap::new(),
+			},
+			routes: HashMap::new(),
+			broadcaster_addresses: HashMap::new(),
+			receiver_addresses: HashMap::new(),
+			broadcaster_ids: HashMap::new(),
+			proof_service_url: "http://localhost:8080".to_string(),
+			proof_wait_time_seconds: 30,
+			storage_proof_timeout_seconds: 30,
+			default_finality_blocks: 42,
+			finality_blocks: HashMap::from([(11155420, 64), (84532, 12)]),
+			chain_block_time_seconds: HashMap::new(),
+			intent_safety_buffer_seconds: None,
+			intent_min_expiry_seconds: None,
+			oracle_selection_strategy: OperatorOracleSelectionStrategy::First,
+			pusher_directions: Vec::new(),
+		});
+
+		let discovery =
+			build_discovery_config_from_operator(&op_config, &[11155420, 84532]).unwrap();
+		let onchain = discovery.implementations.get("onchain_eip7683").unwrap();
+
+		assert_eq!(
+			onchain
+				.get("default_finality_blocks")
+				.and_then(|v| v.as_i64()),
+			Some(42)
+		);
+		let finality_blocks = onchain
+			.get("finality_blocks")
+			.and_then(|v| v.as_object())
+			.unwrap();
+		assert_eq!(
+			finality_blocks.get("11155420").and_then(|v| v.as_i64()),
+			Some(64)
+		);
+		assert_eq!(
+			finality_blocks.get("84532").and_then(|v| v.as_i64()),
+			Some(12)
+		);
+	}
+
+	#[test]
+	fn test_merge_retains_broadcaster_finality_outside_settlement_priority() {
+		let mut overrides = test_seed_overrides();
+		let chain_a = 11155420;
+		let chain_b = 84532;
+		let oracle = address!("1111111111111111111111111111111111111111");
+		let routes = HashMap::from([(chain_a, vec![chain_b]), (chain_b, vec![chain_a])]);
+		let oracles = solver_types::seed_overrides::OracleOverrides {
+			input: HashMap::from([(chain_a, vec![oracle]), (chain_b, vec![oracle])]),
+			output: HashMap::from([(chain_a, vec![oracle]), (chain_b, vec![oracle])]),
+		};
+		overrides.settlement = Some(solver_types::seed_overrides::SettlementOverride {
+			settlement_type: solver_types::seed_overrides::SettlementTypeOverride::Direct,
+			priority: Some(vec![
+				solver_types::seed_overrides::SettlementTypeOverride::Direct,
+			]),
+			hyperlane: None,
+			direct: Some(solver_types::seed_overrides::DirectSettlementOverride {
+				oracles: oracles.clone(),
+				routes: routes.clone(),
+				dispute_period_seconds: Some(1),
+				oracle_selection_strategy: None,
+				intent_min_expiry_seconds: None,
+			}),
+			broadcaster: Some(
+				solver_types::seed_overrides::BroadcasterSettlementOverride {
+					default_finality_blocks: Some(0),
+					finality_blocks: HashMap::from([(chain_b, 3)]),
+					..Default::default()
+				},
+			),
+		});
+
+		let op_config = merge_to_operator_config(overrides, &TESTNET_SEED).unwrap();
+		assert_eq!(
+			op_config.settlement.priority,
+			Some(vec![OperatorSettlementType::Direct])
+		);
+		assert_eq!(
+			op_config
+				.settlement
+				.broadcaster
+				.as_ref()
+				.map(|config| config.default_finality_blocks),
+			Some(0)
+		);
+		assert_eq!(
+			op_config
+				.settlement
+				.broadcaster
+				.as_ref()
+				.and_then(|config| config.finality_blocks.get(&chain_b).copied()),
+			Some(3)
+		);
+
+		let discovery =
+			build_discovery_config_from_operator(&op_config, &[chain_a, chain_b]).unwrap();
+		let onchain = discovery.implementations.get("onchain_eip7683").unwrap();
+		assert_eq!(
+			onchain
+				.get("default_finality_blocks")
+				.and_then(|v| v.as_i64()),
+			Some(0)
+		);
+		assert_eq!(
+			onchain
+				.get("finality_blocks")
+				.and_then(|v| v.as_object())
+				.and_then(|finality| finality.get(&chain_b.to_string()))
+				.and_then(|v| v.as_i64()),
+			Some(3)
+		);
 	}
 
 	#[test]
@@ -7095,10 +7841,15 @@ mod tests {
 			&input_oracle,
 			1,
 			&[42161],
+			true,
 		);
 
-		assert_eq!(timing.fill_deadline_seconds, 300);
-		assert!(timing.expires_seconds >= 691_500);
+		assert_eq!(
+			timing.fill_deadline_seconds,
+			solver_config::DEFAULT_SOURCE_FINALITY_EXPECTED_DELAY_SECONDS
+				+ solver_config::QuoteConfig::default().validity_seconds
+		);
+		assert!(timing.expires_seconds >= 691_200 + timing.fill_deadline_seconds);
 	}
 
 	#[test]
@@ -7261,8 +8012,23 @@ mod tests {
 		assert!(hyperlane.mailboxes.contains_key(&84532));
 		assert!(hyperlane.igp_addresses.contains_key(&11155420));
 		assert!(hyperlane.igp_addresses.contains_key(&84532));
+		assert_eq!(hyperlane.domains.get(&11155420), Some(&11155420));
+		assert_eq!(hyperlane.domains.get(&84532), Some(&84532));
 		assert_eq!(hyperlane.routes.get(&11155420), Some(&vec![84532]));
 		assert_eq!(hyperlane.routes.get(&84532), Some(&vec![11155420]));
+	}
+
+	#[test]
+	fn test_validate_hyperlane_domains_rejects_missing_chain() {
+		let err = validate_hyperlane_domains(
+			&HashMap::from([(11155420, 11155420)]),
+			&[11155420, 84532],
+			"domains",
+		)
+		.unwrap_err();
+		assert!(
+			matches!(err, MergeError::Validation(msg) if msg.contains("domains is missing chain 84532"))
+		);
 	}
 
 	#[test]
@@ -7513,6 +8279,7 @@ mod tests {
 			live_post_fill_estimate_chain_ids: None,
 			fee_policy: None,
 			tx_bump: None,
+			source_finality: None,
 		};
 
 		// Step 1: merge_config should create Config with KMS account

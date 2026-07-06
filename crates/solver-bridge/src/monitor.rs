@@ -9,12 +9,17 @@
 //! Uses `pair.pair_id` (operator-chosen unique key) for cooldowns, transfer
 //! lookups, and any pair-level state.
 
+use crate::storage::retire_system_attempt_scope;
 use crate::threshold::{analyze_pair, RebalanceDirection};
-use crate::types::{BridgeRequest, BridgeTransferStatus, RebalanceTrigger};
+use crate::types::{bridge_system_scope, BridgeRequest, BridgeTransferStatus, RebalanceTrigger};
 use crate::BridgeService;
 use alloy_primitives::{Address, U256};
 use solver_config::RebalanceConfig;
-use solver_storage::StorageService;
+use solver_storage::{QueryFilter, StorageService};
+use solver_types::{
+	StorageKey, TransactionAttempt, TransactionAttemptScope, TransactionAttemptStatus,
+	TransactionHash, TransactionType,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{watch, RwLock, Semaphore};
@@ -52,6 +57,138 @@ const UNWRAP_MISSING_CHECKS_MAX: u32 = 3;
 
 fn is_source_transaction_missing(reason: &str) -> bool {
 	reason.contains("Source transaction not found") || reason.contains("Source transaction missing")
+}
+
+fn bridge_monitor_system_scope(operation: &str, chain_id: u64, transfer_id: &str) -> String {
+	bridge_system_scope(operation, chain_id, transfer_id)
+}
+
+fn hash_hex(hash: &TransactionHash) -> String {
+	format!("0x{}", hex::encode(&hash.0))
+}
+
+fn attempt_hash_rank(attempt: &TransactionAttempt) -> (u8, u8, u64) {
+	let status_rank = match attempt.status {
+		TransactionAttemptStatus::Confirmed | TransactionAttemptStatus::Reverted => 4,
+		TransactionAttemptStatus::Broadcast | TransactionAttemptStatus::Indeterminate => 3,
+		TransactionAttemptStatus::Planned => 2,
+		TransactionAttemptStatus::Replaced | TransactionAttemptStatus::SubmitRejected => 0,
+	};
+	(
+		status_rank,
+		u8::from(attempt.replacement_of.is_some()),
+		attempt.updated_at,
+	)
+}
+
+async fn latest_attempt_hash_for_scope(
+	storage: &Arc<StorageService>,
+	scope_id: &str,
+) -> Result<Option<String>, crate::BridgeError> {
+	let rows = storage
+		.query::<TransactionAttempt>(
+			StorageKey::TransactionAttempts.as_str(),
+			QueryFilter::Equals("scope_id".to_string(), serde_json::json!(scope_id)),
+		)
+		.await
+		.map_err(|e| crate::BridgeError::Storage(e.to_string()))?;
+
+	Ok(rows
+		.into_iter()
+		.map(|(_, attempt)| attempt)
+		.filter(|attempt| {
+			matches!(
+				&attempt.scope,
+				TransactionAttemptScope::System { scope_id: stored } if stored == scope_id
+			) && attempt.tx_hash.is_some()
+				&& !matches!(
+					attempt.status,
+					TransactionAttemptStatus::SubmitRejected | TransactionAttemptStatus::Replaced
+				) && (attempt.replaced_by.is_none()
+				|| matches!(
+					attempt.status,
+					TransactionAttemptStatus::Confirmed | TransactionAttemptStatus::Reverted
+				))
+		})
+		.max_by_key(attempt_hash_rank)
+		.and_then(|attempt| attempt.tx_hash.as_ref().map(hash_hex)))
+}
+
+async fn refresh_transfer_phase_hashes_from_attempts(
+	storage: &Arc<StorageService>,
+	transfer: &mut crate::types::PendingBridgeTransfer,
+) -> Result<bool, crate::BridgeError> {
+	let mut changed = false;
+	if refresh_phase_hash_from_attempt(
+		storage,
+		transfer.approve_scope_id.as_deref(),
+		&mut transfer.approve_tx_hash,
+	)
+	.await?
+	{
+		transfer.approve_missing_checks = 0;
+		transfer.approve_missing_since = None;
+		changed = true;
+	}
+	if refresh_phase_hash_from_attempt(
+		storage,
+		transfer.wrap_scope_id.as_deref(),
+		&mut transfer.wrap_tx_hash,
+	)
+	.await?
+	{
+		transfer.wrap_missing_checks = 0;
+		changed = true;
+	}
+	if refresh_phase_hash_from_attempt(
+		storage,
+		transfer.tx_scope_id.as_deref(),
+		&mut transfer.tx_hash,
+	)
+	.await?
+	{
+		transfer.submitted_missing_checks = 0;
+		transfer.submitted_missing_since = None;
+		changed = true;
+	}
+	if refresh_phase_hash_from_attempt(
+		storage,
+		transfer.redeem_scope_id.as_deref(),
+		&mut transfer.redeem_tx_hash,
+	)
+	.await?
+	{
+		transfer.redeem_missing_checks = 0;
+		transfer.redeem_missing_since = None;
+		changed = true;
+	}
+	if refresh_phase_hash_from_attempt(
+		storage,
+		transfer.unwrap_scope_id.as_deref(),
+		&mut transfer.unwrap_tx_hash,
+	)
+	.await?
+	{
+		transfer.unwrap_missing_checks = 0;
+		changed = true;
+	}
+	Ok(changed)
+}
+
+async fn refresh_phase_hash_from_attempt(
+	storage: &Arc<StorageService>,
+	scope_id: Option<&str>,
+	hash_slot: &mut Option<String>,
+) -> Result<bool, crate::BridgeError> {
+	if let Some(scope_id) = scope_id {
+		if let Some(latest_hash) = latest_attempt_hash_for_scope(storage, scope_id).await? {
+			if hash_slot.as_deref() != Some(latest_hash.as_str()) {
+				*hash_slot = Some(latest_hash);
+				return Ok(true);
+			}
+		}
+	}
+	Ok(false)
 }
 
 /// Background rebalance monitor.
@@ -179,6 +316,13 @@ impl RebalanceMonitor {
 			.as_secs();
 
 		for mut transfer in active {
+			if refresh_transfer_phase_hashes_from_attempts(&self.storage, &mut transfer).await? {
+				self.bridge_service
+					.storage()
+					.save_transfer(&transfer)
+					.await?;
+			}
+
 			let age = now.saturating_sub(transfer.updated_at);
 
 			// (W) WRAP CRASH-WINDOW + RECEIPT POLL + DROPPED-TX + TIMEOUT.
@@ -221,6 +365,11 @@ impl RebalanceMonitor {
 				// stays NeedsIntervention.
 				if !transfer.wrap_submit_attempted && transfer.wrap_tx_hash.is_none() {
 					transfer.wrap_submit_attempted = true;
+					transfer.wrap_scope_id = Some(bridge_monitor_system_scope(
+						"wrap-native",
+						transfer.source_chain,
+						&transfer.id,
+					));
 					self.bridge_service
 						.storage()
 						.save_transfer(&transfer)
@@ -355,7 +504,16 @@ impl RebalanceMonitor {
 											transfer_id = %transfer.id,
 											"WrapPending: wrap tx missing from chain for {WRAP_MISSING_CHECKS_MAX} ticks — clearing for resubmit"
 										);
+										if let Some(scope_id) = transfer.wrap_scope_id.as_deref() {
+											retire_system_attempt_scope(
+											&self.storage,
+											scope_id,
+											"wrap tx dropped; monitor will resubmit with a fresh scope",
+										)
+										.await?;
+										}
 										transfer.wrap_tx_hash = None;
+										transfer.wrap_scope_id = None;
 										transfer.wrap_submit_attempted = false;
 										transfer.wrap_missing_checks = 0;
 										self.bridge_service
@@ -605,7 +763,16 @@ impl RebalanceMonitor {
 									);
 									// Clear stale hash. Preserve approve_was_broadcast +
 									// approve_submitted_at so absolute cap measures whole phase.
+									if let Some(scope_id) = transfer.approve_scope_id.as_deref() {
+										retire_system_attempt_scope(
+											&self.storage,
+											scope_id,
+											"approve tx dropped; monitor will resubmit with a fresh scope",
+										)
+										.await?;
+									}
 									transfer.approve_tx_hash = None;
+									transfer.approve_scope_id = None;
 									transfer.approve_missing_checks = 0;
 									transfer.approve_missing_since = None;
 									// Same-tick retry — actually retry, do not just clear.
@@ -782,6 +949,14 @@ impl RebalanceMonitor {
 					pair = %transfer.pair_id,
 					"Auto-rebalance source tx dropped, failing fast for retry"
 				);
+				if let Some(scope_id) = transfer.tx_scope_id.as_deref() {
+					retire_system_attempt_scope(
+						&self.storage,
+						scope_id,
+						"source bridge tx dropped; auto transfer is being failed",
+					)
+					.await?;
+				}
 				self.bridge_service
 					.update_transfer(&mut transfer, new_status)
 					.await?;
@@ -797,6 +972,14 @@ impl RebalanceMonitor {
 					pair = %transfer.pair_id,
 					"Manual trigger source tx dropped, escalating to NeedsIntervention"
 				);
+				if let Some(scope_id) = transfer.tx_scope_id.as_deref() {
+					retire_system_attempt_scope(
+						&self.storage,
+						scope_id,
+						"source bridge tx dropped; manual transfer needs intervention",
+					)
+					.await?;
+				}
 				self.bridge_service
 					.update_transfer(
 						&mut transfer,
@@ -849,7 +1032,16 @@ impl RebalanceMonitor {
 						checks = transfer.redeem_missing_checks,
 						"Redeem tx hash remained missing; clearing stale hash for resubmission"
 					);
+					if let Some(scope_id) = transfer.redeem_scope_id.as_deref() {
+						retire_system_attempt_scope(
+							&self.storage,
+							scope_id,
+							"redeem tx dropped; monitor will resubmit with a fresh scope",
+						)
+						.await?;
+					}
 					transfer.redeem_tx_hash = None;
+					transfer.redeem_scope_id = None;
 					transfer.redeem_missing_checks = 0;
 					transfer.redeem_missing_since = None;
 					transfer.last_status_poll_at = Some(now);
@@ -873,7 +1065,16 @@ impl RebalanceMonitor {
 						failure_count = transfer.failure_count,
 						"Redeem attempt failed, will retry"
 					);
+					if let Some(scope_id) = transfer.redeem_scope_id.as_deref() {
+						retire_system_attempt_scope(
+							&self.storage,
+							scope_id,
+							"redeem attempt failed; monitor will retry with a fresh scope",
+						)
+						.await?;
+					}
 					transfer.redeem_tx_hash = None;
+					transfer.redeem_scope_id = None;
 				} else {
 					tracing::info!(
 						transfer_id = %transfer.id,
@@ -1227,12 +1428,31 @@ impl RebalanceMonitor {
 						// Persist the crash-window marker BEFORE broadcast so we
 						// can escalate (not auto-retry) on the ambiguous case.
 						transfer.redeem_submit_attempted = true;
+						transfer.redeem_scope_id = Some(bridge_monitor_system_scope(
+							"redeem",
+							transfer.dest_chain,
+							&transfer.id,
+						));
 						self.bridge_service
 							.storage()
 							.save_transfer(&transfer)
 							.await?;
 
-						match self.delivery.deliver(redeem_tx, None).await {
+						match self
+							.delivery
+							.deliver_system(
+								redeem_tx,
+								transfer.redeem_scope_id.clone().unwrap_or_else(|| {
+									bridge_monitor_system_scope(
+										"redeem",
+										transfer.dest_chain,
+										&transfer.id,
+									)
+								}),
+								TransactionType::Bridge,
+							)
+							.await
+						{
 							Ok(tx_hash) => {
 								transfer.redeem_tx_hash =
 									Some(format!("0x{}", hex::encode(&tx_hash.0)));
@@ -1297,6 +1517,11 @@ impl RebalanceMonitor {
 				&& transfer.unwrap_tx_hash.is_none()
 			{
 				transfer.unwrap_submit_attempted = true;
+				transfer.unwrap_scope_id = Some(bridge_monitor_system_scope(
+					"unwrap-native",
+					transfer.dest_chain,
+					&transfer.id,
+				));
 				self.bridge_service
 					.storage()
 					.save_transfer(&transfer)
@@ -1416,7 +1641,18 @@ impl RebalanceMonitor {
 												transfer_id = %transfer.id,
 												"UnwrapPending: tx missing for {UNWRAP_MISSING_CHECKS_MAX} ticks — clearing for resubmit"
 											);
+											if let Some(scope_id) =
+												transfer.unwrap_scope_id.as_deref()
+											{
+												retire_system_attempt_scope(
+													&self.storage,
+													scope_id,
+													"unwrap tx dropped; monitor will resubmit with a fresh scope",
+												)
+												.await?;
+											}
 											transfer.unwrap_tx_hash = None;
+											transfer.unwrap_scope_id = None;
 											transfer.unwrap_submit_attempted = false;
 											transfer.unwrap_missing_checks = 0;
 										}
@@ -1742,6 +1978,9 @@ impl RebalanceMonitor {
 					};
 
 				let metadata = crate::types::TransferMetadata {
+					transfer_id: None,
+					approve_scope_id: None,
+					tx_scope_id: None,
 					source_token_address: effective_source_token,
 					dest_token_address: delivery_scan_token,
 					dest_oft_address: dest_side.oft_address.clone(),
@@ -1915,6 +2154,9 @@ impl RebalanceMonitor {
 		transfer: &crate::types::PendingBridgeTransfer,
 	) -> crate::types::TransferMetadata {
 		crate::types::TransferMetadata {
+			transfer_id: Some(transfer.id.clone()),
+			approve_scope_id: transfer.approve_scope_id.clone(),
+			tx_scope_id: transfer.tx_scope_id.clone(),
 			source_token_address: transfer.source_token_address.clone().unwrap_or_default(),
 			dest_token_address: transfer.dest_token_address.clone().unwrap_or_default(),
 			dest_oft_address: transfer.dest_oft_address.clone().unwrap_or_default(),
@@ -1956,6 +2198,18 @@ impl RebalanceMonitor {
 
 		// CRASH-WINDOW GUARD: persist marker BEFORE the bridge_asset call.
 		transfer.bridge_submit_attempted = true;
+		transfer.tx_scope_id = Some(bridge_monitor_system_scope(
+			"deposit",
+			transfer.source_chain,
+			&transfer.id,
+		));
+		if transfer.approve_scope_id.is_none() {
+			transfer.approve_scope_id = Some(bridge_monitor_system_scope(
+				"approve",
+				transfer.source_chain,
+				&transfer.id,
+			));
+		}
 		self.bridge_service
 			.storage()
 			.save_transfer(transfer)
@@ -1980,7 +2234,10 @@ impl RebalanceMonitor {
 			))
 		})?;
 
-		let metadata = Self::reconstruct_metadata(transfer);
+		let mut metadata = Self::reconstruct_metadata(transfer);
+		metadata.transfer_id = Some(transfer.id.clone());
+		metadata.approve_scope_id = transfer.approve_scope_id.clone();
+		metadata.tx_scope_id = transfer.tx_scope_id.clone();
 		tracing::info!(
 			transfer_id = %transfer.id,
 			pair = %transfer.pair_id,
@@ -2036,6 +2293,14 @@ impl RebalanceMonitor {
 			},
 			Err(crate::BridgeError::ApproveSubmitFailed { error }) => {
 				transfer.bridge_submit_attempted = false; // ROLLBACK
+				if let Some(scope_id) = transfer.approve_scope_id.as_deref() {
+					retire_system_attempt_scope(
+						&self.storage,
+						scope_id,
+						"approve submit failed before bridge deposit",
+					)
+					.await?;
+				}
 				self.bridge_service
 					.update_transfer(
 						transfer,
@@ -2093,8 +2358,9 @@ mod tests {
 	use solver_storage::implementations::file::{FileStorage, TtlConfig};
 	use solver_storage::StorageService;
 	use solver_types::{
-		Address as DeliveryAddress, Log, LogFilter, Transaction, TransactionHash,
-		TransactionReceipt, H256,
+		Address as DeliveryAddress, Log, LogFilter, StorageKey, Transaction, TransactionAttempt,
+		TransactionAttemptScope, TransactionAttemptStatus, TransactionHash, TransactionReceipt,
+		H256,
 	};
 	use std::collections::{HashMap, VecDeque};
 	use std::fs;
@@ -2171,6 +2437,36 @@ mod tests {
 			base_path,
 			TtlConfig::default(),
 		))))
+	}
+
+	fn sample_tx(chain_id: u64) -> Transaction {
+		Transaction {
+			to: Some(DeliveryAddress(vec![0xbb; 20])),
+			data: vec![0x12, 0x34],
+			value: U256::ZERO,
+			chain_id,
+			nonce: Some(5),
+			gas_limit: Some(100000),
+			gas_price: None,
+			max_fee_per_gas: Some(100),
+			max_priority_fee_per_gas: Some(2),
+		}
+	}
+
+	async fn store_attempt_for_scope(storage: &Arc<StorageService>, attempt: &TransactionAttempt) {
+		let indexes = solver_storage::StorageIndexes::new()
+			.with_field("scope_kind", "system")
+			.with_field("scope_id", attempt.scope.scope_id())
+			.with_field("is_terminal", attempt.is_terminal());
+		storage
+			.store(
+				StorageKey::TransactionAttempts.as_str(),
+				&attempt.id,
+				attempt,
+				Some(indexes),
+			)
+			.await
+			.unwrap();
 	}
 
 	fn make_delivery(mock: MockDeliveryInterface) -> Arc<DeliveryService> {
@@ -3949,5 +4245,245 @@ mod tests {
 			stored.updated_at, stale_updated_at,
 			"updated_at must NOT be refreshed by the 'still pending' branch"
 		);
+	}
+
+	#[tokio::test]
+	async fn refreshes_bridge_hash_from_confirmed_system_replacement() {
+		let storage = make_storage();
+		let scope_id = format!(
+			"system:bridge:deposit:{}:{}",
+			Uuid::new_v4(),
+			Uuid::new_v4()
+		);
+		let parent_hash = TransactionHash(vec![0x11; 32]);
+		let child_hash = TransactionHash(vec![0x22; 32]);
+
+		let mut parent = TransactionAttempt::planned(
+			"parent-attempt".to_string(),
+			TransactionAttemptScope::system(scope_id.clone()),
+			Some(DeliveryAddress(vec![0xaa; 20])),
+			solver_types::TransactionType::Bridge,
+			sample_tx(10),
+		);
+		parent.status = TransactionAttemptStatus::Broadcast;
+		parent.tx_hash = Some(parent_hash.clone());
+		parent.replaced_by = Some("child-attempt".to_string());
+
+		let mut child = TransactionAttempt::planned(
+			"child-attempt".to_string(),
+			TransactionAttemptScope::system(scope_id.clone()),
+			Some(DeliveryAddress(vec![0xaa; 20])),
+			solver_types::TransactionType::Bridge,
+			sample_tx(10),
+		);
+		child.status = TransactionAttemptStatus::Confirmed;
+		child.tx_hash = Some(child_hash.clone());
+		child.replacement_of = Some(parent.id.clone());
+		child.updated_at = parent.updated_at + 1;
+
+		store_attempt_for_scope(&storage, &parent).await;
+		store_attempt_for_scope(&storage, &child).await;
+
+		let mut transfer = pending_transfer(BridgeTransferStatus::Submitted);
+		transfer.tx_hash = Some(format!("0x{}", hex::encode(&parent_hash.0)));
+		transfer.tx_scope_id = Some(scope_id);
+
+		let changed = refresh_transfer_phase_hashes_from_attempts(&storage, &mut transfer)
+			.await
+			.unwrap();
+
+		assert!(changed);
+		assert_eq!(
+			transfer.tx_hash.as_deref(),
+			Some(format!("0x{}", hex::encode(&child_hash.0)).as_str())
+		);
+	}
+
+	#[tokio::test]
+	async fn refresh_resets_missing_counters_for_replaced_phase_hashes() {
+		let storage = make_storage();
+		let tx_scope_id = format!(
+			"system:bridge:deposit:{}:{}",
+			Uuid::new_v4(),
+			Uuid::new_v4()
+		);
+		let redeem_scope_id = format!("system:bridge:redeem:{}:{}", Uuid::new_v4(), Uuid::new_v4());
+		let approve_scope_id = format!(
+			"system:bridge:approve:{}:{}",
+			Uuid::new_v4(),
+			Uuid::new_v4()
+		);
+		let wrap_scope_id = format!("system:bridge:wrap:{}:{}", Uuid::new_v4(), Uuid::new_v4());
+		let unwrap_scope_id = format!("system:bridge:unwrap:{}:{}", Uuid::new_v4(), Uuid::new_v4());
+
+		for (attempt_id, scope_id, hash_byte) in [
+			("deposit-attempt", &tx_scope_id, 0x10),
+			("redeem-attempt", &redeem_scope_id, 0x20),
+			("approve-attempt", &approve_scope_id, 0x30),
+			("wrap-attempt", &wrap_scope_id, 0x40),
+			("unwrap-attempt", &unwrap_scope_id, 0x50),
+		] {
+			let mut attempt = TransactionAttempt::planned(
+				attempt_id.to_string(),
+				TransactionAttemptScope::system(scope_id.clone()),
+				Some(DeliveryAddress(vec![0xaa; 20])),
+				solver_types::TransactionType::Bridge,
+				sample_tx(10),
+			);
+			attempt.status = TransactionAttemptStatus::Broadcast;
+			attempt.tx_hash = Some(TransactionHash(vec![hash_byte; 32]));
+			store_attempt_for_scope(&storage, &attempt).await;
+		}
+
+		let mut transfer = pending_transfer(BridgeTransferStatus::Submitted);
+		transfer.tx_scope_id = Some(tx_scope_id);
+		transfer.redeem_scope_id = Some(redeem_scope_id);
+		transfer.approve_scope_id = Some(approve_scope_id);
+		transfer.wrap_scope_id = Some(wrap_scope_id);
+		transfer.unwrap_scope_id = Some(unwrap_scope_id);
+		transfer.tx_hash = Some(format!("0x{}", hex::encode(vec![0x01; 32])));
+		transfer.redeem_tx_hash = Some(format!("0x{}", hex::encode(vec![0x02; 32])));
+		transfer.approve_tx_hash = Some(format!("0x{}", hex::encode(vec![0x03; 32])));
+		transfer.wrap_tx_hash = Some(format!("0x{}", hex::encode(vec![0x04; 32])));
+		transfer.unwrap_tx_hash = Some(format!("0x{}", hex::encode(vec![0x05; 32])));
+		transfer.submitted_missing_checks = 2;
+		transfer.submitted_missing_since = Some(1_700_000_000);
+		transfer.redeem_missing_checks = 2;
+		transfer.redeem_missing_since = Some(1_700_000_001);
+		transfer.approve_missing_checks = 2;
+		transfer.approve_missing_since = Some(1_700_000_002);
+		transfer.wrap_missing_checks = 2;
+		transfer.unwrap_missing_checks = 2;
+
+		let changed = refresh_transfer_phase_hashes_from_attempts(&storage, &mut transfer)
+			.await
+			.unwrap();
+
+		assert!(changed);
+		assert_eq!(transfer.submitted_missing_checks, 0);
+		assert!(transfer.submitted_missing_since.is_none());
+		assert_eq!(transfer.redeem_missing_checks, 0);
+		assert!(transfer.redeem_missing_since.is_none());
+		assert_eq!(transfer.approve_missing_checks, 0);
+		assert!(transfer.approve_missing_since.is_none());
+		assert_eq!(transfer.wrap_missing_checks, 0);
+		assert_eq!(transfer.unwrap_missing_checks, 0);
+	}
+
+	#[tokio::test]
+	async fn refresh_keeps_confirmed_parent_over_pending_replacement() {
+		let storage = make_storage();
+		let scope_id = format!(
+			"system:bridge:deposit:{}:{}",
+			Uuid::new_v4(),
+			Uuid::new_v4()
+		);
+		let parent_hash = TransactionHash(vec![0x33; 32]);
+		let child_hash = TransactionHash(vec![0x44; 32]);
+
+		let mut parent = TransactionAttempt::planned(
+			"parent-attempt".to_string(),
+			TransactionAttemptScope::system(scope_id.clone()),
+			Some(DeliveryAddress(vec![0xaa; 20])),
+			solver_types::TransactionType::Bridge,
+			sample_tx(10),
+		);
+		parent.status = TransactionAttemptStatus::Confirmed;
+		parent.tx_hash = Some(parent_hash.clone());
+		parent.replaced_by = Some("child-attempt".to_string());
+
+		let mut child = TransactionAttempt::planned(
+			"child-attempt".to_string(),
+			TransactionAttemptScope::system(scope_id.clone()),
+			Some(DeliveryAddress(vec![0xaa; 20])),
+			solver_types::TransactionType::Bridge,
+			sample_tx(10),
+		);
+		child.status = TransactionAttemptStatus::Broadcast;
+		child.tx_hash = Some(child_hash.clone());
+		child.replacement_of = Some(parent.id.clone());
+		child.updated_at = parent.updated_at + 1;
+
+		store_attempt_for_scope(&storage, &parent).await;
+		store_attempt_for_scope(&storage, &child).await;
+
+		let mut transfer = pending_transfer(BridgeTransferStatus::Submitted);
+		transfer.tx_hash = Some(format!("0x{}", hex::encode(&child_hash.0)));
+		transfer.tx_scope_id = Some(scope_id);
+
+		let changed = refresh_transfer_phase_hashes_from_attempts(&storage, &mut transfer)
+			.await
+			.unwrap();
+
+		assert!(changed);
+		assert_eq!(
+			transfer.tx_hash.as_deref(),
+			Some(format!("0x{}", hex::encode(&parent_hash.0)).as_str())
+		);
+	}
+
+	#[tokio::test]
+	async fn retire_system_scope_terminalizes_nonterminal_attempts_only() {
+		let storage = make_storage();
+		let scope_id = format!("system:bridge:redeem:{}:{}", Uuid::new_v4(), Uuid::new_v4());
+
+		let mut pending = TransactionAttempt::planned(
+			"pending-attempt".to_string(),
+			TransactionAttemptScope::system(scope_id.clone()),
+			Some(DeliveryAddress(vec![0xaa; 20])),
+			solver_types::TransactionType::Bridge,
+			sample_tx(10),
+		);
+		pending.status = TransactionAttemptStatus::Broadcast;
+		pending.tx_hash = Some(TransactionHash(vec![0x55; 32]));
+
+		let mut confirmed = TransactionAttempt::planned(
+			"confirmed-attempt".to_string(),
+			TransactionAttemptScope::system(scope_id.clone()),
+			Some(DeliveryAddress(vec![0xaa; 20])),
+			solver_types::TransactionType::Bridge,
+			sample_tx(10),
+		);
+		confirmed.status = TransactionAttemptStatus::Confirmed;
+		confirmed.tx_hash = Some(TransactionHash(vec![0x66; 32]));
+
+		store_attempt_for_scope(&storage, &pending).await;
+		store_attempt_for_scope(&storage, &confirmed).await;
+
+		retire_system_attempt_scope(
+			&storage,
+			&scope_id,
+			"dropped; fresh scope will be submitted",
+		)
+		.await
+		.unwrap();
+
+		let rows = storage
+			.query::<TransactionAttempt>(
+				StorageKey::TransactionAttempts.as_str(),
+				solver_storage::QueryFilter::Equals(
+					"scope_id".to_string(),
+					serde_json::json!(scope_id),
+				),
+			)
+			.await
+			.unwrap();
+		let pending = rows
+			.iter()
+			.find(|(_, attempt)| attempt.id == "pending-attempt")
+			.map(|(_, attempt)| attempt)
+			.unwrap();
+		let confirmed = rows
+			.iter()
+			.find(|(_, attempt)| attempt.id == "confirmed-attempt")
+			.map(|(_, attempt)| attempt)
+			.unwrap();
+
+		assert_eq!(pending.status, TransactionAttemptStatus::Replaced);
+		assert_eq!(
+			pending.error.as_deref(),
+			Some("dropped; fresh scope will be submitted")
+		);
+		assert_eq!(confirmed.status, TransactionAttemptStatus::Confirmed);
 	}
 }

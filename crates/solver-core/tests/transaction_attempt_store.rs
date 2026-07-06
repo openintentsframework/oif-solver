@@ -13,8 +13,8 @@ use solver_storage::{
 	MockStorageInterface, StorageService,
 };
 use solver_types::{
-	Address, StorageKey, Transaction, TransactionAttempt, TransactionAttemptStatus,
-	TransactionHash, TransactionReceipt, TransactionType,
+	Address, StorageKey, Transaction, TransactionAttempt, TransactionAttemptScope,
+	TransactionAttemptStatus, TransactionHash, TransactionReceipt, TransactionType,
 };
 use tempfile::TempDir;
 
@@ -62,7 +62,7 @@ fn sample_attempt_with_id_and_status(
 ) -> TransactionAttempt {
 	let mut attempt = TransactionAttempt::planned(
 		id.to_string(),
-		"order-1".to_string(),
+		TransactionAttemptScope::order("order-1"),
 		Some(Address(vec![9; 20])),
 		TransactionType::Fill,
 		sample_tx(10, Some(7)),
@@ -87,7 +87,7 @@ async fn create_planned_attempt_persists_with_v4_id() {
 
 	let parsed_id = uuid::Uuid::parse_str(&attempt.id).unwrap();
 	assert_eq!(parsed_id.get_version_num(), 4);
-	assert_eq!(attempt.order_id, "order-1");
+	assert_eq!(attempt.order_id(), Some("order-1"));
 	assert_eq!(attempt.signer, Some(Address(vec![9; 20])));
 	assert_eq!(attempt.tx_type, TransactionType::Fill);
 	assert_eq!(attempt.chain_id, 10);
@@ -96,7 +96,7 @@ async fn create_planned_attempt_persists_with_v4_id() {
 
 	let loaded = store.get_attempt(&attempt.id).await.unwrap();
 	assert_eq!(loaded.id, attempt.id);
-	assert_eq!(loaded.order_id, attempt.order_id);
+	assert_eq!(loaded.scope, attempt.scope);
 	assert_eq!(loaded.signer, attempt.signer);
 	assert_eq!(loaded.tx_type, attempt.tx_type);
 	assert_eq!(loaded.chain_id, attempt.chain_id);
@@ -140,6 +140,39 @@ async fn attempts_for_order_returns_only_matching_order_attempts() {
 	assert_eq!(order_one_attempts.len(), 1);
 	assert_eq!(order_one_attempts[0].id, first.id);
 	assert_ne!(order_one_attempts[0].id, second.id);
+}
+
+#[tokio::test]
+async fn system_attempts_are_discoverable_without_order_lookup() {
+	let (store, _temp_dir) = make_store();
+	let scope_id = "system:approval:1:token:spender";
+
+	let attempt = store
+		.record_planned_attempt(solver_delivery::PlannedAttemptInit {
+			scope: TransactionAttemptScope::System {
+				scope_id: scope_id.to_string(),
+			},
+			signer: Some(Address(vec![7; 20])),
+			tx_type: TransactionType::Approval,
+			tx: sample_tx(10, Some(3)),
+			attempt_id_override: None,
+			replacement_of: None,
+		})
+		.await
+		.unwrap();
+
+	assert_eq!(
+		attempt.scope,
+		TransactionAttemptScope::System {
+			scope_id: scope_id.to_string()
+		}
+	);
+	assert!(store.attempts_for_order(scope_id).await.unwrap().is_empty());
+
+	let system_attempts = store.non_terminal_system_attempts().await.unwrap();
+	assert_eq!(system_attempts.len(), 1);
+	assert_eq!(system_attempts[0].id, attempt.id);
+	assert_eq!(system_attempts[0].scope.scope_id(), scope_id);
 }
 
 #[tokio::test]

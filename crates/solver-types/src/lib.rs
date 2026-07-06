@@ -18,6 +18,8 @@ pub mod delivery;
 pub mod discovery;
 /// Event types for inter-service communication.
 pub mod events;
+/// Source-chain finality selection helpers.
+pub mod finality;
 /// Network and token configuration types.
 pub mod networks;
 /// Operator configuration types for runtime storage in Redis.
@@ -66,6 +68,9 @@ pub use costs::{CostBreakdown, CostContext};
 pub use delivery::*;
 pub use discovery::*;
 pub use events::*;
+pub use finality::{
+	select_finality_head, select_source_finality_head, SourceFinalityMode, SourceFinalityRule,
+};
 pub use networks::{NetworkConfig, NetworkType, NetworksConfig, TokenConfig};
 pub use operator_config::{
 	OperatorAccountConfig, OperatorAdminConfig, OperatorBroadcasterConfig, OperatorConfig,
@@ -87,8 +92,8 @@ pub use registry::ImplementationRegistry;
 pub use secret_string::SecretString;
 pub use seed_overrides::{AccountOverride, NetworkOverride, SeedOverrides, Token};
 pub use seed_overrides::{
-	BroadcasterSettlementOverride, DirectSettlementOverride, FeePolicyChainOverride,
-	FeePolicyOverride, HyperlaneSettlementOverride, OracleOverrides,
+	BroadcasterSettlementOverride, DirectSettlementOverride, ExtraNativeFeeOverride,
+	FeePolicyChainOverride, FeePolicyOverride, HyperlaneSettlementOverride, OracleOverrides,
 	OracleSelectionStrategyOverride, RoutingDefaults, SettlementOverride, SettlementTypeOverride,
 };
 pub use standards::{
@@ -96,7 +101,9 @@ pub use standards::{
 	eip7930::{InteropAddress, InteropAddressError},
 };
 pub use storage::*;
-pub use transaction_attempt::{TransactionAttempt, TransactionAttemptStatus};
+pub use transaction_attempt::{
+	TransactionAttempt, TransactionAttemptScope, TransactionAttemptStatus,
+};
 pub use utils::{
 	bytes32_to_address, current_timestamp, format_token_amount, normalize_bytes32_address,
 	order_id_to_bytes32, parse_address, truncate_id, wei_string_to_eth_string, with_0x_prefix,

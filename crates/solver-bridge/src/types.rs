@@ -2,6 +2,24 @@
 
 use alloy_primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+pub fn bridge_system_scope(operation: &str, chain_id: u64, transfer_id: &str) -> String {
+	let operation: String = operation
+		.chars()
+		.map(|ch| {
+			if ch.is_ascii_alphanumeric() || ch == '-' {
+				ch.to_ascii_lowercase()
+			} else {
+				'-'
+			}
+		})
+		.collect();
+	format!(
+		"system:bridge:{operation}:{chain_id}:{transfer_id}:{}",
+		Uuid::new_v4()
+	)
+}
 
 /// Typed request for a bridge operation.
 ///
@@ -35,6 +53,12 @@ pub struct BridgeRequest {
 /// Must be provided by the caller (monitor or admin API) when initiating a transfer.
 #[derive(Debug, Clone, Default)]
 pub struct TransferMetadata {
+	/// Persisted transfer id. Used only to derive system transaction tracking scopes.
+	pub transfer_id: Option<String>,
+	/// System attempt scope for the source-chain approve phase, when needed.
+	pub approve_scope_id: Option<String>,
+	/// System attempt scope for the source-chain bridge/deposit phase.
+	pub tx_scope_id: Option<String>,
 	/// Source token/share contract address — the **effective** ERC-20 the solver
 	/// approves/balances on the source chain. For ERC-20 pairs this is the pair's
 	/// `token_address`; for native pairs it's the wrapper (e.g., WETH on Ethereum).
@@ -179,10 +203,16 @@ pub struct PendingBridgeTransfer {
 	pub updated_at: u64,
 	/// Bridge tx hash on the source chain.
 	pub tx_hash: Option<String>,
+	/// System transaction attempt scope for `tx_hash`.
+	#[serde(default)]
+	pub tx_scope_id: Option<String>,
 	/// LayerZero message GUID for tracking.
 	pub message_guid: Option<String>,
 	/// Vault redeem tx hash on Ethereum (for PendingRedemption state).
 	pub redeem_tx_hash: Option<String>,
+	/// System transaction attempt scope for `redeem_tx_hash`.
+	#[serde(default)]
+	pub redeem_scope_id: Option<String>,
 	/// Native gas paid for the LayerZero messaging fee.
 	pub fee_paid: Option<String>,
 
@@ -232,6 +262,9 @@ pub struct PendingBridgeTransfer {
 	/// the only useful recovery pointer.
 	#[serde(default)]
 	pub approve_tx_hash: Option<String>,
+	/// System transaction attempt scope for `approve_tx_hash`.
+	#[serde(default)]
+	pub approve_scope_id: Option<String>,
 	/// Number of consecutive polls where the stored approve tx was not found on-chain.
 	/// Mirrors `submitted_missing_checks` for the source-side allowance step.
 	#[serde(default)]
@@ -296,6 +329,9 @@ pub struct PendingBridgeTransfer {
 	/// or `vbETH.deposit{value: amount}` on Katana).
 	#[serde(default)]
 	pub wrap_tx_hash: Option<String>,
+	/// System transaction attempt scope for `wrap_tx_hash`.
+	#[serde(default)]
+	pub wrap_scope_id: Option<String>,
 	/// Number of consecutive polls where the stored wrap tx was not found on-chain.
 	/// Mirrors `submitted_missing_checks`: after `WRAP_MISSING_CHECKS_MAX` misses
 	/// the hash is cleared so a fresh submit can run on the next tick.
@@ -313,6 +349,9 @@ pub struct PendingBridgeTransfer {
 	/// or `WETH.withdraw(amount)` on Ethereum).
 	#[serde(default)]
 	pub unwrap_tx_hash: Option<String>,
+	/// System transaction attempt scope for `unwrap_tx_hash`.
+	#[serde(default)]
+	pub unwrap_scope_id: Option<String>,
 	/// Number of consecutive polls where the stored unwrap tx was not found on-chain.
 	#[serde(default)]
 	pub unwrap_missing_checks: u32,
@@ -356,8 +395,10 @@ impl PendingBridgeTransfer {
 			created_at: now,
 			updated_at: now,
 			tx_hash,
+			tx_scope_id: None,
 			message_guid,
 			redeem_tx_hash: None,
+			redeem_scope_id: None,
 			fee_paid,
 			last_status_poll_at: None,
 			failure_count: 0,
@@ -376,6 +417,7 @@ impl PendingBridgeTransfer {
 			redeem_missing_checks: 0,
 			redeem_missing_since: None,
 			approve_tx_hash: None,
+			approve_scope_id: None,
 			approve_missing_checks: 0,
 			approve_missing_since: None,
 			approve_submitted_at: None,
@@ -388,10 +430,12 @@ impl PendingBridgeTransfer {
 			route_snapshot: None,
 			wrap_submit_attempted: false,
 			wrap_tx_hash: None,
+			wrap_scope_id: None,
 			wrap_missing_checks: 0,
 			redeem_submit_attempted: false,
 			unwrap_submit_attempted: false,
 			unwrap_tx_hash: None,
+			unwrap_scope_id: None,
 			unwrap_missing_checks: 0,
 			unwrap_amount: None,
 		}

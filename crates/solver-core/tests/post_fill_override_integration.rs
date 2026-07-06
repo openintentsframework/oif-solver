@@ -17,6 +17,8 @@
 //!   - `OIF_TEST_DEST_CHAIN_ID`    — destination chain id (e.g. 1, 747474).
 //!   - `OIF_TEST_ORIGIN_CHAIN_ID` — origin chain id, used as
 //!     `destinationDomain` in the synthetic Hyperlane `submit(...)` call.
+//!   - `OIF_TEST_ORIGIN_DOMAIN` — optional Hyperlane domain for the origin
+//!     chain. Defaults to `OIF_TEST_ORIGIN_CHAIN_ID` and must be non-zero.
 //!   - `OIF_TEST_OUTPUT_SETTLER`   — OutputSettler address on dest chain.
 //!   - `OIF_TEST_OUTPUT_ORACLE` — Hyperlane output oracle address on
 //!     dest chain (= `to` of the submit tx).
@@ -82,6 +84,35 @@ fn skip_unless_live() -> bool {
 
 fn require_env(name: &str) -> String {
 	std::env::var(name).unwrap_or_else(|_| panic!("missing required env var: {name}"))
+}
+
+fn origin_domain_for_test_env(value: Option<&str>, origin_chain_id: u64) -> u32 {
+	let domain = value
+		.map(|value| value.parse().expect("OIF_TEST_ORIGIN_DOMAIN must be u32"))
+		.unwrap_or_else(|| {
+			u32::try_from(origin_chain_id).expect(
+				"OIF_TEST_ORIGIN_CHAIN_ID must fit u32 when OIF_TEST_ORIGIN_DOMAIN is unset",
+			)
+		});
+	assert!(domain != 0, "OIF_TEST_ORIGIN_DOMAIN must be non-zero");
+	domain
+}
+
+#[test]
+fn origin_domain_env_rejects_zero() {
+	let panic = std::panic::catch_unwind(|| origin_domain_for_test_env(Some("0"), 1))
+		.expect_err("zero origin domain must fail fast");
+	let message = panic
+		.downcast_ref::<String>()
+		.map(String::as_str)
+		.or_else(|| panic.downcast_ref::<&str>().copied())
+		.unwrap_or("");
+	assert!(message.contains("OIF_TEST_ORIGIN_DOMAIN must be non-zero"));
+}
+
+#[test]
+fn origin_domain_env_falls_back_to_chain_id() {
+	assert_eq!(origin_domain_for_test_env(None, 747474), 747474);
 }
 
 // -------------------------------------------------------------------------
@@ -324,6 +355,8 @@ async fn post_fill_estimate_with_overrides_returns_realistic_units() {
 	let origin_chain_id: u64 = require_env("OIF_TEST_ORIGIN_CHAIN_ID")
 		.parse()
 		.expect("OIF_TEST_ORIGIN_CHAIN_ID must be u64");
+	let origin_domain_env = std::env::var("OIF_TEST_ORIGIN_DOMAIN").ok();
+	let origin_domain = origin_domain_for_test_env(origin_domain_env.as_deref(), origin_chain_id);
 	let output_settler: Address = require_env("OIF_TEST_OUTPUT_SETTLER")
 		.parse()
 		.expect("OIF_TEST_OUTPUT_SETTLER must be a 0x... address");
@@ -399,7 +432,7 @@ async fn post_fill_estimate_with_overrides_returns_realistic_units() {
 		.erased();
 
 	let quote_call_data = IHyperlaneOracleForQuote::quoteGasPaymentCall {
-		destinationDomain: origin_chain_id as u32,
+		destinationDomain: origin_domain,
 		recipientOracle: recipient_oracle,
 		gasLimit: message_gas_limit,
 		customMetadata: Bytes::new(),
@@ -419,7 +452,7 @@ async fn post_fill_estimate_with_overrides_returns_realistic_units() {
 	let delivery = LiveRpcDelivery::new(&dest_rpc_url, dest_chain_id);
 
 	let submit_call_data = IHyperlaneOracleForQuote::submitCall {
-		destinationDomain: origin_chain_id as u32,
+		destinationDomain: origin_domain,
 		recipientOracle: recipient_oracle,
 		gasLimit: message_gas_limit,
 		customMetadata: Bytes::new(),

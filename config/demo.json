@@ -63,7 +63,9 @@
           31337,
           31338
         ],
-        "polling_interval_secs": 0
+        "polling_interval_secs": 5,
+        "default_finality_blocks": 20,
+        "finality_blocks": {}
       }
     }
   },

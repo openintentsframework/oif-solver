@@ -218,14 +218,16 @@ pub fn estimate_required_expiry_window_seconds(
 	pinned_settlement_name: Option<&str>,
 ) -> Option<(u64, String)> {
 	let input_oracle = parse_address(&order_data.input_oracle).ok()?;
+	let origin_chain_id = u64::try_from(order_data.origin_chain_id).ok()?;
+	let output_chain_ids: Option<Vec<u64>> = order_data
+		.outputs
+		.iter()
+		.map(|output| u64::try_from(output.chain_id).ok())
+		.collect();
 	let inputs = RouteExpiryInputs {
 		input_oracle,
-		origin_chain_id: order_data.origin_chain_id.to::<u64>(),
-		output_chain_ids: order_data
-			.outputs
-			.iter()
-			.map(|output| output.chain_id.to::<u64>())
-			.collect(),
+		origin_chain_id,
+		output_chain_ids: output_chain_ids?,
 	};
 
 	estimate_required_expiry_window_for_route(
@@ -239,6 +241,8 @@ pub fn estimate_required_expiry_window_seconds(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use alloy_primitives::U256;
+	use solver_types::standards::eip7683::MandateOutput;
 	use solver_types::utils::tests::builders::Eip7683OrderDataBuilder;
 
 	fn broadcaster_config() -> serde_json::Value {
@@ -331,5 +335,38 @@ mod tests {
 		);
 
 		assert_eq!(route_based, order_based);
+	}
+
+	#[test]
+	fn estimate_required_expiry_window_ignores_unrepresentable_chain_ids() {
+		let implementations = HashMap::from([("broadcaster".to_string(), broadcaster_config())]);
+		let mut order_data = Eip7683OrderDataBuilder::new().build();
+		order_data.origin_chain_id = U256::MAX;
+
+		assert_eq!(
+			estimate_required_expiry_window_seconds(
+				&order_data,
+				&implementations,
+				3,
+				Some("broadcaster")
+			),
+			None
+		);
+
+		let mut order_data = Eip7683OrderDataBuilder::new().build();
+		order_data.outputs = vec![MandateOutput {
+			chain_id: U256::MAX,
+			..order_data.outputs[0].clone()
+		}];
+
+		assert_eq!(
+			estimate_required_expiry_window_seconds(
+				&order_data,
+				&implementations,
+				3,
+				Some("broadcaster")
+			),
+			None
+		);
 	}
 }

@@ -36,6 +36,10 @@ pub struct CostBreakdown {
 	pub settlement_fee: Decimal,
 	#[serde(default, with = "rust_decimal::serde::str")]
 	pub settlement_fee_buffer: Decimal,
+	#[serde(default, with = "rust_decimal::serde::str")]
+	pub l1_data_fee: Decimal,
+	#[serde(default, with = "rust_decimal::serde::str")]
+	pub l1_data_fee_buffer: Decimal,
 
 	// Market components
 	#[serde(with = "rust_decimal::serde::str")]
@@ -107,5 +111,7 @@ mod tests {
 
 		assert_eq!(breakdown.settlement_fee, Decimal::ZERO);
 		assert_eq!(breakdown.settlement_fee_buffer, Decimal::ZERO);
+		assert_eq!(breakdown.l1_data_fee, Decimal::ZERO);
+		assert_eq!(breakdown.l1_data_fee_buffer, Decimal::ZERO);
 	}
 }

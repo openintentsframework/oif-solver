@@ -51,6 +51,10 @@ pub mod implementations {
 /// Used to filter items when querying storage backends.
 /// Each backend handles indexing differently - databases use native indexes,
 /// file storage uses index files.
+///
+/// Redis supports only positive indexed filters (`All`, `Equals`, `In`).
+/// `NotEquals` and `NotIn` are available for file and memory backends, but Redis
+/// rejects them to avoid namespace-wide negative scans over unbounded sets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum QueryFilter {
 	/// Match items where field equals value.
@@ -159,6 +163,10 @@ pub trait StorageInterface: Send + Sync {
 	///
 	/// Returns list of keys matching the filter criteria.
 	/// Only returns keys for items that have been indexed.
+	///
+	/// Backend support differs by filter. In particular, Redis rejects
+	/// [`QueryFilter::NotEquals`] and [`QueryFilter::NotIn`] because those filters
+	/// require scanning the whole namespace in Redis.
 	async fn query(
 		&self,
 		namespace: &str,

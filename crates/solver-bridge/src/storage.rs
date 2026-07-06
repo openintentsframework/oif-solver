@@ -6,6 +6,10 @@
 
 use crate::types::{BridgeTransferStatus, PendingBridgeTransfer};
 use solver_storage::{QueryFilter, StorageError, StorageIndexes, StorageService};
+use solver_types::{
+	current_timestamp, StorageKey, TransactionAttempt, TransactionAttemptScope,
+	TransactionAttemptStatus,
+};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +22,8 @@ const BRIDGE_COOLDOWN_NS: &str = "bridge-cooldown";
 /// TTL for completed/failed transfers (7 days).
 const TERMINAL_TRANSFER_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 
+const RETIRE_SYSTEM_ATTEMPT_CAS_RETRIES: usize = 3;
+
 /// Manages bridge transfer persistence.
 pub struct BridgeStorage {
 	storage: Arc<StorageService>,
@@ -27,6 +33,10 @@ pub struct BridgeStorage {
 impl BridgeStorage {
 	pub fn new(storage: Arc<StorageService>, solver_id: String) -> Self {
 		Self { storage, solver_id }
+	}
+
+	pub(crate) fn storage_service(&self) -> Arc<StorageService> {
+		self.storage.clone()
 	}
 
 	/// Full namespace prefix for this solver's bridge transfers.
@@ -189,14 +199,111 @@ impl BridgeStorage {
 	}
 }
 
+fn transaction_attempt_indexes(attempt: &TransactionAttempt) -> StorageIndexes {
+	let scope_kind = if attempt.scope.is_system() {
+		"system"
+	} else {
+		"order"
+	};
+	let mut indexes = StorageIndexes::new()
+		.with_field("scope_kind", scope_kind)
+		.with_field("scope_id", attempt.scope.scope_id())
+		.with_field("is_terminal", attempt.is_terminal());
+
+	if let Some(order_id) = attempt.scope.order_id() {
+		indexes = indexes.with_field("order_id", order_id);
+	}
+
+	if let Some(tx_hash) = &attempt.tx_hash {
+		indexes = indexes.with_field("tx_hash", hex::encode(&tx_hash.0));
+	}
+
+	indexes
+}
+
+pub(crate) async fn retire_system_attempt_scope(
+	storage: &Arc<StorageService>,
+	scope_id: &str,
+	reason: &str,
+) -> Result<(), crate::BridgeError> {
+	let rows = storage
+		.query::<TransactionAttempt>(
+			StorageKey::TransactionAttempts.as_str(),
+			QueryFilter::Equals("scope_id".to_string(), serde_json::json!(scope_id)),
+		)
+		.await
+		.map_err(|e| crate::BridgeError::Storage(e.to_string()))?;
+
+	for (attempt_id, attempt) in rows {
+		if attempt.is_terminal()
+			|| !matches!(
+				&attempt.scope,
+				TransactionAttemptScope::System { scope_id: stored } if stored == scope_id
+			) {
+			continue;
+		}
+
+		let namespace = StorageKey::TransactionAttempts.as_str();
+		let mut retired = false;
+		for _ in 0..RETIRE_SYSTEM_ATTEMPT_CAS_RETRIES {
+			let current_bytes = storage
+				.retrieve_bytes(namespace, &attempt_id)
+				.await
+				.map_err(|e| crate::BridgeError::Storage(e.to_string()))?;
+			let mut current: TransactionAttempt = serde_json::from_slice(&current_bytes)
+				.map_err(|e| crate::BridgeError::Storage(e.to_string()))?;
+			if current.is_terminal()
+				|| !matches!(
+					&current.scope,
+					TransactionAttemptScope::System { scope_id: stored } if stored == scope_id
+				) {
+				retired = true;
+				break;
+			}
+
+			current.status = TransactionAttemptStatus::Replaced;
+			current.error = Some(reason.to_string());
+			current.updated_at = current_timestamp();
+			let updated_bytes = serde_json::to_vec(&current)
+				.map_err(|e| crate::BridgeError::Storage(e.to_string()))?;
+			let swapped = storage
+				.compare_and_swap_bytes(
+					namespace,
+					&attempt_id,
+					&current_bytes,
+					updated_bytes,
+					Some(transaction_attempt_indexes(&current)),
+					None,
+				)
+				.await
+				.map_err(|e| crate::BridgeError::Storage(e.to_string()))?;
+			if swapped {
+				retired = true;
+				break;
+			}
+		}
+
+		if !retired {
+			return Err(crate::BridgeError::Storage(format!(
+				"concurrent update while retiring system attempt {attempt_id} for scope {scope_id}"
+			)));
+		}
+	}
+
+	Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::test_support::pending_transfer;
+	use alloy_primitives::U256;
 	use solver_storage::implementations::file::{FileStorage, TtlConfig};
-	use solver_storage::{QueryFilter, StorageService};
+	use solver_storage::{MockStorageInterface, QueryFilter, StorageService};
+	use solver_types::{Address, Transaction, TransactionHash, TransactionType};
 	use std::fs;
 	use std::path::{Path, PathBuf};
+	use std::sync::atomic::{AtomicUsize, Ordering};
 	use uuid::Uuid;
 
 	fn make_storage() -> (BridgeStorage, PathBuf) {
@@ -223,6 +330,30 @@ mod tests {
 		let mut expires_bytes = [0u8; 8];
 		expires_bytes.copy_from_slice(&data[6..14]);
 		u64::from_le_bytes(expires_bytes)
+	}
+
+	fn sample_attempt(scope_id: &str) -> TransactionAttempt {
+		let tx = Transaction {
+			to: Some(Address(vec![0xbb; 20])),
+			data: vec![0x12, 0x34],
+			value: U256::ZERO,
+			chain_id: 1,
+			nonce: Some(5),
+			gas_limit: Some(100000),
+			gas_price: None,
+			max_fee_per_gas: Some(100),
+			max_priority_fee_per_gas: Some(2),
+		};
+		let mut attempt = TransactionAttempt::planned(
+			"attempt-cas".to_string(),
+			TransactionAttemptScope::system(scope_id.to_string()),
+			Some(Address(vec![0xaa; 20])),
+			TransactionType::Bridge,
+			tx,
+		);
+		attempt.status = TransactionAttemptStatus::Broadcast;
+		attempt.tx_hash = Some(TransactionHash(vec![0x11; 32]));
+		attempt
 	}
 
 	#[tokio::test]
@@ -308,6 +439,88 @@ mod tests {
 		assert!(transfers
 			.iter()
 			.any(|transfer| matches!(transfer.status, BridgeTransferStatus::NeedsIntervention(_))));
+	}
+
+	#[tokio::test]
+	async fn test_retire_system_attempt_scope_retries_cas_conflict() {
+		let scope_id = "system:bridge:deposit:cas-conflict";
+		let attempt = sample_attempt(scope_id);
+		let mut concurrent = attempt.clone();
+		concurrent.error = Some("concurrent monitor update".to_string());
+		concurrent.updated_at += 1;
+		let first_bytes = serde_json::to_vec(&attempt).unwrap();
+		let second_bytes = serde_json::to_vec(&concurrent).unwrap();
+		let namespace = StorageKey::TransactionAttempts.as_str().to_string();
+		let key = format!("{namespace}:attempt-cas");
+		let mut backend = MockStorageInterface::new();
+
+		{
+			let key = key.clone();
+			let namespace = namespace.clone();
+			backend
+				.expect_query()
+				.times(1)
+				.returning(move |ns, _filter| {
+					assert_eq!(ns, namespace);
+					let key = key.clone();
+					Box::pin(async move { Ok(vec![key]) })
+				});
+		}
+		{
+			let key = key.clone();
+			let first_bytes = first_bytes.clone();
+			backend.expect_get_batch().times(1).returning(move |keys| {
+				assert_eq!(keys, &[key.clone()]);
+				let key = key.clone();
+				let first_bytes = first_bytes.clone();
+				Box::pin(async move { Ok(vec![(key, first_bytes)]) })
+			});
+		}
+		{
+			let key = key.clone();
+			let first_bytes = first_bytes.clone();
+			let second_bytes = second_bytes.clone();
+			let calls = Arc::new(AtomicUsize::new(0));
+			backend
+				.expect_get_bytes()
+				.times(2)
+				.returning(move |requested| {
+					assert_eq!(requested, key);
+					let call = calls.fetch_add(1, Ordering::SeqCst);
+					let bytes = if call == 0 {
+						first_bytes.clone()
+					} else {
+						second_bytes.clone()
+					};
+					Box::pin(async move { Ok(bytes) })
+				});
+		}
+		{
+			let key = key.clone();
+			let first_bytes = first_bytes.clone();
+			let second_bytes = second_bytes.clone();
+			let calls = Arc::new(AtomicUsize::new(0));
+			backend
+				.expect_compare_and_swap_with_indexes()
+				.times(2)
+				.returning(move |requested, expected, _new_value, _indexes, _ttl| {
+					assert_eq!(requested, key);
+					let call = calls.fetch_add(1, Ordering::SeqCst);
+					if call == 0 {
+						assert_eq!(expected, first_bytes.as_slice());
+						Box::pin(async move { Ok(false) })
+					} else {
+						assert_eq!(expected, second_bytes.as_slice());
+						Box::pin(async move { Ok(true) })
+					}
+				});
+		}
+
+		let storage = Arc::new(StorageService::new(Box::new(backend)));
+
+		retire_system_attempt_scope(&storage, scope_id, "retired after conflict")
+			.await
+			.unwrap();
 	}
 
 	#[tokio::test]

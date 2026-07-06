@@ -44,6 +44,7 @@ fn tx_bump_config() -> OperatorTxBumpConfig {
 fn bump_harness_options() -> HarnessOptions {
 	HarnessOptions {
 		tx_bump: Some(tx_bump_config()),
+		broadcaster_default_finality_blocks: Some(0),
 		..Default::default()
 	}
 }
@@ -75,6 +76,26 @@ fn is_broadcast_with_hash(attempt: &TransactionAttempt) -> bool {
 		&& attempt.nonce.is_some()
 }
 
+fn is_live_attempt_with_hash(attempt: &TransactionAttempt) -> bool {
+	attempt.tx_hash.is_some()
+		&& attempt.nonce.is_some()
+		&& matches!(
+			attempt.status,
+			TransactionAttemptStatus::Broadcast
+				| TransactionAttemptStatus::Confirmed
+				| TransactionAttemptStatus::Indeterminate
+		)
+}
+
+fn is_fresh_root_attempt_with_hash(attempt: &TransactionAttempt) -> bool {
+	attempt.replacement_of.is_none()
+		&& (is_live_attempt_with_hash(attempt) || {
+			attempt.tx_hash.is_some()
+				&& attempt.nonce.is_some()
+				&& attempt.status == TransactionAttemptStatus::Replaced
+		})
+}
+
 fn has_broadcast_replacement(attempts: &[TransactionAttempt]) -> bool {
 	attempts
 		.iter()
@@ -99,8 +120,13 @@ where
 		}
 		if Instant::now() >= deadline {
 			h.dump_solver_stderr();
+			let order_status = match h.stored_order(order_id).await {
+				Ok(order) => format!("{:?}", order.status),
+				Err(error) => format!("<unavailable: {error:#}>"),
+			};
 			return Err(anyhow!(
-				"timeout waiting for {tx_type:?} attempts on {order_id}; last={attempts:?}"
+				"timeout waiting for {tx_type:?} attempts on {order_id}; \
+				 order_status={order_status}; last={attempts:?}"
 			));
 		}
 		tokio::time::sleep(POLL).await;
@@ -127,6 +153,39 @@ where
 			return Err(anyhow!(
 				"timeout waiting for order {order_id}; last status={:?}",
 				order.status
+			));
+		}
+		tokio::time::sleep(POLL).await;
+	}
+}
+
+async fn wait_for_any_replacement(
+	h: &Harness,
+	order_ids: &[(B256, String)],
+	tx_type: TransactionType,
+	timeout: Duration,
+) -> Result<()> {
+	let deadline = Instant::now() + timeout;
+	loop {
+		let mut summaries = Vec::new();
+		for (_order_id, order_id_str) in order_ids {
+			let attempts = h.stored_attempts_by_type(order_id_str, tx_type).await?;
+			let replacement_count = attempts
+				.iter()
+				.filter(|attempt| attempt.replacement_of.is_some())
+				.count();
+			if replacement_count > 0 {
+				return Ok(());
+			}
+			summaries.push(format!(
+				"{order_id_str}: attempts={}, replacements={replacement_count}",
+				attempts.len()
+			));
+		}
+		if Instant::now() >= deadline {
+			h.dump_solver_stderr();
+			return Err(anyhow!(
+				"timeout waiting for any {tx_type:?} replacement under load; {summaries:?}"
 			));
 		}
 		tokio::time::sleep(POLL).await;
@@ -281,13 +340,28 @@ async fn wait_for_first_attempt(
 	tx_type: TransactionType,
 ) -> Result<TransactionAttempt> {
 	let attempts = wait_for_attempts(h, order_id, tx_type, BUMP_WAIT, |attempts| {
-		attempts.iter().any(is_broadcast_with_hash)
+		attempts.iter().any(is_live_attempt_with_hash)
 	})
 	.await?;
 	attempts
 		.into_iter()
-		.find(is_broadcast_with_hash)
+		.find(is_live_attempt_with_hash)
 		.ok_or_else(|| anyhow!("no {tx_type:?} attempt for {order_id}"))
+}
+
+async fn wait_for_fresh_root_attempt(
+	h: &Harness,
+	order_id: &str,
+	tx_type: TransactionType,
+) -> Result<TransactionAttempt> {
+	let attempts = wait_for_attempts(h, order_id, tx_type, BUMP_WAIT, |attempts| {
+		attempts.iter().any(is_fresh_root_attempt_with_hash)
+	})
+	.await?;
+	attempts
+		.into_iter()
+		.find(is_fresh_root_attempt_with_hash)
+		.ok_or_else(|| anyhow!("no root {tx_type:?} attempt for {order_id}"))
 }
 
 fn assert_no_unrelated_nonce_reuse(
@@ -404,7 +478,7 @@ async fn claim_bump_replaces_underpriced_pending_claim_and_writes_canonical_hash
 	)
 	.await?;
 
-	let parent_before_drop = wait_for_first_attempt(&h, &order_id_str, TransactionType::Claim)
+	let parent_before_drop = wait_for_fresh_root_attempt(&h, &order_id_str, TransactionType::Claim)
 		.await
 		.context("wait for parent Claim attempt")?;
 	assert_eq!(parent_before_drop.replacement_of, None);
@@ -584,7 +658,7 @@ async fn nonce_not_reused_after_restart_with_pending_in_flight_tx() -> Result<()
 	let (first_order_id, _first_order) = open_default_order(&h, "tx-bump-nonce-pending-a").await?;
 	let first_order_id_str = order_key(first_order_id);
 	let first_attempt =
-		wait_for_first_attempt(&h, &first_order_id_str, TransactionType::Fill).await?;
+		wait_for_fresh_root_attempt(&h, &first_order_id_str, TransactionType::Fill).await?;
 	let first_nonce = first_attempt.nonce;
 	assert!(
 		first_attempt.replacement_of.is_none(),
@@ -598,7 +672,7 @@ async fn nonce_not_reused_after_restart_with_pending_in_flight_tx() -> Result<()
 		open_default_order(&h, "tx-bump-nonce-pending-b").await?;
 	let second_order_id_str = order_key(second_order_id);
 	let second_attempt =
-		wait_for_first_attempt(&h, &second_order_id_str, TransactionType::Fill).await?;
+		wait_for_fresh_root_attempt(&h, &second_order_id_str, TransactionType::Fill).await?;
 	assert_no_unrelated_nonce_reuse(
 		&first_order_id_str,
 		first_nonce,
@@ -660,7 +734,7 @@ async fn nonce_not_reused_after_restart_with_confirmed_during_downtime_tx() -> R
 		open_default_order(&h, "tx-bump-nonce-confirmed-b").await?;
 	let second_order_id_str = order_key(second_order_id);
 	let second_attempt =
-		wait_for_first_attempt(&h, &second_order_id_str, TransactionType::Fill).await?;
+		wait_for_fresh_root_attempt(&h, &second_order_id_str, TransactionType::Fill).await?;
 	assert_no_unrelated_nonce_reuse(
 		&first_order_id_str,
 		first_nonce,
@@ -691,20 +765,21 @@ async fn many_pending_orders_sweeper_progresses_without_duplicate_offchain_event
 	for index in 0..10 {
 		let (order_id, _order) = open_default_order(&h, &format!("tx-bump-load-{index}")).await?;
 		let order_id_str = order_key(order_id);
-		wait_for_attempts(
-			&h,
-			&order_id_str,
-			TransactionType::Fill,
-			BUMP_WAIT,
-			|attempts| {
-				attempts
-					.iter()
-					.any(|attempt| attempt.replacement_of.is_some())
-			},
-		)
-		.await?;
 		order_ids.push((order_id, order_id_str));
 	}
+
+	for (_order_id, order_id_str) in &order_ids {
+		wait_for_attempts(
+			&h,
+			order_id_str,
+			TransactionType::Fill,
+			LOAD_WAIT,
+			|attempts| attempts.iter().any(is_fresh_root_attempt_with_hash),
+		)
+		.await?;
+	}
+
+	wait_for_any_replacement(&h, &order_ids, TransactionType::Fill, LOAD_WAIT).await?;
 
 	resume_mining(&h, DEST_CHAIN_ID).await?;
 	h.mine_blocks(DEST_CHAIN_ID, 5).await?;

@@ -67,6 +67,12 @@ pub enum SettlementError {
 	/// Slot derivation mismatch detected between expected and proved slot.
 	#[error("Slot derivation mismatch")]
 	SlotDerivationMismatch,
+	/// External settlement backend/RPC infrastructure is temporarily unavailable.
+	#[error("Backend unavailable: {0}")]
+	BackendUnavailable(String),
+	/// Settlement backend storage is temporarily unavailable.
+	#[error("Storage unavailable: {0}")]
+	StorageUnavailable(String),
 }
 
 /// Direction for pushing L1 block hashes into an L2 buffer contract.
