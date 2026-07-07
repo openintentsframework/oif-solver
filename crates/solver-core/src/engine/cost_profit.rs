@@ -2888,9 +2888,10 @@ impl CostProfitService {
 	///
 	/// Assumes an 18-decimal native token (true for all supported EVM chains):
 	/// gas/native amounts are 1e18-base wei. A configured native `decimals != d`
-	/// where `d != 18` would misprice by `10^(18 - d)`; the `debug_assert` below
-	/// guards against that in debug builds. Revisit for non-EVM chains whose
-	/// native token is not 18 decimals.
+	/// where `d != 18` would misprice by `10^(18 - d)`, so this method fails
+	/// closed and returns an error at runtime (in all builds) for any non-18
+	/// native decimals. Revisit for non-EVM chains whose native token is not 18
+	/// decimals.
 	async fn native_base_units_to_usd(
 		&self,
 		chain_id: u64,
@@ -2926,10 +2927,15 @@ impl CostProfitService {
 			Err(e) => return Err(e.into()),
 		};
 
-		debug_assert_eq!(
-			decimals, 18,
-			"native gas pricing assumes 18-decimal native token (EVM-only)"
-		);
+		// Fail closed: gas is denominated in 1e18-base wei, so a config that sets a
+		// non-18 native `decimals` would misprice by 10^(18 - decimals). debug_assert
+		// is stripped in release builds, so enforce this at runtime for all builds.
+		if decimals != 18 {
+			return Err(CostProfitError::Calculation(format!(
+				"Native gas pricing assumes 18-decimal base units; chain {chain_id} \
+				 configured native token {symbol} with {decimals} decimals"
+			)));
+		}
 
 		Self::convert_raw_token_to_usd(value, &symbol, decimals, self.pricing_service.as_ref())
 			.await
@@ -5161,6 +5167,106 @@ mod tests {
 
 		// 1 gas unit * 1e18 wei/gas = 1 POL, priced at 5 USD via the fallback.
 		assert_eq!(breakdown.gas_open, Decimal::from(5));
+	}
+
+	/// Gas is denominated in 1e18-base wei, so a chain whose explicit
+	/// zero-address native `TokenConfig` is misconfigured with non-18 decimals
+	/// must FAIL CLOSED at runtime (all builds), not silently misprice by
+	/// `10^(18 - decimals)`. Regression guard for the release-safe decimals check
+	/// that replaced a debug-only `debug_assert`.
+	#[tokio::test]
+	async fn test_native_gas_pricing_rejects_non_18_decimal_native() {
+		let mut mock_pricing = MockPricingInterface::new();
+		// We must fail on the decimals guard BEFORE any pricing call is made.
+		mock_pricing.expect_wei_to_currency().times(0);
+		mock_pricing.expect_convert_asset().times(0);
+
+		let mut polygon_delivery = MockDeliveryInterface::new();
+		polygon_delivery
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(
+					async move { Ok(FeeParams::legacy(chain_id, 1_000_000_000_000_000_000u128)) },
+				)
+			});
+		polygon_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				137,
+				Arc::new(polygon_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			3600,
+			60,
+		));
+
+		// Explicit zero-address native TokenConfig with NON-18 decimals (6) — the
+		// exact misconfiguration the runtime guard must reject.
+		let mut networks = NetworksConfig::new();
+		networks.insert(
+			137,
+			solver_types::NetworkConfig {
+				name: Some("polygon".to_string()),
+				network_type: solver_types::networks::NetworkType::Hub,
+				rpc_urls: vec![],
+				input_settler_address: solver_types::Address([0x11; 20].to_vec()),
+				output_settler_address: solver_types::Address([0x22; 20].to_vec()),
+				tokens: vec![solver_types::TokenConfig {
+					address: solver_types::Address(vec![0u8; 20]),
+					symbol: "POL".to_string(),
+					name: Some("POL".to_string()),
+					decimals: 6,
+				}],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		let token_manager = Arc::new(TokenManager::new(
+			networks,
+			delivery.clone(),
+			create_mock_account_service(),
+		));
+		let service = CostProfitService::new(
+			Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new())),
+			delivery,
+			token_manager,
+			Arc::new(StorageService::new(Box::new(MockStorageInterface::new()))),
+			no_fee_settlement_service(),
+		);
+
+		// One non-zero origin gas leg on the misconfigured chain forces a native
+		// base-units -> USD conversion; every other leg is zero (early-returns).
+		let result = service
+			.calculate_total_cost(
+				&[],
+				&[],
+				&create_test_config(),
+				137,
+				137,
+				&GasUnits {
+					open_units: 1,
+					fill_units: 0,
+					post_fill_units: 0,
+					pre_claim_units: 0,
+					claim_units: 0,
+				},
+				U256::ZERO,
+				U256::ZERO,
+				U256::ZERO,
+			)
+			.await;
+
+		let err = result
+			.expect_err("native gas pricing must fail closed for a non-18-decimal native config");
+		let msg = err.to_string();
+		assert!(
+			msg.contains("18-decimal") && msg.contains("decimals"),
+			"error must explain the non-18 native decimals rejection, got: {msg}"
+		);
 	}
 
 	/// An unknown chain id that is neither in config nor in the fallback map
