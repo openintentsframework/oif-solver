@@ -197,6 +197,33 @@ fn settlement_failure_policy(
 	}
 }
 
+/// Classifies an error from `handle_confirmed` (a transaction already confirmed
+/// on-chain) into retry-vs-fail, without relying on formatted strings.
+///
+/// The `!receipt.success` gate in `handle_confirmed` runs first, so any error
+/// reaching here is a *local* processing fault on an order whose on-chain
+/// operation already succeeded — a storage retrieve failure, a CAS status/hash
+/// write failure, or a data-repair miss (e.g. a missing fill hash). None of
+/// these justify terminally failing an order whose funds already moved: doing so
+/// strands solver capital and excludes it from recovery. They are all left
+/// retryable so startup recovery re-drives the stage from the attempt ledger and
+/// on-chain state. `SettlementCallback` is routed through the retryable
+/// `handle_settlement_stage_error` branch before this catch-all is reached, so
+/// it is never classified here; the arm defaults to retryable (never strand) to
+/// keep the match total without depending on the non-`Clone` settlement error.
+fn confirmation_failure_policy(
+	error: &crate::handlers::transaction::TransactionError,
+) -> SettlementFailurePolicy {
+	use crate::handlers::transaction::TransactionError;
+
+	match error {
+		TransactionError::Storage(_)
+		| TransactionError::State(_)
+		| TransactionError::Service(_)
+		| TransactionError::SettlementCallback { .. } => SettlementFailurePolicy::RetryLater,
+	}
+}
+
 impl SolverEngine {
 	/// Creates a new solver engine with the given services.
 	///
@@ -695,17 +722,7 @@ impl SolverEngine {
 											crate::handlers::settlement::SettlementError::SettlementService(source),
 										).await
 									},
-									Err(e) => {
-										let error_msg = format!("Failed to handle transaction confirmation: {e}");
-										// Attempt to mark order as failed with the transaction type from the event
-										if let Err(state_err) = engine.state_machine
-											.transition_order_status(&order_id_clone, solver_types::OrderStatus::Failed(tx_type, error_msg.clone()))
-											.await
-										{
-											tracing::error!("Failed to mark order as failed: {}", state_err);
-										}
-										Err(EngineError::Service(error_msg))
-									}
+									Err(e) => engine.handle_confirmation_error(&order_id_clone, tx_type, e).await,
 								}
 							}).await;
 						}
@@ -963,6 +980,47 @@ impl SolverEngine {
 					tx_type = ?tx_type,
 					error = %error_msg,
 					"Settlement stage failed with a transient error; leaving order retryable"
+				);
+			},
+			SettlementFailurePolicy::FailOrder => {
+				if let Err(state_err) = self
+					.state_machine
+					.transition_order_status(
+						order_id,
+						solver_types::OrderStatus::Failed(tx_type, error_msg.clone()),
+					)
+					.await
+				{
+					tracing::error!("Failed to mark order as failed: {}", state_err);
+				}
+			},
+		}
+		Err(EngineError::Service(error_msg))
+	}
+
+	/// Handles an error returned by `handle_confirmed` for a transaction that
+	/// already succeeded on-chain (the `!receipt.success` gate ran first).
+	///
+	/// Every error reaching here is a *local* processing fault (order retrieve,
+	/// CAS status write, or a data-repair miss) on an order whose on-chain
+	/// operation already succeeded. Terminally failing it would strand solver
+	/// funds — the exact invariant this crate guards. Transient/local faults are
+	/// left non-terminal so startup recovery can re-drive the stage; only a
+	/// genuinely permanent classification transitions to `Failed`.
+	async fn handle_confirmation_error(
+		&self,
+		order_id: &str,
+		tx_type: TransactionType,
+		error: crate::handlers::transaction::TransactionError,
+	) -> Result<(), EngineError> {
+		let error_msg = format!("Failed to handle transaction confirmation: {error}");
+		match confirmation_failure_policy(&error) {
+			SettlementFailurePolicy::RetryLater => {
+				tracing::warn!(
+					order_id = %order_id,
+					tx_type = ?tx_type,
+					error = %error_msg,
+					"Confirmation processing failed after on-chain success; leaving order non-terminal for recovery"
 				);
 			},
 			SettlementFailurePolicy::FailOrder => {
@@ -2649,6 +2707,83 @@ mod tests {
 			.await
 			.unwrap();
 		assert_eq!(unaffected.status, OrderStatus::PreClaimed);
+	}
+
+	#[test]
+	fn confirmation_policy_retries_local_processing_errors() {
+		use crate::handlers::transaction::TransactionError;
+		// Every error reaching the TransactionConfirmed catch-all is AFTER the
+		// on-chain transaction succeeded (the `!receipt.success` gate ran first).
+		// A local retrieve/CAS/data fault must not strand the order in terminal
+		// Failed; it must stay retryable so recovery can re-drive it.
+		let errors = vec![
+			TransactionError::Storage("redis timeout".to_string()),
+			TransactionError::State("CAS conflict after retries".to_string()),
+			TransactionError::Service("Missing fill transaction hash".to_string()),
+		];
+		for error in errors {
+			assert_eq!(
+				confirmation_failure_policy(&error),
+				SettlementFailurePolicy::RetryLater,
+				"expected {error:?} to be retryable (transaction already succeeded on-chain)"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn confirmed_state_error_leaves_filled_order_non_terminal() {
+		let engine = create_test_engine().await;
+		let order = OrderBuilder::new()
+			.with_id("confirmed-state-error-order".to_string())
+			.with_status(OrderStatus::Executed)
+			.build();
+		engine.state_machine.store_order(&order).await.unwrap();
+
+		let result = engine
+			.handle_confirmation_error(
+				&order.id,
+				TransactionType::Fill,
+				crate::handlers::transaction::TransactionError::State(
+					"CAS conflict after retries".to_string(),
+				),
+			)
+			.await;
+
+		assert!(result.is_err());
+		let stored = engine.state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(
+			stored.status,
+			OrderStatus::Executed,
+			"a transient State fault after on-chain fill success must not strand the order in Failed"
+		);
+	}
+
+	#[tokio::test]
+	async fn confirmed_storage_error_leaves_claimed_order_non_terminal() {
+		let engine = create_test_engine().await;
+		let order = OrderBuilder::new()
+			.with_id("confirmed-storage-error-order".to_string())
+			.with_status(OrderStatus::PreClaimed)
+			.build();
+		engine.state_machine.store_order(&order).await.unwrap();
+
+		let result = engine
+			.handle_confirmation_error(
+				&order.id,
+				TransactionType::Claim,
+				crate::handlers::transaction::TransactionError::Storage(
+					"redis read timeout".to_string(),
+				),
+			)
+			.await;
+
+		assert!(result.is_err());
+		let stored = engine.state_machine.get_order(&order.id).await.unwrap();
+		assert_eq!(
+			stored.status,
+			OrderStatus::PreClaimed,
+			"a transient Storage fault after on-chain claim success must not strand the order in Failed"
+		);
 	}
 
 	#[tokio::test]
