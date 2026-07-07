@@ -100,14 +100,11 @@ impl PricingInterface for MockPricing {
 	) -> Result<String, PricingError> {
 		let from_upper = from_asset.to_uppercase();
 		let to_upper = to_asset.to_uppercase();
+		let amount_f64 = parse_nonnegative_finite_amount(amount, "amount")?;
 
 		if from_upper == to_upper {
 			return Ok(amount.to_string());
 		}
-
-		let amount_f64 = amount
-			.parse::<f64>()
-			.map_err(|e| PricingError::InvalidData(format!("Invalid amount: {e}")))?;
 
 		// Direct conversion
 		let direct_pair = TradingPair::new(&from_upper, &to_upper);
@@ -153,9 +150,7 @@ impl PricingInterface for MockPricing {
 		let eth_amount_str =
 			wei_string_to_eth_string(wei_amount).map_err(PricingError::InvalidData)?;
 
-		let eth_amount_f64 = eth_amount_str
-			.parse::<f64>()
-			.map_err(|e| PricingError::InvalidData(format!("Invalid ETH amount: {e}")))?;
+		let eth_amount_f64 = parse_nonnegative_finite_amount(&eth_amount_str, "ETH amount")?;
 
 		// Convert ETH to target currency
 		let eth_pair = TradingPair::new("ETH", currency);
@@ -176,9 +171,8 @@ impl PricingInterface for MockPricing {
 		currency_amount: &str,
 		currency: &str,
 	) -> Result<String, PricingError> {
-		let currency_amount_f64 = currency_amount
-			.parse::<f64>()
-			.map_err(|e| PricingError::InvalidData(format!("Invalid currency amount: {e}")))?;
+		let currency_amount_f64 =
+			parse_nonnegative_finite_amount(currency_amount, "currency amount")?;
 
 		// Get ETH price in the given currency
 		let eth_pair = TradingPair::new("ETH", currency);
@@ -244,6 +238,20 @@ impl ConfigSchema for MockPricingSchema {
 
 		Ok(())
 	}
+}
+
+fn parse_nonnegative_finite_amount(value: &str, label: &str) -> Result<f64, PricingError> {
+	let amount = value
+		.parse::<f64>()
+		.map_err(|e| PricingError::InvalidData(format!("Invalid {label}: {e}")))?;
+
+	if !amount.is_finite() || amount < 0.0 {
+		return Err(PricingError::InvalidData(format!(
+			"Invalid {label}: must be non-negative and finite"
+		)));
+	}
+
+	Ok(amount)
 }
 
 /// Registry for mock pricing implementation.
@@ -348,6 +356,73 @@ mod tests {
 			value > 15.0 && value < 25.0,
 			"1 ETH should be between 15-25 SOL, got {value}"
 		);
+	}
+
+	#[tokio::test]
+	async fn test_convert_asset_rejects_invalid_amounts() {
+		let config = create_default_config();
+		let pricing = MockPricing::new(&config).unwrap();
+
+		for amount in ["-1", "NaN", "inf"] {
+			let result = pricing.convert_asset("ETH", "USD", amount).await;
+			assert!(
+				matches!(result, Err(PricingError::InvalidData(_))),
+				"amount {amount} should be rejected"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn test_convert_asset_same_currency_rejects_invalid_amounts() {
+		let config = create_default_config();
+		let pricing = MockPricing::new(&config).unwrap();
+
+		for amount in ["-1", "NaN", "inf"] {
+			let result = pricing.convert_asset("ETH", "ETH", amount).await;
+			assert!(
+				matches!(result, Err(PricingError::InvalidData(_))),
+				"same-currency amount {amount} should be rejected"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn test_currency_to_wei_rejects_invalid_amounts() {
+		let config = create_default_config();
+		let pricing = MockPricing::new(&config).unwrap();
+
+		for amount in ["-1", "NaN", "inf"] {
+			let result = pricing.currency_to_wei(amount, "USD").await;
+			assert!(
+				matches!(result, Err(PricingError::InvalidData(_))),
+				"amount {amount} should be rejected"
+			);
+		}
+	}
+
+	#[test]
+	fn test_parse_nonnegative_finite_amount_rejects_invalid_amounts() {
+		for amount in ["-1", "NaN", "inf"] {
+			let result = parse_nonnegative_finite_amount(amount, "ETH amount");
+			assert!(
+				matches!(result, Err(PricingError::InvalidData(_))),
+				"amount {amount} should be rejected"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn test_wei_to_currency_rejects_invalid_amounts() {
+		let config = create_default_config();
+		let pricing = MockPricing::new(&config).unwrap();
+
+		for amount in ["-1", "NaN", "inf"] {
+			let result = pricing.wei_to_currency(amount, "USD").await;
+			assert!(
+				matches!(result, Err(PricingError::InvalidData(_))),
+				"amount {amount} should be rejected"
+			);
+		}
 	}
 
 	#[tokio::test]
