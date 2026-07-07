@@ -126,6 +126,13 @@ impl ExecutionStrategy for SimpleStrategy {
 					if let Some(balance_str) = context.solver_balances.get(&balance_key) {
 						// Parse balance and required amount
 						let balance = balance_str.parse::<U256>().unwrap_or(U256::ZERO);
+						// Strategy gate: for a native (zero-address) output this
+						// intentionally checks only `native_balance >= output.amount`,
+						// matching the ERC20 pattern above — a cheap early skip, NOT
+						// the authoritative solvency check. The real insolvency guard
+						// (`native_balance >= gas + value + fees`) is enforced at
+						// submit time by the delivery preflight
+						// (crates/solver-delivery/src/implementations/evm/alloy.rs:121-137).
 						let required = output.amount;
 
 						if balance < required {

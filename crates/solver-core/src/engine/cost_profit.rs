@@ -343,6 +343,15 @@ struct GasLegCostsWei {
 /// price on configs that predate the native-token entry. Config always takes
 /// precedence over this map.
 ///
+/// This fallback is intentionally GAS-ONLY. Gas is priced for EVERY order,
+/// including pure-ERC20 flows, so a missing native `TokenConfig` must not
+/// hard-fail gas pricing — hence the fallback. Native OUTPUT (and INPUT)
+/// valuation is the opposite case: it is opt-in and rare, so it deliberately
+/// does NOT consult this map (see `calculate_outputs_usd_value`) and instead
+/// requires an explicit native `TokenConfig` (symbol + decimals). Extending
+/// this fallback to valuation would silently misprice orders whose native
+/// symbol/decimals were never actually configured.
+///
 /// Returned symbols must exist in `solver_pricing::DEFAULT_TOKEN_MAPPINGS`.
 /// All listed chains use an 18-decimal native token, so callers assume 18.
 /// Unknown chains return `None`, keeping the caller's fail-closed behaviour.
@@ -2867,6 +2876,21 @@ impl CostProfitService {
 		Ok((raw, buffer))
 	}
 
+	/// Converts a native (gas-token) amount in base units to USD.
+	///
+	/// Symbol/decimals resolution is fail-open for gas: config first, then the
+	/// gas-only [`native_symbol_fallback`] for well-known chains, so gas pricing
+	/// — which runs for EVERY order, including pure-ERC20 flows — never
+	/// hard-fails on a config lacking a zero-address native `TokenConfig`. This
+	/// fallback is deliberately NOT used for output/input valuation (see
+	/// [`CostProfitService::calculate_outputs_usd_value`]); native OUTPUT is
+	/// opt-in and must be configured explicitly.
+	///
+	/// Assumes an 18-decimal native token (true for all supported EVM chains):
+	/// gas/native amounts are 1e18-base wei. A configured native `decimals != d`
+	/// where `d != 18` would misprice by `10^(18 - d)`; the `debug_assert` below
+	/// guards against that in debug builds. Revisit for non-EVM chains whose
+	/// native token is not 18 decimals.
 	async fn native_base_units_to_usd(
 		&self,
 		chain_id: u64,
@@ -2901,6 +2925,11 @@ impl CostProfitService {
 			},
 			Err(e) => return Err(e.into()),
 		};
+
+		debug_assert_eq!(
+			decimals, 18,
+			"native gas pricing assumes 18-decimal native token (EVM-only)"
+		);
 
 		Self::convert_raw_token_to_usd(value, &symbol, decimals, self.pricing_service.as_ref())
 			.await
@@ -3110,7 +3139,11 @@ impl CostProfitService {
 		let normalized_amount = match token_decimals {
 			0 => raw_amount_decimal,
 			decimals => {
-				let divisor = Decimal::new(10_i64.pow(decimals as u32), 0);
+				// `decimals <= 28` is enforced above. Compute the power in
+				// `i128` (not `i64`, which overflows at 10^19) so tokens with
+				// 19..=28 decimals no longer panic (debug) / wrap (release).
+				// 10^28 fits both `i128` and rust_decimal's 96-bit mantissa.
+				let divisor = Decimal::from_i128_with_scale(10_i128.pow(decimals as u32), 0);
 				raw_amount_decimal / divisor
 			},
 		};
@@ -3142,10 +3175,30 @@ impl CostProfitService {
 				.map_err(|e| CostProfitError::Calculation(format!("Failed to get address: {e}")))?;
 			let token_address = Address(ethereum_addr.0.to_vec());
 
-			let token_info = self
+			let token_info = match self
 				.token_manager
 				.get_token_info(chain_id, &token_address)
-				.await?;
+				.await
+			{
+				Ok(info) => info,
+				Err(e @ TokenManagerError::TokenNotSupported(..)) => {
+					// Defensive: native inputs are rejected upstream (order
+					// validation), so this arm is not expected to fire in
+					// practice — but if a native (zero-address) input ever
+					// reaches valuation it needs an explicit native `TokenConfig`
+					// (symbol + decimals). The `native_symbol_fallback` map is
+					// GAS-ONLY (see its doc) and deliberately does not apply here.
+					let mut token_id = [0u8; 32];
+					token_id[12..].copy_from_slice(&token_address.0);
+					if is_native_token_id(&token_id) {
+						return Err(CostProfitError::Calculation(format!(
+							"Native (zero-address) input on chain {chain_id} requires an explicit native TokenConfig (symbol + decimals) for USD valuation; the chain native-symbol fallback applies to gas pricing only"
+						)));
+					}
+					return Err(e.into());
+				},
+				Err(e) => return Err(e.into()),
+			};
 
 			let usd_amount = Self::convert_raw_token_to_usd(
 				&input.amount,
@@ -3179,10 +3232,29 @@ impl CostProfitService {
 				.map_err(|e| CostProfitError::Calculation(format!("Failed to get address: {e}")))?;
 			let token_address = Address(ethereum_addr.0.to_vec());
 
-			let token_info = self
+			let token_info = match self
 				.token_manager
 				.get_token_info(chain_id, &token_address)
-				.await?;
+				.await
+			{
+				Ok(info) => info,
+				Err(e @ TokenManagerError::TokenNotSupported(..)) => {
+					// A native (zero-address) output needs an explicit native
+					// `TokenConfig` (symbol + decimals) to be valued in USD. The
+					// chain native-symbol fallback in `native_symbol_fallback` is
+					// GAS-ONLY (see its doc), so it deliberately does not rescue
+					// valuation here.
+					let mut token_id = [0u8; 32];
+					token_id[12..].copy_from_slice(&token_address.0);
+					if is_native_token_id(&token_id) {
+						return Err(CostProfitError::Calculation(format!(
+							"Native (zero-address) output on chain {chain_id} requires an explicit native TokenConfig (symbol + decimals) for USD valuation; the chain native-symbol fallback applies to gas pricing only"
+						)));
+					}
+					return Err(e.into());
+				},
+				Err(e) => return Err(e.into()),
+			};
 
 			let usd_amount = Self::convert_raw_token_to_usd(
 				&output.amount,
@@ -3236,8 +3308,30 @@ impl CostProfitService {
 		})?;
 
 		// Convert to smallest unit (apply decimals), rounding up to ensure we collect enough
-		// This protects our margin when costs are deducted from outputs or added to inputs
-		let multiplier = Decimal::new(10_i64.pow(token_info.decimals as u32), 0);
+		// This protects our margin when costs are deducted from outputs or added to inputs.
+		//
+		// Compute the power in `i128` (not `i64`, which overflows at 10^19) and
+		// build the multiplier via `try_from_i128_with_scale`, which fails
+		// cleanly once 10^decimals exceeds rust_decimal's 96-bit mantissa
+		// (>28 decimals). This both fixes the >=19-decimal overflow and adds the
+		// missing <=28 guard as a clear error instead of a panic/wrap.
+		let multiplier = Decimal::try_from_i128_with_scale(
+			10_i128
+				.checked_pow(token_info.decimals as u32)
+				.ok_or_else(|| {
+					CostProfitError::Calculation(format!(
+						"Token decimals {} exceeds maximum supported precision",
+						token_info.decimals
+					))
+				})?,
+			0,
+		)
+		.map_err(|e| {
+			CostProfitError::Calculation(format!(
+				"Token decimals {} exceeds maximum supported precision: {e}",
+				token_info.decimals
+			))
+		})?;
 		let token_amount_in_smallest = token_amount_decimal * multiplier;
 
 		// Ceil to ensure we always collect enough to cover costs after USD->token->USD round-trip
@@ -5156,6 +5250,137 @@ mod tests {
 			result.is_err(),
 			"unknown, unconfigured chain must fail closed, got: {result:?}"
 		);
+	}
+
+	/// A native (zero-address) OUTPUT on a chain that is CONFIGURED but has no
+	/// zero-address native `TokenConfig` must fail valuation with a CLEAR
+	/// message that mentions `native` and `config` — not a bare
+	/// `TokenNotSupported`. The gas-only native-symbol fallback must not rescue
+	/// valuation here. A native output WITH an explicit native config still
+	/// values fine.
+	#[tokio::test]
+	async fn test_native_output_valuation_errors_clearly_without_config() {
+		let mut mock_pricing = MockPricingInterface::new();
+		mock_pricing
+			.expect_convert_asset()
+			.returning(|from, to, amount| {
+				let from = from.to_string();
+				let to = to.to_string();
+				let amount = Decimal::from_str(amount).unwrap();
+				Box::pin(async move {
+					assert_eq!(to, "USD");
+					let price = match from.as_str() {
+						"ETH" => Decimal::from(4000),
+						other => panic!("unexpected asset conversion from {other}"),
+					};
+					Ok((amount * price).to_string())
+				})
+			});
+
+		// Chain 1: WITH a zero-address native ETH TokenConfig.
+		// Chain 137: configured, but NO zero-address native TokenConfig.
+		let native_eth = solver_types::utils::tests::builders::TokenConfigBuilder::new()
+			.address(solver_types::Address(vec![0u8; 20]))
+			.symbol("ETH".to_string())
+			.decimals(18)
+			.build();
+		let some_erc20 = solver_types::utils::tests::builders::TokenConfigBuilder::new()
+			.address(solver_types::Address([0x11u8; 20].to_vec()))
+			.symbol("OUTPUT".to_string())
+			.decimals(18)
+			.build();
+		let networks = NetworksConfigBuilder::new()
+			.add_network(
+				1,
+				NetworkConfigBuilder::new().tokens(vec![native_eth]).build(),
+			)
+			.add_network(
+				137,
+				NetworkConfigBuilder::new().tokens(vec![some_erc20]).build(),
+			)
+			.build();
+		let token_manager = Arc::new(TokenManager::new(
+			networks,
+			create_mock_delivery_service(),
+			create_mock_account_service(),
+		));
+		let service = CostProfitService::new(
+			Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new())),
+			create_mock_delivery_service(),
+			token_manager,
+			Arc::new(StorageService::new(Box::new(MockStorageInterface::new()))),
+			no_fee_settlement_service(),
+		);
+
+		// Native output on chain 137 (no native config) -> clear error.
+		let native_no_config = OrderOutput {
+			receiver: InteropAddress::new_ethereum(
+				137,
+				address!("0000000000000000000000000000000000000000"),
+			),
+			asset: InteropAddress::new_ethereum(
+				137,
+				address!("0000000000000000000000000000000000000000"),
+			),
+			amount: U256::from(1_000_000_000_000_000_000u128),
+			calldata: None,
+		};
+		let err = service
+			.calculate_outputs_usd_value(&[native_no_config])
+			.await
+			.expect_err("native output without native TokenConfig must error");
+		let msg = err.to_string().to_lowercase();
+		assert!(msg.contains("native"), "error must mention native: {msg}");
+		assert!(msg.contains("config"), "error must mention config: {msg}");
+
+		// Native output on chain 1 (WITH native config) -> values fine.
+		let native_with_config = OrderOutput {
+			receiver: InteropAddress::new_ethereum(
+				1,
+				address!("0000000000000000000000000000000000000000"),
+			),
+			asset: InteropAddress::new_ethereum(
+				1,
+				address!("0000000000000000000000000000000000000000"),
+			),
+			amount: U256::from(1_000_000_000_000_000_000u128),
+			calldata: None,
+		};
+		let usd = service
+			.calculate_outputs_usd_value(&[native_with_config])
+			.await
+			.expect("native output with native TokenConfig must value fine");
+		assert_eq!(usd, Decimal::from(4000));
+	}
+
+	/// Regression: `10_i64.pow(20)` overflowed `i64` (panics in debug, wraps in
+	/// release) for tokens with >=19 decimals, despite the <=28 decimals guard.
+	/// Computing the divisor in `i128` fixes it.
+	#[tokio::test]
+	async fn test_convert_raw_token_to_usd_handles_20_decimal_token() {
+		let mut mock_pricing = MockPricingInterface::new();
+		mock_pricing
+			.expect_convert_asset()
+			.returning(|from, to, amount| {
+				let from = from.to_string();
+				let to = to.to_string();
+				let amount = Decimal::from_str(amount).unwrap();
+				Box::pin(async move {
+					assert_eq!(from, "TKN20");
+					assert_eq!(to, "USD");
+					// TKN20 priced at 3 USD each.
+					Ok((amount * Decimal::from(3)).to_string())
+				})
+			});
+		let pricing = PricingService::new(Box::new(mock_pricing), Vec::new());
+
+		// 2 whole tokens with 20 decimals = 2 * 10^20 base units.
+		let raw = U256::from_str("200000000000000000000").unwrap();
+		let usd = CostProfitService::convert_raw_token_to_usd(&raw, "TKN20", 20, &pricing)
+			.await
+			.expect("20-decimal conversion must not overflow");
+		// normalized = 2.0 priced at 3 USD => 6 USD.
+		assert_eq!(usd, Decimal::from(6));
 	}
 
 	// ============================================================================
