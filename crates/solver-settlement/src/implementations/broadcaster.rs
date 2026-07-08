@@ -250,14 +250,11 @@ impl BroadcasterMessageTracker {
 		order_id: &str,
 		submission: BroadcasterSubmission,
 	) -> Result<(), SettlementError> {
+		// Propagate the typed error (StorageUnavailable is retryable); do not
+		// collapse a transient storage fault into terminal ValidationFailed.
 		let mut state = self
 			.load(order_id)
-			.await
-			.map_err(|e| {
-				SettlementError::ValidationFailed(format!(
-					"Failed to load broadcaster submission state for order {order_id}: {e}"
-				))
-			})?
+			.await?
 			.unwrap_or(BroadcasterMessageState {
 				submission: None,
 				proof: None,
@@ -273,14 +270,11 @@ impl BroadcasterMessageTracker {
 		order_id: &str,
 		proof: BroadcasterProofData,
 	) -> Result<(), SettlementError> {
+		// Propagate the typed error (StorageUnavailable is retryable); do not
+		// collapse a transient storage fault into terminal ValidationFailed.
 		let mut state = self
 			.load(order_id)
-			.await
-			.map_err(|e| {
-				SettlementError::ValidationFailed(format!(
-					"Failed to load broadcaster proof state for order {order_id}: {e}"
-				))
-			})?
+			.await?
 			.unwrap_or(BroadcasterMessageState {
 				submission: None,
 				proof: None,
@@ -291,14 +285,11 @@ impl BroadcasterMessageTracker {
 	}
 
 	async fn mark_verified(&self, order_id: &str) -> Result<(), SettlementError> {
+		// Propagate the typed error (StorageUnavailable is retryable); do not
+		// collapse a transient storage fault into terminal ValidationFailed.
 		let mut state = self
 			.load(order_id)
-			.await
-			.map_err(|e| {
-				SettlementError::ValidationFailed(format!(
-					"Failed to load broadcaster verification state for order {order_id}: {e}"
-				))
-			})?
+			.await?
 			.unwrap_or(BroadcasterMessageState {
 				submission: None,
 				proof: None,
@@ -4208,5 +4199,81 @@ mod tests {
 		let err = parse_pusher_directions(&config, &empty_oracle_config()).unwrap_err();
 		let msg = err.to_string();
 		assert!(msg.contains("l2_chain_id"), "unexpected msg: {msg}");
+	}
+}
+
+#[cfg(test)]
+mod tracker_resilience_tests {
+	use super::*;
+	use solver_storage::{MockStorageInterface, StorageError, StorageService};
+
+	// A tracker whose storage backend fails every read with a transient backend
+	// fault — the shape produced by a momentary Redis outage.
+	fn failing_tracker() -> BroadcasterMessageTracker {
+		let mut backend = MockStorageInterface::new();
+		backend.expect_get_bytes().returning(|_| {
+			Box::pin(async { Err(StorageError::Backend("simulated redis outage".to_string())) })
+		});
+		BroadcasterMessageTracker::new(Arc::new(StorageService::new(Box::new(backend))))
+	}
+
+	fn dummy_submission() -> BroadcasterSubmission {
+		BroadcasterSubmission {
+			source_chain: 1,
+			destination_chain: 2,
+			submission_tx_hash: TransactionHash(vec![0u8; 32]),
+			submission_timestamp: 0,
+			submission_block_number: None,
+			payload_hash: [0u8; 32],
+			message: [0u8; 32],
+			message_data: Vec::new(),
+			application: solver_types::Address(vec![0u8; 20]),
+			remote_oracle: solver_types::Address(vec![0u8; 20]),
+		}
+	}
+
+	fn dummy_proof() -> BroadcasterProofData {
+		BroadcasterProofData {
+			route: Vec::new(),
+			bhp_inputs: Vec::new(),
+			storage_proof: Vec::new(),
+			generated_at: 0,
+		}
+	}
+
+	#[tokio::test]
+	async fn track_submission_preserves_transient_storage_error() {
+		let err = failing_tracker()
+			.track_submission("order-transient", dummy_submission())
+			.await
+			.expect_err("a transient storage fault must surface as an error");
+		assert!(
+			matches!(err, SettlementError::StorageUnavailable(_)),
+			"track_submission must stay retryable (StorageUnavailable), got: {err:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn store_proof_preserves_transient_storage_error() {
+		let err = failing_tracker()
+			.store_proof("order-transient", dummy_proof())
+			.await
+			.expect_err("a transient storage fault must surface as an error");
+		assert!(
+			matches!(err, SettlementError::StorageUnavailable(_)),
+			"store_proof must stay retryable (StorageUnavailable), got: {err:?}"
+		);
+	}
+
+	#[tokio::test]
+	async fn mark_verified_preserves_transient_storage_error() {
+		let err = failing_tracker()
+			.mark_verified("order-transient")
+			.await
+			.expect_err("a transient storage fault must surface as an error");
+		assert!(
+			matches!(err, SettlementError::StorageUnavailable(_)),
+			"mark_verified must stay retryable (StorageUnavailable), got: {err:?}"
+		);
 	}
 }
