@@ -118,6 +118,8 @@ jobs:
         include:
           - test: happy_e2e_open_fill_settle
             timeout_minutes: 10
+          - test: happy_e2e_native_fill_settle
+            timeout_minutes: 10
           - test: submit_e2e_hyperlane
             timeout_minutes: 10
           - test: permit2_e2e
