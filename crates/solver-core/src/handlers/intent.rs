@@ -1465,6 +1465,12 @@ mod tests {
 			.decimals(18)
 			.build();
 
+		let native_token = solver_types::utils::tests::builders::TokenConfigBuilder::new()
+			.address(solver_types::Address(vec![0u8; 20]))
+			.symbol("ETH".to_string())
+			.decimals(18)
+			.build();
+
 		let output_token = solver_types::utils::tests::builders::TokenConfigBuilder::new()
 			.address(solver_types::Address(vec![0u8; 20])) // Zero address for output
 			.symbol("OUTPUT".to_string())
@@ -1476,7 +1482,7 @@ mod tests {
 			.add_network(
 				1,
 				solver_types::utils::tests::builders::NetworkConfigBuilder::new()
-					.tokens(vec![input_token])
+					.tokens(vec![native_token, input_token])
 					.build(),
 			)
 			.add_network(

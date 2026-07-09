@@ -749,12 +749,21 @@ mod tests {
 					.unwrap(),
 				output_settler_address: parse_address("0x2222222222222222222222222222222222222222")
 					.unwrap(),
-				tokens: vec![solver_types::TokenConfig {
-					address: parse_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48").unwrap(),
-					symbol: "USDC".to_string(),
-					name: Some("USD Coin".to_string()),
-					decimals: 6,
-				}],
+				tokens: vec![
+					solver_types::TokenConfig {
+						address: Address(vec![0u8; 20]),
+						symbol: "ETH".to_string(),
+						name: Some("Ether".to_string()),
+						decimals: 18,
+					},
+					solver_types::TokenConfig {
+						address: parse_address("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+							.unwrap(),
+						symbol: "USDC".to_string(),
+						name: Some("USD Coin".to_string()),
+						decimals: 6,
+					},
+				],
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -770,12 +779,21 @@ mod tests {
 					.unwrap(),
 				output_settler_address: parse_address("0x4444444444444444444444444444444444444444")
 					.unwrap(),
-				tokens: vec![solver_types::TokenConfig {
-					address: parse_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174").unwrap(),
-					symbol: "USDC".to_string(),
-					name: Some("USD Coin".to_string()),
-					decimals: 6,
-				}],
+				tokens: vec![
+					solver_types::TokenConfig {
+						address: Address(vec![0u8; 20]),
+						symbol: "POL".to_string(),
+						name: Some("Polygon Ecosystem Token".to_string()),
+						decimals: 18,
+					},
+					solver_types::TokenConfig {
+						address: parse_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+							.unwrap(),
+						symbol: "USDC".to_string(),
+						name: Some("USD Coin".to_string()),
+						decimals: 6,
+					},
+				],
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -921,6 +939,8 @@ mod tests {
 		let pricing_impl =
 			solver_pricing::implementations::mock::create_mock_pricing(&serde_json::json!({
 				"pair_prices": {
+					"ETH/USD": "2000.0",
+					"POL/USD": "0.5",
 					"USDC/USD": "1.0"
 				}
 			}))

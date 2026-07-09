@@ -1868,7 +1868,11 @@ fn build_seed_overrides(
 			// test chains as `Parent` — the variant doesn't affect the
 			// settlement flow we exercise here.
 			network_type: Some(NetworkType::Parent),
-			tokens: vec![token("TOKA", d.token_a), token("TOKB", d.token_b)],
+			tokens: vec![
+				token("ETH", Address::ZERO),
+				token("TOKA", d.token_a),
+				token("TOKB", d.token_b),
+			],
 			rpc_urls: Some(vec![d.rpc_http.clone()]),
 			input_settler_address: Some(d.input_settler),
 			output_settler_address: Some(d.output_settler),

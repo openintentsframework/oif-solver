@@ -76,6 +76,9 @@ pub const DEFAULT_TOKEN_MAPPINGS: &[(&str, &str)] = &[
 	("WETH", "ethereum"),
 	("WBTC", "wrapped-bitcoin"),
 	("MATIC", "matic-network"),
+	("POL", "polygon-ecosystem-token"),
+	("BNB", "binancecoin"),
+	("AVAX", "avalanche-2"),
 	("ARB", "arbitrum"),
 	("OP", "optimism"),
 ];
@@ -366,6 +369,9 @@ mod tests {
 		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("ETH", "ethereum")));
 		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("BTC", "bitcoin")));
 		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("USDC", "usd-coin")));
+		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("POL", "polygon-ecosystem-token")));
+		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("BNB", "binancecoin")));
+		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("AVAX", "avalanche-2")));
 	}
 
 	// Tests for PricingService using mock implementation

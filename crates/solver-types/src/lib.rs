@@ -105,10 +105,11 @@ pub use transaction_attempt::{
 	TransactionAttempt, TransactionAttemptScope, TransactionAttemptStatus,
 };
 pub use utils::{
-	bytes32_to_address, current_timestamp, format_token_amount, normalize_bytes32_address,
-	order_id_to_bytes32, parse_address, truncate_id, wei_string_to_eth_string, with_0x_prefix,
-	without_0x_prefix, DEFAULT_GAS_PRICE_WEI, MOCK_ETH_SOL_PRICE, MOCK_ETH_USD_PRICE,
-	MOCK_SOL_USD_PRICE, MOCK_TOKA_USD_PRICE, MOCK_TOKB_USD_PRICE,
+	bytes32_to_address, current_timestamp, format_token_amount, is_native_address,
+	is_native_token_id, normalize_bytes32_address, order_id_to_bytes32, parse_address, truncate_id,
+	wei_string_to_eth_string, with_0x_prefix, without_0x_prefix, DEFAULT_GAS_PRICE_WEI,
+	MOCK_ETH_SOL_PRICE, MOCK_ETH_USD_PRICE, MOCK_SOL_USD_PRICE, MOCK_TOKA_USD_PRICE,
+	MOCK_TOKB_USD_PRICE,
 };
 pub use validation::*;
 pub use versioned::Versioned;

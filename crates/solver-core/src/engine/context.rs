@@ -9,7 +9,7 @@ use crate::SolverError;
 use alloy_primitives::hex;
 use solver_config::Config;
 use solver_delivery::DeliveryService;
-use solver_types::{Address, ExecutionContext, Intent};
+use solver_types::{is_native_address, Address, ExecutionContext, Intent};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -250,6 +250,7 @@ impl ContextBuilder {
 			.get_tokens_for_chain(chain_id)
 			.await
 			.into_iter()
+			.filter(|token| !is_native_address(&token.address))
 			.map(|token| hex::encode(&token.address.0))
 			.collect()
 	}
@@ -339,6 +340,11 @@ mod tests {
 			.symbol("WETH")
 			.decimals(18)
 			.build();
+		let native_token = TokenConfigBuilder::new()
+			.address(Address(vec![0u8; 20]))
+			.symbol("ETH")
+			.decimals(18)
+			.build();
 
 		// Use NetworkConfigBuilder but replace tokens completely using .tokens()
 		// Note: This will extend the default tokens, so we need to account for that
@@ -351,7 +357,7 @@ mod tests {
 			.build();
 
 		// Manually set the tokens to exactly what we want (overriding defaults)
-		network_config.tokens = vec![usdc_token, weth_token];
+		network_config.tokens = vec![native_token, usdc_token, weth_token];
 
 		NetworksConfigBuilder::new()
 			.add_network(1, network_config)

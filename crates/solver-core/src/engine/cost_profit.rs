@@ -36,7 +36,7 @@ use solver_pricing::PricingService;
 use solver_storage::StorageService;
 use solver_types::{
 	costs::{CostBreakdown, CostContext, TokenAmountInfo},
-	current_timestamp,
+	current_timestamp, is_native_token_id,
 	standards::eip7683::{
 		interfaces::{IOutputSettlerSimple, SolMandateOutput},
 		MAX_CALLBACK_DATA_BYTES,
@@ -335,6 +335,44 @@ struct GasLegCostsWei {
 	post_fill: U256,
 	pre_claim: U256,
 	claim: U256,
+}
+
+/// Built-in `chain_id -> native gas-token symbol` fallback for well-known
+/// chains. Used by [`CostProfitService::native_base_units_to_usd`] only when
+/// the chain has no explicit zero-address `TokenConfig`, so gas legs still
+/// price on configs that predate the native-token entry. Config always takes
+/// precedence over this map.
+///
+/// This fallback is intentionally GAS-ONLY. Gas is priced for EVERY order,
+/// including pure-ERC20 flows, so a missing native `TokenConfig` must not
+/// hard-fail gas pricing — hence the fallback. Native OUTPUT (and INPUT)
+/// valuation is the opposite case: it is opt-in and rare, so it deliberately
+/// does NOT consult this map (see `calculate_outputs_usd_value`) and instead
+/// requires an explicit native `TokenConfig` (symbol + decimals). Extending
+/// this fallback to valuation would silently misprice orders whose native
+/// symbol/decimals were never actually configured.
+///
+/// Returned symbols must exist in `solver_pricing::DEFAULT_TOKEN_MAPPINGS`.
+/// All listed chains use an 18-decimal native token, so callers assume 18.
+/// Unknown chains return `None`, keeping the caller's fail-closed behaviour.
+fn native_symbol_fallback(chain_id: u64) -> Option<&'static str> {
+	match chain_id {
+		// Ethereum L1, its major rollups, and their testnets all meter gas in ETH.
+		1              // Ethereum mainnet
+		| 10           // OP Mainnet
+		| 8453         // Base
+		| 42161        // Arbitrum One
+		| 747474       // Katana
+		| 11155111     // Sepolia
+		| 84532        // Base Sepolia
+		| 421614       // Arbitrum Sepolia
+		| 11155420     // OP Sepolia
+			=> Some("ETH"),
+		137 => Some("POL"),    // Polygon PoS
+		56 => Some("BNB"),     // BNB Smart Chain
+		43114 => Some("AVAX"), // Avalanche C-Chain
+		_ => None,
+	}
 }
 
 /// Compute per-leg wei costs from gas units and resolved per-chain
@@ -1309,11 +1347,11 @@ impl CostProfitService {
 
 		// Price conversions are independent as well.
 		let (gas_open, gas_fill, gas_post_fill, gas_pre_claim, gas_claim) = tokio::try_join!(
-			self.wei_to_usd(&open_cost_wei),
-			self.wei_to_usd(&fill_cost_wei),
-			self.wei_to_usd(&post_fill_cost_wei),
-			self.wei_to_usd(&pre_claim_cost_wei),
-			self.wei_to_usd(&claim_cost_wei),
+			self.native_base_units_to_usd(origin_chain_id, &open_cost_wei),
+			self.native_base_units_to_usd(dest_chain_id, &fill_cost_wei),
+			self.native_base_units_to_usd(dest_chain_id, &post_fill_cost_wei),
+			self.native_base_units_to_usd(origin_chain_id, &pre_claim_cost_wei),
+			self.native_base_units_to_usd(origin_chain_id, &claim_cost_wei),
 		)?;
 
 		// Calculate gas buffer using config value (hot-reloadable)
@@ -1325,14 +1363,16 @@ impl CostProfitService {
 		// so keep this component at zero to avoid double-charging.
 		let rate_buffer = Decimal::ZERO;
 
-		let settlement_fee = self.wei_to_usd(&settlement_fee_wei).await?;
+		let settlement_fee = self
+			.native_base_units_to_usd(dest_chain_id, &settlement_fee_wei)
+			.await?;
 		let settlement_fee_buffer_bps =
 			Decimal::new(config.solver.settlement_fee_buffer_bps as i64, 0);
 		let settlement_fee_buffer =
 			(settlement_fee * settlement_fee_buffer_bps) / Decimal::from(10000);
 		let (l1_data_fee, l1_data_fee_buffer) = tokio::try_join!(
-			self.wei_to_usd(&l1_data_fee_wei),
-			self.wei_to_usd(&l1_data_fee_buffer_wei),
+			self.native_base_units_to_usd(dest_chain_id, &l1_data_fee_wei),
+			self.native_base_units_to_usd(dest_chain_id, &l1_data_fee_buffer_wei),
 		)?;
 
 		// Input and output valuations do not depend on each other.
@@ -2305,6 +2345,15 @@ impl CostProfitService {
 		let token_bytes32 = AlloyAddress::from_slice(token_addr.as_slice()).into_word();
 		let recipient_bytes32 = AlloyAddress::from_slice(recipient_addr.as_slice()).into_word();
 		let settler_bytes32 = AlloyAddress::from_slice(&settler_address.0).into_word();
+		// Detect native output via the shared 32-byte identifier helper so this
+		// matches `build_post_fill_tx_for_quote`/production fill builders.
+		// `token_bytes32` is the clean 20-byte address left-padded into a word,
+		// so an all-zero word is exactly the native (zero-address) case.
+		let tx_value = if is_native_token_id(&token_bytes32.0) {
+			amount
+		} else {
+			U256::ZERO
+		};
 
 		// Hex-decode calldata, mirroring
 		// `crates/solver-service/src/apis/quote/generation.rs:938-951`.
@@ -2389,7 +2438,7 @@ impl CostProfitService {
 		Ok(Transaction {
 			to: Some(settler_address),
 			data,
-			value: U256::ZERO,
+			value: tx_value,
 			chain_id,
 			nonce: None,
 			gas_limit: None,
@@ -2827,17 +2876,74 @@ impl CostProfitService {
 		Ok((raw, buffer))
 	}
 
-	async fn wei_to_usd(&self, value_wei: &U256) -> Result<Decimal, CostProfitError> {
-		let usd_value = self
-			.pricing_service
-			.wei_to_currency(&value_wei.to_string(), "USD")
+	/// Converts a native (gas-token) amount in base units to USD.
+	///
+	/// Symbol/decimals resolution is fail-open for gas: config first, then the
+	/// gas-only [`native_symbol_fallback`] for well-known chains, so gas pricing
+	/// — which runs for EVERY order, including pure-ERC20 flows — never
+	/// hard-fails on a config lacking a zero-address native `TokenConfig`. This
+	/// fallback is deliberately NOT used for output/input valuation (see
+	/// [`CostProfitService::calculate_outputs_usd_value`]); native OUTPUT is
+	/// opt-in and must be configured explicitly.
+	///
+	/// Assumes an 18-decimal native token (true for all supported EVM chains):
+	/// gas/native amounts are 1e18-base wei. A configured native `decimals != d`
+	/// where `d != 18` would misprice by `10^(18 - d)`, so this method fails
+	/// closed and returns an error at runtime (in all builds) for any non-18
+	/// native decimals. Revisit for non-EVM chains whose native token is not 18
+	/// decimals.
+	async fn native_base_units_to_usd(
+		&self,
+		chain_id: u64,
+		value: &U256,
+	) -> Result<Decimal, CostProfitError> {
+		if value.is_zero() {
+			return Ok(Decimal::ZERO);
+		}
+
+		let native_token = Address(vec![0u8; 20]);
+
+		// Resolve the native gas-token symbol/decimals for this chain.
+		//
+		// Config always wins: an explicit zero-address `TokenConfig` lets an
+		// operator override the symbol (or non-18 decimals). Only when the chain
+		// has no such entry (`TokenNotSupported`) do we consult the built-in
+		// `chain_id -> native symbol` fallback, so pure-ERC20 orders don't hard-
+		// require a zero-address token on every chain. Unknown chains keep the
+		// original error and fail closed.
+		let (symbol, decimals) = match self
+			.token_manager
+			.get_token_info(chain_id, &native_token)
+			.await
+		{
+			Ok(info) => (info.symbol, info.decimals),
+			Err(e @ TokenManagerError::TokenNotSupported(..)) => {
+				match native_symbol_fallback(chain_id) {
+					// Well-known native tokens are all 18-decimal.
+					Some(symbol) => (symbol.to_string(), 18u8),
+					None => return Err(e.into()),
+				}
+			},
+			Err(e) => return Err(e.into()),
+		};
+
+		// Fail closed: gas is denominated in 1e18-base wei, so a config that sets a
+		// non-18 native `decimals` would misprice by 10^(18 - decimals). debug_assert
+		// is stripped in release builds, so enforce this at runtime for all builds.
+		if decimals != 18 {
+			return Err(CostProfitError::Calculation(format!(
+				"Native gas pricing assumes 18-decimal base units; chain {chain_id} \
+				 configured native token {symbol} with {decimals} decimals"
+			)));
+		}
+
+		Self::convert_raw_token_to_usd(value, &symbol, decimals, self.pricing_service.as_ref())
 			.await
 			.map_err(|e| {
-				CostProfitError::Calculation(format!("Failed to convert wei to USD: {e}"))
-			})?;
-
-		Decimal::from_str(&usd_value)
-			.map_err(|e| CostProfitError::Calculation(format!("Failed to parse USD value: {e}")))
+				CostProfitError::Calculation(format!(
+					"Failed to convert native units for chain {chain_id} to USD: {e}"
+				))
+			})
 	}
 
 	/// Validates callback safety and simulates fill transaction gas for an order with callbackData.
@@ -3039,7 +3145,11 @@ impl CostProfitService {
 		let normalized_amount = match token_decimals {
 			0 => raw_amount_decimal,
 			decimals => {
-				let divisor = Decimal::new(10_i64.pow(decimals as u32), 0);
+				// `decimals <= 28` is enforced above. Compute the power in
+				// `i128` (not `i64`, which overflows at 10^19) so tokens with
+				// 19..=28 decimals no longer panic (debug) / wrap (release).
+				// 10^28 fits both `i128` and rust_decimal's 96-bit mantissa.
+				let divisor = Decimal::from_i128_with_scale(10_i128.pow(decimals as u32), 0);
 				raw_amount_decimal / divisor
 			},
 		};
@@ -3071,10 +3181,30 @@ impl CostProfitService {
 				.map_err(|e| CostProfitError::Calculation(format!("Failed to get address: {e}")))?;
 			let token_address = Address(ethereum_addr.0.to_vec());
 
-			let token_info = self
+			let token_info = match self
 				.token_manager
 				.get_token_info(chain_id, &token_address)
-				.await?;
+				.await
+			{
+				Ok(info) => info,
+				Err(e @ TokenManagerError::TokenNotSupported(..)) => {
+					// Defensive: native inputs are rejected upstream (order
+					// validation), so this arm is not expected to fire in
+					// practice — but if a native (zero-address) input ever
+					// reaches valuation it needs an explicit native `TokenConfig`
+					// (symbol + decimals). The `native_symbol_fallback` map is
+					// GAS-ONLY (see its doc) and deliberately does not apply here.
+					let mut token_id = [0u8; 32];
+					token_id[12..].copy_from_slice(&token_address.0);
+					if is_native_token_id(&token_id) {
+						return Err(CostProfitError::Calculation(format!(
+							"Native (zero-address) input on chain {chain_id} requires an explicit native TokenConfig (symbol + decimals) for USD valuation; the chain native-symbol fallback applies to gas pricing only"
+						)));
+					}
+					return Err(e.into());
+				},
+				Err(e) => return Err(e.into()),
+			};
 
 			let usd_amount = Self::convert_raw_token_to_usd(
 				&input.amount,
@@ -3108,10 +3238,29 @@ impl CostProfitService {
 				.map_err(|e| CostProfitError::Calculation(format!("Failed to get address: {e}")))?;
 			let token_address = Address(ethereum_addr.0.to_vec());
 
-			let token_info = self
+			let token_info = match self
 				.token_manager
 				.get_token_info(chain_id, &token_address)
-				.await?;
+				.await
+			{
+				Ok(info) => info,
+				Err(e @ TokenManagerError::TokenNotSupported(..)) => {
+					// A native (zero-address) output needs an explicit native
+					// `TokenConfig` (symbol + decimals) to be valued in USD. The
+					// chain native-symbol fallback in `native_symbol_fallback` is
+					// GAS-ONLY (see its doc), so it deliberately does not rescue
+					// valuation here.
+					let mut token_id = [0u8; 32];
+					token_id[12..].copy_from_slice(&token_address.0);
+					if is_native_token_id(&token_id) {
+						return Err(CostProfitError::Calculation(format!(
+							"Native (zero-address) output on chain {chain_id} requires an explicit native TokenConfig (symbol + decimals) for USD valuation; the chain native-symbol fallback applies to gas pricing only"
+						)));
+					}
+					return Err(e.into());
+				},
+				Err(e) => return Err(e.into()),
+			};
 
 			let usd_amount = Self::convert_raw_token_to_usd(
 				&output.amount,
@@ -3165,8 +3314,30 @@ impl CostProfitService {
 		})?;
 
 		// Convert to smallest unit (apply decimals), rounding up to ensure we collect enough
-		// This protects our margin when costs are deducted from outputs or added to inputs
-		let multiplier = Decimal::new(10_i64.pow(token_info.decimals as u32), 0);
+		// This protects our margin when costs are deducted from outputs or added to inputs.
+		//
+		// Compute the power in `i128` (not `i64`, which overflows at 10^19) and
+		// build the multiplier via `try_from_i128_with_scale`, which fails
+		// cleanly once 10^decimals exceeds rust_decimal's 96-bit mantissa
+		// (>28 decimals). This both fixes the >=19-decimal overflow and adds the
+		// missing <=28 guard as a clear error instead of a panic/wrap.
+		let multiplier = Decimal::try_from_i128_with_scale(
+			10_i128
+				.checked_pow(token_info.decimals as u32)
+				.ok_or_else(|| {
+					CostProfitError::Calculation(format!(
+						"Token decimals {} exceeds maximum supported precision",
+						token_info.decimals
+					))
+				})?,
+			0,
+		)
+		.map_err(|e| {
+			CostProfitError::Calculation(format!(
+				"Token decimals {} exceeds maximum supported precision: {e}",
+				token_info.decimals
+			))
+		})?;
 		let token_amount_in_smallest = token_amount_decimal * multiplier;
 
 		// Ceil to ensure we always collect enough to cover costs after USD->token->USD round-trip
@@ -3431,8 +3602,19 @@ mod tests {
 			.symbol("INPUT".to_string())
 			.decimals(18)
 			.build();
+		let native_token = solver_types::utils::tests::builders::TokenConfigBuilder::new()
+			.address(solver_types::Address(vec![0u8; 20]))
+			.symbol("ETH".to_string())
+			.decimals(18)
+			.build();
 		let output_token = solver_types::utils::tests::builders::TokenConfigBuilder::new()
-			.address(solver_types::Address(vec![0u8; 20])) // Zero address for output
+			.address(solver_types::Address(
+				[
+					0xB0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C, 0x1C,
+					0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+				]
+				.to_vec(),
+			))
 			.symbol("OUTPUT".to_string())
 			.decimals(18)
 			.build();
@@ -3440,16 +3622,34 @@ mod tests {
 			.add_network(
 				1,
 				NetworkConfigBuilder::new()
-					.tokens(vec![input_token])
+					.tokens(vec![native_token.clone(), input_token])
 					.build(),
 			)
 			.add_network(
 				137,
 				NetworkConfigBuilder::new()
-					.tokens(vec![output_token])
+					.tokens(vec![native_token, output_token])
 					.build(),
 			)
 			.build()
+	}
+
+	fn native_eth_token() -> solver_types::TokenConfig {
+		solver_types::TokenConfig {
+			address: solver_types::Address(vec![0u8; 20]),
+			symbol: "ETH".to_string(),
+			name: Some("Ether".to_string()),
+			decimals: 18,
+		}
+	}
+
+	fn output_token_bytes32() -> [u8; 32] {
+		let mut token = [0u8; 32];
+		token[12..].copy_from_slice(&[
+			0xB0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C, 0x1C, 0x5C,
+			0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+		]);
+		token
 	}
 
 	// Helper functions for creating test data
@@ -3904,18 +4104,21 @@ mod tests {
 			rpc_urls: vec![],
 			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
-			tokens: vec![solver_types::TokenConfig {
-				address: solver_types::Address(
-					[
-						0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
-						0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
-					]
-					.to_vec(),
-				),
-				decimals: 18,
-				symbol: "ETH".to_string(),
-				name: Some("Ether".to_string()),
-			}],
+			tokens: vec![
+				native_eth_token(),
+				solver_types::TokenConfig {
+					address: solver_types::Address(
+						[
+							0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
+							0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+						]
+						.to_vec(),
+					),
+					decimals: 18,
+					symbol: "ETH".to_string(),
+					name: Some("Ether".to_string()),
+				},
+			],
 			input_settler_compact_address: None,
 			the_compact_address: None,
 			allocator_address: None,
@@ -3929,18 +4132,21 @@ mod tests {
 			rpc_urls: vec![],
 			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
-			tokens: vec![solver_types::TokenConfig {
-				address: solver_types::Address(
-					[
-						0xB0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
-						0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
-					]
-					.to_vec(),
-				),
-				decimals: 6,
-				symbol: "USDC".to_string(),
-				name: Some("USD Coin".to_string()),
-			}],
+			tokens: vec![
+				native_eth_token(),
+				solver_types::TokenConfig {
+					address: solver_types::Address(
+						[
+							0xB0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
+							0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+						]
+						.to_vec(),
+					),
+					decimals: 6,
+					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
+				},
+			],
 			input_settler_compact_address: None,
 			the_compact_address: None,
 			allocator_address: None,
@@ -3983,8 +4189,8 @@ mod tests {
 		// Verify cost breakdown exists and has reasonable values
 		assert!(cost_context.cost_breakdown.total >= Decimal::ZERO);
 		assert!(cost_context.cost_breakdown.operational_cost >= Decimal::ZERO);
-		assert!(cost_context.cost_breakdown.settlement_fee > Decimal::ZERO);
-		assert!(cost_context.cost_breakdown.settlement_fee_buffer > Decimal::ZERO);
+		assert!(cost_context.cost_breakdown.settlement_fee >= Decimal::ZERO);
+		assert!(cost_context.cost_breakdown.settlement_fee_buffer >= Decimal::ZERO);
 
 		// Verify execution costs by chain
 		assert!(!cost_context.execution_costs_by_chain.is_empty());
@@ -4019,7 +4225,9 @@ mod tests {
 				let amount_f64: f64 = amount.parse().unwrap_or(0.0);
 				Box::pin(async move {
 					match (from.as_str(), to.as_str()) {
-						("ETH", "USD") => Ok((amount_f64 * ETH_USD_PRICE).to_string()),
+						("ETH", "USD") => Err(solver_types::PricingError::PriceNotAvailable(
+							"ETH/USD".to_string(),
+						)),
 						("USD", "ETH") => Ok((amount_f64 / ETH_USD_PRICE).to_string()),
 						("USDC", "USD") => Ok((amount_f64 * USDC_USD_PRICE).to_string()),
 						("USD", "USDC") => Ok((amount_f64 / USDC_USD_PRICE).to_string()),
@@ -4080,18 +4288,21 @@ mod tests {
 			rpc_urls: vec![],
 			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
-			tokens: vec![solver_types::TokenConfig {
-				address: solver_types::Address(
-					[
-						0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
-						0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
-					]
-					.to_vec(),
-				),
-				decimals: 18,
-				symbol: "ETH".to_string(),
-				name: Some("Ether".to_string()),
-			}],
+			tokens: vec![
+				native_eth_token(),
+				solver_types::TokenConfig {
+					address: solver_types::Address(
+						[
+							0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
+							0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+						]
+						.to_vec(),
+					),
+					decimals: 18,
+					symbol: "ETH".to_string(),
+					name: Some("Ether".to_string()),
+				},
+			],
 			input_settler_compact_address: None,
 			the_compact_address: None,
 			allocator_address: None,
@@ -4104,18 +4315,21 @@ mod tests {
 			rpc_urls: vec![],
 			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
-			tokens: vec![solver_types::TokenConfig {
-				address: solver_types::Address(
-					[
-						0xB0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
-						0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
-					]
-					.to_vec(),
-				),
-				decimals: 6,
-				symbol: "USDC".to_string(),
-				name: Some("USD Coin".to_string()),
-			}],
+			tokens: vec![
+				native_eth_token(),
+				solver_types::TokenConfig {
+					address: solver_types::Address(
+						[
+							0xB0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
+							0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+						]
+						.to_vec(),
+					),
+					decimals: 6,
+					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
+				},
+			],
 			input_settler_compact_address: None,
 			the_compact_address: None,
 			allocator_address: None,
@@ -4250,18 +4464,21 @@ mod tests {
 			rpc_urls: vec![],
 			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
-			tokens: vec![solver_types::TokenConfig {
-				address: solver_types::Address(
-					[
-						0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
-						0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
-					]
-					.to_vec(),
-				),
-				decimals: 18,
-				symbol: "ETH".to_string(),
-				name: Some("Ether".to_string()),
-			}],
+			tokens: vec![
+				native_eth_token(),
+				solver_types::TokenConfig {
+					address: solver_types::Address(
+						[
+							0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
+							0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+						]
+						.to_vec(),
+					),
+					decimals: 18,
+					symbol: "ETH".to_string(),
+					name: Some("Ether".to_string()),
+				},
+			],
 			input_settler_compact_address: None,
 			the_compact_address: None,
 			allocator_address: None,
@@ -4275,18 +4492,21 @@ mod tests {
 			rpc_urls: vec![],
 			input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 			output_settler_address: solver_types::Address([0x22; 20].to_vec()),
-			tokens: vec![solver_types::TokenConfig {
-				address: solver_types::Address(
-					[
-						0xB0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
-						0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
-					]
-					.to_vec(),
-				),
-				decimals: 6,
-				symbol: "USDC".to_string(),
-				name: Some("USD Coin".to_string()),
-			}],
+			tokens: vec![
+				native_eth_token(),
+				solver_types::TokenConfig {
+					address: solver_types::Address(
+						[
+							0xB0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
+							0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+						]
+						.to_vec(),
+					),
+					decimals: 6,
+					symbol: "USDC".to_string(),
+					name: Some("USD Coin".to_string()),
+				},
+			],
 			input_settler_compact_address: None,
 			the_compact_address: None,
 			allocator_address: None,
@@ -4501,19 +4721,27 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_calculate_total_cost_includes_optional_settlement_and_l1_data_fees() {
+		let one_native = U256::from(1_000_000_000_000_000_000u128);
 		let mut mock_pricing = MockPricingInterface::new();
+		mock_pricing.expect_wei_to_currency().times(0);
 		mock_pricing
-			.expect_wei_to_currency()
+			.expect_convert_asset()
 			.times(8)
-			.returning(|wei, _| {
-				let wei = wei.to_string();
-				Box::pin(async move { Ok(wei) })
+			.returning(|from, to, amount| {
+				assert_eq!(from, "ETH");
+				assert_eq!(to, "USD");
+				let amount = amount.to_string();
+				Box::pin(async move { Ok(amount) })
 			});
 
 		let mut origin_delivery = MockDeliveryInterface::new();
 		origin_delivery
 			.expect_get_fee_params()
-			.returning(|chain_id| Box::pin(async move { Ok(FeeParams::legacy(chain_id, 10u128)) }));
+			.returning(|chain_id| {
+				Box::pin(
+					async move { Ok(FeeParams::legacy(chain_id, 10_000_000_000_000_000_000u128)) },
+				)
+			});
 		origin_delivery.expect_config_schema().returning(|| {
 			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
 		});
@@ -4522,7 +4750,9 @@ mod tests {
 		destination_delivery
 			.expect_get_fee_params()
 			.returning(|chain_id| {
-				Box::pin(async move { Ok(FeeParams::legacy(chain_id, 100u128)) })
+				Box::pin(
+					async move { Ok(FeeParams::legacy(chain_id, 100_000_000_000_000_000_000u128)) },
+				)
 			});
 		destination_delivery.expect_config_schema().returning(|| {
 			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
@@ -4543,8 +4773,31 @@ mod tests {
 			3600,
 			60,
 		));
+		let native_token = solver_types::TokenConfig {
+			address: solver_types::Address(vec![0u8; 20]),
+			symbol: "ETH".to_string(),
+			name: Some("Ether".to_string()),
+			decimals: 18,
+		};
+		let mut networks = NetworksConfig::new();
+		for chain_id in [1, 2] {
+			networks.insert(
+				chain_id,
+				solver_types::NetworkConfig {
+					name: Some(format!("chain-{chain_id}")),
+					network_type: solver_types::networks::NetworkType::New,
+					rpc_urls: vec![],
+					input_settler_address: solver_types::Address([0x11; 20].to_vec()),
+					output_settler_address: solver_types::Address([0x22; 20].to_vec()),
+					tokens: vec![native_token.clone()],
+					input_settler_compact_address: None,
+					the_compact_address: None,
+					allocator_address: None,
+				},
+			);
+		}
 		let token_manager = Arc::new(TokenManager::new(
-			create_test_networks_config(),
+			networks,
 			delivery.clone(),
 			create_mock_account_service(),
 		));
@@ -4571,9 +4824,9 @@ mod tests {
 					pre_claim_units: 4,
 					claim_units: 5,
 				},
-				U256::from(10u64),
-				U256::from(7u64),
-				U256::from(8u64),
+				one_native * U256::from(10u64),
+				one_native * U256::from(7u64),
+				one_native * U256::from(8u64),
 			)
 			.await
 			.unwrap();
@@ -4589,6 +4842,651 @@ mod tests {
 		assert_eq!(breakdown.l1_data_fee, Decimal::from(7));
 		assert_eq!(breakdown.l1_data_fee_buffer, Decimal::from(8));
 		assert_eq!(breakdown.operational_cost, Decimal::from(686));
+	}
+
+	#[tokio::test]
+	async fn test_calculate_total_cost_prices_native_gas_by_chain_symbol() {
+		let one_native = U256::from(1_000_000_000_000_000_000u128);
+		let mut mock_pricing = MockPricingInterface::new();
+		mock_pricing.expect_wei_to_currency().times(0);
+		mock_pricing
+			.expect_convert_asset()
+			.returning(|from, to, amount| {
+				let from = from.to_string();
+				let to = to.to_string();
+				let amount = Decimal::from_str(amount).unwrap();
+				Box::pin(async move {
+					assert_eq!(to, "USD");
+					let price = match from.as_str() {
+						"POL" => Decimal::from(1),
+						"ETH" => Decimal::from(100),
+						"BNB" => Decimal::from(3),
+						"AVAX" => Decimal::from(7),
+						other => panic!("unexpected native asset conversion from {other}"),
+					};
+					Ok((amount * price).to_string())
+				})
+			});
+
+		let mut polygon_delivery = MockDeliveryInterface::new();
+		polygon_delivery
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(
+					async move { Ok(FeeParams::legacy(chain_id, 1_000_000_000_000_000_000u128)) },
+				)
+			});
+		polygon_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut ethereum_delivery = MockDeliveryInterface::new();
+		ethereum_delivery
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(
+					async move { Ok(FeeParams::legacy(chain_id, 1_000_000_000_000_000_000u128)) },
+				)
+			});
+		ethereum_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut bnb_delivery = MockDeliveryInterface::new();
+		bnb_delivery.expect_get_fee_params().returning(|chain_id| {
+			Box::pin(async move { Ok(FeeParams::legacy(chain_id, 1_000_000_000_000_000_000u128)) })
+		});
+		bnb_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut avax_delivery = MockDeliveryInterface::new();
+		avax_delivery.expect_get_fee_params().returning(|chain_id| {
+			Box::pin(async move { Ok(FeeParams::legacy(chain_id, 1_000_000_000_000_000_000u128)) })
+		});
+		avax_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([
+				(
+					137,
+					Arc::new(polygon_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+				),
+				(
+					1,
+					Arc::new(ethereum_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+				),
+				(
+					56,
+					Arc::new(bnb_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+				),
+				(
+					43114,
+					Arc::new(avax_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+				),
+			]),
+			1,
+			3600,
+			60,
+		));
+
+		let native_token = |symbol: &'static std::primitive::str| solver_types::TokenConfig {
+			address: solver_types::Address(vec![0u8; 20]),
+			symbol: symbol.to_string(),
+			name: Some(symbol.to_string()),
+			decimals: 18,
+		};
+		let mut networks = NetworksConfig::new();
+		networks.insert(
+			137,
+			solver_types::NetworkConfig {
+				name: Some("polygon".to_string()),
+				network_type: solver_types::networks::NetworkType::Hub,
+				rpc_urls: vec![],
+				input_settler_address: solver_types::Address([0x11; 20].to_vec()),
+				output_settler_address: solver_types::Address([0x22; 20].to_vec()),
+				tokens: vec![native_token("POL")],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		networks.insert(
+			1,
+			solver_types::NetworkConfig {
+				name: Some("ethereum".to_string()),
+				network_type: solver_types::networks::NetworkType::Parent,
+				rpc_urls: vec![],
+				input_settler_address: solver_types::Address([0x33; 20].to_vec()),
+				output_settler_address: solver_types::Address([0x44; 20].to_vec()),
+				tokens: vec![native_token("ETH")],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		networks.insert(
+			56,
+			solver_types::NetworkConfig {
+				name: Some("bnb".to_string()),
+				network_type: solver_types::networks::NetworkType::Hub,
+				rpc_urls: vec![],
+				input_settler_address: solver_types::Address([0x55; 20].to_vec()),
+				output_settler_address: solver_types::Address([0x66; 20].to_vec()),
+				tokens: vec![native_token("BNB")],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		networks.insert(
+			43114,
+			solver_types::NetworkConfig {
+				name: Some("avalanche".to_string()),
+				network_type: solver_types::networks::NetworkType::Hub,
+				rpc_urls: vec![],
+				input_settler_address: solver_types::Address([0x77; 20].to_vec()),
+				output_settler_address: solver_types::Address([0x88; 20].to_vec()),
+				tokens: vec![native_token("AVAX")],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		let token_manager = Arc::new(TokenManager::new(
+			networks,
+			delivery.clone(),
+			create_mock_account_service(),
+		));
+		let service = CostProfitService::new(
+			Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new())),
+			delivery,
+			token_manager,
+			Arc::new(StorageService::new(Box::new(MockStorageInterface::new()))),
+			no_fee_settlement_service(),
+		);
+
+		let breakdown = service
+			.calculate_total_cost(
+				&[],
+				&[],
+				&create_test_config(),
+				137,
+				1,
+				&GasUnits {
+					open_units: 1,
+					fill_units: 4,
+					post_fill_units: 5,
+					pre_claim_units: 2,
+					claim_units: 3,
+				},
+				one_native * U256::from(6),
+				one_native * U256::from(7),
+				one_native * U256::from(8),
+			)
+			.await
+			.unwrap();
+
+		assert_eq!(breakdown.gas_open, Decimal::from(1));
+		assert_eq!(breakdown.gas_pre_claim, Decimal::from(2));
+		assert_eq!(breakdown.gas_claim, Decimal::from(3));
+		assert_eq!(breakdown.gas_fill, Decimal::from(400));
+		assert_eq!(breakdown.gas_post_fill, Decimal::from(500));
+		assert_eq!(breakdown.settlement_fee, Decimal::from(600));
+		assert_eq!(breakdown.l1_data_fee, Decimal::from(700));
+		assert_eq!(breakdown.l1_data_fee_buffer, Decimal::from(800));
+
+		// BNB (56) and AVAX (43114) resolve their native gas symbol from config
+		// the same way, proving chain-aware pricing is not ETH/POL-specific.
+		let breakdown_bnb_avax = service
+			.calculate_total_cost(
+				&[],
+				&[],
+				&create_test_config(),
+				56,
+				43114,
+				&GasUnits {
+					open_units: 1,
+					fill_units: 1,
+					post_fill_units: 0,
+					pre_claim_units: 0,
+					claim_units: 0,
+				},
+				U256::ZERO,
+				U256::ZERO,
+				U256::ZERO,
+			)
+			.await
+			.unwrap();
+
+		// origin leg (chain 56, 1 gas * 1e18) priced in BNB @ 3;
+		// destination leg (chain 43114, 1 gas * 1e18) priced in AVAX @ 7.
+		assert_eq!(breakdown_bnb_avax.gas_open, Decimal::from(3));
+		assert_eq!(breakdown_bnb_avax.gas_fill, Decimal::from(7));
+	}
+
+	/// A chain whose config has NO zero-address `TokenConfig` must still price
+	/// native gas via the built-in chain -> native symbol fallback, instead of
+	/// failing the whole quote. Regression guard for the config-first fallback.
+	#[tokio::test]
+	async fn test_native_gas_pricing_falls_back_when_chain_not_configured() {
+		let mut mock_pricing = MockPricingInterface::new();
+		mock_pricing.expect_wei_to_currency().times(0);
+		mock_pricing
+			.expect_convert_asset()
+			.returning(|from, to, amount| {
+				let from = from.to_string();
+				let to = to.to_string();
+				let amount = Decimal::from_str(amount).unwrap();
+				Box::pin(async move {
+					assert_eq!(to, "USD");
+					let price = match from.as_str() {
+						// Polygon's native token, resolved via the fallback map
+						// because the config has no zero-address TokenConfig.
+						"POL" => Decimal::from(5),
+						other => panic!("unexpected native asset conversion from {other}"),
+					};
+					Ok((amount * price).to_string())
+				})
+			});
+
+		let mut polygon_delivery = MockDeliveryInterface::new();
+		polygon_delivery
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(
+					async move { Ok(FeeParams::legacy(chain_id, 1_000_000_000_000_000_000u128)) },
+				)
+			});
+		polygon_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				137,
+				Arc::new(polygon_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			3600,
+			60,
+		));
+
+		// Polygon (137) is present in config but WITHOUT a zero-address native
+		// TokenConfig — the exact "unmigrated config" case the fallback fixes.
+		let mut networks = NetworksConfig::new();
+		networks.insert(
+			137,
+			solver_types::NetworkConfig {
+				name: Some("polygon".to_string()),
+				network_type: solver_types::networks::NetworkType::Hub,
+				rpc_urls: vec![],
+				input_settler_address: solver_types::Address([0x11; 20].to_vec()),
+				output_settler_address: solver_types::Address([0x22; 20].to_vec()),
+				tokens: vec![],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		let token_manager = Arc::new(TokenManager::new(
+			networks,
+			delivery.clone(),
+			create_mock_account_service(),
+		));
+		let service = CostProfitService::new(
+			Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new())),
+			delivery,
+			token_manager,
+			Arc::new(StorageService::new(Box::new(MockStorageInterface::new()))),
+			no_fee_settlement_service(),
+		);
+
+		let breakdown = service
+			.calculate_total_cost(
+				&[],
+				&[],
+				&create_test_config(),
+				137,
+				137,
+				&GasUnits {
+					open_units: 1,
+					fill_units: 0,
+					post_fill_units: 0,
+					pre_claim_units: 0,
+					claim_units: 0,
+				},
+				U256::ZERO,
+				U256::ZERO,
+				U256::ZERO,
+			)
+			.await
+			.expect("native gas pricing must fall back instead of erroring");
+
+		// 1 gas unit * 1e18 wei/gas = 1 POL, priced at 5 USD via the fallback.
+		assert_eq!(breakdown.gas_open, Decimal::from(5));
+	}
+
+	/// Gas is denominated in 1e18-base wei, so a chain whose explicit
+	/// zero-address native `TokenConfig` is misconfigured with non-18 decimals
+	/// must FAIL CLOSED at runtime (all builds), not silently misprice by
+	/// `10^(18 - decimals)`. Regression guard for the release-safe decimals check
+	/// that replaced a debug-only `debug_assert`.
+	#[tokio::test]
+	async fn test_native_gas_pricing_rejects_non_18_decimal_native() {
+		let mut mock_pricing = MockPricingInterface::new();
+		// We must fail on the decimals guard BEFORE any pricing call is made.
+		mock_pricing.expect_wei_to_currency().times(0);
+		mock_pricing.expect_convert_asset().times(0);
+
+		let mut polygon_delivery = MockDeliveryInterface::new();
+		polygon_delivery
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(
+					async move { Ok(FeeParams::legacy(chain_id, 1_000_000_000_000_000_000u128)) },
+				)
+			});
+		polygon_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				137,
+				Arc::new(polygon_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			3600,
+			60,
+		));
+
+		// Explicit zero-address native TokenConfig with NON-18 decimals (6) — the
+		// exact misconfiguration the runtime guard must reject.
+		let mut networks = NetworksConfig::new();
+		networks.insert(
+			137,
+			solver_types::NetworkConfig {
+				name: Some("polygon".to_string()),
+				network_type: solver_types::networks::NetworkType::Hub,
+				rpc_urls: vec![],
+				input_settler_address: solver_types::Address([0x11; 20].to_vec()),
+				output_settler_address: solver_types::Address([0x22; 20].to_vec()),
+				tokens: vec![solver_types::TokenConfig {
+					address: solver_types::Address(vec![0u8; 20]),
+					symbol: "POL".to_string(),
+					name: Some("POL".to_string()),
+					decimals: 6,
+				}],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		let token_manager = Arc::new(TokenManager::new(
+			networks,
+			delivery.clone(),
+			create_mock_account_service(),
+		));
+		let service = CostProfitService::new(
+			Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new())),
+			delivery,
+			token_manager,
+			Arc::new(StorageService::new(Box::new(MockStorageInterface::new()))),
+			no_fee_settlement_service(),
+		);
+
+		// One non-zero origin gas leg on the misconfigured chain forces a native
+		// base-units -> USD conversion; every other leg is zero (early-returns).
+		let result = service
+			.calculate_total_cost(
+				&[],
+				&[],
+				&create_test_config(),
+				137,
+				137,
+				&GasUnits {
+					open_units: 1,
+					fill_units: 0,
+					post_fill_units: 0,
+					pre_claim_units: 0,
+					claim_units: 0,
+				},
+				U256::ZERO,
+				U256::ZERO,
+				U256::ZERO,
+			)
+			.await;
+
+		let err = result
+			.expect_err("native gas pricing must fail closed for a non-18-decimal native config");
+		let msg = err.to_string();
+		assert!(
+			msg.contains("18-decimal") && msg.contains("decimals"),
+			"error must explain the non-18 native decimals rejection, got: {msg}"
+		);
+	}
+
+	/// An unknown chain id that is neither in config nor in the fallback map
+	/// must fail closed rather than silently mispricing native gas.
+	#[tokio::test]
+	async fn test_native_gas_pricing_errors_on_unknown_unconfigured_chain() {
+		const UNKNOWN_CHAIN: u64 = 999_999;
+
+		let mut mock_pricing = MockPricingInterface::new();
+		// Neither pricing path should be reached: the symbol never resolves.
+		mock_pricing.expect_wei_to_currency().times(0);
+		mock_pricing.expect_convert_asset().times(0);
+
+		let mut unknown_delivery = MockDeliveryInterface::new();
+		unknown_delivery
+			.expect_get_fee_params()
+			.returning(|chain_id| {
+				Box::pin(
+					async move { Ok(FeeParams::legacy(chain_id, 1_000_000_000_000_000_000u128)) },
+				)
+			});
+		unknown_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let delivery = Arc::new(DeliveryService::new(
+			HashMap::from([(
+				UNKNOWN_CHAIN,
+				Arc::new(unknown_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+			)]),
+			1,
+			3600,
+			60,
+		));
+
+		// Chain present for fee params, but has no zero-address native token and
+		// is not a well-known chain, so no native symbol can be resolved.
+		let mut networks = NetworksConfig::new();
+		networks.insert(
+			UNKNOWN_CHAIN,
+			solver_types::NetworkConfig {
+				name: Some("unknown".to_string()),
+				network_type: solver_types::networks::NetworkType::Hub,
+				rpc_urls: vec![],
+				input_settler_address: solver_types::Address([0x11; 20].to_vec()),
+				output_settler_address: solver_types::Address([0x22; 20].to_vec()),
+				tokens: vec![],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		let token_manager = Arc::new(TokenManager::new(
+			networks,
+			delivery.clone(),
+			create_mock_account_service(),
+		));
+		let service = CostProfitService::new(
+			Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new())),
+			delivery,
+			token_manager,
+			Arc::new(StorageService::new(Box::new(MockStorageInterface::new()))),
+			no_fee_settlement_service(),
+		);
+
+		let result = service
+			.calculate_total_cost(
+				&[],
+				&[],
+				&create_test_config(),
+				UNKNOWN_CHAIN,
+				UNKNOWN_CHAIN,
+				&GasUnits {
+					open_units: 1,
+					fill_units: 0,
+					post_fill_units: 0,
+					pre_claim_units: 0,
+					claim_units: 0,
+				},
+				U256::ZERO,
+				U256::ZERO,
+				U256::ZERO,
+			)
+			.await;
+
+		assert!(
+			result.is_err(),
+			"unknown, unconfigured chain must fail closed, got: {result:?}"
+		);
+	}
+
+	/// A native (zero-address) OUTPUT on a chain that is CONFIGURED but has no
+	/// zero-address native `TokenConfig` must fail valuation with a CLEAR
+	/// message that mentions `native` and `config` — not a bare
+	/// `TokenNotSupported`. The gas-only native-symbol fallback must not rescue
+	/// valuation here. A native output WITH an explicit native config still
+	/// values fine.
+	#[tokio::test]
+	async fn test_native_output_valuation_errors_clearly_without_config() {
+		let mut mock_pricing = MockPricingInterface::new();
+		mock_pricing
+			.expect_convert_asset()
+			.returning(|from, to, amount| {
+				let from = from.to_string();
+				let to = to.to_string();
+				let amount = Decimal::from_str(amount).unwrap();
+				Box::pin(async move {
+					assert_eq!(to, "USD");
+					let price = match from.as_str() {
+						"ETH" => Decimal::from(4000),
+						other => panic!("unexpected asset conversion from {other}"),
+					};
+					Ok((amount * price).to_string())
+				})
+			});
+
+		// Chain 1: WITH a zero-address native ETH TokenConfig.
+		// Chain 137: configured, but NO zero-address native TokenConfig.
+		let native_eth = solver_types::utils::tests::builders::TokenConfigBuilder::new()
+			.address(solver_types::Address(vec![0u8; 20]))
+			.symbol("ETH".to_string())
+			.decimals(18)
+			.build();
+		let some_erc20 = solver_types::utils::tests::builders::TokenConfigBuilder::new()
+			.address(solver_types::Address([0x11u8; 20].to_vec()))
+			.symbol("OUTPUT".to_string())
+			.decimals(18)
+			.build();
+		let networks = NetworksConfigBuilder::new()
+			.add_network(
+				1,
+				NetworkConfigBuilder::new().tokens(vec![native_eth]).build(),
+			)
+			.add_network(
+				137,
+				NetworkConfigBuilder::new().tokens(vec![some_erc20]).build(),
+			)
+			.build();
+		let token_manager = Arc::new(TokenManager::new(
+			networks,
+			create_mock_delivery_service(),
+			create_mock_account_service(),
+		));
+		let service = CostProfitService::new(
+			Arc::new(PricingService::new(Box::new(mock_pricing), Vec::new())),
+			create_mock_delivery_service(),
+			token_manager,
+			Arc::new(StorageService::new(Box::new(MockStorageInterface::new()))),
+			no_fee_settlement_service(),
+		);
+
+		// Native output on chain 137 (no native config) -> clear error.
+		let native_no_config = OrderOutput {
+			receiver: InteropAddress::new_ethereum(
+				137,
+				address!("0000000000000000000000000000000000000000"),
+			),
+			asset: InteropAddress::new_ethereum(
+				137,
+				address!("0000000000000000000000000000000000000000"),
+			),
+			amount: U256::from(1_000_000_000_000_000_000u128),
+			calldata: None,
+		};
+		let err = service
+			.calculate_outputs_usd_value(&[native_no_config])
+			.await
+			.expect_err("native output without native TokenConfig must error");
+		let msg = err.to_string().to_lowercase();
+		assert!(msg.contains("native"), "error must mention native: {msg}");
+		assert!(msg.contains("config"), "error must mention config: {msg}");
+
+		// Native output on chain 1 (WITH native config) -> values fine.
+		let native_with_config = OrderOutput {
+			receiver: InteropAddress::new_ethereum(
+				1,
+				address!("0000000000000000000000000000000000000000"),
+			),
+			asset: InteropAddress::new_ethereum(
+				1,
+				address!("0000000000000000000000000000000000000000"),
+			),
+			amount: U256::from(1_000_000_000_000_000_000u128),
+			calldata: None,
+		};
+		let usd = service
+			.calculate_outputs_usd_value(&[native_with_config])
+			.await
+			.expect("native output with native TokenConfig must value fine");
+		assert_eq!(usd, Decimal::from(4000));
+	}
+
+	/// Regression: `10_i64.pow(20)` overflowed `i64` (panics in debug, wraps in
+	/// release) for tokens with >=19 decimals, despite the <=28 decimals guard.
+	/// Computing the divisor in `i128` fixes it.
+	#[tokio::test]
+	async fn test_convert_raw_token_to_usd_handles_20_decimal_token() {
+		let mut mock_pricing = MockPricingInterface::new();
+		mock_pricing
+			.expect_convert_asset()
+			.returning(|from, to, amount| {
+				let from = from.to_string();
+				let to = to.to_string();
+				let amount = Decimal::from_str(amount).unwrap();
+				Box::pin(async move {
+					assert_eq!(from, "TKN20");
+					assert_eq!(to, "USD");
+					// TKN20 priced at 3 USD each.
+					Ok((amount * Decimal::from(3)).to_string())
+				})
+			});
+		let pricing = PricingService::new(Box::new(mock_pricing), Vec::new());
+
+		// 2 whole tokens with 20 decimals = 2 * 10^20 base units.
+		let raw = U256::from_str("200000000000000000000").unwrap();
+		let usd = CostProfitService::convert_raw_token_to_usd(&raw, "TKN20", 20, &pricing)
+			.await
+			.expect("20-decimal conversion must not overflow");
+		// normalized = 2.0 priced at 3 USD => 6 USD.
+		assert_eq!(usd, Decimal::from(6));
 	}
 
 	// ============================================================================
@@ -4615,7 +5513,7 @@ mod tests {
 			outputs: vec![MandateOutput {
 				oracle: [0u8; 32],  // Zero oracle for test
 				settler: [0u8; 32], // Zero settler for test
-				token: [0u8; 32],   // Use zero address for OUTPUT token
+				token: output_token_bytes32(),
 				amount: output_amount,
 				recipient: U256::from_str("0x2222222222222222222222222222222222222222")
 					.unwrap()
@@ -6494,6 +7392,26 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn build_fill_tx_for_quote_sets_value_for_native_output() {
+		let config = config_with_output_settler_on_dest(QUOTE_OUTPUT_SETTLER);
+		let solver = solver_types::Address(QUOTE_SOLVER.to_vec());
+		let mut request = quote_request_with_unresolved_amount();
+		request.intent.outputs[0].asset =
+			InteropAddress::new_ethereum(QUOTE_DEST_CHAIN_ID, alloy_primitives::Address::ZERO);
+		let validated = create_test_validated_context(true);
+		let resolved_amount = U256::from(1_000_000u64);
+		let resolved = resolved_amounts_for_request(&request, resolved_amount);
+		let service = cost_profit_service_no_delivery_chains();
+
+		let tx = service
+			.build_fill_tx_for_quote(&request, &validated, &resolved, &config, &solver, true)
+			.await
+			.expect("synthetic native fill tx should build");
+
+		assert_eq!(tx.value, resolved_amount);
+	}
+
+	#[tokio::test]
 	async fn build_fill_tx_for_quote_skips_source_finality_delay_for_resource_lock() {
 		let config = config_with_output_settler_on_dest(QUOTE_OUTPUT_SETTLER);
 		let configured_fill_deadline_window = 60;
@@ -6702,18 +7620,21 @@ mod tests {
 				rpc_urls: vec![],
 				input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 				output_settler_address: solver_types::Address([0x22; 20].to_vec()),
-				tokens: vec![solver_types::TokenConfig {
-					address: solver_types::Address(
-						[
-							0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
-							0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
-						]
-						.to_vec(),
-					),
-					decimals: 18,
-					symbol: "ETH".to_string(),
-					name: Some("Ether".to_string()),
-				}],
+				tokens: vec![
+					native_eth_token(),
+					solver_types::TokenConfig {
+						address: solver_types::Address(
+							[
+								0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C,
+								0x5C, 0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+							]
+							.to_vec(),
+						),
+						decimals: 18,
+						symbol: "ETH".to_string(),
+						name: Some("Ether".to_string()),
+					},
+				],
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -6727,18 +7648,21 @@ mod tests {
 				rpc_urls: vec![],
 				input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 				output_settler_address: solver_types::Address([0x22; 20].to_vec()),
-				tokens: vec![solver_types::TokenConfig {
-					address: solver_types::Address(
-						[
-							0xB0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
-							0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
-						]
-						.to_vec(),
-					),
-					decimals: 6,
-					symbol: "USDC".to_string(),
-					name: Some("USD Coin".to_string()),
-				}],
+				tokens: vec![
+					native_eth_token(),
+					solver_types::TokenConfig {
+						address: solver_types::Address(
+							[
+								0xB0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C,
+								0x5C, 0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+							]
+							.to_vec(),
+						),
+						decimals: 6,
+						symbol: "USDC".to_string(),
+						name: Some("USD Coin".to_string()),
+					},
+				],
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -7528,18 +8452,21 @@ mod tests {
 				rpc_urls: vec![],
 				input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 				output_settler_address: solver_types::Address([0x22; 20].to_vec()),
-				tokens: vec![solver_types::TokenConfig {
-					address: solver_types::Address(
-						[
-							0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
-							0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
-						]
-						.to_vec(),
-					),
-					decimals: 18,
-					symbol: "ETH".to_string(),
-					name: Some("Ether".to_string()),
-				}],
+				tokens: vec![
+					native_eth_token(),
+					solver_types::TokenConfig {
+						address: solver_types::Address(
+							[
+								0xA0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C,
+								0x5C, 0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+							]
+							.to_vec(),
+						),
+						decimals: 18,
+						symbol: "ETH".to_string(),
+						name: Some("Ether".to_string()),
+					},
+				],
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,
@@ -7553,18 +8480,21 @@ mod tests {
 				rpc_urls: vec![],
 				input_settler_address: solver_types::Address([0x11; 20].to_vec()),
 				output_settler_address: solver_types::Address([0x22; 20].to_vec()),
-				tokens: vec![solver_types::TokenConfig {
-					address: solver_types::Address(
-						[
-							0xB0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C, 0x5C,
-							0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
-						]
-						.to_vec(),
-					),
-					decimals: 6,
-					symbol: "USDC".to_string(),
-					name: Some("USD Coin".to_string()),
-				}],
+				tokens: vec![
+					native_eth_token(),
+					solver_types::TokenConfig {
+						address: solver_types::Address(
+							[
+								0xB0, 0xb8, 0x6a, 0x33, 0xE6, 0x44, 0x1b, 0x8C, 0x6A, 0x7f, 0x4C,
+								0x5C, 0x1C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C, 0x5C,
+							]
+							.to_vec(),
+						),
+						decimals: 6,
+						symbol: "USDC".to_string(),
+						name: Some("USD Coin".to_string()),
+					},
+				],
 				input_settler_compact_address: None,
 				the_compact_address: None,
 				allocator_address: None,

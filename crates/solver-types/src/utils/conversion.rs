@@ -22,6 +22,16 @@ pub fn pow10(dp: u32) -> Decimal {
 	f
 }
 
+/// True iff the 32-byte mandate token identifier denotes the native gas token.
+pub fn is_native_token_id(token: &[u8; 32]) -> bool {
+	token.iter().all(|b| *b == 0)
+}
+
+/// True iff a solver address is exactly the 20-byte zero address.
+pub fn is_native_address(addr: &Address) -> bool {
+	addr.0.len() == 20 && addr.0.iter().all(|b| *b == 0)
+}
+
 /// Ceiling to `dp` decimal places.
 ///
 /// Rounds a decimal number up to the specified number of decimal places.
@@ -432,6 +442,27 @@ mod tests {
 	}
 
 	#[allow(clippy::mixed_case_hex_literals)]
+	#[test]
+	fn test_is_native_token_id_detects_only_bytes32_zero() {
+		assert!(is_native_token_id(&[0u8; 32]));
+
+		let mut non_native = [0u8; 32];
+		non_native[31] = 1;
+		assert!(!is_native_token_id(&non_native));
+	}
+
+	#[test]
+	fn test_is_native_address_requires_exact_20_zero_bytes() {
+		assert!(is_native_address(&Address(vec![0u8; 20])));
+		assert!(!is_native_address(&Address(Vec::new())));
+		assert!(!is_native_address(&Address(vec![0u8; 19])));
+		assert!(!is_native_address(&Address(vec![0u8; 21])));
+
+		let mut non_native = vec![0u8; 20];
+		non_native[19] = 1;
+		assert!(!is_native_address(&Address(non_native)));
+	}
+
 	#[test]
 	fn test_bytes20_to_alloy_address_valid() {
 		// Test with a valid 20-byte address
