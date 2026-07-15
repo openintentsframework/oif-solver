@@ -451,6 +451,12 @@ impl QuoteValidator {
 			let asset_addr = &asset_info.asset;
 			let (chain_id, evm_addr) = Self::extract_chain_and_address(asset_addr)?;
 
+			if evm_addr == AlloyAddress::ZERO {
+				return Err(QuoteError::UnsupportedAsset(format!(
+					"Native input token is not supported on chain {chain_id}"
+				)));
+			}
+
 			// ALL assets must be supported for proper pricing
 			if !Self::is_token_supported(networks, chain_id, &evm_addr) {
 				return Err(QuoteError::UnsupportedAsset(format!(
@@ -586,7 +592,7 @@ impl QuoteValidator {
 				let token_addr: solver_types::Address = evm_addr.into();
 
 				let balance_str = token_manager
-					.check_balance(chain_id, &token_addr)
+					.check_balance_any(chain_id, &token_addr)
 					.await
 					.map_err(|e| QuoteError::Internal(format!("Balance check failed: {e}")))?;
 
@@ -760,11 +766,20 @@ mod tests {
 
 	/// Creates a minimal mock SolverEngine for testing with custom network configurations
 	async fn create_mock_solver_with_networks(networks: NetworksConfig) -> SolverEngine {
+		use solver_delivery::DeliveryService;
+
+		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
+		create_mock_solver_with_networks_and_delivery(networks, delivery).await
+	}
+
+	async fn create_mock_solver_with_networks_and_delivery(
+		networks: NetworksConfig,
+		delivery: Arc<solver_delivery::DeliveryService>,
+	) -> SolverEngine {
 		use solver_account::AccountService;
 		use solver_config::Config;
 		use solver_core::engine::event_bus::EventBus;
 		use solver_core::engine::token_manager::TokenManager;
-		use solver_delivery::DeliveryService;
 		use solver_discovery::DiscoveryService;
 		use solver_order::OrderService;
 		use solver_settlement::SettlementService;
@@ -830,7 +845,6 @@ mod tests {
 		));
 
 		let solver_address = Address(vec![1u8; 20]);
-		let delivery = Arc::new(DeliveryService::new(HashMap::new(), 1, 20, 60));
 		let discovery = Arc::new(DiscoveryService::new(HashMap::new()));
 
 		let strategy_config = serde_json::Value::Object(serde_json::Map::new());
@@ -1972,6 +1986,38 @@ mod tests {
 	}
 
 	#[test]
+	fn test_validate_and_collect_inputs_with_costs_rejects_native_input_even_when_configured() {
+		let input_token = InteropAddress::new_ethereum(1, alloy_primitives::Address::ZERO);
+		let output_token =
+			InteropAddress::new_ethereum(137, address!("2b2C76e42a8a6dDA8dF24ecCc6C8a9D3f5506bF1"));
+
+		let mut supported_tokens = HashMap::new();
+		supported_tokens.insert(1u64, vec![alloy_primitives::Address::ZERO]);
+		let networks = create_mock_solver_with_token_support(supported_tokens);
+
+		let request = create_simple_test_quote_request(
+			input_token,
+			Some("1000000"),
+			output_token,
+			None,
+			SwapType::ExactInput,
+		);
+		let cost_context =
+			create_mock_cost_context(HashMap::new(), HashMap::new(), SwapType::ExactInput);
+
+		let result = QuoteValidator::validate_and_collect_inputs_with_costs(
+			&request,
+			&networks,
+			&cost_context,
+		);
+
+		assert!(
+			matches!(result, Err(QuoteError::UnsupportedAsset(ref msg)) if msg.contains("Native input token is not supported")),
+			"Should reject native input token despite config entry: {result:?}"
+		);
+	}
+
+	#[test]
 	fn test_validate_and_collect_inputs_with_costs_multiple_inputs_mixed_support() {
 		// Test: Multiple inputs, some supported, some not - should fail if ANY is unsupported
 		let supported_token =
@@ -2255,6 +2301,55 @@ mod tests {
 
 		assert_eq!(asset1.amount, U256::from(1000000u64)); // From cost context
 		assert_eq!(asset2.amount, U256::from(750000u64)); // From cost context
+	}
+
+	#[tokio::test]
+	async fn test_ensure_destination_balances_with_costs_uses_native_balance_for_native_output() {
+		use solver_delivery::{DeliveryInterface, DeliveryService, MockDeliveryInterface};
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_balance()
+			.times(1)
+			.withf(|_, token, chain_id| token.is_none() && *chain_id == 137)
+			.returning(|_, _, _| Box::pin(async { Ok("100".to_string()) }));
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+		implementations.insert(137, Arc::new(mock_delivery));
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 20, 60));
+		let solver = create_mock_solver_with_networks_and_delivery(HashMap::new(), delivery).await;
+
+		let native_asset =
+			InteropAddress::new_ethereum(137, address!("0000000000000000000000000000000000000000"));
+		let outputs = vec![SupportedAsset {
+			asset: native_asset,
+			amount: U256::from(100),
+		}];
+		let context = ValidatedQuoteContext {
+			swap_type: SwapType::ExactOutput,
+			known_inputs: None,
+			known_outputs: Some(vec![]),
+			constraint_inputs: Some(vec![]),
+			constraint_outputs: None,
+		};
+		let cost_context =
+			create_mock_cost_context(HashMap::new(), HashMap::new(), SwapType::ExactOutput);
+
+		let result = QuoteValidator::ensure_destination_balances_with_costs(
+			&solver,
+			&outputs,
+			&context,
+			&cost_context,
+		)
+		.await;
+
+		assert!(
+			result.is_ok(),
+			"Native output liquidity should use native balance: {result:?}"
+		);
 	}
 
 	// ========== validate_callback_whitelist Tests ==========

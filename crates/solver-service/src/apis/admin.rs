@@ -35,8 +35,8 @@ pub use solver_types::admin_api::{
 #[cfg(test)]
 use solver_types::AdminWhitelistEntry as SolverAdminWhitelistEntry;
 use solver_types::{
-	format_token_amount, with_0x_prefix, AdminConfig, AdminRole, OperatorAdminConfig,
-	OperatorConfig, OperatorToken,
+	format_token_amount, is_native_address, with_0x_prefix, AdminConfig, AdminRole,
+	OperatorAdminConfig, OperatorConfig, OperatorToken,
 };
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -176,8 +176,17 @@ pub async fn handle_get_balances(
 	for (chain_id, network) in networks {
 		let mut tokens = Vec::new();
 		let mut error: Option<String> = None;
+		let configured_native = network
+			.tokens
+			.iter()
+			.find(|token| is_native_address(&token.address))
+			.cloned();
 
 		for token in &network.tokens {
+			if is_native_address(&token.address) {
+				continue;
+			}
+
 			match state
 				.token_manager
 				.check_balance(chain_id, &token.address)
@@ -209,12 +218,25 @@ pub async fn handle_get_balances(
 			.await
 		{
 			Ok(balance) => {
-				let formatted = format_token_amount(&balance, 18);
+				let decimals = configured_native
+					.as_ref()
+					.map(|token| token.decimals)
+					.unwrap_or(18);
+				let formatted = format_token_amount(&balance, decimals);
 				tokens.push(TokenBalance {
-					address: zero_address.to_string(),
-					symbol: "NATIVE".to_string(),
-					name: Some("Native Token".to_string()),
-					decimals: 18,
+					address: configured_native
+						.as_ref()
+						.map(|token| token.address.to_string())
+						.unwrap_or_else(|| zero_address.to_string()),
+					symbol: configured_native
+						.as_ref()
+						.map(|token| token.symbol.clone())
+						.unwrap_or_else(|| "NATIVE".to_string()),
+					name: configured_native
+						.as_ref()
+						.and_then(|token| token.name.clone())
+						.or_else(|| Some("Native Token".to_string())),
+					decimals,
 					balance,
 					balance_formatted: formatted,
 				});
@@ -2010,6 +2032,87 @@ mod tests {
 				solver_bridge::monitor::RebalanceMonitorStatus::default(),
 			)),
 		}
+	}
+
+	#[tokio::test]
+	async fn test_handle_get_balances_uses_configured_native_metadata_once() {
+		use solver_types::networks::{
+			NetworkConfig as RuntimeNetworkConfig, RpcEndpoint, TokenConfig,
+		};
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_balance()
+			.times(2)
+			.returning(|_, token, chain_id| {
+				assert_eq!(chain_id, 1);
+				let balance = match token {
+					None => "5000000000000000000".to_string(),
+					Some("5555555555555555555555555555555555555555") => "1000000".to_string(),
+					Some(other) => panic!("unexpected balance query for {other}"),
+				};
+				Box::pin(async move { Ok(balance) })
+			});
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations: HashMap<u64, Arc<dyn DeliveryInterface>> = HashMap::new();
+		implementations.insert(1, Arc::new(mock_delivery));
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 30, 60));
+		let withdrawals = OperatorWithdrawalsConfig {
+			enabled: true,
+			recipient_allowlist: vec![],
+		};
+		let operator_config = build_operator_config(
+			alloy_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"),
+			withdrawals,
+		);
+		let state = create_admin_state_with_operator_config(operator_config, delivery).await;
+
+		let native = TokenConfig {
+			address: solver_types::Address(vec![0u8; 20]),
+			symbol: "ETH".to_string(),
+			name: Some("Ether".to_string()),
+			decimals: 18,
+		};
+		let erc20 = TokenConfig {
+			address: solver_address("0x5555555555555555555555555555555555555555"),
+			symbol: "USDC".to_string(),
+			name: Some("USD Coin".to_string()),
+			decimals: 6,
+		};
+		let mut networks = NetworksConfig::default();
+		networks.insert(
+			1,
+			RuntimeNetworkConfig {
+				name: Some("mainnet".to_string()),
+				network_type: NetworkType::Parent,
+				rpc_urls: vec![RpcEndpoint::http_only("http://localhost:8545".to_string())],
+				input_settler_address: solver_address("0x1111111111111111111111111111111111111111"),
+				output_settler_address: solver_address(
+					"0x2222222222222222222222222222222222222222",
+				),
+				tokens: vec![native.clone(), erc20],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+		state.token_manager.update_networks(networks).await;
+
+		let response = handle_get_balances(State(state)).await.unwrap().0;
+		let tokens = &response.networks.get("1").unwrap().tokens;
+		let native_rows: Vec<_> = tokens
+			.iter()
+			.filter(|token| token.address == native.address.to_string())
+			.collect();
+
+		assert_eq!(tokens.len(), 2);
+		assert_eq!(native_rows.len(), 1);
+		assert_eq!(native_rows[0].symbol, "ETH");
+		assert_eq!(native_rows[0].name.as_deref(), Some("Ether"));
+		assert_eq!(native_rows[0].balance, "5000000000000000000");
 	}
 
 	struct EnvVarGuard {

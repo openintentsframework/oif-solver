@@ -7,6 +7,12 @@
       "type": "parent",
       "tokens": [
         {
+          "symbol": "ETH",
+          "name": "Ether",
+          "address": "0x0000000000000000000000000000000000000000",
+          "decimals": 18
+        },
+        {
           "symbol": "USDC",
           "name": "USD Coin",
           "address": "0x191688B2Ff5Be8F0A5BCAB3E819C900a810FAaf6",
@@ -19,6 +25,12 @@
       "name": "base-sepolia",
       "type": "hub",
       "tokens": [
+        {
+          "symbol": "ETH",
+          "name": "Ether",
+          "address": "0x0000000000000000000000000000000000000000",
+          "decimals": 18
+        },
         {
           "symbol": "USDC",
           "name": "USD Coin",

@@ -12,7 +12,14 @@
       "input_settler_compact_address": "0x3333333333333333333333333333333333333333",
       "the_compact_address": "0x4444444444444444444444444444444444444444",
       "allocator_address": "0x5555555555555555555555555555555555555555",
-      "tokens": []
+      "tokens": [
+        {
+          "symbol": "ETH",
+          "name": "Ether",
+          "address": "0x0000000000000000000000000000000000000000",
+          "decimals": 18
+        }
+      ]
     },
     {
       "chain_id": 1235,
@@ -24,7 +31,14 @@
       "input_settler_compact_address": "0x8888888888888888888888888888888888888888",
       "the_compact_address": "0x9999999999999999999999999999999999999999",
       "allocator_address": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "tokens": []
+      "tokens": [
+        {
+          "symbol": "ETH",
+          "name": "Ether",
+          "address": "0x0000000000000000000000000000000000000000",
+          "decimals": 18
+        }
+      ]
     }
   ],
   "admin": {

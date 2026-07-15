@@ -25,8 +25,8 @@ use solver_delivery::{
 	DeliveryService, TransactionAttemptRecorder, TransactionMonitoringEvent, TransactionTracking,
 };
 use solver_types::{
-	with_0x_prefix, Address, NetworksConfig, TokenConfig, Transaction, TransactionHash,
-	TransactionType,
+	is_native_address, with_0x_prefix, Address, NetworksConfig, TokenConfig, Transaction,
+	TransactionHash, TransactionType,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,6 +55,10 @@ pub enum TokenManagerError {
 	/// Failed to parse a value.
 	#[error("Failed to parse value: {0}")]
 	ParseError(String),
+
+	/// Native tokens do not support ERC-20 approvals.
+	#[error("Native token approvals are unsupported")]
+	NativeApprovalUnsupported,
 }
 
 /// Manages token configurations and approvals across multiple blockchain networks.
@@ -231,6 +235,15 @@ impl TokenManager {
 		let networks = self.networks.read().await;
 		for (chain_id, network) in networks.iter() {
 			for token in &network.tokens {
+				if is_native_address(&token.address) {
+					tracing::debug!(
+						token = %token.symbol,
+						chain_id,
+						"Skipping approval for native token"
+					);
+					continue;
+				}
+
 				// Process input settler if not zero address
 				if network.input_settler_address.0 != [0u8; 20] {
 					// Check allowance for input settler
@@ -335,6 +348,9 @@ impl TokenManager {
 						continue;
 					}
 				}
+				if is_native_address(&token.address) {
+					continue;
+				}
 
 				if self
 					.ensure_token_approval(*cid, &token.address, &spender, amount)
@@ -361,6 +377,16 @@ impl TokenManager {
 		spender: &Address,
 		amount: U256,
 	) -> Result<bool, TokenManagerError> {
+		if is_native_address(token_address) {
+			tracing::debug!(
+				chain_id,
+				token = %with_0x_prefix(&hex::encode(&token_address.0)),
+				spender = %with_0x_prefix(&hex::encode(&spender.0)),
+				"Skipping approval for native token"
+			);
+			return Ok(false);
+		}
+
 		let solver_address = self.account.get_address().await?;
 		let solver_address_str = with_0x_prefix(&hex::encode(&solver_address.0));
 
@@ -417,6 +443,10 @@ impl TokenManager {
 		spender: &Address,
 		amount: U256,
 	) -> Result<TransactionHash, TokenManagerError> {
+		if is_native_address(token_address) {
+			return Err(TokenManagerError::NativeApprovalUnsupported);
+		}
+
 		// Create approval transaction data
 		// ERC20 approve(address spender, uint256 amount)
 		// Function selector: 0x095ea7b3
@@ -476,13 +506,14 @@ impl TokenManager {
 		let networks = self.networks.read().await;
 		for (chain_id, network) in networks.iter() {
 			for token in &network.tokens {
+				let token_address = if is_native_address(&token.address) {
+					None
+				} else {
+					Some(hex::encode(&token.address.0))
+				};
 				let balance = self
 					.delivery
-					.get_balance(
-						*chain_id,
-						&solver_address_str,
-						Some(&hex::encode(&token.address.0)),
-					)
+					.get_balance(*chain_id, &solver_address_str, token_address.as_deref())
 					.await?;
 
 				balances.insert((*chain_id, token.clone()), balance);
@@ -534,7 +565,7 @@ impl TokenManager {
 		chain_id: u64,
 		token_address: &Address,
 	) -> Result<String, TokenManagerError> {
-		if token_address.0 == [0u8; 20] {
+		if is_native_address(token_address) {
 			let solver_address = self.account.get_address().await?;
 			let solver_address_str = hex::encode(&solver_address.0);
 			let balance = self
@@ -563,7 +594,7 @@ impl TokenManager {
 		recipient: &Address,
 		amount: U256,
 	) -> Result<TransactionHash, TokenManagerError> {
-		let tx = if token_address.0 == [0u8; 20] {
+		let tx = if is_native_address(token_address) {
 			// Native token transfer - let delivery service estimate gas
 			// (21k is only enough for EOAs, contracts/multisigs need more)
 			Transaction {
@@ -1158,6 +1189,108 @@ mod tests {
 			.await;
 
 		assert!(result.unwrap());
+	}
+
+	#[tokio::test]
+	async fn ensure_token_approval_skips_native_token() {
+		let networks = create_test_networks_config();
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery.expect_get_allowance().times(0);
+		mock_delivery.expect_submit().times(0);
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations = HashMap::new();
+		implementations.insert(
+			1,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 20, 60));
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		let native = Address(vec![0u8; 20]);
+		let spender = parse_address("2222222222222222222222222222222222222222").unwrap();
+
+		let approved = token_manager
+			.ensure_token_approval(1, &native, &spender, U256::MAX)
+			.await
+			.expect("native approval should be skipped without error");
+
+		assert!(!approved);
+	}
+
+	#[tokio::test]
+	async fn check_balances_routes_configured_native_to_native_balance() {
+		let native = TokenConfigBuilder::new()
+			.address(Address(vec![0u8; 20]))
+			.symbol("ETH")
+			.decimals(18)
+			.build();
+		let erc20 = TokenConfigBuilder::new()
+			.address(parse_address("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").unwrap())
+			.symbol("USDC")
+			.decimals(6)
+			.build();
+		let mut networks = NetworksConfig::new();
+		networks.insert(
+			1,
+			solver_types::NetworkConfig {
+				name: None,
+				network_type: solver_types::NetworkType::New,
+				rpc_urls: vec![],
+				input_settler_address: parse_address("0x1111111111111111111111111111111111111111")
+					.unwrap(),
+				output_settler_address: parse_address("0x2222222222222222222222222222222222222222")
+					.unwrap(),
+				tokens: vec![native.clone(), erc20.clone()],
+				input_settler_compact_address: None,
+				the_compact_address: None,
+				allocator_address: None,
+			},
+		);
+
+		let mut mock_delivery = MockDeliveryInterface::new();
+		mock_delivery
+			.expect_get_balance()
+			.times(2)
+			.returning(|_, token, chain_id| {
+				assert_eq!(chain_id, 1);
+				let balance = match token {
+					None => "5000000000000000000".to_string(),
+					Some("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48") => "1000000".to_string(),
+					Some(other) => panic!("unexpected ERC20 balance query for {other}"),
+				};
+				Box::pin(async move { Ok(balance) })
+			});
+		mock_delivery.expect_config_schema().returning(|| {
+			Box::new(solver_delivery::implementations::evm::alloy::AlloyDeliverySchema)
+		});
+
+		let mut implementations = HashMap::new();
+		implementations.insert(
+			1,
+			Arc::new(mock_delivery) as Arc<dyn solver_delivery::DeliveryInterface>,
+		);
+		let delivery = Arc::new(DeliveryService::new(implementations, 1, 20, 60));
+		let account = create_mock_account_service();
+		let token_manager = TokenManager::new(networks, delivery, account);
+
+		let balances = token_manager
+			.check_balances()
+			.await
+			.expect("balances should load");
+
+		assert_eq!(
+			balances.get(&(1, native)).map(String::as_str),
+			Some("5000000000000000000")
+		);
+		assert_eq!(
+			balances.get(&(1, erc20)).map(String::as_str),
+			Some("1000000")
+		);
 	}
 
 	#[tokio::test]

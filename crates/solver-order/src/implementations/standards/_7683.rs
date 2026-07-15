@@ -19,7 +19,7 @@ use solver_types::{
 		GasLimitOverrides, LockType, MAX_CALLBACK_DATA_BYTES, MAX_ESCROW_SIGNATURE_BYTES,
 		MAX_ORDER_SIGNATURE_BYTES, MAX_STANDARD_ORDER_INPUTS, MAX_STANDARD_ORDER_OUTPUTS,
 	},
-	utils::conversion::hex_to_alloy_address,
+	utils::conversion::{hex_to_alloy_address, is_native_token_id},
 	Address, ConfigSchema, Eip7683OrderData, ExecutionParams, FillProof, NetworksConfig, Order,
 	OrderStatus, Schema, Transaction,
 };
@@ -392,10 +392,16 @@ impl OrderInterface for Eip7683OrderImpl {
 		}
 		.abi_encode();
 
+		let value = if is_native_token_id(&output.token) {
+			output.amount
+		} else {
+			U256::ZERO
+		};
+
 		Ok(Transaction {
 			to: Some(output_settler_address),
 			data: fill_data,
-			value: U256::ZERO,
+			value,
 			chain_id: dest_chain_id,
 			nonce: None,
 			gas_limit: order_data.gas_limit_overrides.fill_gas_limit,
@@ -637,6 +643,21 @@ impl OrderInterface for Eip7683OrderImpl {
 			return Err(OrderError::ValidationFailed(format!(
 				"too many inputs: maximum supported is {MAX_STANDARD_ORDER_INPUTS}"
 			)));
+		}
+		for (i, input) in standard_order.inputs.iter().enumerate() {
+			// `input[0]` is the `[token, amount]` word's token slot: the address lives in
+			// the low 20 bytes, matching `parse_available_inputs` in solver-types
+			// (`bytes32_to_address(input[0].to_be_bytes::<32>())`). A native input has a
+			// zero address regardless of high bits, so a Compact resource lock encodes it as
+			// `(lockTag << 160) | 0x0` — nonzero high bits, zero address. Check only the low
+			// 20 bytes so those slip through no longer (mirrors the quote-path guard). Do NOT
+			// use `is_native_token_id`, which requires all 32 bytes to be zero.
+			let token = input[0].to_be_bytes::<32>();
+			if token[12..].iter().all(|b| *b == 0) {
+				return Err(OrderError::ValidationFailed(format!(
+					"native inputs are unsupported: input[{i}]"
+				)));
+			}
 		}
 		if standard_order.outputs.len() > MAX_STANDARD_ORDER_OUTPUTS {
 			return Err(OrderError::ValidationFailed(format!(
@@ -1222,6 +1243,35 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn test_generate_fill_transaction_sets_value_for_native_output() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut order_data = create_test_order_data();
+		order_data.outputs[0].token = [0u8; 32];
+		order_data.outputs[0].amount = U256::from(12345);
+		let order = OrderBuilder::new()
+			.with_data(serde_json::to_value(&order_data).unwrap())
+			.with_solver_address(Address(vec![99u8; 20]))
+			.with_quote_id(Some("test-quote".to_string()))
+			.with_input_chain_ids(vec![1])
+			.with_output_chain_ids(vec![137])
+			.build();
+		let params = ExecutionParams {
+			gas_price: U256::ZERO,
+			priority_fee: None,
+		};
+
+		let tx = order_impl
+			.generate_fill_transaction(&order, &params)
+			.await
+			.expect("native fill transaction should be generated");
+
+		assert_eq!(tx.value, order_data.outputs[0].amount);
+	}
+
+	#[tokio::test]
 	async fn test_generate_claim_transaction_escrow() {
 		let networks = create_test_networks();
 		let oracle_routes = create_test_oracle_routes();
@@ -1555,6 +1605,53 @@ mod tests {
 			assert!(
 				err.contains("exclusive output contexts are unsupported"),
 				"unexpected error message for 0x{order_type:02x}: {err}"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_rejects_native_output_with_dutch_context() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		// Fill-time value uses `value = output.amount` for a native output token (see the
+		// `is_native_token_id` branch in `generate_fill_transaction`). That is only sound
+		// while amount-varying contexts (Dutch/exclusive) are refused, otherwise the ETH
+		// attached to the fill would diverge from the amount the settler actually pays.
+		// Lock the invariant: a native OUTPUT (all-zero bytes32 token) plus a Dutch/
+		// exclusive context is still rejected.
+		for context in [
+			dutch_auction_context(), // 0x01 Dutch auction
+			vec![0xe0],              // exclusive limit
+			vec![0xe1],              // exclusive Dutch
+		] {
+			let context_tag = context[0];
+			let mut standard_order = create_valid_standard_order();
+			standard_order.outputs[0].token = alloy_primitives::B256::ZERO;
+			standard_order.outputs[0].context = context.into();
+			let order_bytes = encode_standard_order(&standard_order);
+
+			let result = order_impl.validate_order(&order_bytes).await;
+			assert!(
+				result.is_err(),
+				"expected native output with context 0x{context_tag:02x} to be rejected"
+			);
+		}
+
+		// Guard against over-rejection: a native OUTPUT with a normal (empty) or limit
+		// (single 0x00 byte) context must still be ACCEPTED.
+		for context in [Vec::<u8>::new(), vec![0x00]] {
+			let mut standard_order = create_valid_standard_order();
+			standard_order.outputs[0].token = alloy_primitives::B256::ZERO;
+			standard_order.outputs[0].context = context.into();
+			let order_bytes = encode_standard_order(&standard_order);
+
+			let result = order_impl.validate_order(&order_bytes).await;
+			assert!(
+				result.is_ok(),
+				"native output with a normal/limit context must be accepted: {:?}",
+				result.err()
 			);
 		}
 	}
@@ -1895,6 +1992,52 @@ mod tests {
 		let err = result.unwrap_err().to_string();
 		assert!(
 			err.contains("too many inputs"),
+			"unexpected error message: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_rejects_native_input() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		let mut standard_order = create_valid_standard_order();
+		standard_order.inputs = vec![[U256::ZERO, U256::from(200)]];
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(result.is_err(), "expected native input to be rejected");
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("native inputs are unsupported"),
+			"unexpected error message: {err}"
+		);
+	}
+
+	#[tokio::test]
+	async fn test_validate_order_rejects_compact_native_input() {
+		let networks = create_test_networks();
+		let oracle_routes = create_test_oracle_routes();
+		let order_impl = Eip7683OrderImpl::new(networks, oracle_routes).unwrap();
+
+		// Compact resource-lock native input: input[0] = (lockTag << 160) | 0x0.
+		// The token address occupies only the low 20 bytes (all zero here), while the
+		// high bytes carry a nonzero lockTag. The old `input[0].is_zero()` guard checked
+		// the full 256-bit word, so this native input slipped through. bit 200 sits well
+		// above the low 160 address bits, so the low 20 bytes stay zero.
+		let mut standard_order = create_valid_standard_order();
+		standard_order.inputs = vec![[U256::from(1) << 200, U256::from(200)]];
+		let order_bytes = encode_standard_order(&standard_order);
+
+		let result = order_impl.validate_order(&order_bytes).await;
+		assert!(
+			result.is_err(),
+			"expected Compact native input (zero token in low 20 bytes) to be rejected"
+		);
+		let err = result.unwrap_err().to_string();
+		assert!(
+			err.contains("native inputs are unsupported"),
 			"unexpected error message: {err}"
 		);
 	}

@@ -57,6 +57,7 @@ pub trait PricingRegistry: ImplementationRegistry<Factory = PricingFactory> {}
 /// Re-export implementations
 pub mod implementations {
 	pub mod coingecko;
+	pub mod coinpaprika;
 	pub mod defillama;
 	pub mod mock;
 }
@@ -75,13 +76,16 @@ pub const DEFAULT_TOKEN_MAPPINGS: &[(&str, &str)] = &[
 	("WETH", "ethereum"),
 	("WBTC", "wrapped-bitcoin"),
 	("MATIC", "matic-network"),
+	("POL", "polygon-ecosystem-token"),
+	("BNB", "binancecoin"),
+	("AVAX", "avalanche-2"),
 	("ARB", "arbitrum"),
 	("OP", "optimism"),
 ];
 
 /// Get all registered pricing implementations.
 pub fn get_all_implementations() -> Vec<(&'static str, PricingFactory)> {
-	use implementations::{coingecko, defillama, mock};
+	use implementations::{coingecko, coinpaprika, defillama, mock};
 	vec![
 		(
 			mock::MockPricingRegistry::NAME,
@@ -90,6 +94,10 @@ pub fn get_all_implementations() -> Vec<(&'static str, PricingFactory)> {
 		(
 			coingecko::CoinGeckoPricingRegistry::NAME,
 			coingecko::CoinGeckoPricingRegistry::factory(),
+		),
+		(
+			coinpaprika::CoinPaprikaPricingRegistry::NAME,
+			coinpaprika::CoinPaprikaPricingRegistry::factory(),
 		),
 		(
 			defillama::DefiLlamaPricingRegistry::NAME,
@@ -346,11 +354,12 @@ mod tests {
 	#[test]
 	fn test_get_all_implementations() {
 		let implementations = get_all_implementations();
-		assert_eq!(implementations.len(), 3);
+		assert_eq!(implementations.len(), 4);
 
 		let names: Vec<&str> = implementations.iter().map(|(name, _)| *name).collect();
 		assert!(names.contains(&"mock"));
 		assert!(names.contains(&"coingecko"));
+		assert!(names.contains(&"coinpaprika"));
 		assert!(names.contains(&"defillama"));
 	}
 
@@ -360,6 +369,9 @@ mod tests {
 		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("ETH", "ethereum")));
 		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("BTC", "bitcoin")));
 		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("USDC", "usd-coin")));
+		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("POL", "polygon-ecosystem-token")));
+		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("BNB", "binancecoin")));
+		assert!(DEFAULT_TOKEN_MAPPINGS.contains(&("AVAX", "avalanche-2")));
 	}
 
 	// Tests for PricingService using mock implementation
