@@ -335,12 +335,56 @@ fn parse_u16_env_var(name: &str, default: u16) -> Result<u16, MergeError> {
 	}
 }
 
+fn parse_u64_env_var(name: &str, default: u64) -> Result<u64, MergeError> {
+	match std::env::var(name) {
+		Ok(raw) => raw.trim().parse::<u64>().map_err(|_| {
+			MergeError::Validation(format!(
+				"Invalid integer value for {name}: {raw} (expected a non-negative integer)"
+			))
+		}),
+		Err(std::env::VarError::NotPresent) => Ok(default),
+		Err(std::env::VarError::NotUnicode(_)) => Err(MergeError::Validation(format!(
+			"Invalid unicode value for {name}"
+		))),
+	}
+}
+
 fn load_public_register_enabled(orders_auth_enabled: bool) -> Result<bool, MergeError> {
 	if !orders_auth_enabled {
 		return Ok(false);
 	}
 
 	parse_bool_env_var("AUTH_PUBLIC_REGISTER_ENABLED", false)
+}
+
+/// Validates the on-chain discovery polling interval.
+///
+/// The upper bound mirrors MAX_POLLING_INTERVAL_SECS in the onchain_eip7683
+/// discovery schema; values outside it would pass the merge but abort startup
+/// when the discovery factory validates its config, so reject them here.
+/// Zero is rejected because the implementation treats 0 as WebSocket mode,
+/// which is currently disabled.
+fn validate_discovery_polling_interval_secs(secs: u64) -> Result<u64, MergeError> {
+	if !(1..=300).contains(&secs) {
+		return Err(MergeError::Validation(format!(
+			"SOLVER_DISCOVERY_POLLING_INTERVAL_SECS must be between 1 and 300, got {secs}"
+		)));
+	}
+	Ok(secs)
+}
+
+/// Reads the on-chain discovery polling interval from the environment,
+/// falling back to the seed default when unset.
+fn load_discovery_polling_interval_secs() -> Result<u64, MergeError> {
+	let secs = validate_discovery_polling_interval_secs(parse_u64_env_var(
+		"SOLVER_DISCOVERY_POLLING_INTERVAL_SECS",
+		COMMON_DEFAULTS.polling_interval_secs,
+	)?)?;
+	tracing::info!(
+		polling_interval_secs = secs,
+		"On-chain discovery polling interval resolved"
+	);
+	Ok(secs)
 }
 
 /// Merges seed overrides with a seed config to produce a complete Config.
@@ -1747,7 +1791,10 @@ fn build_discovery_config_from_operator(
 	// Onchain discovery - polls chain for new orders
 	let onchain_config = json_object(vec![
 		("network_ids", network_ids_array.clone()),
-		("polling_interval_secs", int(5)),
+		(
+			"polling_interval_secs",
+			int(load_discovery_polling_interval_secs()? as i64),
+		),
 		(
 			"default_finality_blocks",
 			int(default_finality_blocks as i64),
@@ -7408,6 +7455,64 @@ mod tests {
 	}
 
 	#[test]
+	fn test_validate_discovery_polling_interval_bounds() {
+		assert!(matches!(
+			validate_discovery_polling_interval_secs(0),
+			Err(MergeError::Validation(_))
+		));
+		assert_eq!(validate_discovery_polling_interval_secs(1).unwrap(), 1);
+		assert_eq!(validate_discovery_polling_interval_secs(5).unwrap(), 5);
+		assert_eq!(validate_discovery_polling_interval_secs(300).unwrap(), 300);
+
+		let err = validate_discovery_polling_interval_secs(301).unwrap_err();
+		assert!(matches!(err, MergeError::Validation(_)));
+		assert!(err
+			.to_string()
+			.contains("SOLVER_DISCOVERY_POLLING_INTERVAL_SECS"));
+	}
+
+	#[test]
+	#[serial]
+	fn test_discovery_polling_interval_env_override() {
+		let _guard = EnvVarGuard::capture("SOLVER_DISCOVERY_POLLING_INTERVAL_SECS");
+		std::env::set_var("SOLVER_DISCOVERY_POLLING_INTERVAL_SECS", "300");
+
+		let chain_ids = vec![1, 10];
+		let op_config = merge_to_operator_config(test_seed_overrides(), &TESTNET_SEED).unwrap();
+		let discovery = build_discovery_config_from_operator(&op_config, &chain_ids).unwrap();
+
+		let onchain = discovery.implementations.get("onchain_eip7683").unwrap();
+		assert_eq!(
+			onchain
+				.get("polling_interval_secs")
+				.and_then(|v| v.as_u64()),
+			Some(300)
+		);
+	}
+
+	#[test]
+	#[serial]
+	fn test_discovery_polling_interval_defaults_to_seed_default_when_unset() {
+		let _guard = EnvVarGuard::capture("SOLVER_DISCOVERY_POLLING_INTERVAL_SECS");
+		std::env::remove_var("SOLVER_DISCOVERY_POLLING_INTERVAL_SECS");
+
+		let chain_ids = vec![1, 10];
+		let op_config = merge_to_operator_config(test_seed_overrides(), &TESTNET_SEED).unwrap();
+		let discovery = build_discovery_config_from_operator(&op_config, &chain_ids).unwrap();
+
+		let onchain = discovery.implementations.get("onchain_eip7683").unwrap();
+		assert_eq!(
+			onchain
+				.get("polling_interval_secs")
+				.and_then(|v| v.as_u64()),
+			Some(COMMON_DEFAULTS.polling_interval_secs)
+		);
+		// Pin the current default so a change to COMMON_DEFAULTS is a
+		// deliberate, reviewed behavior change rather than a silent one.
+		assert_eq!(COMMON_DEFAULTS.polling_interval_secs, 5);
+	}
+
+	#[test]
 	fn test_build_discovery_config_reuses_broadcaster_finality() {
 		let mut op_config = merge_to_operator_config(test_seed_overrides(), &TESTNET_SEED).unwrap();
 		op_config.settlement.broadcaster = Some(OperatorBroadcasterConfig {
@@ -7925,6 +8030,38 @@ mod tests {
 		std::env::set_var(key, "not-a-port");
 		let err = parse_u16_env_var(key, 8081).unwrap_err();
 		std::env::remove_var(key);
+
+		assert!(matches!(err, MergeError::Validation(_)));
+		assert!(err.to_string().contains("Invalid integer value"));
+	}
+
+	#[test]
+	#[serial]
+	fn test_parse_u64_env_var_uses_default_when_missing() {
+		let key = "TEST_PARSE_U64_MISSING";
+		let _guard = EnvVarGuard::capture(key);
+		std::env::remove_var(key);
+		let parsed = parse_u64_env_var(key, 5).unwrap();
+		assert_eq!(parsed, 5);
+	}
+
+	#[test]
+	#[serial]
+	fn test_parse_u64_env_var_parses_value() {
+		let key = "TEST_PARSE_U64_VALUE";
+		let _guard = EnvVarGuard::capture(key);
+		std::env::set_var(key, " 500 ");
+		let parsed = parse_u64_env_var(key, 5).unwrap();
+		assert_eq!(parsed, 500);
+	}
+
+	#[test]
+	#[serial]
+	fn test_parse_u64_env_var_rejects_invalid_value() {
+		let key = "TEST_PARSE_U64_INVALID";
+		let _guard = EnvVarGuard::capture(key);
+		std::env::set_var(key, "not-a-number");
+		let err = parse_u64_env_var(key, 5).unwrap_err();
 
 		assert!(matches!(err, MergeError::Validation(_)));
 		assert!(err.to_string().contains("Invalid integer value"));
