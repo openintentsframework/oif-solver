@@ -17,6 +17,7 @@ See root `AGENTS.md` for the full list. The ones this crate reads directly:
 - `REDIS_URL` (default `redis://localhost:6379`)
 - `STORAGE_BACKEND` (`redis` default, `file` alternative)
 - `STORAGE_PATH` (used only with file backend)
+- `SOLVER_DISCOVERY_POLLING_INTERVAL_SECS` (optional; default `5`, range `1..=300`) — on-chain discovery polling cadence, read in `config_merge.rs`
 
 ## Config loading
 

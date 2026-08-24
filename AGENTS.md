@@ -82,6 +82,7 @@ cargo clippy --all-features --all-targets 2>&1 | tee /tmp/clippy.log
 - `STORAGE_PATH` — used only when `STORAGE_BACKEND=file`. Default `./data/storage`.
 - `OIF_CONTRACTS_PATH` — e2e only. Defaults to `../oif-contracts`.
 - `RUST_LOG` — auto-defaulted in the e2e harness.
+- `SOLVER_DISCOVERY_POLLING_INTERVAL_SECS` — optional. On-chain discovery polling cadence in seconds; default `5`, range `1..=300` (bound by the discovery schema's max). Read at boot during config merge (restart to apply).
 
 `.env` is gitignored; never commit one. Templates (`.env.example`, `crates/solver-demo/.env.example`, `config/example.env.docker`) are tracked and safe to read.
 
