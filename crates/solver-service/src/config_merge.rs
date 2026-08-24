@@ -335,6 +335,20 @@ fn parse_u16_env_var(name: &str, default: u16) -> Result<u16, MergeError> {
 	}
 }
 
+fn parse_u64_env_var(name: &str, default: u64) -> Result<u64, MergeError> {
+	match std::env::var(name) {
+		Ok(raw) => raw.trim().parse::<u64>().map_err(|_| {
+			MergeError::Validation(format!(
+				"Invalid integer value for {name}: {raw} (expected a non-negative integer)"
+			))
+		}),
+		Err(std::env::VarError::NotPresent) => Ok(default),
+		Err(std::env::VarError::NotUnicode(_)) => Err(MergeError::Validation(format!(
+			"Invalid unicode value for {name}"
+		))),
+	}
+}
+
 fn load_public_register_enabled(orders_auth_enabled: bool) -> Result<bool, MergeError> {
 	if !orders_auth_enabled {
 		return Ok(false);
@@ -7925,6 +7939,38 @@ mod tests {
 		std::env::set_var(key, "not-a-port");
 		let err = parse_u16_env_var(key, 8081).unwrap_err();
 		std::env::remove_var(key);
+
+		assert!(matches!(err, MergeError::Validation(_)));
+		assert!(err.to_string().contains("Invalid integer value"));
+	}
+
+	#[test]
+	#[serial]
+	fn test_parse_u64_env_var_uses_default_when_missing() {
+		let key = "TEST_PARSE_U64_MISSING";
+		let _guard = EnvVarGuard::capture(key);
+		std::env::remove_var(key);
+		let parsed = parse_u64_env_var(key, 5).unwrap();
+		assert_eq!(parsed, 5);
+	}
+
+	#[test]
+	#[serial]
+	fn test_parse_u64_env_var_parses_value() {
+		let key = "TEST_PARSE_U64_VALUE";
+		let _guard = EnvVarGuard::capture(key);
+		std::env::set_var(key, " 500 ");
+		let parsed = parse_u64_env_var(key, 5).unwrap();
+		assert_eq!(parsed, 500);
+	}
+
+	#[test]
+	#[serial]
+	fn test_parse_u64_env_var_rejects_invalid_value() {
+		let key = "TEST_PARSE_U64_INVALID";
+		let _guard = EnvVarGuard::capture(key);
+		std::env::set_var(key, "not-a-number");
+		let err = parse_u64_env_var(key, 5).unwrap_err();
 
 		assert!(matches!(err, MergeError::Validation(_)));
 		assert!(err.to_string().contains("Invalid integer value"));
