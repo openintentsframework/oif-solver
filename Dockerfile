@@ -35,6 +35,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # ------------------------------------------------------------------------------
 FROM cgr.dev/chainguard/wolfi-base@sha256:417d791afa234c538bca977fe0f44011d2381e60a9fde44c938bd17b9cc38f66
 
+# Minimum CA bundle version. 20260909-r3 distrusts the compromised eMudhra
+# intermediates (https://emudhra.we-have-a-problem.com/). The pinned base above
+# ships an older bundle, so upgrade it explicitly; apk fails the build if the
+# floor cannot be met.
+ARG MIN_CA_CERTIFICATES_BUNDLE_VERSION=20260909-r3
+RUN apk add --no-cache "ca-certificates-bundle>=${MIN_CA_CERTIFICATES_BUNDLE_VERSION}"
+
 WORKDIR /app
 
 # Copy the compiled binary
