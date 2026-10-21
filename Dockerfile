@@ -8,8 +8,10 @@ FROM cgr.dev/chainguard/rust:latest-dev@sha256:33faad9a26e8437ed9725bea3eb2d1e85
 ARG FEATURES=""
 
 USER root
+# Pin OpenSSL 3.6 headers: unversioned openssl-dev now resolves to OpenSSL 4.0,
+# which openssl-sys rejects and which would not match libssl3 in the runtime image.
 RUN apk update && apk --no-cache add \
-    openssl-dev \
+    openssl-3.6-dev \
     perl
 
 ENV PKG_CONFIG_PATH=/usr/lib/pkgconfig
@@ -34,6 +36,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Runtime environment
 # ------------------------------------------------------------------------------
 FROM cgr.dev/chainguard/wolfi-base@sha256:417d791afa234c538bca977fe0f44011d2381e60a9fde44c938bd17b9cc38f66
+
+# Minimum CA bundle version. 20260909-r3 distrusts the compromised eMudhra
+# intermediates (https://emudhra.we-have-a-problem.com/). The pinned base above
+# ships an older bundle, so upgrade it explicitly; apk fails the build if the
+# floor cannot be met.
+ARG MIN_CA_CERTIFICATES_BUNDLE_VERSION=20260909-r3
+RUN apk add --no-cache "ca-certificates-bundle>=${MIN_CA_CERTIFICATES_BUNDLE_VERSION}"
 
 WORKDIR /app
 
