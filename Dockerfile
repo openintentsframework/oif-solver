@@ -8,8 +8,10 @@ FROM cgr.dev/chainguard/rust:latest-dev@sha256:33faad9a26e8437ed9725bea3eb2d1e85
 ARG FEATURES=""
 
 USER root
+# Pin OpenSSL 3.6 headers: unversioned openssl-dev now resolves to OpenSSL 4.0,
+# which openssl-sys rejects and which would not match libssl3 in the runtime image.
 RUN apk update && apk --no-cache add \
-    openssl-dev \
+    openssl-3.6-dev \
     perl
 
 ENV PKG_CONFIG_PATH=/usr/lib/pkgconfig
